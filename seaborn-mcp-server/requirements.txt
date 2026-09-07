@@ -1,0 +1,8 @@
+fastmcp
+pandas
+numpy
+seaborn
+matplotlib
+plotly
+mpld3
+pydantic

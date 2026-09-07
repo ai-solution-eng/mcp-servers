@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-seaborn-server.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-seaborn-server.labels" . | nindent 4 }}
+    {{- include "hpe-ezua.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mcp-seaborn-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcp-seaborn-server.selectorLabels" . | nindent 8 }}
+        {{- include "hpe-ezua.labels" . | nindent 8 }}
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      {{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+      initContainers:
+        - name: build-ca-bundle
+          image: {{ .Values.certificatesPolicy.initContainer.image | quote }}
+          command:
+{{ toYaml .Values.certificatesPolicy.initContainer.command | indent 12 }}
+          volumeMounts:
+{{- range .Values.certificatesPolicy.initVolumeMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              {{- if .subPath }}
+              subPath: {{ .subPath }}
+              {{- end }}
+              {{- if hasKey . "readOnly" }}
+              readOnly: {{ .readOnly }}
+              {{- end }}
+{{- end }}
+      {{- end }}
+
+      containers:
+        - name: mcp-seaborn-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http-ui
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+
+{{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+          env:
+{{- range .Values.certificatesPolicy.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+{{- end }}
+{{- end }}
+          volumeMounts:
+{{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+{{- range .Values.certificatesPolicy.volumeMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              {{- if .subPath }}
+              subPath: {{ .subPath }}
+              {{- end }}
+              {{- if hasKey . "readOnly" }}
+              readOnly: {{ .readOnly }}
+              {{- end }}
+{{- end }}
+{{- end }}
+          resources:
+{{ toYaml .Values.service.resources | indent 12 }}
+
+      volumes:
+{{- if and .Values.certificatesPolicy .Values.certificatesPolicy.enabled }}
+{{- range .Values.certificatesPolicy.volumes }}
+        - name: {{ .name }}
+{{- if hasKey . "emptyDir" }}
+          emptyDir: {}
+{{- else if .configMap }}
+          configMap:
+            name: {{ .configMap.name }}
+            items:
+{{- range .configMap.items }}
+              - key: {{ .key }}
+                path: {{ .path }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

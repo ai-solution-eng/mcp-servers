@@ -1,0 +1,34 @@
+image:
+  repository: ghcr.io/ai-solution-eng/seaborn-mcp
+  pullPolicy: IfNotPresent
+  tag: 1.0.0
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 9092
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+ezua:
+  enabled: true
+  virtualService:
+    endpoint: "mcp-seaborn-server.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+
+certificatesPolicy:
+  enabled: false
+  env: []                 # e.g. NODE_EXTRA_CA_CERTS / SSL_CERT_DIR / REQUESTS_CA_BUNDLE / DOCKER_CERT_PATH
+  initContainer:
+    image: alpine:3.20
+    command: []
+  initVolumeMounts: []    # mounts applied to the build-ca-bundle init container (e.g. combined-certs, ezaf-root-ca)
+  volumes: []
+  volumeMounts: []
+

@@ -1,0 +1,47 @@
+image:
+  repository: ghcr.io/ai-solution-eng/ddgs-mcp
+  tag: v1.0
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 9090
+  targetPort: 9090
+
+deployment:
+  name: ddgs-lite
+  appName: ddgs-lite
+  replicaCount: 1
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 200Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+env:
+  - name: DDG_REGION
+    value: ""
+
+# Route outbound HTTP(S) traffic through the HPE corporate proxy.
+# Default false: open-internet systems must NOT use the proxy (DNS/egress
+# failures). Set true (and configure proxy.*) only behind the HPE proxy.
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "ddgs-lite.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

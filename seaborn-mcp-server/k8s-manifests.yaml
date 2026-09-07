@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-seaborn-server
+  namespace: mcp-seaborn-server
+  labels:
+    app: mcp-seaborn-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-seaborn-server
+  template:
+    metadata:
+      labels:
+        app: mcp-seaborn-server
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+      - name: mcp-seaborn-server
+        image: fcaliva/seaborn-mcp:0.0.3
+        ports:
+        - containerPort: 9092
+          name: mcp-sse
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-seaborn-server-svc
+  namespace: mcp-seaborn-server
+  labels:
+    app: mcp-seaborn-server
+spec:
+  ports:
+  - port: 9092
+    targetPort: 9092
+    name: http-mcp
+  selector:
+    app: mcp-seaborn-server
