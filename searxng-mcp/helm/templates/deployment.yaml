@@ -41,6 +41,13 @@ spec:
             name: {{ .Values.deployment.name }}-settings
         - name: config-runtime
           emptyDir: {}
+        {{- if and .Values.browser.enabled .Values.browser.caCert.enabled }}
+        # Corporate MITM CA for the headless browser (Chromium verifies TLS
+        # against the OS trust store, not *_PROXY env or SSL_CERT_FILE).
+        - name: browser-ca-src
+          configMap:
+            name: {{ .Values.browser.caCert.configMap }}
+        {{- end }}
       containers:
         # ------------------------------------------------------------------
         # SearXNG sidecar — the metasearch engine itself (localhost:8080)
@@ -127,3 +134,52 @@ spec:
             - name: no_proxy
               value: {{ .Values.proxy.noProxy | quote }}
             {{- end }}
+        {{- if .Values.browser.enabled }}
+        # ------------------------------------------------------------------
+        # Headless-browser sidecar (optional) — Playwright Chromium serving
+        # an unauthenticated CDP port bound to pod-loopback. fetch_content
+        # escalates JS-only pages to it. Loopback-only is load-bearing: all
+        # pod containers share one network namespace, so 127.0.0.1 works
+        # pod-locally while the cluster network never sees the port (the
+        # cluster has no NetworkPolicies — never add
+        # --remote-debugging-address=0.0.0.0).
+        # ------------------------------------------------------------------
+        - name: browser
+          image: "{{ .Values.browser.image.repository }}:{{ .Values.browser.image.tag }}"
+          imagePullPolicy: {{ .Values.browser.image.pullPolicy }}
+          env:
+            # Chromium ignores *_PROXY env vars; the entrypoint converts
+            # this into --proxy-server.
+            - name: BROWSER_PROXY
+              value: {{ if and .Values.hpe_proxies .Values.proxy.https }}{{ .Values.proxy.https | quote }}{{ else }}""{{ end }}
+            {{- if .Values.browser.extraArgs }}
+            - name: BROWSER_EXTRA_ARGS
+              value: {{ .Values.browser.extraArgs | quote }}
+            {{- end }}
+          # CDP binds pod-loopback, so kubelet http/tcp probes against the
+          # pod IP cannot reach it — probe via exec instead. The container
+          # ships python3; a real CDP handshake beats a "PID 1 exists" check.
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=3)\""]
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=3)\""]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=3)\""]
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.browser.resources | nindent 12 }}
+          {{- if .Values.browser.caCert.enabled }}
+          volumeMounts:
+            - name: browser-ca-src
+              mountPath: /certs-src
+              readOnly: true
+          {{- end }}
+        {{- end }}

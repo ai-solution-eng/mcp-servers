@@ -1,6 +1,10 @@
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.0.0
+  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
+  # this default is what a helm install WITHOUT -f values.se-g2.yaml deploys,
+  # and a stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
+  # an MCP too old to know the sidecar exists.
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
 # ddgs-mcp convention) pull anonymously. Create with:
@@ -64,6 +68,40 @@ resources:
   limits:
     cpu: "1"
     memory: 512Mi
+
+# Optional headless-browser sidecar: lets fetch_content render JavaScript
+# pages (auto-escalation when plain HTTP fails or returns a JS-stub shell,
+# render="always", and include_screenshot). The image is built from
+# ./browser/Dockerfile (Playwright Chromium headless shell). Disabled by
+# default: adds ~512Mi memory and a second image to maintain, while plain
+# HTTP + curl_cffi already covers most sites. The MCP container reaches the
+# browser on http://127.0.0.1:9222 (pod-localhost, loopback-only binding) —
+# no service, port, or policy changes needed.
+browser:
+  enabled: false
+  image:
+    repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
+    tag: v1.1.0
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # Corporate MITM CA: the entrypoint installs *.crt files from this
+  # ConfigMap into the container trust store at startup (Chromium does not
+  # honor SSL_CERT_FILE / NODE_EXTRA_CA_CERTS). The ConfigMap must exist in
+  # the release namespace, e.g. copy the cluster-wide one:
+  #   kubectl get cm ezaf-root-ca -n <existing-ns> -o yaml | \
+  #     yq 'del(.metadata.namespace,.metadata.uid,.metadata.resourceVersion,
+  #            .metadata.creationTimestamp)' | \
+  #     kubectl apply -n <release-ns> -f -
+  caCert:
+    enabled: false
+    configMap: "ezaf-root-ca"
+  # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
+  extraArgs: ""
 
 env:
   - name: SEARXNG_URL

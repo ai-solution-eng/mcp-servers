@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "searxng-mcp"
-version = "1.0.3"
+version = "1.1.0"
 description = "SearXNG MCP Server — metasearch via a self-hosted SearXNG instance + content fetcher"
 authors = []
 requires-python = ">=3.10"
@@ -28,8 +28,15 @@ dependencies = [
     "curl_cffi>=0.9.0",
 ]
 
+[project.optional-dependencies]
+# Playwright drives the headless-browser sidecar over CDP (client side only —
+# the Chromium binary lives in the separate searxng-mcp-browser image). The
+# core install stays fully functional without it: fetch_content simply never
+# escalates to rendering.
+browser = ["playwright>=1.49"]
+
 [project.scripts]
 searxng-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "searxng_client", "fetcher"]
+py-modules = ["server", "searxng_client", "fetcher", "browser_client"]

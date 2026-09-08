@@ -8,6 +8,11 @@ Fetch phase (getting the HTML):
    edge rejects python's TLS fingerprint with 403 (wikipedia does this from
    some egress paths); restores the ddgs-lite primp capability without the
    ddgs scraping library
+3. headless browser (optional sidecar, Playwright over CDP) — escalation
+   for pages the first two rungs cannot see: JS-rendered SPAs, challenge
+   interstitials, or content that only exists after scripts run. Renders
+   the page, then feeds the resulting DOM through the same extraction
+   chain below.
 
 Extraction phase (HTML -> markdown):
 1. trafilatura  — best-quality readability extraction, native markdown output
@@ -18,6 +23,15 @@ The tool-level output contract (pagination meta line, source attribution,
 error wording) matches ddgs-lite's fetch_content exactly, plus failure
 telemetry: the error names the actual HTTP status / exception of the last
 attempt.
+
+Rendering is controlled by the ``render`` parameter:
+* "auto" (default) — escalate to the browser only when the plain fetch
+  failed outright or produced a weak/JS-stub extraction (see
+  ``_weak_extraction``).
+* "always" — render in the browser first; fall back to plain HTTP if the
+  sidecar is unavailable.
+* "never" — plain HTTP ladder only, exactly like before the sidecar
+  existed.
 """
 
 from __future__ import annotations
@@ -30,6 +44,12 @@ from urllib.parse import unquote
 
 import httpx
 
+from browser_client import (
+    RENDER_MODES,
+    BrowserClient,
+    BrowserError,
+    BrowserUnavailable,
+)
 from searxng_client import RateLimiter
 
 FETCH_HEADERS = {
@@ -41,6 +61,23 @@ FETCH_HEADERS = {
 }
 
 BACKENDS = ("auto", "trafilatura", "bs4", "httpx", "curl", "wikipedia")
+
+# Escalation-to-browser heuristics (render="auto"). A page whose extracted
+# text is shorter than RENDER_MIN_CHARS *and* smells like a JS-only shell
+# gets one render attempt in the sidecar browser.
+RENDER_MIN_CHARS = 250
+JS_PAGE_MARKERS = re.compile(
+    r"<noscript[\s>]"
+    r"|enable\s+javascript"
+    r"|just\s+a\s+moment"  # Cloudflare interstitial title
+    r"|attention\s+required"
+    r"|challenge-platform"
+    r"|cf-browser-verification"
+    r"|checking\s+your\s+browser"
+    r"|ddos\s+protection",
+    re.IGNORECASE,
+)
+WIKIPEDIA_URL_RE = re.compile(r"https?://([a-z]+)\.wikipedia\.org/wiki/([^?#]+)")
 
 
 def clean_markdown_cruft(text: str) -> str:
@@ -112,9 +149,15 @@ class WebContentFetcher:
         requests_per_minute: int = 20,
         timeout: float = 30.0,
         verify_tls: bool = True,
+        browser: BrowserClient | None = None,
     ):
         self.rate_limiter = RateLimiter(requests_per_minute)
         self.last_fetch_error: str | None = None
+        self.browser_note: str | None = None  # why the browser rung failed, if it did
+        # Headless-browser client, created lazily on first escalation so a
+        # plain install (no playwright, no sidecar) never pays for it.
+        # Tests inject a stub here.
+        self._browser = browser
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
@@ -124,8 +167,16 @@ class WebContentFetcher:
             verify=verify_tls,
         )
 
+    @property
+    def browser(self) -> BrowserClient:
+        if self._browser is None:
+            self._browser = BrowserClient()
+        return self._browser
+
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._browser is not None:
+            await self._browser.aclose()
 
     async def _get_html(self, url: str) -> str | None:
         """Plain HTTP GET returning the raw HTML, or None on any failure.
@@ -216,53 +267,90 @@ class WebContentFetcher:
         start_index: int = 0,
         max_length: int = 8000,
         backend: str = "auto",
+        render: str = "auto",
+        include_screenshot: bool = False,
     ) -> str:
         await self.rate_limiter.acquire()
         await ctx.info(f"Fetching content from: {url}")
 
         text = None
         source = None
+        screenshot_b64 = None
         loop = asyncio.get_running_loop()
+        is_wiki_url = bool(WIKIPEDIA_URL_RE.match(url))
 
         if backend == "wikipedia":
             text = await self._try_wikipedia_api(url)
             if text:
                 source = "Wikipedia API"
         else:
-            # ---- fetch phase: plain httpx, escalating to a browser-grade
-            # TLS fingerprint when the site rejects plain clients.
-            if backend == "curl":
-                html = await self._get_html_impersonated(url)
-            else:
-                html = await self._get_html(url)
-                if html is None:
-                    html = await self._get_html_impersonated(url)
+            html = None
+            rendered_in_browser = False
 
-            # ---- extraction phase
-            if html is not None:
-                if backend in ("auto", "trafilatura", "curl"):
-                    text = await loop.run_in_executor(
-                        None, extract_via_trafilatura, html, url
+            # ---- fetch phase, rung 0: explicit headless-browser render.
+            # "always" or a requested screenshot skips the plain-HTTP ladder
+            # entirely — the caller asked for JS execution by definition.
+            if render == "always" or include_screenshot:
+                page, shot = await self._render_via_browser(
+                    url, ctx, with_screenshot=include_screenshot
+                )
+                if page is not None:
+                    rendered_in_browser = True
+                    text, source = await self._extract_html(
+                        page.html, url, loop, backend, source_prefix="headless-browser+"
                     )
-                    if text:
-                        source = "trafilatura"
-                if text is None and backend in ("auto", "bs4", "httpx", "curl"):
-                    text = await loop.run_in_executor(None, extract_via_bs4, html)
-                    if text:
-                        source = "bs4+html2text"
+                    screenshot_b64 = shot
 
-            if text is None and backend == "auto":
-                wiki_text = await self._try_wikipedia_api(url)
-                if wiki_text:
-                    text, source = wiki_text, "Wikipedia API"
+            # ---- fetch phase, rungs 1-2: plain httpx, escalating to a
+            # browser-grade TLS fingerprint when the site rejects plain
+            # clients.
+            if text is None:
+                if backend == "curl":
+                    html = await self._get_html_impersonated(url)
+                else:
+                    html = await self._get_html(url)
+                    if html is None:
+                        html = await self._get_html_impersonated(url)
+
+                text, source = await self._extract_html(html, url, loop, backend, "")
+
+                if text is None and backend == "auto":
+                    wiki_text = await self._try_wikipedia_api(url)
+                    if wiki_text:
+                        text, source = wiki_text, "Wikipedia API"
+
+            # ---- fetch phase, rung 3: headless-browser escalation
+            # (render="auto"). Wikipedia URLs skip it — the Wikipedia API
+            # fallback above is cheaper and authoritative for those. A page
+            # already rendered in rung 0 is never re-rendered.
+            if (
+                render == "auto"
+                and not is_wiki_url
+                and not rendered_in_browser
+                and (text is None or self._weak_extraction(html, text))
+            ):
+                page, shot = await self._render_via_browser(
+                    url, ctx, with_screenshot=include_screenshot
+                )
+                if page is not None:
+                    alt_text, alt_source = await self._extract_html(
+                        page.html, url, loop, backend, source_prefix="headless-browser+"
+                    )
+                    if alt_text and (text is None or len(alt_text) > len(text)):
+                        text, source = alt_text, alt_source
+                    screenshot_b64 = screenshot_b64 or shot
 
         if text is None:
             detail = f" (last attempt: {self.last_fetch_error})" if self.last_fetch_error else ""
+            browser_note = getattr(self, "browser_note", None)
+            if browser_note:
+                detail += f" [headless browser: {browser_note}]"
             return (
                 f"Error: Could not access the webpage at {url}{detail}. "
                 "The site may require JavaScript, be blocked, or require authentication. "
                 "Fetching escalates from plain HTTP to a browser-grade TLS fingerprint "
-                "(curl_cffi); sites that block even that (JS challenges, logins) "
+                "(curl_cffi) and then to a headless browser (when the sidecar is "
+                "enabled); sites that block even a real browser or need logins "
                 "remain out of reach."
             )
 
@@ -271,6 +359,13 @@ class WebContentFetcher:
         total = len(text)
         text = text[start_index : start_index + max_length]
         truncated = start_index + max_length < total
+
+        if screenshot_b64:
+            text += (
+                "\n\n---\n[Screenshot of the rendered page (PNG data URL — "
+                f"pass to a vision tool as-is, ~{len(screenshot_b64) // 1024} KB base64):]\n"
+                f"data:image/png;base64,{screenshot_b64}"
+            )
 
         meta = (
             f"\n\n---\n[Content info: Showing characters {start_index}-"
@@ -282,3 +377,46 @@ class WebContentFetcher:
 
         await ctx.info(f"Extracted {len(text)} characters from {url}")
         return text + meta
+
+    # ------------------------------------------------------- browser rung
+    def _weak_extraction(self, html: str | None, text: str | None) -> bool:
+        """True when the plain-HTTP result smells like a JS-only page:
+        almost no readable text despite a substantial document, or explicit
+        JS-required / challenge markers."""
+        if text is None:
+            return False  # nothing extracted at all is escalated regardless
+        if len(text) >= RENDER_MIN_CHARS:
+            return False
+        haystack = (html or "")[:8000] + text
+        return bool(JS_PAGE_MARKERS.search(haystack))
+
+    async def _render_via_browser(self, url, ctx, *, with_screenshot=False):
+        """Render via the sidecar; every failure degrades to (None, None)
+        with the reason logged, never raised — the browser is an optional
+        escalation rung, not a hard dependency."""
+        try:
+            return await self.browser.render(url, screenshot=with_screenshot)
+        except BrowserUnavailable as e:
+            self.browser_note = str(e)
+            await ctx.info(f"Headless browser unavailable, continuing without it: {e}")
+            return None, None
+        except BrowserError as e:
+            self.browser_note = str(e)
+            await ctx.info(f"Headless browser render failed, continuing without it: {e}")
+            return None, None
+
+    async def _extract_html(self, html, url, loop, backend, source_prefix):
+        """Run the trafilatura -> bs4 extraction chain over raw HTML."""
+        if html is None:
+            return None, None
+        text = None
+        source = None
+        if backend in ("auto", "trafilatura", "curl"):
+            text = await loop.run_in_executor(None, extract_via_trafilatura, html, url)
+            if text:
+                source = f"{source_prefix}trafilatura"
+        if text is None and backend in ("auto", "bs4", "httpx", "curl"):
+            text = await loop.run_in_executor(None, extract_via_bs4, html)
+            if text:
+                source = f"{source_prefix}bs4+html2text"
+        return text, source

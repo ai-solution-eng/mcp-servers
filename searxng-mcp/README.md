@@ -77,6 +77,8 @@ fetch_content(
     start_index: int = 0,      # pagination offset
     max_length: int = 8000,    # characters per call
     backend: str = "auto",     # auto|trafilatura|bs4 ('httpx' alias)|curl|wikipedia
+    render: str = "auto",      # auto|always|never — headless-browser usage
+    include_screenshot: bool = False,  # append a PNG data URL of the page
 ) -> str
 ```
 
@@ -91,6 +93,18 @@ some egress paths). `curl` always uses the impersonated fetch; `wikipedia`
 goes straight to the Wikipedia API. Failures are self-describing — the error
 includes the last attempt's HTTP status or exception.
 
+**Headless-browser escalation** (when the sidecar is deployed — see the
+section below): `render="auto"` further escalates to a real Chromium render
+when the plain ladder fails outright or returns a JS-stub shell (near-empty
+text, `<noscript>` markers, challenge interstitials); the rendered DOM flows
+through the same trafilatura → bs4 extraction chain and the
+`(via headless-browser+…)` footer says so. `render="always"` skips plain HTTP
+entirely; `render="never"` keeps the old plain-only behavior.
+`include_screenshot=True` forces a browser render and appends the page
+screenshot as a base64 PNG data URL — pass it to a vision tool as-is. Every
+browser failure degrades gracefully to the plain result with the reason
+logged; the sidecar is never a hard dependency.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -103,17 +117,52 @@ includes the last attempt's HTTP status or exception.
 | `FETCH_REQUESTS_PER_MINUTE` | `20` | Fetch rate limit |
 | `FETCH_VERIFY_TLS` | `true` | TLS verification for fetched pages |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | Corporate proxy for `fetch_content` |
+| `BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Headless-browser sidecar CDP endpoint |
+| `BROWSER_NAV_TIMEOUT_MS` etc. | see `browser_client.py` | Nav timeout, settle wait, max pages, resource blocking |
 
 The search client deliberately ignores environment proxies
 (`trust_env=False`): the sidecar is reached over `localhost`, and nothing
 must intercept that.
+
+## Headless browser rendering (optional sidecar)
+
+JS-only pages (SPAs, challenge interstitials) are invisible to plain HTTP
+fetching. The optional `browser` container — Playwright's Chromium headless
+shell — closes that gap. All containers in a pod share a network namespace,
+so the MCP server connects over `http://127.0.0.1:9222` with **no service,
+port, or policy changes** — and because CDP binds loopback only, nothing
+outside the pod can reach it (CDP is unauthenticated
+code-execution-as-browser-user; on a cluster without NetworkPolicies this
+binding is not negotiable — never add `--remote-debugging-address=0.0.0.0`).
+
+Build & push (separate image; the MCP image stays slim — only the ~40 MB
+playwright *client* package is added to it). The Playwright version is baked
+into the Dockerfile as the `ARG PLAYWRIGHT_VERSION` default, so no build-arg
+is needed; pass `--build-arg PLAYWRIGHT_VERSION=<ver>` only to override it
+without editing the file (e.g., once a version with official Debian-13
+support lands):
+
+```bash
+docker buildx build \
+  -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+  mcp_servers/searxng_mcp/browser --push
+```
+
+Then enable per site: `browser.enabled: true` (+ resources) in the site
+values. The chart adds the container with CDP `json/version` exec probes,
+turns `proxy.https` into Chromium's `--proxy-server` (Chromium ignores
+`*_PROXY` env vars), and — with `browser.caCert.enabled` — mounts the
+corporate MITM CA ConfigMap into the container trust store at startup
+(Chromium honors neither `SSL_CERT_FILE` nor `NODE_EXTRA_CA_CERTS`). Without
+the sidecar the server behaves exactly as before: escalation is simply
+unavailable and self-describes in tool output.
 
 ## Local development
 
 ```bash
 uv venv --python 3.12 .venv          # or any python ≥3.10
 uv pip install -e . pytest           # or: uv pip install -r <(sed ...) — see pyproject
-.venv/bin/python -m pytest tests/ -v # 30 unit tests (fully mocked, no network)
+.venv/bin/python -m pytest tests/ -v # 55 unit tests (fully mocked, no network)
 
 # Live check against any real SearXNG:
 SEARXNG_URL=https://searxng.example.com SEARXNG_VERIFY_TLS=false \
@@ -137,8 +186,12 @@ docker run --rm -p 8080:8080 \
 ## Deployment
 
 ```bash
-# Build & push the MCP image
-docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v0.1.0 -f Dockerfile . --push
+# Build & push the MCP image (playwright client included via the browser extra)
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v1.1.0 -f Dockerfile . --push
+
+# Optional: build & push the headless-browser sidecar (see the section above)
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+    mcp_servers/searxng_mcp/browser --push
 
 # Render & inspect, then install (per-site values from helm/local/)
 helm template searxng-mcp helm/ -f helm/local/values.<site>.yaml
@@ -148,10 +201,10 @@ helm upgrade --install searxng-mcp helm/ -n searxng-mcp --create-namespace \
 
 Chart contents:
 
-- `deployment.yaml` — one pod, three containers: an init container that
-  copies the settings ConfigMap into an `emptyDir` (SearXNG's entrypoint
-  writes to `/etc/searxng`), the SearXNG sidecar (8080), and the MCP server
-  (9090).
+- `deployment.yaml` — one pod: an init container that copies the settings
+  ConfigMap into an `emptyDir` (SearXNG's entrypoint writes to
+  `/etc/searxng`), the SearXNG sidecar (8080), the MCP server (9090), and —
+  when `browser.enabled` — the headless-browser sidecar (loopback CDP).
 - `configmap.yaml` — renders `settings.yml` from values: JSON format
   enabled, limiter off (no valkey needed), optional disabled-engine list
   (default: none), optional
@@ -234,12 +287,18 @@ searxng_mcp/
 ├── server.py               # MCP 2.0 MCPServer + tools (search, fetch_content)
 ├── searxng_client.py       # SearXNG JSON API client + formatting
 ├── fetcher.py              # trafilatura → bs4/html2text → Wikipedia fetcher
+│                           #   (+ headless-browser escalation rung)
+├── browser_client.py       # Playwright-over-CDP client for the browser sidecar
+├── browser/                # headless-browser sidecar image (Chromium headless
+│   ├── Dockerfile          #   shell, loopback CDP, CA/proxy entrypoint)
+│   └── entrypoint.sh
 ├── pyproject.toml          # package: searxng-mcp, entry point: searxng-mcp
 ├── Dockerfile
 ├── searxng/settings.yml    # reference settings (bare docker / docs)
 ├── helm/                   # chart: configmap, sidecar deployment, service, VS
 │   └── local/              # per-site values (never committed)
 └── tests/
-    ├── test_searxng_mcp.py # 30 unit tests (mocked transport, in-memory MCP)
-    └── live_check.py       # end-to-end check vs a real instance
+    ├── test_searxng_mcp.py # 32 unit tests (mocked transport, in-memory MCP)
+    ├── test_browser_render.py # 23 escalation tests (stubbed browser client)
+    └── live_check.py       # end-to-end check vs a real instance (+ sidecar)
 ```

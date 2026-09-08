@@ -73,6 +73,38 @@ async def main() -> None:
             print(text[:500], "...")
             assert not r.is_error and "Content info" in text
 
+            # 6. Headless-browser sidecar (optional): render="always" on a
+            # JS-rendered page. Skips cleanly when no sidecar is reachable
+            # (degradation message instead of a failure).
+            try:
+                import httpx as _hx
+
+                await _hx.AsyncClient(timeout=3).get(
+                    os.environ.get("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+                    + "/json/version"
+                )
+                sidecar_up = True
+            except Exception:
+                sidecar_up = False
+            print(f"\n[browser sidecar] {'reachable' if sidecar_up else 'not reachable — skipping render check'}")
+            if sidecar_up:
+                r = await session.call_tool(
+                    "fetch_content",
+                    {
+                        "url": "https://example.com",
+                        "render": "always",
+                        "include_screenshot": True,
+                        "max_length": 800,
+                    },
+                )
+                text = r.content[0].text
+                print("=== fetch_content render=always + screenshot: example.com ===")
+                print(text[:400], "...")
+                assert not r.is_error
+                assert "Example Domain" in text
+                assert "data:image/png;base64," in text
+                print("[browser render] markdown + screenshot data URL OK")
+
     print("\nALL LIVE CHECKS PASSED")
 
 

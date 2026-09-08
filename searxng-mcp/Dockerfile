@@ -15,9 +15,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the project and all its dependencies from pyproject.toml
-COPY pyproject.toml server.py searxng_client.py fetcher.py ./
-RUN uv pip install --system .
+# Install the project and all its dependencies from pyproject.toml.
+# The 'browser' extra pulls in the playwright *client* library (~40 MB pip
+# package, no browser download) so fetch_content can escalate JS-only pages
+# to the searxng-mcp-browser sidecar. Without it the server still runs;
+# rendering is simply unavailable and fetch_content degrades to plain HTTP.
+COPY pyproject.toml server.py searxng_client.py fetcher.py browser_client.py ./
+RUN uv pip install --system ".[browser]"
 
 EXPOSE 9090
 
