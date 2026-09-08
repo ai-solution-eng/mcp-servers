@@ -1,0 +1,6 @@
+apiVersion: v2
+name: searxng-mcp
+description: SearXNG MCP Server — MCP 2.0 metasearch + content fetcher backed by a bundled SearXNG sidecar
+type: application
+version: 1.0.3
+appVersion: "v1.0.3"

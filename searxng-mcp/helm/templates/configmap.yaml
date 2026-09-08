@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.deployment.name }}-settings
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+data:
+  settings.yml: |
+    use_default_settings: true
+
+    general:
+      debug: false
+      enable_metrics: false
+      instance_name: SearXNG (searxng-mcp)
+
+    search:
+      formats:
+        - html
+        - json
+      safe_search: 0
+
+    # NOTE: engine overrides MUST be at the TOP LEVEL (searx/settings_loader.py
+    # reads user_settings['engines']). A 'search.engines' key is silently
+    # ignored — the mistake the previous deployment made.
+    {{- if .Values.searxng.disabledEngines }}
+    engines:
+    {{- range .Values.searxng.disabledEngines }}
+    - name: {{ . | quote }}
+      disabled: true
+    {{- end }}
+    {{- end }}
+
+    server:
+      {{- if .Values.searxng.baseUrl }}
+      base_url: {{ .Values.searxng.baseUrl | quote }}
+      {{- end }}
+      limiter: false
+      image_proxy: true
+      method: GET
+      public_instance: false
+
+    outgoing:
+      enable_http2: true
+      max_request_timeout: 10
+      request_timeout: 5
+      {{- if and .Values.hpe_proxies .Values.proxy.https }}
+      proxies:
+        all://:
+          - {{ .Values.proxy.https }}
+      {{- end }}

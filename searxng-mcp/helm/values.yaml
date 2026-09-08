@@ -1,0 +1,96 @@
+image:
+  repository: ghcr.io/ai-solution-eng/searxng-mcp
+  tag: v1.0.0
+  pullPolicy: IfNotPresent
+# Only needed if the GHCR package stays PRIVATE. Public packages (the
+# ddgs-mcp convention) pull anonymously. Create with:
+#   kubectl create secret docker-registry ghcr-pull -n searxng-mcp \
+#     --docker-server=ghcr.io --docker-username=<gh-user> \
+#     --docker-password=<gh-PAT-with-read:packages>
+imagePullSecrets: []
+
+# Bundled SearXNG sidecar.
+# Pinned to the dated tag that Docker Hub 'latest' resolved to when the
+# chart was updated (2026-09-08) — a mutable 'latest' tag would give
+# different images per node/restart. To re-pin later:
+#   curl -s https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=5 | jq -r '.results[].name' | head -3
+# For a fully immutable reference, switch to the digest form:
+#   image: docker.io/searxng/searxng@sha256:3547509b419cd6a67333d6d68bd1ffad8d46d3669d82e7a7bd538f7b45827432
+searxng:
+  image:
+    repository: docker.io/searxng/searxng
+    tag: "2026.9.8-3fdc6d753"
+    pullPolicy: IfNotPresent
+  # Secret key used by SearXNG for session/crypto. CHANGE THIS for any real
+  # deployment (kubectl create secret is an alternative — wire envFrom then).
+  secretKey: "change-me-searxng-secret"
+  # Public base URL of the SearXNG UI (rendered into settings.yml
+  # server.base_url). Leave "" to omit — the JSON API works without it; set
+  # the literal https://<endpoint>/ in site values for correct UI links.
+  baseUrl: ""
+  # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
+  language: "en-US"
+  # Engines to disable via settings.yml (top-level engines key). Default: []
+  # — every default SearXNG engine stays enabled, including ddg/brave/
+  # startpage. SearXNG auto-suspends engines that fail repeatedly and the
+  # search tool reports per-query which engines did not respond, so leaving
+  # them on is cheap. If one proves consistently dead on a given network
+  # (startpage showed a hard CAPTCHA wall on the HPE proxy), add its name
+  # here and helm upgrade.
+  disabledEngines: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+service:
+  type: ClusterIP
+  port: 9090        # MCP server (streamable-http + SSE at /mcp)
+  targetPort: 9090
+  searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
+
+deployment:
+  name: searxng-mcp
+  appName: searxng-mcp
+  replicaCount: 1
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 200Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+env:
+  - name: SEARXNG_URL
+    value: "http://localhost:8080"
+
+# Route outbound HTTP(S) traffic through the HPE corporate proxy.
+# Default false: open-internet systems must NOT use the proxy (DNS/egress
+# failures). Set true (and configure proxy.*) only behind the HPE proxy.
+# When true this configures BOTH: env proxies for the MCP container
+# (fetch_content) and SearXNG's outgoing.proxies (engine requests).
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    # Root of this host serves the normal SearXNG web page; /mcp is routed
+    # to the MCP server (streamable-http + SSE).
+    endpoint: "searxng-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  authorizationPolicy:
+    enabled: true
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

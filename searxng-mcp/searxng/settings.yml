@@ -1,0 +1,56 @@
+# Reference SearXNG settings for the searxng-mcp sidecar.
+#
+# The Helm chart renders its own ConfigMap from values.yaml (see
+# helm/templates/configmap.yaml); this file documents the same shape and can
+# be used for bare-docker or local runs:
+#
+#   docker run --rm -p 8080:8080 \
+#     -v $PWD/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+#     -e SEARXNG_BASE_URL=http://localhost:8080/ \
+#     -e SEARXNG_SECRET=dev-secret \
+#     searxng/searxng:2026.9.8-3fdc6d753
+#
+# Key points:
+# - search.formats MUST include "json" — the MCP server uses format=json and
+#   SearXNG returns 403 for it otherwise.
+# - server.limiter MUST stay false (and no valkey needed) for internal API use.
+# - The disabled engine list mirrors the engine tuning proven to work on the
+#   HPE network (ddg/brave/startpage get CAPTCHAs from datacenter IPs).
+
+use_default_settings: true
+
+general:
+  debug: false
+  enable_metrics: false
+  instance_name: SearXNG (searxng-mcp)
+
+search:
+  formats:
+    - html
+    - json
+  safe_search: 0
+
+# Engine overrides are OPTIONAL and go at the TOP LEVEL (searx/settings_loader.py
+# reads user_settings['engines'] — a 'search.engines' key is silently ignored).
+# Default: nothing disabled; SearXNG auto-suspends failing engines and the
+# MCP tool reports per-query which engines did not respond. To pin an engine
+# off, add it here, e.g.:
+# engines:
+#   - name: startpage
+#     disabled: true
+
+server:
+  base_url: http://localhost:8080/
+  limiter: false
+  image_proxy: true
+  method: GET
+  public_instance: false
+
+outgoing:
+  enable_http2: true
+  max_request_timeout: 10
+  request_timeout: 5
+  # Uncomment when the cluster has no direct internet egress (HPE sites):
+  # proxies:
+  #   all://:
+  #     - http://hpeproxy.its.hpecorp.net:8080

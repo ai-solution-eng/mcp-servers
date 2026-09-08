@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      # SearXNG's entrypoint writes into /etc/searxng, so its ConfigMap is
+      # copied into an emptyDir by an init container (same pattern as the
+      # proven community deployments).
+      initContainers:
+        - name: init-config
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - mkdir -p /config-dst && if [ -d /config-src ]; then cp -R /config-src/. /config-dst/ || true; fi
+          volumeMounts:
+            - name: config-runtime
+              mountPath: /config-dst
+            - name: config-src
+              mountPath: /config-src
+      volumes:
+        - name: config-src
+          configMap:
+            name: {{ .Values.deployment.name }}-settings
+        - name: config-runtime
+          emptyDir: {}
+      containers:
+        # ------------------------------------------------------------------
+        # SearXNG sidecar — the metasearch engine itself (localhost:8080)
+        # ------------------------------------------------------------------
+        - name: searxng
+          image: "{{ .Values.searxng.image.repository }}:{{ .Values.searxng.image.tag }}"
+          imagePullPolicy: {{ .Values.searxng.image.pullPolicy }}
+          env:
+            - name: FORCE_OWNERSHIP
+              value: "true"
+            - name: SEARXNG_SECRET
+              value: {{ .Values.searxng.secretKey | required "searxng.secretKey is required (SEARXNG_SECRET)" | quote }}
+            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          ports:
+            - containerPort: 8080
+              name: http
+          startupProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.searxng.resources | nindent 12 }}
+          volumeMounts:
+            - name: config-runtime
+              mountPath: /etc/searxng
+        # ------------------------------------------------------------------
+        # MCP server — streamable-http + SSE at /mcp (port 9090)
+        # ------------------------------------------------------------------
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}

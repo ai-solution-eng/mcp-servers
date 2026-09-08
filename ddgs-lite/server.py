@@ -21,7 +21,8 @@ from dataclasses import dataclass
 import httpx
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
 
@@ -280,11 +281,9 @@ class WebContentFetcher:
 # MCP server setup
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    "ddg-search-lite",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    sse_path="/mcp",
-)
+_mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+mcp = MCPServer("ddg-search-lite")
 
 REGION_CODE = os.getenv("DDG_REGION", "") or "us-en"
 searcher = Metasearcher(default_region=REGION_CODE)
@@ -419,11 +418,20 @@ def main():
 
     host = args.host or "127.0.0.1"
     port = args.port or 8000
-    mcp.settings.host = host
-    mcp.settings.port = port
 
-    sse_app = mcp.sse_app() if "sse" in transports else None
-    http_app = mcp.streamable_http_app() if "streamable-http" in transports else None
+    sse_app = (
+        mcp.sse_app(sse_path="/mcp", transport_security=_mcp_transport_security)
+        if "sse" in transports
+        else None
+    )
+    http_app = (
+        mcp.streamable_http_app(
+            streamable_http_path="/mcp",
+            transport_security=_mcp_transport_security,
+        )
+        if "streamable-http" in transports
+        else None
+    )
 
     combined_routes: list[BaseRoute] = []
     added_routes: set = set()
@@ -475,11 +483,9 @@ def main():
 
     print(f"Starting DDG Lite MCP Server with {' and '.join(transports)} transport")
     if "sse" in transports:
-        print(f"SSE endpoint: http://{host}:{port}{mcp.settings.sse_path}")
+        print(f"SSE endpoint: http://{host}:{port}/mcp")
     if "streamable-http" in transports:
-        print(
-            f"Streamable HTTP endpoint: http://{host}:{port}{mcp.settings.streamable_http_path}"
-        )
+        print(f"Streamable HTTP endpoint: http://{host}:{port}/mcp")
 
     uvicorn.run(app, host=host, port=port)
 
