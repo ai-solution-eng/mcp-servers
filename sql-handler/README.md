@@ -291,6 +291,49 @@ as documented above.
 - The per-source table list is cached like any other source; new files appear
   after the async refresh (see caching & freshness).
 
+## External databases (read-only attach)
+
+The engine is a *lake* engine — but some questions need the **system of
+record** behind the lake. Configure one or more external Postgres/MySQL
+servers and their tables become queryable (and join-able with lake tables in
+the SAME query) as `<db-alias>.<schema>.<table>`:
+
+```bash
+export SQLHANDLER_ATTACH='[
+  {"name":"ops", "type":"postgres", "host":"pg.internal", "port":5432,
+   "database":"opsdb", "user":"ro_user", "password_env":"OPS_PG_PASSWORD"}
+]'
+# or: export SQLHANDLER_ATTACH_FILE=/etc/sqlhandler/attach.json
+```
+
+```sql
+SELECT o.status, count(*) AS n
+FROM ops.public.work_orders o            -- attached Postgres (read-only)
+JOIN work_order_header w ON w.id = o.id  -- registered lake table
+GROUP BY 1
+```
+
+- `list_tables` gains an "Attached databases" section with the qualified
+  table names; `describe_table` / `profile_table` accept
+  `<db-alias>.<schema>.<table>` directly (profile runs `SUMMARIZE` on the
+  server, bounded by `SQLHANDLER_PROFILE_MAX_ROWS`).
+- **Read-only is enforced by DuckDB itself** — every `ATTACH` carries
+  `READ_ONLY`, so writes against the attached catalog fail at the engine
+  level, not by convention.
+- **Secrets hygiene**: the config carries env-var *names* (`password_env`);
+  a literal `password` key is rejected at startup, and resolved passwords
+  are scrubbed from every error message. (Trust-auth over a unix socket:
+  `"password_env": ""`.)
+- **The filesystem lockdown stays on**: attaching a database does not
+  re-open DuckDB file reads — `read_parquet('/etc/passwd')` still fails on
+  attached-DB connections. The scanner extensions (`postgres_scanner`,
+  `mysql_scanner`) are preinstalled in the image and loaded explicitly;
+  runtime extension downloads stay disabled.
+- A database that is down does not fail the lake: `list_tables` reports it
+  as unavailable, and queries touching only the lake never attach anything.
+- The catalog alias must be DuckDB-identifier-safe and unique; malformed
+  config fails loudly at startup by design.
+
 ## Iceberg (catalog) backend
 
 Set `SQLHANDLER_BACKEND=iceberg` to query **Apache Iceberg** tables through a

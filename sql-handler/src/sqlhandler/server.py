@@ -136,7 +136,10 @@ async def _handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResul
 _TOOLS = [
     Tool(
         name="list_tables",
-        description="List the tables available in the configured data source.",
+        description=(
+            "List the tables available in the configured data source, plus a live "
+            "inventory of any attached (read-only) external databases."
+        ),
         input_schema={"type": "object", "properties": {}},
     ),
     Tool(
@@ -147,7 +150,10 @@ _TOOLS = [
             "properties": {
                 "table": {
                     "type": "string",
-                    "description": 'Table name; use "schema/name" when the source uses schemas.',
+                    "description": (
+                        'Table name; use "schema/name" when the source uses schemas, '
+                        'or "<db-alias>.<schema>.<table>" for an attached database.'
+                    ),
                 }
             },
             "required": ["table"],
@@ -166,7 +172,10 @@ _TOOLS = [
             "properties": {
                 "table": {
                     "type": "string",
-                    "description": 'Table name; use "schema/name" when the source uses schemas.',
+                    "description": (
+                        'Table name; use "schema/name" when the source uses schemas, '
+                        'or "<db-alias>.<schema>.<table>" for an attached database.'
+                    ),
                 },
                 "columns": {
                     "type": "string",
@@ -195,15 +204,20 @@ _TOOLS = [
         name="run_sql",
         description=(
             "Execute a SQL query against the source tables and return results. "
-            "Tables are referenced by folder name (e.g. work_order_header, or schema/name). "
-            "Aggregations, filters, and joins are pushed into the scan."
+            "Tables are referenced by folder name (e.g. work_order_header, or schema/name); "
+            "attached external databases (read-only) are referenced as "
+            "<db-alias>.<schema>.<table> and can be joined with lake tables in the same "
+            "query. Aggregations, filters, and joins are pushed into the scan."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "sql": {
                     "type": "string",
-                    "description": "The SQL SELECT to run against the source tables.",
+                    "description": (
+                        "The SQL SELECT to run against the source tables. Attached "
+                        "databases are read-only: writes against their catalogs fail."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
@@ -293,7 +307,10 @@ mcp = Server(
         "as an EzPresto replacement. Use list_tables to discover tables, describe_table "
         "for schema, profile_table for column statistics (value ranges, null %, distinct "
         "counts — helps write correct filters first try), and run_sql / scan_table to "
-        "query. Prefers predicate filters and column projections to avoid full scans."
+        "query. Prefers predicate filters and column projections to avoid full scans. "
+        "When external databases are attached (see the list_tables output), their tables "
+        "are addressed as <db-alias>.<schema>.<table>, join-able with lake tables in one "
+        "query, and strictly read-only."
     ),
     on_list_tools=_handle_list_tools,
     on_call_tool=_handle_call_tool,
@@ -393,15 +410,40 @@ def list_tables() -> str:
     try:
         handler = _handler()
         tables = handler.list_tables()
+        lines: list[str]
         if not tables:
-            return "No tables found in the configured data source."
-        lines = ["Tables:"]
-        for t in tables:
-            # Catalog descriptions annotate the list when present (compact:
-            # name first, description after an em dash), so agents can pick
-            # the right table without a describe round-trip per candidate.
-            desc = handler.table_description(t)
-            lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
+            lines = ["No tables found in the configured data source."]
+        else:
+            lines = ["Tables:"]
+            for t in tables:
+                # Catalog descriptions annotate the list when present (compact:
+                # name first, description after an em dash), so agents can pick
+                # the right table without a describe round-trip per candidate.
+                desc = handler.table_description(t)
+                lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
+        # Attached external databases (read-only): listed with fully-qualified
+        # names so agents can address them in run_sql / describe_table
+        # directly. Best-effort — a database that is down must not fail the
+        # lake listing.
+        try:
+            for db in handler.attached_databases():
+                lines.append("")
+                if db.get("error"):
+                    lines.append(
+                        f"Attached database {db['name']} ({db['type']}, {db['uri']}): "
+                        f"unavailable — {db['error']}"
+                    )
+                    continue
+                lines.append(
+                    f"Attached database {db['name']} ({db['type']}, {db['uri']}, "
+                    "read-only) — address tables as <db-alias>.<schema>.<table>:"
+                )
+                for t in db.get("tables", []):
+                    lines.append(f"  - {t['qualified']}")
+                if db.get("truncated"):
+                    lines.append(f"  … and {db['truncated']} more (use describe_table to confirm)")
+        except Exception as exc:
+            lines.append(f"(attached-database listing unavailable: {exc})")
         return "\n".join(lines)
     except Exception as exc:
         return f"Error listing tables: {exc}"

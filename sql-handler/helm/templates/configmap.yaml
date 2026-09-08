@@ -71,6 +71,21 @@ data:
   # Federated multi-source mode: overrides the single backend (see values.yaml).
   SQLHANDLER_SOURCES: {{ .Values.sources | toJson | quote }}
   {{- end }}
+  {{- if .Values.databases }}
+  {{- /* External read-only databases: the JSON carries env-var NAMES only
+         (password_env = SQLHANDLER_DB_PW_<NAME>); the password VALUES are
+         wired via secretKeyRef from the db-credentials Secret (see
+         secret.yaml / deployment.yaml) and never enter the ConfigMap. */}}
+  {{- $attach := list }}
+  {{- range .Values.databases }}
+  {{- $entry := dict "name" .name "type" (.type | default "postgres") "host" .host "database" .database "password_env" (printf "SQLHANDLER_DB_PW_%s" (upper .name)) }}
+  {{- with .port }}{{- $_ := set $entry "port" (. | int) }}{{- end }}
+  {{- with .user }}{{- $_ := set $entry "user" . }}{{- end }}
+  {{- $attach = append $attach $entry }}
+  {{- end }}
+  # Attached external databases (read-only; see README: External databases).
+  SQLHANDLER_ATTACH: {{ $attach | toJson | quote }}
+  {{- end }}
   # In-process metadata cache (list_tables / describe_table). NOTE: no sprig
   # `default` here — `0` (disable caching / check every query) and `false`
   # are meaningful values that `default` treats as empty and would override.

@@ -1,0 +1,58 @@
+image:
+  repository: ghcr.io/ai-solution-eng/prometheus-mcp
+  # REALITY NOTE: tag v0.1.0 was OVERWRITTEN in the registry with the
+  # lifespan-fixed build ("replace in place"), so the tag is mutable and
+  # pullPolicy must stay Always until a fresh immutable tag (v0.1.1+) is
+  # pushed — with IfNotPresent, nodes holding the cached old digest would
+  # silently serve the broken image. To cut a proper release: push
+  # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
+  tag: v0.1.0
+  pullPolicy: Always
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously, the ddgs-mcp convention).
+imagePullSecrets: []
+
+# Prometheus to query. Default: the kube-prometheus-stack's Prometheus
+# service (verified present on the G2 cluster in the `prometheus` namespace).
+# In-cluster plain HTTP; no RBAC needed (raw HTTP API, read-only endpoints).
+prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+
+service:
+  type: ClusterIP
+  port: 9095
+  targetPort: 9095
+
+deployment:
+  name: prometheus-mcp
+  appName: prometheus-mcp
+  replicaCount: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# PROM_URL is rendered by deployment.yaml from .Values.prometheusUrl (Helm
+# does not template inside values files — see the template comment).
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------
+# Deploys the Istio VirtualService so MCP clients OUTSIDE the cluster (DSH
+# runs locally on the operator's laptop) reach the server through the
+# ezaf-gateway. The MCP path uses a long timeout (range queries over wide
+# windows can run for minutes).
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "prometheus-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
+  # rotating-token pain for machine MCP callers is an accepted lab trade; the
+  # template is real, so flipping it on enforces tokens for this host.
+  authorizationPolicy:
+    enabled: false
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

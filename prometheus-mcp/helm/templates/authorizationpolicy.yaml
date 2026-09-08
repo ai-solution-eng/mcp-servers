@@ -1,0 +1,26 @@
+{{- if and .Values.ezua.enabled .Values.ezua.authorizationPolicy.enabled }}
+{{- /*
+  Gateway-level auth gate: delegates the auth decision for this host to the
+  PCAI oauth2-proxy extension (SSO / bearer tokens). OFF by default — the
+  rotating-token pain for machine MCP callers is a known, accepted trade on
+  the lab cluster (see the searxng/sqlhandler discussions). When enabled,
+  external MCP clients must present a valid PCAI token.
+*/ -}}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-auth-policy
+  namespace: {{ .Values.ezua.authorizationPolicy.namespace }}
+spec:
+  action: CUSTOM
+  provider:
+    name: {{ .Values.ezua.authorizationPolicy.providerName }}
+  rules:
+    - to:
+        - operation:
+            hosts:
+              - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required when ezua is enabled !" }}
+  selector:
+    matchLabels:
+      istio: "ingressgateway"
+{{- end }}

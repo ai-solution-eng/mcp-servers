@@ -35,6 +35,13 @@ from pathlib import Path
 import pyarrow as pa
 
 from . import observability, resources
+from .external import (
+    AttachSpec,
+    apply_external,
+    parse_attach_config,
+    sql_references_attach,
+    validate_qualified_name,
+)
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 
 logger = logging.getLogger("sqlhandler.engine")
@@ -212,6 +219,14 @@ class QueryJob:
         with self._lock:
             self._con = con
         try:
+            if self._engine._sql_needs_external(self.sql):
+                # Extension LOAD + ATTACH must precede the fs lockdown: both
+                # use DuckDB's filesystem layer internally (the scanner .so
+                # and the attach bind), while query-time data fetch does not
+                # (libpq talks to the server directly). After the lockdown
+                # the attached catalogs stay fully queryable and the fs
+                # protections still hold — see sqlhandler/external.py.
+                apply_external(con, self._engine.attaches)
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
             self._engine._register_schema(con, self.sql, version=self._version)
@@ -596,6 +611,12 @@ class SqlEngine:
         self._catalog_path = os.environ.get("SQLHANDLER_CATALOG", "").strip() or None
         self._catalog_mtime: float | None = None
         self._catalog_data: dict = {}
+        # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
+        # config parses loudly at startup (operator-authored, security
+        # relevant — a typo should kill the pod, not silently skip a source).
+        # Connections attach on demand per query; see sqlhandler/external.py.
+        self.attaches: list[AttachSpec] = parse_attach_config()
+        self._attached_listing: tuple[float, list[dict]] | None = None
         # Query memory: recent query outcomes for the query-memory MCP
         # resource (self-improving loop — agents reuse proven patterns).
         self._query_memory: deque = deque(maxlen=_query_memory_size())
@@ -967,6 +988,9 @@ class SqlEngine:
         path, so frequently-described tables come from memory instead of
         re-opening the metadata on every agent call.
         """
+        ext = self._match_external_table(table)
+        if ext is not None:
+            return self._describe_external(*ext)
         info = self._resolve(table)
         key = (info.source, info.path)
         now = time.monotonic()
@@ -1009,6 +1033,208 @@ class SqlEngine:
             if self.cache_ttl > 0:
                 self._describe_cache[key] = (time.monotonic(), result)
         self._save_cache_to_disk()
+        return result
+
+    # ---------------------------------------------------------- external
+    def _sql_needs_external(self, sql: str) -> bool:
+        """True when the SQL references an attached database's catalog."""
+        return bool(self.attaches) and bool(sql_references_attach(sql, self.attaches))
+
+    def _match_external_table(self, table: str) -> tuple[AttachSpec, str] | None:
+        """Match a ``<alias>.<...>`` table reference against the attach config.
+
+        Returns ``(spec, validated_dotted_name)`` for attached-database
+        references, None for lake tables (and for anything without a dot —
+        bare names can never address another catalog).
+        """
+        if not self.attaches or "." not in table:
+            return None
+        first = table.split(".", 1)[0].lower()
+        for spec in self.attaches:
+            if spec.name.lower() == first:
+                return spec, validate_qualified_name(spec.name, table)
+        return None
+
+    def _external_connection(self):
+        """A locked-down DuckDB connection with every database attached.
+
+        The exact production sequence (see sqlhandler/external.py):
+        LOAD scanners -> ATTACH READ_ONLY -> fs lockdown. Used by the
+        metadata routes (attached listing / describe / profile); data
+        queries go through QueryJob, which applies the same sequence on a
+        fresh connection per query.
+        """
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            apply_external(con, self.attaches)
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+        except Exception:
+            con.close()
+            raise
+        return con
+
+    def attached_databases(self, refresh: bool = False) -> list[dict]:
+        """Live inventory of the attached databases (TTL-cached).
+
+        One probe connection per refresh; each entry carries the catalog
+        alias, a credential-free display URI, and its tables. A database
+        that fails to attach is reported with an ``error`` key (scrubbed)
+        instead of failing the whole listing.
+        """
+        if not self.attaches:
+            return []
+        now = time.monotonic()
+        with self._lock:
+            if not refresh and self._attached_listing is not None:
+                ts, listing = self._attached_listing
+                if now - ts < self.cache_ttl:
+                    return listing
+        listing: list[dict] = []
+        for spec in self.attaches:
+            entry: dict = {
+                "name": spec.name,
+                "type": spec.type,
+                "uri": spec.display_uri,
+                "read_only": True,
+                "tables": [],
+                "error": None,
+            }
+            try:
+                con = self._external_connection()
+            except Exception as exc:
+                entry["error"] = str(exc)
+                listing.append(entry)
+                continue
+            try:
+                rows = con.execute(
+                    "SELECT table_schema, table_name FROM information_schema.tables "
+                    "WHERE table_catalog = ? AND table_schema NOT IN "
+                    "('pg_catalog', 'information_schema', 'mysql', "
+                    "'performance_schema', 'sys') "
+                    "ORDER BY table_schema, table_name",
+                    [spec.name],
+                ).fetchall()
+                entry["tables"] = [
+                    {"qualified": f"{spec.name}.{s}.{t}", "schema": s, "name": t}
+                    for s, t in rows[:500]
+                ]
+                if len(rows) > 500:
+                    entry["truncated"] = len(rows) - 500
+            except Exception as exc:
+                entry["error"] = str(exc)
+            finally:
+                con.close()
+            listing.append(entry)
+        with self._lock:
+            self._attached_listing = (time.monotonic(), listing)
+        return listing
+
+    def _describe_external(self, spec: AttachSpec, qualified: str) -> dict:
+        """describe_table for an attached-database table (cached like lake describes).
+
+        ``DESCRIBE SELECT …`` is bind-only — schema comes from the server's
+        catalog without fetching any rows.
+        """
+        key = ("external", qualified)
+        now = time.monotonic()
+        with self._lock:
+            hit = self._describe_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._describe_hits += 1
+                return hit[1]
+        con = self._external_connection()
+        try:
+            rows = con.execute(f"DESCRIBE SELECT * FROM {qualified}").fetchall()
+        except Exception as exc:
+            raise LakehouseError(
+                f"Describing attached table '{qualified}' failed: {exc}"
+            ) from exc
+        finally:
+            con.close()
+        result = {
+            "table": qualified,
+            "uri": spec.display_uri,
+            "source": "external",
+            "read_only": True,
+            "columns": [{"name": r[0], "type": r[1]} for r in rows],
+            "n_columns": len(rows),
+        }
+        with self._lock:
+            self._describe_misses += 1
+            if self.cache_ttl > 0:
+                self._describe_cache[key] = (time.monotonic(), result)
+        self._save_cache_to_disk()
+        return result
+
+    def _profile_external(
+        self, spec: AttachSpec, qualified: str, columns: Sequence[str] | None = None
+    ) -> dict:
+        """profile_table for an attached-database table.
+
+        ``SUMMARIZE`` runs against the live server (bounded by
+        ``SQLHANDLER_PROFILE_MAX_ROWS``); there is no cheap metadata row
+        count for a live database, so ``n_rows`` is None — the profiled
+        count comes from the capped sample.
+        """
+        col_key = tuple(columns) if columns else ()
+        key = ("external", qualified, col_key)
+        now = time.monotonic()
+        with self._lock:
+            hit = self._profile_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._profile_hits += 1
+                return hit[1]
+        cap = _profile_max_rows()
+        con = self._external_connection()
+        try:
+            col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+            inner = f"SELECT {col_sel} FROM {qualified}"
+            if cap > 0:
+                inner = f"SELECT * FROM ({inner}) LIMIT {cap}"
+            profiled = con.sql(f"SELECT count(*) FROM ({inner})").fetchone()
+            summary = con.sql(f"SUMMARIZE {inner}").arrow()
+            if isinstance(summary, pa.RecordBatchReader):
+                summary = summary.read_all()
+        except Exception as exc:
+            raise LakehouseError(
+                f"Profiling attached table '{qualified}' failed: {exc}"
+            ) from exc
+        finally:
+            con.close()
+        result = {
+            "table": qualified,
+            "uri": spec.display_uri,
+            "source": "external",
+            "read_only": True,
+            "n_rows": None,
+            "profiled_rows": int(profiled[0]) if profiled else 0,
+            "profile_max_rows": cap,
+            "n_columns": len(summary),
+            "columns": [
+                {
+                    "name": str(r.get("column_name", "")),
+                    "type": str(r.get("column_type", "")),
+                    "min": r.get("min"),
+                    "max": r.get("max"),
+                    "approx_unique": r.get("approx_unique"),
+                    "null_pct": r.get("null_percentage"),
+                    "avg": r.get("avg"),
+                    "std": r.get("std"),
+                    "q25": r.get("q25"),
+                    "q50": r.get("q50"),
+                    "q75": r.get("q75"),
+                    "non_null": r.get("count"),
+                }
+                for r in summary.to_pylist()
+            ],
+        }
+        with self._lock:
+            self._profile_misses += 1
+            if self.cache_ttl > 0:
+                self._profile_cache[key] = (time.monotonic(), result)
         return result
 
     # ------------------------------------------------------------- search
@@ -1103,9 +1329,13 @@ class SqlEngine:
         ``SQLHANDLER_PROFILE_MAX_ROWS``).
 
         Args:
-            table: table name (``schema/name`` when the source uses schemas).
+            table: table name (``schema/name`` when the source uses schemas;
+                ``<db-alias>.<schema>.<table>`` for an attached database).
             columns: optional subset of columns to profile (default: all).
         """
+        ext = self._match_external_table(table)
+        if ext is not None:
+            return self._profile_external(*ext, columns=columns)
         info = self._resolve(table)
         col_key = tuple(columns) if columns else ()
         key = (info.source, info.path, col_key)

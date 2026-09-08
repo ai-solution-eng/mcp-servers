@@ -29,6 +29,16 @@ RUN uv pip install --system \
         pyarrow duckdb azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette \
     && uv pip install --system -e ".[iceberg]"
 
+# Preinstall the external-database scanner extensions (SQLHANDLER_ATTACH):
+# DuckDB extension autoinstall is DISABLED at runtime (fs lockdown), so these
+# must be baked. They load from /opt/duckdb-ext (SQLHANDLER_DUCKDB_EXTENSION_DIR,
+# applied by sqlhandler.external before LOAD); the network-facing pod never
+# downloads extensions at runtime — the egress this step needs belongs to the
+# build machine, not the pod.
+RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(f'INSTALL {ext}') for ext in ('postgres_scanner', 'mysql_scanner')]" \
+    && chmod -R a+rX /opt/duckdb-ext
+ENV SQLHANDLER_DUCKDB_EXTENSION_DIR=/opt/duckdb-ext
+
 # The build context may carry restrictive file modes (e.g. 600 from a
 # hardlink-based working tree). COPY preserves modes, and the app now runs
 # as uid 1000 — without this it cannot read its own source and crashes on

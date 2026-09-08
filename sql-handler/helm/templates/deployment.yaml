@@ -123,6 +123,15 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- range .Values.databases }}
+            {{- if .password }}
+            - name: {{ printf "SQLHANDLER_DB_PW_%s" (upper .name) }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sqlhandler.fullname" $ }}-db-credentials
+                  key: {{ printf "SQLHANDLER_DB_PW_%s" (upper .name) }}
+            {{- end }}
+            {{- end }}
           {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
                  backend additionally mounts its PVC. One merged block so the
                  YAML key is never emitted twice. */}}
