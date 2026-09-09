@@ -23,7 +23,7 @@ frontend is inert (no guards to bypass — there is no `lockdown` flag at all).
 version-suffix convention (`0.2.2`, `0.2.1-customer`).
 
 ```bash
-docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.4 . --push
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.6 . --push
 
 # ── INTERNAL (HPE cluster): every knob lives in values ─────────────────
 # 1. edit helm/local/values-internal.yaml (endpoint! blocked ns! exec!)
@@ -87,7 +87,7 @@ Delivery to `pcai-solutions/mcp-servers/k8s-mcp/` (the git repo) is via
 ```bash
 # Dockerfile lives at the repo root — no -f needed (buildx auto-detects it).
 docker login ghcr.io   # once, if not already logged in
-docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.4 . --push
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.6 . --push
 ```
 
 kubectl is pinned + checksum-verified inside the Dockerfile — no extra steps.

@@ -115,6 +115,22 @@ async function callTool(name, args) {
   return text;
 }
 
+/* Curated object-of-interest groups for the resource-type dropdown. The
+   "Discovered on the cluster" group is appended from api-resources at form
+   build time (CRDs land there automatically). secrets is deliberately NOT
+   curated — the read-only role never grants it, and a guaranteed-forbidden
+   option teaches the wrong habit; use ✎ other if policy ever changes. */
+const COMMON_RESOURCES = [
+  ["Workloads", ["pods", "deployments", "statefulsets", "daemonsets", "replicasets",
+                 "jobs", "cronjobs", "controllerrevisions"]],
+  ["Networking", ["services", "endpoints", "ingresses", "networkpolicies",
+                  "ingressclasses", "virtualservices"]],
+  ["Config & storage", ["configmaps", "persistentvolumeclaims", "persistentvolumes",
+                        "serviceaccounts"]],
+  ["Cluster", ["nodes", "namespaces", "events", "customresourcedefinitions",
+               "limitranges", "resourcequotas", "replicationcontrollers"]],
+];
+
 /* ── Shared data (namespaces, resource types) ─────────────────────────── */
 
 function parseNamespaces(text) {
@@ -193,15 +209,32 @@ function widgetFor(name, prop, override) {
 
   let input;
   if (w.kind === "namespace") {
-    input = document.createElement("input");
-    input.type = "text";
-    input.setAttribute("list", "ns-options");
-    input.placeholder = "(empty = all namespaces)";
+    const names = state.namespaces || [];
+    if (names.length) {
+      // obvious dropdown, populated from the cluster (list_namespaces)
+      input = document.createElement("select");
+      input.className = "combo";
+      input.title = "Namespace — choose from the cluster";
+      if (!w.required) {
+        const all = document.createElement("option");
+        all.value = ""; all.textContent = "(all namespaces)";
+        input.appendChild(all);
+      }
+      for (const n of names) {
+        const o = document.createElement("option");
+        o.value = o.textContent = n;
+        input.appendChild(o);
+      }
+      if (w.required) input.value = names[0];
+    } else {
+      // namespaces not fetched yet (or the call failed): combobox fallback
+      input = document.createElement("input");
+      input.type = "text";
+      input.setAttribute("list", "ns-options");
+      input.placeholder = "(empty = all namespaces)";
+    }
   } else if (w.kind === "resourcetype") {
-    input = document.createElement("input");
-    input.type = "text";
-    input.setAttribute("list", "rt-options");
-    input.placeholder = "e.g. pods, deployments, inferenceservices";
+    input = buildResourceTypeSelect(prop);   // dataset.param/kind set by widgetFor
   } else if (w.kind === "verb") {
     input = document.createElement("select");
     for (const v of READ_VERBS) {
@@ -256,6 +289,60 @@ function widgetFor(name, prop, override) {
   input.dataset.kind = w.kind;
   wrap.appendChild(input);
   return wrap;
+}
+
+/* Object-of-interest dropdown: curated groups first, then everything the
+   cluster reported (api-resources — CRDs included), plus a type-it escape. */
+function buildResourceTypeSelect(prop) {
+  const sel = document.createElement("select");
+  sel.className = "combo";
+  sel.title = "Object of interest — choose, or pick ✎ other";
+  const groups = new Map();                       // label → optgroup
+  const group = (label) => {
+    let g = groups.get(label);
+    if (!g) {
+      g = document.createElement("optgroup");
+      g.label = label; sel.appendChild(g); groups.set(label, g);
+    }
+    return g;
+  };
+  const seen = new Set();
+  for (const [label, items] of COMMON_RESOURCES) {
+    for (const r of items) {
+      const o = document.createElement("option");
+      o.value = o.textContent = r;
+      group(label).appendChild(o);
+      seen.add(r);
+    }
+  }
+  const extra = (state.apiResources || []).filter((r) => !seen.has(r)).sort();
+  for (const r of extra) {
+    const o = document.createElement("option");
+    o.value = o.textContent = r;
+    group("Discovered on the cluster (api-resources)").appendChild(o);
+    seen.add(r);
+  }
+  const other = document.createElement("option");
+  other.value = "__custom__";
+  other.textContent = "✎ other / CRD (type it)";
+  sel.appendChild(other);
+  sel.value = String(prop.default || "pods");
+  if (sel.selectedIndex === -1) sel.value = "pods";
+  // ✎ other → swap the dropdown for a free-text field. dataset.param/kind
+  // are assigned by widgetFor right after this returns, so read them
+  // lazily inside the handler.
+  sel.addEventListener("change", () => {
+    if (sel.value !== "__custom__") return;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.setAttribute("list", "rt-options");
+    inp.placeholder = "resource type, e.g. inferenceservices";
+    inp.dataset.param = sel.dataset.param;
+    inp.dataset.kind = sel.dataset.kind;
+    sel.replaceWith(inp);
+    inp.focus();
+  });
+  return sel;
 }
 
 function buildForm(toolName, overrides) {
@@ -314,20 +401,23 @@ function splitArgv(raw) {
 
 function readForm() {
   const args = {};
-  for (const field of $("form").querySelectorAll("[data-param]")) {
-    const name = field.dataset.param, kind = field.dataset.kind;
+  // [data-param] sits ON the control itself (input/select/textarea) for
+  // simple widgets, and on the .field-row div for the composite command
+  // widget — so read el.value directly; never query inside a control.
+  for (const el of $("form").querySelectorAll("[data-param]")) {
+    const name = el.dataset.param, kind = el.dataset.kind;
     if (name.startsWith("__")) continue;          // internal widgets (tool picker)
     if (kind === "command") {
-      const bin = field.querySelector("select").value;
-      const rest = splitArgv(field.querySelector("input").value.trim());
-      args[name] = [bin, ...rest];
+      const bin = el.querySelector("select");
+      const rest = el.querySelector("input");
+      if (!bin || !rest) { console.warn("readForm: malformed command widget", name); continue; }
+      args[name] = [bin.value, ...splitArgv(rest.value.trim())];
     } else if (kind === "bool") {
-      args[name] = field.querySelector("input").checked;
+      args[name] = !!el.checked;
     } else if (kind === "lines") {
-      const lines = field.querySelector("textarea").value.split("\n").map((s) => s.trim()).filter(Boolean);
+      const lines = (el.value || "").split("\n").map((s) => s.trim()).filter(Boolean);
       if (lines.length) args[name] = lines;
     } else {
-      const el = field.querySelector("input, select");
       const v = (el.value || "").trim();
       if (v !== "") args[name] = kind === "number" ? Number(v) : v;
     }
@@ -516,20 +606,89 @@ function renderNav(activeId) {
 function prefillForm(prefill) {
   if (!prefill) return;
   for (const [k, v] of Object.entries(prefill)) {
-    const field = $("form").querySelector(`[data-param="${CSS.escape(k)}"]`);
-    if (!field) continue;
-    const kind = field.dataset.kind;
+    // the match IS the control for simple widgets; the .field-row div for
+    // the composite command widget — same distinction as readForm.
+    const el = $("form").querySelector(`[data-param="${CSS.escape(k)}"]`);
+    if (!el) continue;
+    const kind = el.dataset.kind;
     if (kind === "command") {
       const parts = Array.isArray(v) ? v.slice() : String(v).split(/\s+/);
-      field.querySelector("select").value = parts[0] || field.querySelector("select").value;
-      field.querySelector("input").value = parts.slice(1).join(" ");
+      const bin = el.querySelector("select");
+      const rest = el.querySelector("input");
+      if (bin) bin.value = parts[0] || bin.value;
+      if (rest) rest.value = parts.slice(1).join(" ");
     } else if (kind === "bool") {
-      field.querySelector("input").checked = !!v;
+      el.checked = !!v;
     } else {
-      const el = field.querySelector("input, select, textarea");
-      if (el) el.value = String(v);
+      if (el.tagName === "SELECT" && String(v) !== "") {
+        let ok = false;
+        for (const o of el.options) if (o.value === String(v)) { ok = true; break; }
+        if (!ok) {
+          const o = document.createElement("option");
+          o.value = o.textContent = String(v);
+          el.appendChild(o);            // keep pod-row → logs/exec prefills working
+        }
+      }
+      el.value = String(v);
     }
   }
+}
+
+/* ── Pod dropdown (logs/exec) ─────────────────────────────────────────── */
+
+const podCache = new Map();                       // namespace → [{name, phase}]
+
+async function wirePodPicker() {
+  const nsEl = $("form").querySelector('[data-param="namespace"]');
+  const podEl = $("form").querySelector('[data-param="pod_name"]');
+  if (!nsEl || !podEl) return;
+  const load = async () => {
+    const ns = (nsEl.value || "").trim();
+    if (!ns) return;                              // "(all namespaces)" → type it
+    let pods = podCache.get(ns);
+    if (!pods) {
+      try {
+        pods = parsePods(await callTool("list_pods", { namespace: ns }))
+          .map((r) => ({ name: r.name, phase: r.phase }));
+        podCache.set(ns, pods);
+      } catch { return; }                         // callTool already reported it
+    }
+    const cur = $("form").querySelector('[data-param="pod_name"]');
+    if (!cur || cur.tagName !== "INPUT" || !pods.length) return;
+    const sel = document.createElement("select");
+    sel.className = "combo";
+    sel.dataset.param = "pod_name";
+    sel.dataset.kind = "text";
+    const prev = cur.value;
+    for (const p of pods) {
+      const o = document.createElement("option");
+      o.value = p.name; o.textContent = `${p.name} (${p.phase})`;
+      sel.appendChild(o);
+    }
+    const other = document.createElement("option");
+    other.value = "__custom__"; other.textContent = "✎ type a pod name";
+    sel.appendChild(other);
+    if (prev && !pods.some((p) => p.name === prev)) {
+      const o = document.createElement("option");
+      o.value = o.textContent = prev;
+      sel.insertBefore(o, other);
+    }
+    sel.value = prev || (pods[0] ? pods[0].name : "__custom__");
+    if (sel.selectedIndex === -1) sel.value = "__custom__";
+    cur.replaceWith(sel);
+    sel.addEventListener("change", () => {
+      if (sel.value !== "__custom__") return;
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.dataset.param = "pod_name";
+      inp.dataset.kind = "text";
+      inp.placeholder = "pod name";
+      sel.replaceWith(inp);
+      inp.focus();
+    });
+  };
+  nsEl.addEventListener("change", load);
+  await load();
 }
 
 async function navigate(screenId, prefill, autoRun) {
@@ -549,6 +708,7 @@ async function navigate(screenId, prefill, autoRun) {
   prefillForm(prefill);
 
   if (screen.exec) prepareExecScreen(prefill);
+  if (screen.tool === "get_pod_logs" || screen.tool === "exec_in_pod") wirePodPicker();
 
   if (autoRun || screen.auto) runCurrent();
 }
@@ -720,6 +880,11 @@ function wire() {
 }
 
 async function boot() {
+  // Surface any uncaught JS error with its line number — a crash should
+  // always be diagnosable from the toast, even without devtools open.
+  window.addEventListener("error", (ev) => {
+    toast("JS error: " + ev.message + " (app.js:" + ev.lineno + ")", true);
+  });
   wire();
   const saved = sessionStorage.getItem("k8s-mcp-key");
   if (saved) {

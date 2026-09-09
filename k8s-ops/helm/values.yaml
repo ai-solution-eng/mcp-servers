@@ -7,7 +7,7 @@ image:
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a helm install WITHOUT a profile file deploys, and
   # a stale default is how an "old MCP + new chart" pod happens.
-  tag: v0.2.4
+  tag: v0.2.6
   pullPolicy: IfNotPresent
 # Only needed if the GHCR package stays PRIVATE (public packages pull
 # anonymously). Per-namespace secret:

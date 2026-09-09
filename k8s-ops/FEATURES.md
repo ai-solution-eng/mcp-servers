@@ -1,8 +1,8 @@
-# FEATURES.md — Hardening & Capability changelog (v0.0.1 → v0.2.4)
+# FEATURES.md — Hardening & Capability changelog (v0.0.1 → v0.2.6)
 
 This file summarizes everything that changed across the hardening session that took
 `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl,
-`cluster-admin`, unauthenticated endpoint) to the current v0.2.4 — deployed, verified
+`cluster-admin`, unauthenticated endpoint) to the current v0.2.6 — deployed, verified
 live, and in daily use from DSH.
 
 ---
@@ -237,7 +237,10 @@ block with `hpe-ezua/*` vendor labels via a Kyverno pre-install policy,
 | v0.2.0 | 2.2.0 | `list_virtual_services` (read-only Istio visibility + `networking.istio.io` RBAC grant), built-in HPE ops console on the same pod, Helm chart with internal / customer-lockdown profiles, env-overridable exec RBAC names, cluster-scoped singular forms in the kubectl guard |
 | v0.2.1 | 2.2.0 | Helm chart conformed to the PCAI house style: `ezua:` integration block (endpoint doubles as MCP_HOSTNAME), `hpe-ezua/*` vendor labels via a Kyverno pre-install policy, values-driven naming (no fullname helpers), explicit `image.tag` in lockstep with appVersion, optional gateway AuthorizationPolicy, `.helmignore` for `helm/local/`, packaged `k8s-mcp-<ver>.tgz` committed alongside the chart |
 | v0.2.2 | 2.2.0 | Two-chart split — `helm/` (trusted operators, fully frontend-configurable) + `helm-customer/` (structurally locked: security keys don't exist in values and templates never read them, baked read-only RBAC via chart constant, exec RBAC never minted, day-2 runbook in NOTES); wildcard apiGroups refused at render in both; `lockdown` values flag removed (it was customer-removable, so its guards were advisory) |
-| v0.2.3 | 2.2.0 | Console-serving fix: `ui/*` shipped mode-600 in the image (COPY preserves source modes; DSH workspace default), so the uid-10001 container got PermissionError and `/ui/` returned `{"error": "not found"}`; fixed with `chmod 644` at the source plus `COPY --chmod=0644` enforcement in the Dockerfile |
+| v0.2.3 | 2.2.0 | Console-serving fix, attempt 1: `ui/*` shipped mode-600 in the image (COPY preserves source modes; DSH workspace default) → uid-10001 got PermissionError and `/ui/` returned `{"error": "not found"}`; "fixed" with `COPY --chmod=0644` — which turned out to strip the execute bit from the `ui/` DIRECTORY (see v0.2.4) |
+| v0.2.4 | 2.2.0 | Console-serving fix, attempt 2: `--chmod=0644` had left `/app/ui` untraversable (`d?????????` in exec ls); replaced with `COPY ui/ ./ui/` + `RUN chmod -R a+rX /app` (dirs traversable, files readable); console verified live on G2 |
+| v0.2.5 | 2.2.0 | Console dropdowns: namespace fields render as real selects populated from the cluster (`list_namespaces`; `(all namespaces)` where optional, combobox fallback if the fetch fails), and `resource_type` renders a grouped object-of-interest select (curated Workloads/Networking/Config/Cluster groups + "Discovered on the cluster" from api-resources — CRDs included — plus a ✎ other type-it escape); pod-row → logs/exec prefills inject missing options |
+| v0.2.6 | 2.2.0 | Console form-engine fix: `readForm`/`prefillForm` queried *inside* the matched control (`querySelector` on an `<input>`), so every simple widget read `null` — every Run sent `{}` (namespace "ignored", `pod_name Field required`) or crashed with `el is null`; now reads the matched control directly. Plus pod dropdowns: on Logs/Exec, choosing a namespace fetches its pods (`list_pods`, cached) and swaps pod_name for a select with phase labels and a ✎ type-it escape |
 
 ## 14. Files
 

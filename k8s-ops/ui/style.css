@@ -94,7 +94,7 @@ body {
 }
 #form { margin-bottom: 18px; }
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
-.field > label { font-size: 12.5px; font-weight: 600; color: var(--ink-soft); }
+.field > label { display: block; font-size: 12.5px; font-weight: 700; color: var(--ink-soft); margin-bottom: 2px; }
 .field > label .req { color: var(--danger); }
 .field > label .hint { font-weight: 400; color: var(--muted); }
 .field input[type="text"], .field input[type="password"], .field input[type="number"],
@@ -108,6 +108,20 @@ body {
 }
 .field-row { display: flex; gap: 14px; flex-wrap: wrap; }
 .field-row .field { flex: 1 1 180px; }
+/* Obvious dropdowns (namespace / object-of-interest) */
+.field select.combo {
+  appearance: none; -webkit-appearance: none;
+  padding-right: 30px;
+  border-color: var(--ink-soft);
+  font-weight: 600;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%2300c389' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.field select.combo:hover { border-color: var(--hpe-green); }
+.field select.combo option { font-weight: 400; }
+.field select.combo optgroup { font-weight: 600; color: var(--ink-soft); }
 .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .form-actions { display: flex; gap: 10px; margin-top: 4px; }
 

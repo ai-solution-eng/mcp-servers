@@ -2,5 +2,5 @@ apiVersion: v2
 name: k8s-mcp
 description: K8s ops MCP server — read-only Kubernetes inspection, hardened exec, namespace governance and an HPE ops console over MCP 2.0
 type: application
-version: 0.2.4
-appVersion: "v0.2.4"
+version: 0.2.6
+appVersion: "v0.2.6"
