@@ -7,7 +7,11 @@ metadata:
     {{- include "sqlhandler.labels" . | nindent 4 }}
     {{- include "sqlhandler.ezua.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # When the HPA is enabled, spec.replicas is omitted so the autoscaler owns
+  # the count (a rendered value here would fight it on every helm upgrade).
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
@@ -217,4 +221,13 @@ spec:
       {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.topologySpread.topologyKey }}
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "sqlhandler.selectorLabels" . | nindent 14 }}
       {{- end }}

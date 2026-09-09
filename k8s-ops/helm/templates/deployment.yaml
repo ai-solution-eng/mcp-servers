@@ -1,0 +1,131 @@
+{{- /* Trusted-operator chart: every knob is values-configurable. The
+      customer distribution (helm-customer/) is the locked one. */ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name | default .Values.deployment.name }}
+      automountServiceAccountToken: true
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: http
+          env:
+            # API key: ALWAYS out-of-band (the chart never creates it; the
+            # Deployment fails loud with CreateContainerConfigError until
+            # the Secret exists).
+            - name: K8S_MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            {{- if and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if not .Values.console.enabled }}
+            - name: K8S_MCP_CONSOLE_ENABLED
+              value: "false"
+            {{- end }}
+            {{- /* knobs — values-driven; still kubectl-changeable */}}
+            - name: K8S_MCP_ALLOWED_NAMESPACES
+              value: {{ .Values.namespaces.allowed | quote }}
+            - name: K8S_MCP_BLOCKED_NAMESPACES
+              value: {{ .Values.namespaces.blocked | quote }}
+            {{- if .Values.clients.existingSecret }}
+            - name: K8S_MCP_CLIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clients.existingSecret }}
+                  key: {{ .Values.clients.existingSecretKey }}
+            {{- else }}
+            - name: K8S_MCP_CLIENTS
+              value: {{ .Values.clients.value | quote }}
+            {{- end }}
+            - name: K8S_MCP_EXEC_ENABLED
+              value: {{ .Values.exec.enabled | quote }}
+            - name: K8S_MCP_EXEC_NAMESPACES
+              value: {{ .Values.exec.namespaces | quote }}
+            - name: K8S_MCP_EXEC_ALLOWED_COMMANDS
+              value: {{ .Values.exec.allowedCommands | quote }}
+            - name: K8S_MCP_EXEC_REQUIRE_LABEL
+              value: {{ .Values.exec.requireLabel | quote }}
+            {{- if eq .Values.rbac.scope "cluster" }}
+            - name: K8S_MCP_EXEC_AUTO_RBAC
+              value: {{ .Values.exec.autoRbac | quote }}
+            {{- else }}
+            # namespace clamp: the server cannot bind cluster-scoped templates
+            # here; exec is granted by the chart's namespaced Role,
+            # auto-provisioning off.
+            - name: K8S_MCP_EXEC_AUTO_RBAC
+              value: "false"
+            {{- end }}
+            # Per-release exec RBAC names (multi-release coexistence).
+            - name: K8S_MCP_EXEC_TEMPLATE_ROLE
+              value: {{ .Values.deployment.name }}-pods-exec
+            - name: K8S_MCP_EXEC_BINDING_NAME
+              value: {{ .Values.deployment.name }}-exec
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,9 +1,61 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
 # SQLhandler MCP server — PCAI (HPE Ezmeral Unified Analytics) deployment.
 # Deploys SQLhandler as a MCP 2.0 (streamable-http) server exposed at
 # <endpoint>/mcp through the PCAI Istio gateway.
 
 # -- Deployment ---------------------------------------------------------------
+# Scale OUT, not UP — benchmark evidence (G2, 2026-09-08, 9-query workload):
+# a single replica's throughput COLLAPSES under concurrent clients (5.5 qps at
+# 1 client -> 2.7 qps at 16, p95 17.8s) because the embedded DuckDB engine
+# serializes requests per process, while 4 replicas held a flat ~6 qps at 16
+# clients (p50 3.1-4.0s) using only 0.24 cores / 1.3GiB fleet-wide peak. CPU
+# and memory bumps on a single replica buy nothing (limits went unused).
 replicaCount: 1
+
+# -- Horizontal autoscaling -----------------------------------------------------
+# HorizontalPodAutoscaler (autoscaling/v2). Requires metrics-server for the
+# CPU metric. CAUTION, from the same benchmark: steady-state CPU is ~8% of
+# limits even at full concurrent load, so the CPU target below fires only on
+# heavy scan bursts (runaway-query protection) — NOT on request volume. For
+# load-following scale-out add a custom metric (needs prometheus-adapter),
+# e.g. requests-per-second per pod targeted at ~1.5, the measured per-pod
+# saturation point:
+#   extraMetrics:
+#     - type: Pods
+#       pods:
+#         metric:
+#           name: sqlhandler_http_requests_per_second
+#         target:
+#           type: AverageValue
+#           averageValue: "1.5"
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 80
+  # Raw extra HPA metrics appended verbatim (autoscaling/v2 schema).
+  extraMetrics: []
+  behavior:
+    # Scale-up reacts quickly; scale-down is deliberately slow so a burst of
+    # MCP tool calls doesn't thrash the fleet.
+    scaleUpStabilizationSeconds: 30
+    scaleDownStabilizationSeconds: 300
+
+# Spread replicas across nodes (ScheduleAnyway keeps scheduling permissive on
+# single-node clusters).
+topologySpread:
+  enabled: false
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+  whenUnsatisfiable: ScheduleAnyway
+
+# Budget for voluntary disruptions (node drains) once replicaCount > 1.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
 
 # Grace period for in-flight MCP tool calls on rollout (gateway allows up
 # to 3600s per call; the pod gets this many seconds to finish draining).
@@ -13,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v1.1.0
+  tag: v1.3.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -100,18 +152,30 @@ mcp:
   port: 9097                   # container + service port
 
 # -- Resources ----------------------------------------------------------------
-# Defaults sized for wide-table scans: DuckDB's query budget is derived from
-# the LIMIT (a fraction of it — see src/sqlhandler/resources.py), so a bigger
-# limit directly buys a bigger in-memory query budget before spilling. The
-# CPU request is deliberately modest relative to the limit: a request is a
-# hard reservation on the node and this workload idles near-zero, bursting
-# only during scans — the limit governs the burst.
+# Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
+# at 16 concurrent clients with a fleet-wide peak of 0.24 cores / 1.3GiB, so
+# the REQUESTS below are all the reservation the scheduler needs — the
+# workload idles near-zero and bursts only during scans. LIMITS stay generous
+# because the actual target is big data:
+#   - memory: DuckDB's in-query budget is duckdbMemoryFraction (0.6) x the
+#     memory LIMIT — 16Gi keeps a ~9.6Gi budget before DuckDB spills to
+#     spillDir instead of being OOMKilled mid-join (which also wipes every
+#     in-process cache).
+#   - cpu: the limit governs how many threads ONE wide scan/aggregate can use
+#     in parallel (DuckDB defaults its thread count to the core limit).
+# The memory REQUEST is purely a scheduler reservation (DuckDB's budget keys
+# off the LIMIT — see src/sqlhandler/resources.py) — but keep it at or above
+# steady-state RSS: under node memory pressure the kubelet evicts pods whose
+# usage exceeds their request first. 1Gi covers observed usage (~0.3GiB fresh,
+# ~1.1GiB long-warmed) with margin; don't go below that.
+# Raise the limits (not the requests) on sites running very wide tables or
+# large joins; the requests can stay put in every case observed so far.
 resources:
   requests:
-    cpu: 2
-    memory: 4Gi
+    cpu: 250m
+    memory: 1Gi
   limits:
-    cpu: "8"
+    cpu: "4"
     memory: 16Gi
 
 # -- Probes --------------------------------------------------------------------

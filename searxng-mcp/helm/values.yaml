@@ -1,10 +1,14 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a helm install WITHOUT -f values.se-g2.yaml deploys,
   # and a stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
-  tag: v1.1.0
+  tag: v1.2.0
   pullPolicy: IfNotPresent
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
 # ddgs-mcp convention) pull anonymously. Create with:
@@ -81,7 +85,7 @@ browser:
   enabled: false
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.1.0
+    tag: v1.2.0
     pullPolicy: IfNotPresent
   resources:
     requests:

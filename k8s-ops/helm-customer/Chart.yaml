@@ -1,0 +1,6 @@
+apiVersion: v2
+name: k8s-mcp-customer
+description: Customer distribution of the K8s ops MCP server — structurally locked; security knobs (exec, namespace policy, per-user keys, RBAC) do not exist in values and cannot be configured from the PCAI frontend
+type: application
+version: 0.2.4-customer
+appVersion: "v0.2.4"

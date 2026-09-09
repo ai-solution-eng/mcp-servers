@@ -1,0 +1,62 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret | default (printf "%s-apikey" $name) -}}
+{{- $host := .Values.ezua.virtualService.endpoint -}}
+
+k8s-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+Trusted-operator chart: every knob is values-configurable (and stays
+kubectl-changeable — `kubectl set env` triggers a rollout; exec RBAC
+re-provisions at startup).
+
+════════════════════════════════════════════════════════════════════
+1. API key — the chart NEVER creates it (an empty-key apply once took
+   a live endpoint open). Create/rotate out-of-band, then restart:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-key=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n {{ $ns }} rollout restart deploy/{{ $name }}
+
+  Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-key}' | base64 -d
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints (port-forward while testing; the PCAI VirtualService
+   fronts it for real):
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 9090:9090
+  Console : http://localhost:9090/ui/     (paste the API key in the login card)
+  MCP     : http://localhost:9090/mcp     (Authorization: Bearer <api-key>)
+{{- if and .Values.ezua.enabled $host }}
+
+  Public hostname: {{ $host }}
+    (Istio VirtualService: {{ $name }}-vs in {{ $ns }} via {{ .Values.ezua.virtualService.istioGateway }})
+{{- end }}
+
+════════════════════════════════════════════════════════════════════
+3. MCP client config:
+  {
+    "mcpServers": {
+      "k8s-ops": {
+        "type": "remote",
+        "url": "https://<public-host>/mcp",
+        "headers": { "Authorization": "Bearer <api-key>" }
+      }
+    }
+  }
+
+════════════════════════════════════════════════════════════════════
+Current settings:
+  namespaces.allowed : {{ .Values.namespaces.allowed | quote }}
+  namespaces.blocked : {{ .Values.namespaces.blocked | quote }}
+  exec.enabled       : {{ .Values.exec.enabled }}
+  exec.namespaces    : {{ .Values.exec.namespaces | quote }}
+  exec.requireLabel  : {{ .Values.exec.requireLabel }}
+  rbac.scope         : {{ .Values.rbac.scope }}
+  console            : {{ .Values.console.enabled }}
+
+════════════════════════════════════════════════════════════════════
+4. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | head -5
+  # → "Loaded In-Cluster Service Account Config", no API-key warning
+  # unauthenticated → 401; with the key → tools/list works.

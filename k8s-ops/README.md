@@ -7,9 +7,49 @@ A read-only **Kubernetes ops MCP server** migrated to **MCP 2.0** (protocol revi
 > MCP client setup, namespace policy, and enabling exec per namespace.
 
 This is the MCP 2.0 successor to `k8s-mcp-server`. It exposes a read-only
-tool surface (pods, workloads, events, logs, services, ConfigMaps, Secrets,
-PVCs, CRDs, RBAC, and a generic `kubectl` escape hatch) while speaking the new
-stateless protocol.
+tool surface (pods, workloads, events, logs, services, Istio VirtualServices,
+ConfigMaps, Secrets, PVCs, CRDs, RBAC, and a generic `kubectl` escape hatch)
+while speaking the new stateless protocol. It also ships a **built-in HPE ops
+console** (static web UI on the same pod) and a **Helm chart** with internal
+and customer-lockdown profiles.
+
+> **Screenshots lie, schemas don't:** the console renders every tool from its
+> `inputSchema` — anything the server registers, the console can drive.
+
+## Deploy options
+
+| Path | When | How |
+| --- | --- | --- |
+| Helm chart (`helm/`) | HPE / trusted operators — every knob frontend-configurable | `helm install k8s-mcp helm -f helm/local/values-internal.yaml` — profile file is HPE-local, never shipped |
+| Helm chart (`helm-customer/`) | Customer PCAI catalogs — structurally locked: exec/policy/clients/RBAC keys don't exist in values, pasting them is inert | `helm install k8s-mcp-customer helm-customer -f helm-customer/local/values-site.yaml` |
+| envsubst manifest | legacy / exact-parity with v0.1.x | see [DEPLOYMENT.md](DEPLOYMENT.md) |
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full runbook.
+
+## Built-in ops console (same pod, `/ui/`)
+
+A static, HPE-branded single-page console is served by the server itself:
+`https://<host>/ui/` (and `/` redirects there). It is a **universal MCP client
+with curated dressing**:
+
+- **Same endpoint, same guards.** The browser calls `/mcp` with your API key —
+  the identical auth middleware, namespace policy, read-verb allowlist, exec
+  gates and RBAC that MCP clients get. The console cannot do anything a
+  client cannot.
+- **Curated screens:** cluster health · namespaces · pods (click a row → logs,
+  or straight into hardened exec when enabled) · workloads · events · services
+  · VirtualServices · ConfigMaps · PVCs · secrets (names only) · CRD lookup ·
+  RBAC can-I · any-resource get/describe · a read-only kubectl console.
+- **"Any tool" runner:** every registered tool, with a form generated from its
+  `inputSchema` — future server tools appear without UI changes.
+- **Exec screen only when the server has it:** the tool is gated by
+  `K8S_MCP_EXEC_ENABLED` server-side; the UI mirrors the binary allowlist and
+  offers the `X-Exec-Namespaces` narrowing header (it can only narrow).
+- **Hygiene:** the shell carries no data (no key needed to load it); the key
+  lives in memory/sessionStorage (never localStorage); all cluster output is
+  rendered as text, never HTML; CSP `default-src 'none'` + nosniff +
+  no-referrer on the shell; traversal-guarded static handler.
+- **Toggle:** `K8S_MCP_CONSOLE_ENABLED=false` removes the shell entirely.
 
 ## MCP 2.0 — what changed (protocol `2026-07-28`)
 
@@ -45,7 +85,7 @@ Verified against the real wrapped app served by uvicorn (kubernetes stubbed):
 
 | Behavior | Result |
 | --- | --- |
-| Stateless `tools/list` with per-request envelope | 200, all 17 tools |
+| Stateless `tools/list` with per-request envelope | 200, all 18 tools |
 | Cacheable list result | `ttlMs=300000, cacheScope=public` on `tools/list` |
 | Tool `inputSchema` | JSON Schema 2020-12 shape, properties from type hints |
 | `server/discover` | `supportedVersions=["2026-07-28"]`, tools/prompts/resources capabilities |
@@ -93,9 +133,11 @@ The audit that shipped with v2.1.0 fixed the following; do not regress them:
    `ClusterRole` (`k8s-mcp-2-0-readonly`) — **not** `cluster-admin`. Secrets
    and RBAC objects are deliberately excluded, so `list_secrets` and
    `get secret ...` return 403: the "values are NOT shown" promise is now
-   enforced by the API server, not by tool formatting. Extend the CRD
-   `apiGroups` list per installed operator; never use `apiGroups: ["*"]`
-   there (it would re-grant secrets read).
+   enforced by the API server, not by tool formatting. The role grants
+   `get/list/watch` on `networking.istio.io/virtualservices` for
+   `list_virtual_services`; extend the CRD `apiGroups` list per installed
+   operator, never with `apiGroups: ["*"]` there (it would re-grant secrets
+   read).
 6. **Pod hardening.** Non-root (uid/gid 10001), read-only root filesystem,
    all capabilities dropped, RuntimeDefault seccomp, `/tmp` as emptyDir.
 7. **Pinned toolchain.** kubectl is pinned via `KUBECTL_VERSION` and
@@ -167,8 +209,8 @@ Semantics when a policy is active:
   with an explanatory error (the error lists the allowed namespaces).
 - Python-API-backed tools (`cluster_health`, `list_pods`, `get_events`,
   `list_workloads`, `list_services`, `list_pvcs`, `list_namespaces`,
-  `get_custom_resource`) **filter** denied namespaces from cluster-wide
-  results.
+  `list_virtual_services`, `get_custom_resource`) **filter** denied
+  namespaces from cluster-wide results.
 - kubectl-backed tools enforce through the escape hatch: explicit `-n` is
   checked directly; namespaced queries without `-n` are rejected with a hint;
   `-A`/`--all-namespaces` is **rewritten** into one query per whitelisted

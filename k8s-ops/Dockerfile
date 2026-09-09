@@ -26,6 +26,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+# Built-in HPE ops console (static shell served at /ui/ by server.py).
+COPY ui/ ./ui/
+# COPY preserves source file modes, and workspace defaults can be tighter
+# than the container user (uid 10001) needs: a+rX = directories traversable,
+# files readable, nothing executable that was not already.
+RUN chmod -R a+rX /app
 
 RUN addgroup --system --gid 10001 k8smcp && \
     adduser --system --uid 10001 --ingroup k8smcp k8smcp

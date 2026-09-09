@@ -1,0 +1,89 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $sa := .Values.serviceAccount.name | default $name -}}
+{{- $secret := .Values.apiKey.existingSecret | default (printf "%s-apikey" $name) -}}
+{{- $host := .Values.ezua.virtualService.endpoint -}}
+
+k8s-mcp-customer {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+STRUCTURALLY LOCKED CHART: exec, namespace policy, per-user keys and RBAC
+scope do not exist in values and cannot be configured from the frontend —
+the templates never read them. Everything day-2 is a kube command-line
+action, printed below.
+
+════════════════════════════════════════════════════════════════════
+1. API key — the chart NEVER creates it (an empty-key apply once took
+   a live endpoint open). Create/rotate out-of-band, then restart:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-key=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n {{ $ns }} rollout restart deploy/{{ $name }}
+
+  Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-key}' | base64 -d
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints (port-forward while testing; the PCAI VirtualService
+   fronts it for real):
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 9090:9090
+  Console : http://localhost:9090/ui/     (paste the API key in the login card)
+  MCP     : http://localhost:9090/mcp     (Authorization: Bearer <api-key>)
+{{- if and .Values.ezua.enabled $host }}
+
+  Public hostname: {{ $host }}
+    (Istio VirtualService: {{ $name }}-vs in {{ $ns }} via {{ .Values.ezua.virtualService.istioGateway }})
+{{- end }}
+
+════════════════════════════════════════════════════════════════════
+3. MCP client config:
+  {
+    "mcpServers": {
+      "k8s-ops": {
+        "type": "remote",
+        "url": "https://<public-host>/mcp",
+        "headers": { "Authorization": "Bearer <api-key>" }
+      }
+    }
+  }
+
+════════════════════════════════════════════════════════════════════
+4. DAY-2 — security knobs (command line only, by design). Read-only
+   tooling works out of the box; exec requires ALL of steps a–c:
+
+  a) Enable exec on the Deployment (rollout happens automatically):
+     kubectl -n {{ $ns }} set env deploy/{{ $name }} \
+       K8S_MCP_EXEC_ENABLED=true \
+       K8S_MCP_EXEC_TEMPLATE_ROLE={{ $name }}-pods-exec \
+       K8S_MCP_EXEC_BINDING_NAME={{ $name }}-exec \
+       K8S_MCP_EXEC_NAMESPACES="<namespace(s)>" \
+       K8S_MCP_EXEC_REQUIRE_LABEL=true
+
+  b) Create the exec role (this chart ships WITHOUT it):
+     kubectl create clusterrole {{ $name }}-pods-exec \
+       --verb=get,create --resource=pods,pods/exec
+
+  c) Bind it in each exec namespace (repeat per namespace; only pods
+     labeled k8s-mcp.io/exec="true" accept commands while REQUIRE_LABEL
+     is true):
+     kubectl -n <target-ns> create rolebinding {{ $name }}-exec \
+       --serviceaccount={{ $ns }}:{{ $sa }} \
+       --clusterrole={{ $name }}-pods-exec \
+       --dry-run=client -o yaml | kubectl apply -f -
+
+  Namespace governance (app layer):
+     kubectl -n {{ $ns }} set env deploy/{{ $name }} \
+       K8S_MCP_BLOCKED_NAMESPACES="kube-system,kube-public"
+     kubectl -n {{ $ns }} set env deploy/{{ $name }} \
+       K8S_MCP_ALLOWED_NAMESPACES="<ns1>,<ns2>"
+
+  Per-user keys:
+     kubectl -n {{ $ns }} set env deploy/{{ $name }} \
+       K8S_MCP_CLIENTS="name:key[:ns-patterns];..."
+
+════════════════════════════════════════════════════════════════════
+5. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | head -5
+  # → "Loaded In-Cluster Service Account Config", no API-key warning
+  # unauthenticated → 401; with the key → tools/list works.

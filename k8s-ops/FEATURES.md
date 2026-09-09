@@ -1,8 +1,8 @@
-# FEATURES.md — Hardening & Capability changelog (v0.0.1 → v0.1.3)
+# FEATURES.md — Hardening & Capability changelog (v0.0.1 → v0.2.4)
 
 This file summarizes everything that changed across the hardening session that took
 `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl,
-`cluster-admin`, unauthenticated endpoint) to the current v0.1.3 — deployed, verified
+`cluster-admin`, unauthenticated endpoint) to the current v0.2.4 — deployed, verified
 live, and in daily use from DSH.
 
 ---
@@ -129,14 +129,95 @@ eight independent layers:
 - `check_rbac` surfaces `kubectl auth can-i` "no" answers (which exit 1) instead of
   masking them as errors.
 
-## 9. Verification
+## 9. Istio VirtualServices visibility (v0.2.0)
 
-- `test_namespace_policy.py` — **144 self-contained checks**: namespace policy and globs,
+- **New tool `list_virtual_services`** — fully read-only:
+  - `namespace` given: one summary line-group per VirtualService (hosts, gateways,
+    http/tls/tcp route entries with weighted destinations, redirects, delegates, fault
+    injection, mirrors, age);
+  - `name` + `namespace`: the full VirtualService definition (JSON);
+  - no namespace: cluster-wide listing with denied namespaces filtered by the policy.
+- Resolves the CRD across Istio API versions (`v1` → `v1beta1` → `v1alpha3`) via the
+  dynamic client and falls back to kubectl on discovery/schema errors (name without a
+  namespace falls back with `--field-selector metadata.name=…`, never `name + -A`).
+- **RBAC grant added** to `k8s-mcp-2-0-readonly`: `networking.istio.io` →
+  `virtualservices` (`get, list, watch`) — the deployed role did not cover Istio, so
+  the generic kubectl path returned 403 before this. Minimal by design: gateways /
+  destinationrules are NOT granted; extend the rule consciously if ever needed.
+- Bonus fix: `clusterrole` (and other singular cluster-scoped forms) are now recognized
+  by `_CLUSTER_SCOPED_RESOURCES` — `get clusterrole …` no longer requires `-n` under an
+  active namespace policy (it is cluster-scoped; RBAC still enforces the 403).
+
+## 10. Built-in ops console (v0.2.0)
+
+- **Same pod, same endpoint, one auth path**: a static HPE-branded single-page
+  console served by the server at `/ui/` (`/` redirects there). The shell is
+  inert — every data request is a browser `POST /mcp` with the API key through
+  the SAME auth middleware / namespace policy / read-verb allowlist as MCP
+  clients. No second backend, no drift, no CORS.
+- **Powerful by construction**: forms are generated from each tool's
+  `inputSchema` — a tool added server-side appears in the console with no UI
+  change. Curated screens (cluster health, pods→logs→exec, workloads, events,
+  services, VirtualServices, ConfigMaps, PVCs, secrets-names-only, CRD lookup,
+  can-I, any-resource, kubectl console) are presets over one universal runner;
+  "Any tool" exposes every registered tool.
+- Exec screen only exists when the server registered `exec_in_pod`; its binary
+  dropdown mirrors the server allowlist (server remains the boundary); optional
+  `X-Exec-Namespaces` narrowing header per session (can only narrow).
+- Hygiene: API key in memory/sessionStorage (never localStorage), all cluster
+  output rendered as text (never HTML-interpolated), CSP `default-src 'none'` +
+  nosniff + no-referrer on the shell, path-traversal-guarded static handler,
+  `K8S_MCP_CONSOLE_ENABLED=false` removes the shell.
+- Speaks the 2026-07-28 envelope (Mcp-Method/Mcp-Name headers + `_meta`) with an
+  automatic legacy-2025 fallback; verified over real HTTP in both eras.
+
+## 11. Helm charts — one trusted, one structurally locked (v0.2.2)
+
+Two charts in the PCAI house style (values-driven naming, `ezua:` integration
+block with `hpe-ezua/*` vendor labels via a Kyverno pre-install policy,
+`/mcp`-first VirtualService routing, committed packaged `.tgz`, `.helmignore`d
+`local/` site values). One image; the difference is what the chart *reads*:
+
+- **`helm/` (k8s-mcp, v0.2.2) — trusted operators, fully frontend-configurable**:
+  exec + exec namespaces, namespace policy, per-user clients, `rbac.scope`,
+  `extraResourceGroups`, provisioner auto-RBAC, `ezua` exposure — all values.
+  Site values in the HPE-local `helm/local/values-internal.yaml` (never ships).
+- **`helm-customer/` (k8s-mcp-customer, 0.2.1-customer) — structurally locked**:
+  the security keys (exec, namespace policy, per-user clients, RBAC scope and
+  extra groups) **do not exist in its values and its templates never read
+  them** — pasting `exec: {enabled: true}` into the PCAI frontend is inert.
+  There is no `lockdown` flag to flip. The read-only ClusterRole is baked via
+  a chart constant (clamp a tenant by editing the constant + repackaging — a
+  platform action); exec RBAC is never minted, so exec becomes possible only
+  via the deliberate NOTES.txt runbook (`kubectl set env` + manual Role and
+  RoleBinding creation). Site values in `helm-customer/local/values-site.yaml`.
+- **API key is out-of-band, always** (`apiKey.existingSecret`) — neither chart
+  creates or inlines it (the envsubst empty-Secret incident must not repeat).
+- **Wildcard apiGroups are refused at render time in both charts** (`""`/`"*"`
+  in `extraResourceGroups` would re-grant secrets read — enforced, not just
+  documented).
+- Container hardening (non-root, read-only rootfs, dropped capabilities,
+  seccomp, `/tmp` emptyDir) is fixed in both charts, not values-overridable.
+- Exec RBAC names are env-overridable (`K8S_MCP_EXEC_TEMPLATE_ROLE/_BINDING_NAME`)
+  so multiple releases coexist in one cluster without RoleName collisions.
+- History note: v0.2.0/v0.2.1 shipped ONE chart with a values-controlled
+  `lockdown` flag + fail-guards; superseded in v0.2.2 by the two-chart split
+  (the flag was customer-removable, so the guards were advisory).
+
+## 12. Verification
+
+- `test_namespace_policy.py` — **168 self-contained checks**: namespace policy and globs,
   precedence (blacklist wins), exec command guard (allowlist, hard-denies, token denials),
   argv building, per-client parsing/auth/narrowing, provisioning (create/keep/patch/
   skip/refuse/degrade), API-key middleware (401 paths, both headers, dev mode), MCP 2.0
-  envelope behavior, and `check_rbac` answer surfacing. Runs without a cluster (the
+  envelope behavior, `check_rbac` answer surfacing, the VirtualServices tool
+  (summary/detail rendering, policy filtering, kubectl fallback argv), and the built-in
+  console (routing, CSP, traversal guards, disable knob). Runs without a cluster (the
   `kubernetes` package is stubbed when absent).
+- `smoke_console.py` — boots the REAL ASGI wiring (uvicorn, kubernetes stubbed) and
+  verifies over HTTP: static shell + CSP, traversal 404s, console toggle, modern
+  `tools/list`/`tools/call` with the 2026-07-28 envelope, legacy SSE fallback, and the
+  401 gate with the console-shell exemption.
 - **Live protocol conformance**: stateless tools/list+call, `server/discover`, cache
   hints, legacy-era fallback, strict envelope rejection — verified over real HTTP.
 - **Live deployment verification** (production cluster): 236 exec RoleBindings
@@ -144,7 +225,7 @@ eight independent layers:
   kept namespaces / no elsewhere; real `ps` executed inside a running predictor through
   the full gateway→auth→policy→allowlist→RBAC chain; 401 gate and audit trail confirmed.
 
-## 10. Version history
+## 13. Version history
 
 | Tag | Server | Highlights |
 | --- | --- | --- |
@@ -153,14 +234,24 @@ eight independent layers:
 | v0.1.1 | 2.1.1 | Crashloop fix (dict bodies, degrade-don't-die provisioning), imagePullSecrets, `check_rbac` truth |
 | v0.1.2 | 2.1.2 | `check_rbac` "no" surfacing, provisioner `get` grant, migration repointing, `MCP_HOSTNAME` knob |
 | v0.1.3 | 2.1.3 | Host-header protection correctly scoped (the 421 fix), Secret out-of-band, `MCP_HOSTNAME` reaches the container |
+| v0.2.0 | 2.2.0 | `list_virtual_services` (read-only Istio visibility + `networking.istio.io` RBAC grant), built-in HPE ops console on the same pod, Helm chart with internal / customer-lockdown profiles, env-overridable exec RBAC names, cluster-scoped singular forms in the kubectl guard |
+| v0.2.1 | 2.2.0 | Helm chart conformed to the PCAI house style: `ezua:` integration block (endpoint doubles as MCP_HOSTNAME), `hpe-ezua/*` vendor labels via a Kyverno pre-install policy, values-driven naming (no fullname helpers), explicit `image.tag` in lockstep with appVersion, optional gateway AuthorizationPolicy, `.helmignore` for `helm/local/`, packaged `k8s-mcp-<ver>.tgz` committed alongside the chart |
+| v0.2.2 | 2.2.0 | Two-chart split — `helm/` (trusted operators, fully frontend-configurable) + `helm-customer/` (structurally locked: security keys don't exist in values and templates never read them, baked read-only RBAC via chart constant, exec RBAC never minted, day-2 runbook in NOTES); wildcard apiGroups refused at render in both; `lockdown` values flag removed (it was customer-removable, so its guards were advisory) |
+| v0.2.3 | 2.2.0 | Console-serving fix: `ui/*` shipped mode-600 in the image (COPY preserves source modes; DSH workspace default), so the uid-10001 container got PermissionError and `/ui/` returned `{"error": "not found"}`; fixed with `chmod 644` at the source plus `COPY --chmod=0644` enforcement in the Dockerfile |
 
-## 11. Files
+## 14. Files
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | The server — 18 tools, auth, policy, exec, provisioning |
-| `k8s-mcp-2-0-server.yaml` | Full deployment: RBAC (read-only + exec template + scoped provisioner), hardened pod, envsubst knobs |
-| `Dockerfile` | Pinned + checksum-verified kubectl, non-root, arch-aware |
+| `server.py` | The server — 19 tools, auth, policy, exec, provisioning, console serving |
+| `ui/` | Built-in HPE ops console (static: `index.html`, `style.css`, `app.js`) |
+| `helm/` | Trusted-operator chart (k8s-mcp): every security knob values-configurable, `ezua:` exposure, Kyverno vendor labels; packaged `.tgz` at the repo root |
+| `helm-customer/` | Locked customer distribution (k8s-mcp-customer): security keys absent from values and unread by templates, baked read-only RBAC, exec RBAC never minted — day-2 via the NOTES.txt kubectl runbook |
+| `helm/local/` | HPE-local site values (`values-internal.yaml`) + internal runbook — `.helmignore`d, excluded from the hardlinker base ignores, never shipped |
+| `helm-customer/local/` | Per-customer site values template (`values-site.yaml`) — `.helmignore`d, never shipped |
+| `k8s-mcp-2-0-server.yaml` | Legacy envsubst deployment: RBAC (read-only + exec template + scoped provisioner), hardened pod, envsubst knobs |
+| `Dockerfile` | Pinned + checksum-verified kubectl, non-root, arch-aware, console included |
 | `DEPLOYMENT.md` | Operator runbook (deploy, clients, exec, migration, rotation, troubleshooting) |
 | `FEATURES.md` | This file |
-| `test_namespace_policy.py` | 144-check verification suite (no cluster required) |
+| `test_namespace_policy.py` | 168-check verification suite (no cluster required) |
+| `smoke_console.py` | HTTP-level console + protocol smoke test (real ASGI wiring, kubernetes stubbed) |

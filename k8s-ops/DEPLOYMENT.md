@@ -1,21 +1,93 @@
 # Deploying k8s-mcp-2-0-server
 
 A read-only Kubernetes ops MCP server (MCP 2.0 / protocol `2026-07-28`) with
-API-key auth, optional namespace governance, and an opt-in hardened exec tool.
+API-key auth, optional namespace governance, an opt-in hardened exec tool, a
+built-in HPE ops console at `/ui/`, and a Helm chart with two profiles.
 
 ## Prerequisites
 
 - `kubectl` configured against your cluster
 - `docker` (to build/push the image)
-- A gateway/Ingress for external exposure (the shipped manifest uses an Istio
-  VirtualService on `ezaf-gateway`)
+- A gateway for external exposure — every PCAI cluster ships the ezaf-gateway;
+  the chart's `ezua:` block deploys the Istio VirtualService against it
+- `helm` (only for the chart path)
 
-## 1. Build & push
+## 0. Helm — the recommended path (two charts: trusted + locked)
+
+Two charts, one image. `helm/` is the trusted-operator chart — every security
+knob is values/frontend-configurable. `helm-customer/` is the customer
+distribution — **structurally locked**: the security keys do not exist in its
+values and its templates never read them, so anything pasted into the PCAI
+frontend is inert (no guards to bypass — there is no `lockdown` flag at all).
+`bump_version.sh` covers both automatically via the `helm*` glob and the
+version-suffix convention (`0.2.2`, `0.2.1-customer`).
+
+```bash
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.4 . --push
+
+# ── INTERNAL (HPE cluster): every knob lives in values ─────────────────
+# 1. edit helm/local/values-internal.yaml (endpoint! blocked ns! exec!)
+#    — HPE-local (.helmignore'd + hardlink-ignored), it never ships. It
+#    already pins apiKey.existingSecret=k8s-mcp-2-0-apikey (reuses the
+#    v0.1.3 Secret → bearer tokens survive the cutover).
+# 2. on a FRESH cluster (no existing Secret), create it once — same name
+#    the values file pins:
+kubectl -n $NAMESPACE create secret generic k8s-mcp-2-0-apikey \
+  --from-literal="api-key=$(openssl rand -hex 32)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+helm install k8s-mcp helm -n $NAMESPACE \
+  -f helm/local/values-internal.yaml
+
+# ── CUSTOMER (structurally locked chart) ────────────────────────────────
+# Per customer: copy helm-customer/local/values-site.yaml, set the endpoint
+# and the API-key Secret name, upload k8s-mcp-customer-<ver>.tgz to the
+# PCAI catalog (or install directly):
+helm install k8s-mcp-customer helm-customer -n customer-ns \
+  -f helm-customer/local/values-site.yaml
+```
+
+Chart semantics:
+
+| | `helm/` (trusted operators) | `helm-customer/` (locked distribution) |
+| --- | --- | --- |
+| exec, namespace policy, clients | set from values; `kubectl set env` also works | **keys do not exist** — templates never read them, pasting is inert; command line only (`kubectl set env deploy/…`) |
+| RBAC | `rbac.scope: cluster\|namespace`, `extraResourceGroups` (wildcards refused at render) | **baked**: read-only ClusterRole via a chart constant; clamp = edit the constant + repackage (platform action) |
+| exec RBAC | chart renders the template role; autoRbac binds it | **never minted** — exec stays impossible until the operator creates the Role by hand (NOTES prints every command) |
+| exposure | Istio VirtualService via `ezua.enabled` + `ezua.virtualService.endpoint` (PCAI convention) | same `ezua:` block — set the customer's endpoint |
+| API key | out-of-band Secret (both charts — never in values) | out-of-band Secret |
+| day-2 knobs | values upgrade (`helm upgrade`) or `kubectl set env` | `kubectl set env` (+ manual exec RBAC; NOTES prints every command) |
+
+Why the split: with one chart, the customer owns the `lockdown` flag itself,
+so any values-based guard was advisory. With two charts the locked posture is
+structural — there is nothing to flip. (`lockdown` values key: removed in
+chart v0.2.2.)
+
+Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
+RuntimeDefault seccomp) is fixed in both charts — not values-overridable.
+
+Release flow (toolkit is hardlinked from `pcai_utils` at the repo root —
+edit shared files in `pcai_utils`, never re-copy them):
+
+```bash
+./bump_version.sh 0.3.0     # BOTH charts: helm/ (0.3.0) + helm-customer/
+                            #   (0.3.0-customer) — version, appVersion and
+                            #   the explicit image.tag, kept in lockstep
+helm package helm/          # → k8s-mcp-0.3.0.tgz
+helm package helm-customer/ # → k8s-mcp-customer-0.3.0-customer.tgz
+./prune_charts.py           # keep only the newest archive per chart
+```
+
+Manual stragglers the bumper doesn't touch: the image tag inside
+`k8s-mcp-2-0-server.yaml` and `VERSION` in `server.py`.
+Delivery to `pcai-solutions/mcp-servers/k8s-mcp/` (the git repo) is via
+`hardlinker.py` — see `helm/local/adopt_pcai_utils.sh` and the pcai_utils README.
+
+## 1. Build & push (legacy envsubst path uses the same image)
 
 ```bash
 # Dockerfile lives at the repo root — no -f needed (buildx auto-detects it).
 docker login ghcr.io   # once, if not already logged in
-docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.1.3 . --push
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.4 . --push
 ```
 
 kubectl is pinned + checksum-verified inside the Dockerfile — no extra steps.
@@ -82,7 +154,7 @@ What gets installed:
 | --- | --- |
 | Secret `k8s-mcp-2-0-apikey` | the API key (wired into the Deployment) |
 | ServiceAccount `k8s-mcp-2-0-sa` | the server's identity |
-| ClusterRole `k8s-mcp-2-0-readonly` (+binding) | read-only cluster access — **no secrets, no RBAC objects** |
+| ClusterRole `k8s-mcp-2-0-readonly` (+binding) | read-only cluster access — **no secrets, no RBAC objects**; includes Istio VirtualServices (`networking.istio.io`) |
 | ClusterRole `k8s-mcp-pods-exec` | exec **template** — grants nothing until bound per namespace |
 | ClusterRole `k8s-mcp-2-0-rbac-provisioner` (+binding) | lets the server bind the exec template itself (bind-scoped; cannot escalate) |
 | Deployment `k8s-mcp-2-0-server` | non-root, read-only rootfs, dropped capabilities, seccomp |
@@ -326,6 +398,8 @@ for NS in team-a debug-x; do kubectl -n "$NS" delete rolebinding k8s-mcp-2-0-exe
 | --- | --- |
 | HTTP 401 from the endpoint | API key missing/mismatch in the client header |
 | Startup warning "endpoint is UNAUTHENTICATED" | `K8S_MCP_API_KEY` not set — do not expose this |
+| Console at `/ui/` shows 404 | disabled via `K8S_MCP_CONSOLE_ENABLED=false` (helm: `--set console.enabled=false`) or the `ui/` directory is missing from the image — rebuild |
+| `list_virtual_services` returns `403 Forbidden` | the deployed ClusterRole predates the Istio grant — re-apply the manifest to add `networking.istio.io/virtualservices` (or patch the ClusterRole in place) |
 | `RBAC provisioning: cannot read template ClusterRole: Forbidden` | the provisioner ClusterRole predates the `get` grant — re-apply the manifest (export your knobs again first, see below) |
 | `RBAC provisioning: template ClusterRole missing` | the manifest wasn't fully applied — re-run step 2 |
 | Re-applying the manifest wiped my env knobs | `envsubst` renders `K8S_MCP_*` from the current shell — re-run your `export` block before every `envsubst \| kubectl apply`, or change knobs with `kubectl set env` instead |

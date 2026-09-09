@@ -1,0 +1,63 @@
+{{- if .Values.rbac.create -}}
+{{- /* Wildcard guard — enforced in EVERY mode, not just lockdown:
+      core group ("") or "*" with resources:"*" re-grants secrets read. */ -}}
+{{- range $g := .Values.rbac.extraResourceGroups }}
+{{- if or (eq $g "") (eq $g "*") -}}
+{{- fail (printf "rbac.extraResourceGroups must never contain %q — a wildcard apiGroup with resources:* re-grants secrets read. List real apiGroups (e.g. serving.kserve.io)." $g) }}
+{{- end }}
+{{- end }}
+{{- /* Customer variant lock lives in the separate helm-customer/ chart;
+      this trusted-operator chart only refuses wildcard apiGroups. */ -}}
+{{- $sa := .Values.serviceAccount.name | default .Values.deployment.name -}}
+{{- if eq .Values.rbac.scope "cluster" }}
+# Cluster scope (internal default): read-only, cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.deployment.name }}-readonly
+  labels:
+    app: {{ .Values.deployment.appName }}
+{{ include "k8s-mcp.readonlyRules" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-readonly
+  labels:
+    app: {{ .Values.deployment.appName }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Values.deployment.name }}-readonly
+  apiGroup: rbac.authorization.k8s.io
+{{- else }}
+# Namespace clamp: the API server confines every read to THIS namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.deployment.name }}-readonly
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+{{ include "k8s-mcp.readonlyRules" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-readonly
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ .Values.deployment.name }}-readonly
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

@@ -27,6 +27,45 @@ response with a truncation footer naming the count. Caps are env-tunable
 (`PROM_MAX_SERIES`/`PROM_MAX_POINTS`/`PROM_MAX_LABEL_VALUES`). A busy
 cluster never floods a model's context.
 
+## Web UI (HPE-branded)
+
+The streamable-http server also serves a self-contained, no-build web UI —
+the same HPE branding as the SQLhandler explorer (green element mark,
+MetricHPE wordmark, light/dark theme with no-flash init and
+`localStorage` persistence). It is a **read-only** human front-end over
+the SAME `PrometheusClient` + caps that back the MCP tools, available at
+`/` (and `/ui`) — through the PCAI gateway too, since the VirtualService
+already routes `/` to the service.
+
+| Tab | What it shows |
+| --- | --- |
+| **Dashboard** | The nice stats: firing/pending alert counts, up targets, node CPU/memory %, running pods, top-pods-by-CPU/memory bar charts, cluster CPU + memory trend lines (last 3h), active alerts preview. Optional 30s auto-refresh. |
+| **Query** | PromQL editor with Instant/Range modes (`now-6h`-style relative times, auto step), SVG line chart + table for range results, CSV copy, preset library in the sidebar, saved queries + history (browser-local). |
+| **Alerts & Rules** | Full alert table (state/severity badges, ages, labels, summaries) with filters, plus the rule browser showing each rule's exact expression — searchable, filterable by state. |
+| **MCP Tools** | The tool catalog: what each of the six tools is good for, when an agent reaches for it, arguments, tips, clickable example queries, and the K8s-MCP triage-pairing workflow. |
+
+Every dashboard card fails soft: a metric that doesn't exist on a given
+cluster shows an error inline instead of breaking the page, and the JSON
+API mirrors the MCP-side caps so a busy cluster can't flood the browser
+either.
+
+### JSON API (all read-only)
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/status` | Server status + Prometheus URL + caps |
+| `GET /api/overview` | Dashboard aggregate (cards, top-N, trends, alerts) |
+| `GET /api/alerts` | Alerts, shaped + counted (`n_total` accurate, items capped) |
+| `GET /api/rules?state=&search=` | Rules with expressions, filtered |
+| `POST /api/query` | Instant query `{"query", "time"?}` |
+| `POST /api/query_range` | Range query `{"query", "start", "end", "step"?}` |
+| `GET /api/series?match=` | Series/label discovery for a selector |
+| `GET /api/label_values?label=&match=` | Values of one label |
+
+Prometheus upstream errors map to HTTP 502 with the error text; malformed
+requests to 400. The UI asset (`ui/index.html`) is copied into `/app/ui`
+by the Dockerfile; `webui.py` also honors a `PROM_UI_HTML` override.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -46,13 +85,18 @@ HTTP, and the pod needs no Kubernetes permissions at all.
 ```bash
 uv venv --python 3.12 .venv
 UV_CACHE_DIR=$PWD/.uv-cache uv pip install -e . pytest
-.venv/bin/python -m pytest tests/ -v   # 15 unit tests (fully mocked)
+.venv/bin/python -m pytest tests/ -v   # 29 unit tests (fully mocked)
 
 # Live check (needs a route to the Prometheus — run in-cluster or port-forward):
 PROM_URL=http://localhost:9090 .venv/bin/python tests/live_check.py
 
 # Locally with stdio (inspector):
 PROM_URL=http://localhost:9090 .venv/bin/python server.py --transport stdio
+
+# Locally with the web UI:
+PROM_URL=http://localhost:9090 .venv/bin/python server.py \
+    --transport streamable-http --port 9095
+# -> http://localhost:9095/
 ```
 
 ## Deployment

@@ -1,0 +1,121 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
+image:
+  repository: ghcr.io/ai-solution-eng/k8s-mcp
+  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
+  # this default is what a helm install WITHOUT a profile file deploys, and
+  # a stale default is how an "old MCP + new chart" pod happens.
+  tag: v0.2.4
+  pullPolicy: IfNotPresent
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously). Per-namespace secret:
+#   kubectl create secret docker-registry ghcr-pull -n <ns> \
+#     --docker-server=ghcr.io --docker-username=<gh-user> \
+#     --docker-password=<gh-PAT-with-read:packages>
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 9090        # MCP (streamable-http at /mcp) + ops console (/ui/)
+  targetPort: 9090
+
+deployment:
+  name: k8s-mcp
+  appName: k8s-mcp
+  replicaCount: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ── MCP server app config ─────────────────────────────────────────────────
+# SECURITY INVARIANTS (do not weaken):
+#  * The API key is NEVER created by this chart and NEVER inlined in values —
+#    an envsubst apply once emptied a live key Secret. Reference an out-of-band
+#    Secret instead; the Deployment fails loud until it exists.
+#  * Wildcard apiGroups are refused at render time (see templates/rbac-readonly.yaml).
+# This is the TRUSTED-OPERATOR chart: every knob below is frontend- and
+# values-configurable. Customer deliveries use the separate helm-customer/
+# chart, where the security knobs do not exist at all.
+apiKey:
+  existingSecret: ""         # empty = "<deployment.name>-apikey"
+  existingSecretKey: api-key
+
+console:
+  enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
+
+serviceAccount:
+  create: true
+  name: ""                   # empty = deployment.name (it is the RBAC subject)
+
+# ── Cluster access (read-only RBAC — this chart talks to the K8s API) ────
+rbac:
+  create: true
+  # cluster:   read-only ClusterRole + ClusterRoleBinding (internal default).
+  # namespace: Role + RoleBinding bound to THIS release's namespace only —
+  #            the API server clamps every read to the release namespace.
+  scope: cluster
+  # CRD apiGroups the tools may read (resources: "*", verbs get/list/watch).
+  # Add one entry per installed operator. NEVER ["*"] — that would re-grant
+  # secrets read. networking.istio.io/virtualservices is always granted.
+  extraResourceGroups: []
+
+# ── Namespace governance (app layer; RBAC remains the true boundary) ─────
+namespaces:
+  allowed: ""                # K8S_MCP_ALLOWED_NAMESPACES ("" = all namespaces)
+  blocked: ""                # K8S_MCP_BLOCKED_NAMESPACES
+
+# ── Hardened exec (opt-in) ────────────────────────────────────────────────
+exec:
+  enabled: false
+  namespaces: ""             # exec namespace list; "" = follow the general policy
+  requireLabel: true         # pod must carry k8s-mcp.io/exec="true"
+  allowedCommands: ""        # extra binaries beyond the read-only allowlist
+  autoRbac: true             # cluster scope only: server binds pods/exec Roles at startup
+
+# ── Per-user keys with per-user exec assignments ──────────────────────────
+clients:
+  # "name:key[:ns-patterns];…" — CONTAINS SECRETS; prefer existingSecret.
+  value: ""
+  existingSecret: ""         # Secret with the whole K8S_MCP_CLIENTS string
+  existingSecretKey: clients
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------
+# Deploys the Istio VirtualService so MCP clients OUTSIDE the cluster (DSH
+# runs locally on the operator's laptop) reach the server through the
+# ezaf-gateway. The MCP path (/mcp) uses a long timeout; /ui/ (console) and
+# everything else ride the fallback route. The endpoint doubles as
+# MCP_HOSTNAME (DNS-rebinding pin) — MUST be unique per release on the
+# shared gateway: two VirtualServices claiming one host split traffic
+# between their backends (observed live).
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "k8s-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
+  # rotating-token pain for machine MCP callers is an accepted lab trade; the
+  # template is real, so flipping it on enforces PCAI tokens for this host.
+  authorizationPolicy:
+    enabled: false
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+podAnnotations:
+  sidecar.istio.io/inject: "false"
+
+# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
+# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
+# — it is the audited baseline.
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

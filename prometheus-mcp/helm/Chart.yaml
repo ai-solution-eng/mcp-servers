@@ -2,5 +2,5 @@ apiVersion: v2
 name: prometheus-mcp
 description: Prometheus MCP Server — read-only PromQL queries, series discovery, alerts and rules over MCP
 type: application
-version: 0.1.2
-appVersion: "v0.1.0"
+version: 0.2.1
+appVersion: "v0.2.1"

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>HPE Kubernetes Ops Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2300C389'/%3E%3Ctext x='16' y='21' font-family='Arial,sans-serif' font-size='11' font-weight='bold' fill='%23101820' text-anchor='middle'%3EHPE%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">HPE</span>
+    <span class="brand-text">
+      <strong>Kubernetes Ops Console</strong>
+      <small>read-only cluster inspection</small>
+    </span>
+  </div>
+  <div class="topbar-right">
+    <span class="conn-pill off" id="conn-pill" title="MCP connection state">
+      <span class="dot"></span><span id="conn-label">not connected</span>
+    </span>
+    <button id="btn-settings" class="btn ghost" type="button">Settings</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="sidebar" id="sidebar" aria-label="Screens">
+    <div id="nav-groups"><!-- populated by app.js --></div>
+    <div class="sidebar-foot">
+      <div>Hewlett Packard Enterprise</div>
+      <div class="muted" id="foot-version"></div>
+    </div>
+  </nav>
+
+  <main class="main" id="main">
+    <div class="screen-head">
+      <h1 id="screen-title">Connect to get started</h1>
+      <p id="screen-desc" class="muted"></p>
+    </div>
+
+    <form id="form" class="card hidden" autocomplete="off"></form>
+    <div id="table-wrap" class="hidden"></div>
+
+    <section id="output-wrap" class="hidden">
+      <div class="out-bar">
+        <span id="out-meta" class="muted"></span>
+        <span class="out-actions">
+          <button id="btn-raw" class="btn ghost small" type="button">Raw</button>
+          <button id="btn-copy" class="btn ghost small" type="button">Copy</button>
+        </span>
+      </div>
+      <pre id="output" tabindex="0" spellcheck="false"></pre>
+    </section>
+  </main>
+</div>
+
+<!-- Login -->
+<div class="overlay hidden" id="login">
+  <div class="login-card card">
+    <div class="brand login-brand">
+      <span class="brand-mark big" aria-hidden="true">HPE</span>
+      <h1>Kubernetes Ops Console</h1>
+      <p class="muted">Sign in with your MCP API key.<br>
+      The console speaks the same read-only tools as every MCP client —
+      namespace policy, exec gates and RBAC all apply.</p>
+    </div>
+    <label for="login-key">API key</label>
+    <input id="login-key" type="password" placeholder="Bearer token (K8S_MCP_API_KEY)" autofocus>
+    <label class="check"><input type="checkbox" id="login-remember"> Remember in this tab (sessionStorage)</label>
+    <button id="login-go" class="btn primary" type="button">Connect</button>
+    <p id="login-error" class="error hidden"></p>
+  </div>
+</div>
+
+<!-- Settings -->
+<dialog id="settings">
+  <h2>Settings</h2>
+  <label for="set-key">API key</label>
+  <input id="set-key" type="password" placeholder="Bearer token">
+  <label for="set-exec-ns">X-Exec-Namespaces header <span class="muted">(optional — can only narrow)</span></label>
+  <input id="set-exec-ns" type="text" placeholder="e.g. debug-a,debug-b">
+  <div class="dialog-actions">
+    <button id="set-cancel" class="btn ghost" type="button">Cancel</button>
+    <button id="set-save" class="btn primary" type="button">Save</button>
+  </div>
+</dialog>
+
+<div id="toast" class="hidden"></div>
+<script src="/ui/app.js"></script>
+</body>
+</html>

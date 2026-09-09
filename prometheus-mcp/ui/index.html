@@ -1,0 +1,1302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+  // Resolve the theme before first paint to avoid a flash of the wrong theme.
+  // Precedence: saved choice > OS preference > dark (the historical default).
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("prometheus-theme"); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<title>Prometheus MCP · Ops Timeline</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-2: #1c2438;
+    --border: #2a3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --yellow: #f0b429;
+    --header-grad-1: #131a2b;
+    --header-grad-2: #10162a;
+    --row-hover: #1a2338;
+    --row-border: #202a42;
+    --editor-bg: #0d1220;
+    --err-bg: #2a1620;
+    --err-border: #5a2430;
+    --err-text: #ffb3b3;
+    --shadow: rgba(0, 0, 0, 0.4);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  /* Light theme: opt in via <html data-theme="light">, set before first paint
+     by the head script (OS preference) and toggled from the header. */
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+  }
+  * { box-sizing: border-box; }
+  @font-face {
+    font-family: 'MetricHPE';
+    src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, var(--header-grad-1), var(--header-grad-2));
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .hpe-element {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    background: var(--hpe);
+    clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+  .brand-company {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--muted);
+  }
+  .brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+  .brand-product b { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  header .meta .pill {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  header .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 320px;
+    min-width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  aside .search { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  aside input[type="search"] {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  aside input[type="search"]:focus { border-color: var(--accent); }
+  #preset-list { flex: 1; overflow: auto; padding: 6px; }
+  .preset-cat {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 10px 8px 4px;
+  }
+  .preset-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text);
+    border: 1px solid transparent;
+  }
+  .preset-item:hover { background: var(--panel-2); border-color: var(--border); }
+  .preset-item .fmt {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 5px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .preset-item .pname { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 4px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tab {
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .pane { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
+  .pane.hidden { display: none; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .panel h2 .hint { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .panel h2 .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid th {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  table.grid td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  table.grid tr:hover td { background: var(--row-hover); }
+  .badge {
+    display: inline-block;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-family: var(--mono);
+  }
+  .badge.firing { background: rgba(255, 107, 107, 0.15); color: var(--red); border: 1px solid var(--red); }
+  .badge.pending { background: rgba(240, 180, 41, 0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge.critical { color: var(--red); border: 1px solid var(--red); background: rgba(255, 107, 107, 0.08); }
+  .badge.warning { color: var(--yellow); border: 1px solid var(--yellow); background: rgba(240, 180, 41, 0.08); }
+  .badge.info, .badge.none { color: var(--muted); border: 1px solid var(--border); background: transparent; }
+  .badge.ok { color: var(--green); border: 1px solid var(--green); background: rgba(62, 207, 142, 0.08); }
+
+  /* ---- stat cards ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .card .card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 6px; }
+  .card .card-value { font-size: 26px; font-weight: 700; line-height: 1.1; font-family: var(--mono); }
+  .card .card-value.red { color: var(--red); }
+  .card .card-value.yellow { color: var(--yellow); }
+  .card .card-value.green { color: var(--green); }
+  .card .card-sub { color: var(--muted); font-size: 11px; margin-top: 4px; min-height: 15px; }
+
+  /* ---- horizontal bar charts (top-N pods) ---- */
+  .hbar-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+  .hbar-label { width: 220px; flex-shrink: 0; font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .hbar-track { flex: 1; background: var(--panel-2); border-radius: 4px; height: 16px; overflow: hidden; }
+  .hbar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); border-radius: 4px; min-width: 2px; }
+  .hbar-val { font-family: var(--mono); font-size: 11px; color: var(--muted); width: 76px; text-align: right; flex-shrink: 0; }
+
+  /* ---- svg line charts ---- */
+  #chart svg text, svg text.axis { font-size: 10px; fill: var(--muted); }
+  svg line.grid { stroke: var(--border); stroke-width: 1; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .legend-item .chip { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+
+  .query-box { display: flex; flex-direction: column; }
+  .query-box textarea {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 12px;
+    min-height: 96px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    tab-size: 2;
+  }
+  .query-box textarea:focus { border-color: var(--accent); }
+  .mode-row { display: flex; gap: 14px; margin-bottom: 8px; }
+  .mode-row label { display: inline-flex; gap: 5px; align-items: center; color: var(--muted); font-size: 12px; cursor: pointer; }
+  .mode-row label:has(input:checked) { color: var(--text); font-weight: 600; }
+  .query-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .query-actions .spacer { flex: 1; }
+  button {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-2); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover { border-color: var(--accent); }
+  button.copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; font-weight: 400; }
+  button.theme-toggle {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 9px;
+    border-radius: 6px;
+  }
+  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  input.inline {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    width: 90px;
+    outline: none;
+  }
+  input.inline:focus { border-color: var(--accent); }
+  select.inline {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-size: 12px;
+    outline: none;
+  }
+  #error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #error.show { display: block; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin: 10px 0; flex-wrap: wrap; }
+  .result-meta .ok { color: var(--green); font-weight: 600; }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 20px var(--shadow);
+    display: none;
+    z-index: 50;
+  }
+  .toast.show { display: block; }
+  .mini-row { display: flex; gap: 8px; align-items: baseline; padding: 5px 4px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 12px; }
+  .mini-row:last-child { border-bottom: none; }
+  .mini-row:hover { background: var(--panel-2); }
+  .mini-name { font-weight: 600; white-space: nowrap; }
+  .mini-q { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-family: var(--mono); font-size: 11px; }
+  .mini-del { color: var(--muted); background: none; border: none; padding: 0 4px; font-size: 11px; color: var(--muted); }
+  .mini-del:hover { color: var(--red); }
+
+  /* ---- tool catalog ---- */
+  .tool-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+  .tool-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .tool-card h3 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .tool-card h3 .tname { font-family: var(--mono); color: var(--accent); font-size: 13px; }
+  .tool-card p { margin: 6px 0; font-size: 13px; }
+  .tool-card .when { color: var(--muted); font-size: 12px; }
+  .tool-card .when b { color: var(--text); font-weight: 600; }
+  .tool-args { margin: 8px 0 0; padding: 8px 10px; background: var(--panel-2); border-radius: 6px; font-size: 12px; }
+  .tool-args div { padding: 1px 0; }
+  .tool-args code { font-family: var(--mono); color: var(--accent-2); font-size: 11px; }
+  .tool-args span { color: var(--muted); }
+  .ex-chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 8px;
+    margin: 4px 4px 0 0;
+    cursor: pointer;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  .ex-chip:hover { border-color: var(--accent); color: var(--accent-2); }
+  .step-list { margin: 0; padding-left: 18px; font-size: 13px; }
+  .step-list li { margin: 6px 0; }
+  .step-list code { font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="hpe-element" aria-hidden="true"></span>
+    <div class="brand-text">
+      <div class="brand-company">Hewlett Packard Enterprise</div>
+      <div class="brand-product"><b>Prometheus MCP</b> · Ops Timeline</div>
+    </div>
+  </div>
+  <div class="meta">
+    <span><span class="dot" id="status-dot"></span><span id="status-text">connecting…</span></span>
+    <span class="pill" id="prom-url">prometheus: ?</span>
+    <span class="pill" style="color:var(--yellow)">read-only</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="search">
+      <input type="search" id="filter" placeholder="Filter preset queries…" autocomplete="off" />
+    </div>
+    <div id="preset-list"></div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="query">Query</button>
+      <button class="tab" data-tab="alerts">Alerts &amp; Rules</button>
+      <button class="tab" data-tab="tools">MCP Tools</button>
+    </div>
+
+    <!-- ============ DASHBOARD ============ -->
+    <div id="pane-dashboard" class="pane">
+      <div class="cards" id="cards">
+        <div class="card"><div class="card-label">Firing alerts</div><div class="card-value red" id="card-firing">—</div><div class="card-sub" id="card-firing-sub"></div></div>
+        <div class="card"><div class="card-label">Pending alerts</div><div class="card-value yellow" id="card-pending">—</div><div class="card-sub" id="card-pending-sub"></div></div>
+        <div class="card"><div class="card-label">Up targets</div><div class="card-value green" id="card-up">—</div><div class="card-sub" id="card-up-sub"></div></div>
+        <div class="card"><div class="card-label">Node CPU</div><div class="card-value" id="card-cpu">—</div><div class="card-sub" id="card-cpu-sub">cluster avg, 5m</div></div>
+        <div class="card"><div class="card-label">Node memory</div><div class="card-value" id="card-mem">—</div><div class="card-sub" id="card-mem-sub">cluster avg</div></div>
+        <div class="card"><div class="card-label">Running pods</div><div class="card-value" id="card-pods">—</div><div class="card-sub" id="card-pods-sub"></div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Top pods by CPU <span class="hint">cores · 5m rate</span><span class="spacer"></span>
+          <label class="hint" style="text-transform:none"><input type="checkbox" id="auto-refresh" checked /> auto 30s</label>
+          <button id="dash-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="chart-top-cpu"><div class="loading">loading…</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Top pods by memory <span class="hint">working set</span></h2>
+        <div id="chart-top-mem"><div class="loading">loading…</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Cluster trends <span class="hint">last 3h · cluster totals</span></h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+          <div><div class="hint" style="margin-bottom:4px">CPU usage (cores)</div><div id="chart-cpu-trend"><div class="loading">loading…</div></div></div>
+          <div><div class="hint" style="margin-bottom:4px">Memory usage (working set)</div><div id="chart-mem-trend"><div class="loading">loading…</div></div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Active alerts <span class="hint">first 12 · full list in Alerts &amp; Rules</span></h2>
+        <div id="dash-alerts"><div class="loading">loading…</div></div>
+      </div>
+    </div>
+
+    <!-- ============ QUERY ============ -->
+    <div id="pane-query" class="pane hidden">
+      <div class="panel query-box">
+        <h2>PromQL query</h2>
+        <div class="mode-row">
+          <label><input type="radio" name="mode" value="instant" checked /> Instant <span class="hint">(value at one point in time)</span></label>
+          <label><input type="radio" name="mode" value="range" /> Range <span class="hint">(trend over a window)</span></label>
+        </div>
+        <textarea id="promql" spellcheck="false" placeholder="up">up</textarea>
+        <div class="query-actions">
+          <button id="run">Run (Ctrl+Enter)</button>
+          <button id="save-query" class="ghost" title="Save this query in this browser">💾 Save</button>
+          <span class="hint">read-only · PromQL</span>
+          <span class="spacer"></span>
+          <label class="hint" id="time-label">at
+            <input id="q-time" class="inline" value="now" title="'now', relative 'now-6h', unix seconds, RFC3339" />
+          </label>
+          <span class="hint hidden" id="range-labels">from
+            <input id="q-start" class="inline" value="now-1h" title="'now-1h', unix seconds, RFC3339" /> to
+            <input id="q-end" class="inline" value="now" /> step
+            <input id="q-step" class="inline" value="" placeholder="auto" style="width:60px" />
+          </span>
+        </div>
+      </div>
+      <div id="error"></div>
+      <div id="result"></div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Saved queries <span class="hint">(this browser)</span></h2>
+        <div id="saved-list"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Recent queries</h2>
+        <div id="history-list"></div>
+      </div>
+    </div>
+
+    <!-- ============ ALERTS & RULES ============ -->
+    <div id="pane-alerts" class="pane hidden">
+      <div class="panel">
+        <h2>Alerts
+          <span class="spacer"></span>
+          <input id="alert-filter" class="inline" style="width:180px" placeholder="filter name/label…" />
+          <select id="alert-state" class="inline">
+            <option value="">all states</option>
+            <option value="firing">firing</option>
+            <option value="pending">pending</option>
+          </select>
+          <button id="alerts-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="alerts-summary" class="hint" style="margin-bottom:8px"></div>
+        <div id="alerts-table"><div class="empty">no alerts loaded</div></div>
+      </div>
+      <div class="panel">
+        <h2>Rules
+          <span class="hint">what is monitored, and the exact expr behind every alert</span>
+          <span class="spacer"></span>
+          <input id="rule-search" class="inline" style="width:180px" placeholder="search name/expr…" />
+          <select id="rule-state" class="inline">
+            <option value="">all states</option>
+            <option value="firing">firing</option>
+            <option value="pending">pending</option>
+            <option value="inactive">inactive</option>
+          </select>
+          <button id="rules-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="rules-list"><div class="empty">no rules loaded</div></div>
+      </div>
+    </div>
+
+    <!-- ============ MCP TOOLS ============ -->
+    <div id="pane-tools" class="pane hidden">
+      <div class="panel">
+        <h2>What the six MCP tools are good for <span class="hint">all read-only · same API this page uses</span></h2>
+        <p class="hint" style="margin-top:0">
+          A Kubernetes API (the K8s MCP) sees <b>state</b>: pods, events, logs, instantaneous <code>top</code>.
+          Prometheus sees <b>behavior over time</b>: rates, trends, quantiles, alert state. Together they complete
+          an ops agent — the K8s MCP answers <i>what happened</i>, Prometheus MCP answers
+          <i>since when, how fast, and why</i>. Click any example to load it in the Query tab.
+        </p>
+        <div class="tool-grid" id="tool-grid"></div>
+      </div>
+      <div class="panel">
+        <h2>Triage pairing — the K8s MCP + Prometheus MCP workflow</h2>
+        <ol class="step-list">
+          <li>K8s MCP: <code>describe pod</code> → <code>lastState: OOMKilled</code>, restart count</li>
+          <li>K8s MCP: <code>logs --previous</code> → what it was doing</li>
+          <li><b>Prometheus MCP</b>: <code>prom_query_range</code> on <code>container_memory_working_set_bytes{pod=…}[6h]</code> → sawtooth = leak, plateau-at-limit = undersized</li>
+          <li>Evidence-backed verdict instead of a guess</li>
+        </ol>
+      </div>
+      <div class="panel">
+        <h2>LLM-safe shaping <span class="hint">why tool answers stay small</span></h2>
+        <p class="hint" style="margin:0">
+          Range results are downsampled to evenly-spaced points (the <i>shape</i> — ramp/spike/sawtooth — survives),
+          floats are rounded to 4 significant digits, and series counts are capped with a truncation footer.
+          Caps are env-tunable (<code>PROM_MAX_SERIES</code>, <code>PROM_MAX_POINTS</code>,
+          <code>PROM_MAX_LABEL_VALUES</code>), and this page reuses the exact same caps and client as the tools.
+        </p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = { tab: "dashboard", alerts: [], autoTimer: null };
+
+const PALETTE = ["#01a982","#4f8ff7","#f0b429","#ff6b6b","#b678f0","#3ecf8e","#6bc7e8","#e8875b","#c9d34f","#8f7ff0"];
+
+// ---- preset query library (the sidebar) ------------------------------------
+const PRESETS = [
+  { cat: "Cluster", name: "Scrape health", mode: "instant", q: "up", note: "1 = healthy target" },
+  { cat: "Cluster", name: "Dead scrape targets", mode: "instant", q: "up == 0", note: "targets failing to scrape" },
+  { cat: "Cluster", name: "Pods by phase", mode: "instant", q: "sum by (phase) (kube_pod_status_phase)" },
+  { cat: "Cluster", name: "Restarts by pod (1h)", mode: "instant", q: "topk(10, increase(kube_pod_container_status_restarts_total[1h]))" },
+  { cat: "CPU", name: "Top pods by CPU", mode: "instant", q: 'topk(8, sum by (pod) (rate(container_cpu_usage_seconds_total{container!="",image!=""}[5m])))' },
+  { cat: "CPU", name: "CPU throttling ratio", mode: "instant", q: 'topk(8, sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{container!=""}[5m])) / sum by (pod) (rate(container_cpu_cfs_periods_total{container!=""}[5m])))' },
+  { cat: "CPU", name: "Cluster CPU trend", mode: "range", q: 'sum(rate(container_cpu_usage_seconds_total{container!="",image!=""}[5m]))', start: "now-3h", step: "1m" },
+  { cat: "Memory", name: "Top pods by memory", mode: "instant", q: 'topk(8, sum by (pod) (container_memory_working_set_bytes{container!="",image!=""}))' },
+  { cat: "Memory", name: "Leak check (sawtooth?)", mode: "range", q: 'sum by (pod) (container_memory_working_set_bytes{pod=~"myapp-.*",container!=""})', start: "now-6h", step: "2m", note: "edit pod=~ regex · sawtooth = restart loop, ramp = leak" },
+  { cat: "Nodes", name: "Node CPU %", mode: "instant", q: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))' },
+  { cat: "Nodes", name: "Node memory %", mode: "instant", q: "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)" },
+  { cat: "Nodes", name: "Node disk usage %", mode: "instant", q: '100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})' },
+  { cat: "Errors", name: "HTTP 5xx rate by pod", mode: "instant", q: 'sum by (pod) (rate(http_requests_total{status=~"5.."}[5m]))', note: "only if workloads export it" },
+  { cat: "Errors", name: "Error ratio %", mode: "instant", q: '100 * sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))', note: "only if workloads export it" },
+];
+
+// ---- tiny fetch + UI helpers ------------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok || (data && data.error)) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+function setError(msg) {
+  const el = $("error");
+  if (msg) { el.textContent = msg; el.className = "show"; }
+  else { el.textContent = ""; el.className = ""; }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function fmtBytes(v) {
+  if (!isFinite(v)) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let i = 0;
+  while (Math.abs(v) >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + " " + units[i];
+}
+
+function fmtVal(v, bytes) {
+  if (v === null || v === undefined || v === "") return "—";
+  const f = parseFloat(v);
+  if (!isFinite(f)) return String(v);
+  if (bytes) return fmtBytes(f);
+  return String(v);
+}
+
+function fmtAge(iso) {
+  const ms = Date.now() - Date.parse(iso);
+  if (!isFinite(ms)) return "";
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h " + (m % 60) + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+// ---- header status -----------------------------------------------------------
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("status-dot").className = "dot ok";
+    $("status-text").textContent = "connected";
+    let host = s.prometheus || "?";
+    try { host = new URL(host).host; } catch (e) {}
+    $("prom-url").textContent = "prometheus: " + host;
+  } catch (e) {
+    $("status-dot").className = "dot err";
+    $("status-text").textContent = "offline";
+  }
+}
+
+// ---- charts -------------------------------------------------------------------
+function barList(hostId, items, opts) {
+  const host = $(hostId);
+  const rows = (items || []).filter((it) => it.value !== null && it.value !== undefined);
+  if (!rows.length) { host.innerHTML = '<div class="empty">no data (metric absent on this cluster, or nothing running)</div>'; return; }
+  const vals = rows.map((r) => Math.abs(parseFloat(r.value)) || 0);
+  const max = Math.max(...vals, 1e-9);
+  let html = "";
+  rows.forEach((r, i) => {
+    const f = parseFloat(r.value);
+    const pct = Math.max(0.5, (Math.abs(f) / max) * 100);
+    const color = PALETTE[i % PALETTE.length];
+    html += '<div class="hbar-row" title="' + esc(r.label + ": " + r.value) + '">' +
+      '<span class="hbar-label">' + esc(trunc(r.label, 30)) + "</span>" +
+      '<div class="hbar-track"><div class="hbar-fill" style="width:' + pct + "%;background:" + color + '"></div></div>' +
+      '<span class="hbar-val">' + esc(fmtVal(r.value, opts && opts.bytes)) + "</span></div>";
+  });
+  host.innerHTML = html;
+}
+
+function lineChart(hostId, seriesArr, opts) {
+  opts = opts || {};
+  const host = $(hostId);
+  const parsed = (seriesArr || []).map((s) => ({
+    name: s.name,
+    pts: (s.values || [])
+      .map((p) => ({ t: Number(p[0]), v: parseFloat(p[1]) }))
+      .filter((p) => isFinite(p.t) && isFinite(p.v)),
+  })).filter((s) => s.pts.length > 1);
+  if (!parsed.length) { host.innerHTML = '<div class="empty">no plottable values</div>'; return; }
+  let tMin = Infinity, tMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+  parsed.forEach((s) => s.pts.forEach((p) => {
+    tMin = Math.min(tMin, p.t); tMax = Math.max(tMax, p.t);
+    vMin = Math.min(vMin, p.v); vMax = Math.max(vMax, p.v);
+  }));
+  if (tMax === tMin) tMax = tMin + 1;
+  if (vMax === vMin) { vMin -= Math.abs(vMin || 1) * 0.05 + 0.5; vMax += Math.abs(vMax || 1) * 0.05 + 0.5; }
+  const W = Math.max(560, (host.clientWidth || 720) - 8);
+  const H = 190, padL = 52, padR = 12, padT = 8, padB = 22;
+  const X = (t) => padL + ((t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const Y = (v) => padT + (1 - (v - vMin) / (vMax - vMin)) * (H - padT - padB);
+  const fmtAxis = (v) => (opts.bytes ? fmtBytes(v) : (Math.abs(v) >= 1000 ? v.toPrecision(3) : Number(v.toPrecision(3)).toString()));
+  let svg = '<svg width="' + W + '" height="' + H + '" role="img" aria-label="time series chart">';
+  for (let i = 0; i <= 2; i++) {
+    const v = vMin + (vMax - vMin) * (i / 2), yy = Y(v).toFixed(1);
+    svg += '<line class="grid" x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy + '"/>';
+    svg += '<text class="axis" x="' + (padL - 6) + '" y="' + (Number(yy) + 3) + '" text-anchor="end">' + esc(fmtAxis(v)) + "</text>";
+  }
+  for (let i = 0; i <= 3; i++) {
+    const t = tMin + ((tMax - tMin) * i) / 3;
+    const lbl = new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    svg += '<text class="axis" x="' + X(t).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle">' + esc(lbl) + "</text>";
+  }
+  parsed.forEach((s, si) => {
+    const color = PALETTE[si % PALETTE.length];
+    const pts = s.pts.map((p) => X(p.t).toFixed(1) + "," + Y(p.v).toFixed(1)).join(" ");
+    svg += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" points="' + pts + '"/>';
+    s.pts.forEach((p) => {
+      svg += '<circle cx="' + X(p.t).toFixed(1) + '" cy="' + Y(p.v).toFixed(1) + '" r="2.4" fill="' + color + '">' +
+        "<title>" + esc(s.name) + " @ " + new Date(p.t * 1000).toLocaleTimeString() + " → " + p.v + "</title></circle>";
+    });
+  });
+  svg += "</svg>";
+  const legend = parsed.map((s, si) =>
+    '<span class="legend-item"><span class="chip" style="background:' + PALETTE[si % PALETTE.length] + '"></span>' + esc(trunc(s.name, 48)) + "</span>"
+  ).join("");
+  host.innerHTML = '<div class="legend">' + legend + "</div>" + svg;
+}
+
+// ---- dashboard ----------------------------------------------------------------
+async function loadOverview() {
+  let d;
+  try { d = await api("/api/overview"); }
+  catch (e) {
+    markPromBad();
+    setCard("card-up", "?", ""); setCard("card-firing", "?", "prometheus unreachable");
+    ["chart-top-cpu", "chart-top-mem", "chart-cpu-trend", "chart-mem-trend"].forEach((id) => {
+      $(id).innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    });
+    $("dash-alerts").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    return;
+  }
+  const cards = d.cards || {};
+  const c = (n) => (cards[n] || {});
+  const pct = (n) => {
+    const v = parseFloat(c(n).value);
+    return isFinite(v) ? v.toFixed(1) + "%" : "—";
+  };
+  setCard("card-up", c("up_targets").value ?? "—", c("up_total").value != null ? "of " + c("up_total").value + " scrape targets" : "");
+  setCard("card-cpu", pct("node_cpu_pct"), "");
+  setCard("card-mem", pct("node_mem_pct"), "");
+  setCard("card-pods", c("pods_running").value ?? "—", "");
+  const al = d.alerts || {};
+  const counts = al.counts || {};
+  if (al.error) {
+    setCard("card-firing", "?", "unavailable");
+    setCard("card-pending", "?", "unavailable");
+  } else {
+    setCard("card-firing", counts.firing ?? 0, counts.critical ? counts.critical + " critical" : "");
+    setCard("card-pending", counts.pending ?? 0, "");
+  }
+  const topCpu = d.top && d.top.top_cpu;
+  const topMem = d.top && d.top.top_mem;
+  barList("chart-top-cpu", topCpu.error ? [] : topCpu.items, {});
+  barList("chart-top-mem", topMem.error ? [] : topMem.items, { bytes: true });
+  ["chart-top-cpu", "chart-top-mem"].forEach((id) => {
+    const block = id === "chart-top-cpu" ? topCpu : topMem;
+    if (block.error && !$(id).querySelector(".hbar-row")) {
+      $(id).innerHTML = '<div class="empty">' + esc(trunc(block.error, 140)) + "</div>";
+    }
+  });
+  const trends = d.trends || {};
+  const cpuT = trends.cpu_trend, memT = trends.mem_trend;
+  const fill = (id, block, bytes) => {
+    if (block && block.series && block.series.length) {
+      lineChart(id, block.series.map((s) => ({ name: "cluster total", values: s.values })), { bytes });
+    } else {
+      $(id).innerHTML = '<div class="empty">' + esc(trunc((block && block.error) || "no trend data", 140)) + "</div>";
+    }
+  };
+  fill("chart-cpu-trend", cpuT, false);
+  fill("chart-mem-trend", memT, true);
+  renderDashAlerts(al.items || []);
+  if (!al.error && (counts.firing > 0 || counts.pending > 0)) markPromOk();
+}
+
+function setCard(id, value, sub) {
+  $(id).textContent = value;
+  if (sub !== undefined) {
+    const el = $(id + "-sub");
+    if (el) el.textContent = sub;
+  }
+}
+
+function markPromOk() {
+  const el = $("prom-url");
+  el.style.borderColor = "";
+  if (el && !el.dataset.ok) { el.dataset.ok = "1"; toast("Prometheus reachable"); }
+}
+
+function markPromBad() {
+  const el = $("prom-url");
+  el.style.borderColor = "var(--red)";
+}
+
+function renderAlertsTable(hostId, items) {
+  if (!items.length) { $(hostId).innerHTML = '<div class="empty">no alerts match</div>'; return; }
+  let html = '<div style="overflow:auto;max-height:52vh;border:1px solid var(--border);border-radius:8px;">' +
+    '<table class="grid"><thead><tr><th>state</th><th>alert</th><th>severity</th><th>active</th><th>labels</th><th>summary</th></tr></thead><tbody>';
+  items.forEach((a) => {
+    html += "<tr><td><span class='badge " + esc(a.state) + "'>" + esc(a.state) + "</span></td>" +
+      "<td>" + esc(a.alertname) + "</td>" +
+      "<td>" + (a.severity ? "<span class='badge " + esc(a.severity) + "'>" + esc(a.severity) + "</span>" : "<span class='badge none'>—</span>") + "</td>" +
+      "<td title='" + esc(a.activeAt) + "'>" + esc(fmtAge(a.activeAt)) + "</td>" +
+      "<td title='" + esc(JSON.stringify(a.labels)) + "'>" + esc(trunc(Object.entries(a.labels || {}).map(([k, v]) => k + "=" + v).join(", "), 60)) + "</td>" +
+      "<td>" + esc(trunc(a.summary || a.description || "", 90)) + "</td></tr>";
+  });
+  html += "</tbody></table></div>";
+  $(hostId).innerHTML = html;
+}
+
+function renderDashAlerts(items) {
+  renderAlertsTable("dash-alerts", items);
+}
+
+// ---- alerts & rules tab ---------------------------------------------------------
+async function loadAlerts() {
+  $("alerts-summary").textContent = "loading…";
+  try {
+    const d = await api("/api/alerts");
+    state.alerts = d.alerts || [];
+    const c = d.counts || {};
+    $("alerts-summary").textContent =
+      (d.n_total || 0) + " alert(s): " + (c.firing || 0) + " firing · " + (c.pending || 0) + " pending" +
+      (d.n_shown < d.n_total ? " · showing first " + d.n_shown : "");
+    renderAlertsFiltered();
+  } catch (e) {
+    $("alerts-summary").textContent = "";
+    $("alerts-table").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderAlertsFiltered() {
+  const q = ($("alert-filter").value || "").toLowerCase();
+  const st = $("alert-state").value;
+  const rows = state.alerts.filter((a) =>
+    (!st || a.state === st) &&
+    (!q || (a.alertname + " " + a.severity + " " + JSON.stringify(a.labels) + " " + (a.summary || "")).toLowerCase().includes(q))
+  );
+  renderAlertsTable("alerts-table", rows);
+}
+
+let rulesTimer = null;
+async function loadRules() {
+  const params = new URLSearchParams();
+  if ($("rule-state").value) params.set("state", $("rule-state").value);
+  if ($("rule-search").value.trim()) params.set("search", $("rule-search").value.trim());
+  $("rules-list").innerHTML = '<div class="loading">loading rules…</div>';
+  try {
+    const d = await api("/api/rules" + (params.toString() ? "?" + params.toString() : ""));
+    const groups = d.groups || [];
+    if (!groups.length) { $("rules-list").innerHTML = '<div class="empty">no rules match</div>'; return; }
+    let html = "<div class='hint' style='margin-bottom:8px'>" + d.n_total + " matching rule(s)</div>";
+    groups.forEach((g) => {
+      html += "<div class='preset-cat'>" + esc(g.name || "(group)") + "</div>";
+      g.rules.forEach((r) => {
+        html += "<div style='padding:6px 4px;border-bottom:1px solid var(--row-border)'>" +
+          "<span class='badge " + esc(r.state || "info") + "'>" + esc(r.state || "?") + "</span> " +
+          "<span class='mini-name'>" + esc(r.name) + "</span>" +
+          (r.duration ? " <span class='hint'>for " + r.duration + "s</span>" : "") +
+          (r.severity ? " <span class='badge " + esc(r.severity) + "'>" + esc(r.severity) + "</span>" : "") +
+          " <span class='hint'>health=" + esc(r.health || "?") + "</span>" +
+          "<div class='mini-q' style='white-space:normal;margin-top:3px'>" + esc(r.query) + "</div>" +
+          (r.summary ? "<div class='hint' style='margin-top:2px'>" + esc(r.summary) + "</div>" : "") +
+          "</div>";
+      });
+    });
+    $("rules-list").innerHTML = html;
+  } catch (e) {
+    $("rules-list").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+  }
+}
+
+// ---- query execution --------------------------------------------------------------
+function currentMode() {
+  return document.querySelector("input[name=mode]:checked").value;
+}
+
+function setMode(mode) {
+  const radio = document.querySelector("input[name=mode][value=" + mode + "]");
+  if (radio) radio.checked = true;
+  syncModeInputs();
+}
+
+function syncModeInputs() {
+  const instant = currentMode() === "instant";
+  $("time-label").classList.toggle("hidden", !instant);
+  $("range-labels").classList.toggle("hidden", instant);
+}
+
+async function runQuery() {
+  const q = $("promql").value.trim();
+  if (!q) { setError("Enter a PromQL expression."); return; }
+  setError("");
+  $("run").disabled = true;
+  $("result").innerHTML = '<div class="loading">running…</div>';
+  try {
+    let payload;
+    if (currentMode() === "instant") {
+      payload = await api("/api/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, time: $("q-time").value.trim() || "now" }),
+      });
+    } else {
+      payload = await api("/api/query_range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: q,
+          start: $("q-start").value.trim() || "now-1h",
+          end: $("q-end").value.trim() || "now",
+          step: $("q-step").value.trim(),
+        }),
+      });
+    }
+    markPromOk();
+    renderResult(payload);
+    pushHistory(q, payload.duration_ms);
+  } catch (e) {
+    $("result").innerHTML = "";
+    setError(e.message);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+function renderResult(payload) {
+  const host = $("result");
+  const rows = payload.result || [];
+  const meta =
+    '<div class="result-meta"><span class="ok">✓ ' + payload.n_shown + " series" +
+    (payload.n_total > payload.n_shown ? " of " + payload.n_total + " (capped — narrow the query)" : "") +
+    "</span><span>took: " + payload.duration_ms + " ms</span>" +
+    (payload.step ? "<span>step: " + esc(payload.step) + "</span>" : "") +
+    '<button class="ghost copy-btn" id="copy-csv">copy CSV</button></div>';
+  if (payload.resultType === "matrix") {
+    host.innerHTML = meta + '<div id="range-chart"></div>' +
+      '<div id="range-table" style="margin-top:10px"></div>';
+    lineChart("range-chart", rows, { bytes: /bytes|memory/i.test(payload.query) });
+    let html = '<div class="hint" style="margin-bottom:4px">values (' + (rows[0] ? rows[0].values.length : 0) + ' points/series, downsampled shape-preserving)</div>' +
+      '<div style="overflow:auto;max-height:40vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr><th>series</th><th>values</th></tr></thead><tbody>';
+    rows.forEach((r) => {
+      const vals = r.values.map((p) => p[1]).join(" ");
+      html += "<tr><td>" + esc(trunc(r.series, 70)) + "</td><td>" + esc(vals) + "</td></tr>";
+    });
+    html += "</tbody></table></div>";
+    $("range-table").innerHTML = html;
+  } else {
+    if (!rows.length) {
+      host.innerHTML = meta + '<div class="empty">no results (the query matched no series at that instant)</div>';
+    } else {
+      let html = "";
+      rows.forEach((r) => {
+        html += "<tr><td>" + esc(r.series) + "</td><td>" + esc(r.value) + "</td></tr>";
+      });
+      host.innerHTML = meta +
+        '<div style="overflow:auto;max-height:55vh;border:1px solid var(--border);border-radius:8px;">' +
+        '<table class="grid"><thead><tr><th>series</th><th>value</th></tr></thead><tbody>' + html + "</tbody></table></div>";
+    }
+  }
+  const cp = $("copy-csv");
+  if (cp) cp.onclick = () => {
+    const csv = rows.map((r) => {
+      if (payload.resultType === "matrix") return '"' + r.series.replaceAll('"', '""') + '",' + r.values.map((p) => p[0] + "," + p[1]).join(",");
+      return '"' + r.series.replaceAll('"', '""') + '",' + r.value;
+    }).join("\n");
+    navigator.clipboard.writeText(csv).then(() => toast("CSV copied"));
+  };
+}
+
+// ---- presets ------------------------------------------------------------------------
+function loadPreset(p) {
+  setMode(p.mode);
+  $("promql").value = p.q;
+  if (p.mode === "range") {
+    if (p.start) $("q-start").value = p.start;
+    if (p.step) $("q-step").value = p.step;
+    else $("q-step").value = "";
+  }
+  switchTab("query");
+  runQuery();
+  if (p.note) toast(p.note);
+}
+
+function renderPresets() {
+  const host = $("preset-list");
+  const q = ($("filter").value || "").toLowerCase();
+  const rows = PRESETS.filter((p) =>
+    !q || (p.name + " " + p.cat + " " + p.q).toLowerCase().includes(q)
+  );
+  if (!rows.length) { host.innerHTML = '<div class="empty">no presets match</div>'; return; }
+  let html = "", lastCat = null;
+  rows.forEach((p) => {
+    if (p.cat !== lastCat) { html += "<div class='preset-cat'>" + esc(p.cat) + "</div>"; lastCat = p.cat; }
+    const idx = PRESETS.indexOf(p);
+    html += "<div class='preset-item' data-i='" + idx + "' title='" + esc(p.q) + (p.note ? " — " + esc(p.note) : "") + "'>" +
+      "<span class='fmt'>" + (p.mode === "range" ? "range" : "inst") + "</span>" +
+      "<span class='pname'>" + esc(p.name) + "</span></div>";
+  });
+  host.innerHTML = html;
+  host.querySelectorAll(".preset-item").forEach((el) => {
+    el.onclick = () => loadPreset(PRESETS[Number(el.dataset.i)]);
+  });
+}
+
+// ---- saved queries + history (localStorage) ------------------------------------------
+const SAVED_KEY = "prometheus-saved-queries";
+const HIST_KEY = "prometheus-query-history";
+
+function lsAll(key, cap) {
+  try { return JSON.parse(localStorage.getItem(key) || "[]").slice(0, cap); } catch (e) { return []; }
+}
+function lsPut(key, val, cap) {
+  try { localStorage.setItem(key, JSON.stringify(val.slice(0, cap))); } catch (e) { /* ignore */ }
+}
+
+function miniList(el, items, onDelete) {
+  if (!items.length) { el.innerHTML = '<div class="empty">none yet</div>'; return; }
+  let html = "";
+  items.forEach((q, i) => {
+    html += '<div class="mini-row" data-i="' + i + '"><span class="mini-name">' + esc(q.name || "") + "</span>" +
+      '<span class="mini-q">' + esc(trunc(q.q, 90)) + "</span>" +
+      '<button class="mini-del" data-i="' + i + '" title="delete">✕</button></div>';
+  });
+  el.innerHTML = html;
+  el.querySelectorAll(".mini-row").forEach((row) => {
+    row.onclick = (ev) => {
+      if (ev.target.classList.contains("mini-del")) return;
+      const q = items[Number(row.dataset.i)];
+      if (q) {
+        setMode(q.mode || "instant");
+        $("promql").value = q.q;
+        if (q.start) $("q-start").value = q.start;
+        if (q.step !== undefined) $("q-step").value = q.step || "";
+        toast("Loaded: " + (q.name || "query"));
+      }
+    };
+  });
+  el.querySelectorAll(".mini-del").forEach((btn) => {
+    btn.onclick = (ev) => { ev.stopPropagation(); onDelete(Number(btn.dataset.i)); };
+  });
+}
+
+function renderSaved() {
+  const saved = lsAll(SAVED_KEY, 50);
+  miniList($("saved-list"), saved, (i) => {
+    const next = lsAll(SAVED_KEY, 50);
+    next.splice(i, 1);
+    lsPut(SAVED_KEY, next, 50);
+    renderSaved();
+  });
+  if (!saved.length) $("saved-list").innerHTML = '<div class="empty">nothing saved yet — run a query and click 💾 Save</div>';
+}
+
+function renderHistory() {
+  const hist = lsAll(HIST_KEY, 30);
+  const named = hist.map((h) => ({
+    name: new Date(h.ts).toLocaleTimeString() + (h.ms != null ? " · " + h.ms + "ms" : ""),
+    q: h.q, mode: h.mode, start: h.start, step: h.step,
+  }));
+  miniList($("history-list"), named, (i) => {
+    const next = lsAll(HIST_KEY, 30);
+    next.splice(i, 1);
+    lsPut(HIST_KEY, next, 30);
+    renderHistory();
+  });
+  if (!hist.length) $("history-list").innerHTML = '<div class="empty">no queries run in this browser yet</div>';
+}
+
+function pushHistory(q, ms) {
+  const entry = { q, ts: Date.now(), ms, mode: currentMode(), start: $("q-start").value, step: $("q-step").value };
+  const hist = lsAll(HIST_KEY, 30).filter((h) => h.q !== q);
+  hist.unshift(entry);
+  lsPut(HIST_KEY, hist, 30);
+  renderHistory();
+}
+
+function saveCurrentQuery() {
+  const q = $("promql").value.trim();
+  if (!q) { setError("Nothing to save."); return; }
+  const name = prompt("Name for this query:", q.slice(0, 40));
+  if (!name) return;
+  const saved = lsAll(SAVED_KEY, 50).filter((s) => s.name !== name);
+  saved.unshift({ name, q, mode: currentMode(), start: $("q-start").value, step: $("q-step").value });
+  lsPut(SAVED_KEY, saved, 50);
+  renderSaved();
+  toast('Saved "' + name + '"');
+}
+
+// ---- MCP tools catalog ----------------------------------------------------------------
+const TOOLS = [
+  {
+    name: "prom_query", title: "Instant Query", icon: "⚡",
+    purpose: "Evaluate one PromQL expression at a single point in time — now, or any timestamp.",
+    when: "<b>Current values:</b> request rates, error percentages, memory usage, queue depth, throttle ratios. The natural “what is the value NOW” tool.",
+    args: [["query", "PromQL expression"], ["time", "'now' (default), relative 'now-6h', unix seconds, RFC3339"]],
+    tip: "rate() windows need ≥ 2× the scrape interval — for a 30s scrape use rate(...[2m]) or wider.",
+    examples: [
+      "up",
+      'sum(rate(http_requests_total{status=~"5.."}[5m])) by (pod)',
+      'topk(5, container_memory_working_set_bytes{container!=""})',
+    ],
+  },
+  {
+    name: "prom_query_range", title: "Range Query", icon: "📈",
+    purpose: "Evaluate a PromQL expression over a time range — trends, spikes, leaks, sawtooth-vs-plateau patterns.",
+    when: "<b>Behavior over time.</b> Debugging tip from the tool docs: “pod restarts” wants the memory CURVE, not one sample. Downsampled shape-preserving, so the pattern survives.",
+    args: [["query", "PromQL expression"], ["start", "default now-1h"], ["end", "default now"], ["step", "default span/240"]],
+    tip: "Narrow the label selectors rather than paging — series counts are capped.",
+    examples: [
+      'container_memory_working_set_bytes{pod=~"myapp-.*",container!=""}',
+      'sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))',
+    ],
+  },
+  {
+    name: "prom_series", title: "Series Discovery", icon: "🔎",
+    purpose: "List the series matching a selector with their label sets.",
+    when: "<b>Label discovery before querying.</b> Which pods export http_requests_total? What does the label set of a metric actually look like? Ask this before writing an exact query.",
+    args: [["match", "series selector"], ["start", "lookback start (default now-1h)"], ["end", "lookback end"]],
+    examples: ['http_requests_total{namespace="prod"}', 'kube_pod_status_phase{phase="Pending"}'],
+    noRun: true,
+  },
+  {
+    name: "prom_label_values", title: "Label Values", icon: "🏷️",
+    purpose: "List the values of one label — e.g. every pod reporting a metric, or every namespace.",
+    when: "<b>Build selectors without guessing.</b> label='pod' + match='container_memory_working_set_bytes' → the pods that report memory. Always scope with match, or the values span ALL metrics.",
+    args: [["label", "label name"], ["match", "optional series selector (recommended)"], ["start / end", "optional lookback"]],
+    examples: ["label=pod · match=container_memory_working_set_bytes", "label=namespace"],
+    noRun: true,
+  },
+  {
+    name: "prom_alerts", title: "Alerts", icon: "🚨",
+    purpose: "Currently firing / pending alerts with severity, labels, annotations, and how long each has been active.",
+    when: "<b>The first call when a user asks “is anything wrong?”</b> — and the context provider when a K8s MCP investigation needs the alert state.",
+    args: [["—", "no arguments; returns everything active"]],
+    openTab: "alerts",
+  },
+  {
+    name: "prom_rules", title: "Rules", icon: "📜",
+    purpose: "Alerting & recording rules with their exact expressions, filterable by state or name.",
+    when: "<b>WHAT is monitored and WHY an alert fires</b> — the bridge between “something is firing” and “here is the exact condition and threshold”.",
+    args: [["state", "firing | pending | inactive"], ["search", "case-insensitive name/expr substring"]],
+    openTab: "alerts",
+  },
+];
+
+function renderTools() {
+  const host = $("tool-grid");
+  host.innerHTML = TOOLS.map((t, i) => {
+    let html = "<div class='tool-card'><h3><span>" + t.icon + "</span><span class='tname'>" + esc(t.name) + "</span><span class='hint'>· " + esc(t.title) + "</span></h3>" +
+      "<p>" + esc(t.purpose) + "</p>" +
+      "<p class='when'>" + t.when + "</p>" +
+      "<div class='tool-args'>" + t.args.map(([a, d]) => "<div><code>" + esc(a) + "</code> <span>" + esc(d) + "</span></div>").join("") + "</div>";
+    if (t.tip) html += "<p class='hint'>💡 " + esc(t.tip) + "</p>";
+    if (t.examples) {
+      html += "<div style='margin-top:8px'>" + t.examples.map((ex, j) =>
+        "<span class='ex-chip' data-tool='" + i + "' data-ex='" + j + "' title='try it in the Query tab'>" + (t.noRun ? "📋 " : "▶ ") + esc(trunc(ex, 64)) + "</span>"
+      ).join("") + "</div>";
+    }
+    if (t.openTab) {
+      html += "<div style='margin-top:8px'><button class='ghost copy-btn' data-open='" + t.openTab + "'>Open " + (t.openTab === "alerts" ? "Alerts & Rules" : t.openTab) + " tab →</button></div>";
+    }
+    return html + "</div>";
+  }).join("");
+  host.querySelectorAll(".ex-chip").forEach((chip) => {
+    chip.onclick = () => {
+      const t = TOOLS[Number(chip.dataset.tool)];
+      const ex = t.examples[Number(chip.dataset.ex)];
+      if (t.noRun) {
+        // Discovery tools: show the raw example — it documents the tool call,
+        // not a PromQL expression to run.
+        toast(ex);
+        return;
+      }
+      const isRange = /\[\d+[smhdw]\]/.test(ex);
+      setMode(isRange ? "range" : "instant");
+      if (isRange) $("q-start").value = "now-1h";
+      $("promql").value = ex;
+      switchTab("query");
+      runQuery();
+    };
+  });
+  host.querySelectorAll("button[data-open]").forEach((btn) => {
+    btn.onclick = () => switchTab(btn.dataset.open);
+  });
+}
+
+// ---- tab switching ---------------------------------------------------------------------
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("pane-dashboard").classList.toggle("hidden", tab !== "dashboard");
+  $("pane-query").classList.toggle("hidden", tab !== "query");
+  $("pane-alerts").classList.toggle("hidden", tab !== "alerts");
+  $("pane-tools").classList.toggle("hidden", tab !== "tools");
+  // Lazy-load the heavier lists on first open (the live cluster can have
+  // thousands of alerts — no reason to fetch them before they are wanted).
+  if (tab === "alerts" && !state.alertsLoaded) { state.alertsLoaded = true; loadAlerts(); loadRules(); }
+}
+
+// ---- theme toggle ----------------------------------------------------------------------
+function initThemeToggle() {
+  const btn = $("theme-toggle");
+  const sync = () => {
+    const dark = document.documentElement.dataset.theme !== "light";
+    btn.textContent = dark ? "☀️" : "🌙";
+    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
+  };
+  btn.onclick = () => {
+    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("prometheus-theme", t); } catch (e) { /* ignore */ }
+    sync();
+    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
+  };
+  sync();
+}
+
+// ---- wiring -----------------------------------------------------------------------------
+document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+$("run").onclick = runQuery;
+$("save-query").onclick = saveCurrentQuery;
+$("promql").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); }
+});
+document.querySelectorAll("input[name=mode]").forEach((r) => (r.onchange = syncModeInputs));
+$("filter").oninput = renderPresets;
+$("dash-refresh").onclick = loadOverview;
+$("alerts-refresh").onclick = loadAlerts;
+$("rules-refresh").onclick = loadRules;
+$("alert-filter").oninput = renderAlertsFiltered;
+$("alert-state").onchange = renderAlertsFiltered;
+$("rule-state").onchange = loadRules;
+$("rule-search").oninput = () => {
+  clearTimeout(rulesTimer);
+  rulesTimer = setTimeout(loadRules, 350);
+};
+$("auto-refresh").onchange = () => {
+  if (state.autoTimer) { clearInterval(state.autoTimer); state.autoTimer = null; }
+  if ($("auto-refresh").checked) startAuto();
+};
+
+function startAuto() {
+  state.autoTimer = setInterval(() => {
+    if (state.tab === "dashboard" && !document.hidden && $("auto-refresh").checked) loadOverview();
+  }, 30000);
+}
+
+initThemeToggle();
+renderPresets();
+renderTools();
+renderSaved();
+renderHistory();
+refreshStatus();
+syncModeInputs();
+loadOverview();
+startAuto();
+</script>
+</body>
+</html>

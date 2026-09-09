@@ -1,0 +1,87 @@
+{{- if and .Values.rbac.create .Values.exec.enabled -}}
+{{- $cluster := eq .Values.rbac.scope "cluster" -}}
+{{- $sa := .Values.serviceAccount.name | default .Values.deployment.name -}}
+{{- $tplRole := printf "%s-pods-exec" .Values.deployment.name -}}
+{{- if $cluster }}
+# Exec TEMPLATE ClusterRole — grants NOTHING until a namespaced RoleBinding
+# references it. Never reference from a ClusterRoleBinding: that would make
+# every pod in the cluster exec-able.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $tplRole }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: [get, create]
+{{- if .Values.exec.autoRbac }}
+---
+# Auto-provisioner: lets the server bind the exec template itself, scoped so
+# it cannot escalate — `bind` is resourceNames-restricted to THIS chart's
+# template role, it cannot create/modify role content, and it never creates
+# ClusterRoleBindings.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.deployment.name }}-provisioner
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  resourceNames: ["{{ $tplRole }}"]
+  verbs: [get, bind]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["rolebindings"]
+  verbs: [get, list, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-provisioner
+  labels:
+    app: {{ .Values.deployment.appName }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Values.deployment.name }}-provisioner
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- else }}
+# Namespace clamp + exec: a namespaced exec Role for THIS namespace only.
+# exec elsewhere requires a manual RoleBinding from the command line
+# (see NOTES.txt) — matching the customer-chart philosophy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $tplRole }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $tplRole }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $tplRole }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

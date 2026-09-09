@@ -1,3 +1,7 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
   # REALITY NOTE: tag v0.1.0 was OVERWRITTEN in the registry with the
@@ -6,7 +10,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.1.0
+  tag: v0.2.1
   pullPolicy: Always
 # Only needed if the GHCR package stays PRIVATE (public packages pull
 # anonymously, the ddgs-mcp convention).

@@ -28,6 +28,13 @@ namespaces is rewritten into one query per allowed namespace (limit 20) when
 a whitelist is set, and rejected when only a blacklist is set (arbitrary
 kubectl output cannot be filtered reliably). Python-API-backed tools
 (cluster_health, list_*, get_events) filter denied namespaces from results.
+
+BUILT-IN CONSOLE
+----------------
+A static HPE-branded web console is served from the same pod at /ui/ (and /
+redirects there). The shell carries no cluster data: the browser calls the
+same /mcp endpoint with the same API key, so the console inherits every
+auth/policy layer above. Disable with K8S_MCP_CONSOLE_ENABLED=false.
 """
 
 import asyncio
@@ -62,12 +69,13 @@ mcp = MCPServer(
     title="Kubernetes Ops MCP Server",
     description=(
         "Read-only Kubernetes inspection: pods, workloads, events, logs, "
-        "services, ConfigMaps, Secrets, PVCs, CRDs, RBAC, and generic "
-        "kubectl, plus an opt-in hardened exec_in_pod (disabled unless "
-        "K8S_MCP_EXEC_ENABLED=true). Serves both 2025-era and 2026-07-28 "
-        "(MCP 2.0) clients."
+        "services, Istio VirtualServices, ConfigMaps, Secrets, PVCs, CRDs, "
+        "RBAC, and generic kubectl, plus an opt-in hardened exec_in_pod "
+        "(disabled unless K8S_MCP_EXEC_ENABLED=true). Ships a built-in "
+        "HPE ops console (static UI on the same pod, /ui/). Serves both "
+        "2025-era and 2026-07-28 (MCP 2.0) clients."
     ),
-    version="2.1.3",
+    version="2.2.0",
     cache_hints={"tools/list": CacheHint(ttl_ms=300_000, scope="public")},
 )
 
@@ -190,6 +198,12 @@ def _filter_visible(items):
     return kept
 
 
+def _dict_visible(item: dict) -> bool:
+    """Namespace-policy filter for raw dicts (dynamic-client results)."""
+    ns = (item.get("metadata") or {}).get("namespace")
+    return ns is None or _visible(ns)
+
+
 # ─── Input validation for kubectl parameters ─────────────────────────────
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
@@ -249,13 +263,19 @@ _CLUSTER_SCOPED_RESOURCES = frozenset({
     "persistentvolumes", "pv", "customresourcedefinitions",
     "customresourcedefinition", "crd", "crds", "clusterroles",
     "clusterrolebindings", "storageclasses", "storageclass", "sc",
-    "priorityclasses", "priorityclass", "pc", "ingressclasses",
-    "runtimeclasses", "mutatingwebhookconfigurations",
-    "validatingwebhookconfigurations", "validatingadmissionpolicies",
-    "validatingadmissionpolicybindings", "csidrivers", "csinodes",
-    "volumeattachments", "certificatesigningrequests", "csr", "apiservices",
-    "flowschemas", "prioritylevelconfigurations", "clusterissuers",
-    "componentstatuses", "cs",
+    "priorityclasses", "priorityclass", "pc", "ingressclasses", "ingressclass",
+    "runtimeclasses", "runtimeclass", "mutatingwebhookconfigurations",
+    "mutatingwebhookconfiguration", "validatingwebhookconfigurations",
+    "validatingwebhookconfiguration", "validatingadmissionpolicies",
+    "validatingadmissionpolicy", "validatingadmissionpolicybindings",
+    "validatingadmissionpolicybinding", "csidrivers", "csidriver", "csinodes",
+    "csinode", "volumeattachments", "volumeattachment",
+    "certificatesigningrequests", "certificatesigningrequest", "csr",
+    "apiservices", "apiservice", "flowschemas", "flowschema",
+    "prioritylevelconfigurations", "prioritylevelconfiguration",
+    "clusterroles", "clusterrole", "clusterrolebindings", "clusterrolebinding",
+    "clusterissuers", "componentstatuses", "componentstatus",
+    "persistentvolumes", "persistentvolume",
 })
 
 
@@ -989,6 +1009,187 @@ async def get_custom_resource(
         return await _kubectl_plan_execute(argv)
 
 
+# ─── Istio VirtualServices (read-only) ──────────────────────────────────
+
+ISTIO_VIRTUALSERVICE_GROUP = "networking.istio.io"
+# Preferred Istio API versions, newest first. The VirtualService CRD serves
+# all three on Istio >= 1.18; older meshes may only serve v1alpha3.
+_VIRTUALSERVICE_API_VERSIONS = ("v1", "v1beta1", "v1alpha3")
+
+
+async def _virtualservice_resource():
+    """Resolve the VirtualService dynamic resource across Istio API versions.
+
+    Raises the last discovery error when Istio is not installed or none of
+    the known versions is served; the caller falls back to kubectl.
+    """
+    last_error = None
+    for version in _VIRTUALSERVICE_API_VERSIONS:
+        try:
+            return await asyncio.to_thread(
+                dyn_client.resources.get,
+                api_version=f"{ISTIO_VIRTUALSERVICE_GROUP}/{version}",
+                plural="virtualservices",
+            )
+        except ResourceNotFoundError as e:
+            last_error = e
+    raise last_error
+
+
+def _iso_age(ts) -> str:
+    """_age() for the ISO-8601 timestamps the dynamic client returns."""
+    if not ts:
+        return "Unknown"
+    if isinstance(ts, str):
+        try:
+            ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return "Unknown"
+    return _age(ts)
+
+
+def _vs_destination(route_dest) -> str:
+    """Render one route destination compactly: host:port (weight%)."""
+    dest = route_dest.get("destination") or {}
+    host = dest.get("host") or "?"
+    port = (dest.get("port") or {}).get("number")
+    out = f"{host}:{port}" if port else host
+    weight = route_dest.get("weight")
+    if weight is not None:
+        out += f" ({weight}%)"
+    return out
+
+
+def _vs_route_bits(entry: dict) -> list:
+    """Compact descriptors for one http/tls/tcp route entry."""
+    bits = []
+    if entry.get("name"):
+        bits.append(entry["name"])
+    for m in entry.get("match") or []:
+        if not isinstance(m, dict):
+            continue
+        uri = m.get("uri")
+        if isinstance(uri, dict):
+            for key in ("prefix", "exact", "regex"):
+                if key in uri:
+                    bits.append(f"uri-{key}:{uri[key]}")
+                    break
+        if m.get("sni"):
+            bits.append(f"sni:{m['sni']}")
+        if m.get("port"):
+            bits.append(f"port:{m['port']}")
+    if entry.get("route"):
+        bits.append("-> " + ", ".join(_vs_destination(d) for d in entry["route"]))
+    if entry.get("redirect"):
+        red = entry["redirect"]
+        shown = red.get("uri") or red.get("authority") or red.get("redirectCode")
+        bits.append(f"-> redirect {shown or ''}".rstrip())
+    if entry.get("delegate"):
+        d = entry["delegate"]
+        bits.append(f"-> delegate {d.get('name') or d.get('virtualServiceHost') or '?'}")
+    if entry.get("mirror"):
+        bits.append(f"mirror:{_vs_destination({'destination': entry['mirror']})}")
+    if entry.get("fault"):
+        bits.append("fault-injection")
+    return bits
+
+
+def _vs_summary(item: dict) -> list:
+    """Human-readable lines for one VirtualService (dict form)."""
+    meta = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    ns = meta.get("namespace") or "cluster-scoped"
+    lines = [
+        f"  {ns}/{meta.get('name', '?')} (Age: {_iso_age(meta.get('creationTimestamp'))})"
+    ]
+    hosts = spec.get("hosts") or []
+    if hosts:
+        lines.append(f"    hosts: {', '.join(str(h) for h in hosts)}")
+    gateways = spec.get("gateways") or []
+    if gateways:
+        lines.append(f"    gateways: {', '.join(str(g) for g in gateways)}")
+    for kind in ("http", "tls", "tcp"):
+        entries = spec.get(kind) or []
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            bits = _vs_route_bits(entry)
+            lines.append(f"    {kind}[{i}]: " + (" ".join(bits) if bits else "(no route targets)"))
+    if not (spec.get("http") or spec.get("tls") or spec.get("tcp")):
+        lines.append("    (no http/tls/tcp routes)")
+    return lines
+
+
+@mcp.tool()
+async def list_virtual_services(namespace: str = "", name: str = "") -> str:
+    """List Istio VirtualServices with hosts, gateways, and route targets.
+    Fully read-only.
+    Examples:
+      list_virtual_services(namespace="ml-ns")
+      list_virtual_services(namespace="ml-ns", name="checkout-vs")  # full definition
+      list_virtual_services()                                       # all namespaces
+    With `name` and `namespace`, returns the VirtualService's full definition
+    instead of the summary. An omitted namespace lists across all namespaces
+    (namespace policy filters the results)."""
+    try:
+        ns = _validated_namespace(namespace)
+        vs_name = _validated_name(name) if name else ""
+    except ValueError as e:
+        return f"Error: {e}"
+    violation = namespace_violation(ns)
+    if violation:
+        return f"Error: {violation}"
+
+    try:
+        resource = await _virtualservice_resource()
+        if vs_name and ns:
+            obj = await asyncio.to_thread(resource.get, name=vs_name, namespace=ns)
+            instances = [obj]
+        elif vs_name:
+            # Cluster-wide collection, filtered by name below — a namespaced
+            # resource cannot be fetched by name without its namespace.
+            listing = await asyncio.to_thread(resource.get)
+            instances = list(getattr(listing, "items", None) or [])
+        else:
+            listing = await asyncio.to_thread(resource.get, namespace=ns or None)
+            instances = list(getattr(listing, "items", None) or [])
+        # Work on plain dicts: nested-field attribute access on dynamic-client
+        # ResourceInstances varies across kubernetes-client versions.
+        dicts = [i.to_dict() if hasattr(i, "to_dict") else i for i in instances]
+        if vs_name and not ns:
+            dicts = [d for d in dicts
+                     if (d.get("metadata") or {}).get("name") == vs_name]
+        if _namespace_policy_active() and not ns:
+            dicts = [d for d in dicts if _dict_visible(d)]
+    except (ApiException, ResourceNotFoundError, ValueError, TypeError, AttributeError):
+        # Istio CRD absent or discovery/schema trouble — same kubectl fallback
+        # contract as get_custom_resource.
+        argv = ["get", f"virtualservices.{ISTIO_VIRTUALSERVICE_GROUP}"]
+        if vs_name and ns:
+            argv.append(vs_name)
+        elif vs_name:
+            argv += ["--field-selector", f"metadata.name={vs_name}"]
+        if ns:
+            argv += ["-n", ns]
+        else:
+            argv.append("-A")
+        argv += ["-o", "yaml"]
+        return await _kubectl_plan_execute(argv)
+
+    if not dicts:
+        return "No VirtualServices found."
+    if vs_name and ns:
+        return _truncate(json.dumps(dicts[0], indent=2, default=str))
+    dicts.sort(key=lambda d: ((d.get("metadata") or {}).get("namespace") or "",
+                              (d.get("metadata") or {}).get("name") or ""))
+    where = f"in namespace '{ns}'" if ns else "across all namespaces"
+    header = f"VIRTUALSERVICES {where} ({len(dicts)}):"
+    lines = []
+    for d in dicts:
+        lines.extend(_vs_summary(d))
+    return _truncate(header + "\n" + "\n".join(lines))
+
+
 # ─── RBAC ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -1051,8 +1252,11 @@ EXEC_AUTO_RBAC_ENV = "K8S_MCP_EXEC_AUTO_RBAC"
 SA_NAME_ENV = "K8S_MCP_SA_NAME"
 SA_NAMESPACE_ENV = "K8S_MCP_SA_NAMESPACE"
 EXEC_LABEL = "k8s-mcp.io/exec"
-EXEC_TEMPLATE_ROLE = "k8s-mcp-pods-exec"
-EXEC_BINDING_NAME = "k8s-mcp-2-0-exec"
+# Env-overridable so multiple chart releases can coexist in one cluster:
+# each release provisions bindings for ITS template role only. Defaults keep
+# compatibility with pre-chart deployments.
+EXEC_TEMPLATE_ROLE = os.environ.get("K8S_MCP_EXEC_TEMPLATE_ROLE", "").strip() or "k8s-mcp-pods-exec"
+EXEC_BINDING_NAME = os.environ.get("K8S_MCP_EXEC_BINDING_NAME", "").strip() or "k8s-mcp-2-0-exec"
 _SA_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 _SA_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
@@ -1626,6 +1830,125 @@ class _ApiKeyAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+# ─── Built-in ops console (static shell, same pod) ──────────────────────
+#
+# The console is a static single-page app served next to the MCP endpoint.
+# The shell itself is inert (it contains no cluster data): every request
+# that returns data is a POST /mcp with the API key — the exact same
+# middleware / namespace-policy / read-verb path as every MCP client. The
+# shell therefore needs no API-key auth of its own; the middleware is
+# wrapped around the MCP app only (see __main__), never around the shell.
+
+CONSOLE_ENABLED_ENV = "K8S_MCP_CONSOLE_ENABLED"
+
+_UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+_UI_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".json": "application/json",
+    ".woff2": "font/woff2",
+}
+_UI_SECURITY_HEADERS = [
+    (b"content-security-policy",
+     b"default-src 'none'; style-src 'self'; script-src 'self'; "
+     b"connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+     b"base-uri 'none'; frame-ancestors 'none'"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+]
+
+
+def _console_enabled() -> bool:
+    return os.environ.get(CONSOLE_ENABLED_ENV, "").strip().lower() != "false"
+
+
+async def _redirect_response(send, location: str):
+    await send({
+        "type": "http.response.start", "status": 302,
+        "headers": [(b"location", location.encode("ascii")),
+                    (b"content-length", b"0")],
+    })
+    await send({"type": "http.response.body", "body": b""})
+
+
+class _ConsoleApp:
+    """ASGI app serving the static console shell under /ui (and / → /ui/)."""
+
+    def __init__(self, root: str):
+        self.root = os.path.realpath(root)
+
+    async def _not_found(self, send):
+        for message in _json_asgi_response(send, 404, b'{"error": "not found"}'):
+            await send(message)
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "/")
+        if not _console_enabled():
+            await self._not_found(send)
+            return
+        if path in ("", "/"):
+            await _redirect_response(send, "/ui/")
+            return
+        if path != "/ui" and not path.startswith("/ui/"):
+            await self._not_found(send)
+            return
+        rel = path[len("/ui"):].lstrip("/") or "index.html"
+        candidate = os.path.realpath(os.path.join(self.root, rel))
+        # Path-traversal guard: the resolved file must stay inside the
+        # console directory, no matter what the URL says.
+        if candidate != self.root and not candidate.startswith(self.root + os.sep):
+            await self._not_found(send)
+            return
+        if not os.path.isfile(candidate):
+            if "." not in os.path.basename(rel):
+                candidate = os.path.join(self.root, "index.html")  # app shell
+            else:
+                await self._not_found(send)
+                return
+        try:
+            with open(candidate, "rb") as f:
+                body = f.read()
+        except OSError:
+            await self._not_found(send)
+            return
+        ext = os.path.splitext(candidate)[1].lower()
+        ctype = _UI_CONTENT_TYPES.get(ext, "application/octet-stream").encode("ascii")
+        await send({
+            "type": "http.response.start", "status": 200,
+            "headers": [
+                (b"content-type", ctype),
+                (b"cache-control", b"no-cache"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                *_UI_SECURITY_HEADERS,
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class _ConsoleRouterApp:
+    """Routes /ui/* (and /) to the console shell, everything else to MCP.
+
+    The MCP app keeps its own auth middleware; console paths never reach it,
+    so serving the shell cannot bypass or weaken API-key auth on /mcp.
+    """
+
+    def __init__(self, mcp_app, console_app):
+        self.mcp_app = mcp_app
+        self.console_app = console_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path in ("", "/", "/ui") or path.startswith("/ui/"):
+                await self.console_app(scope, receive, send)
+                return
+        await self.mcp_app(scope, receive, send)
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -1669,9 +1992,12 @@ if __name__ == "__main__":
             allowed_origins=[f"https://{mcp_hostname}"],
         )
     uvicorn.run(
-        _ApiKeyAuthMiddleware(mcp.streamable_http_app(
-            stateless_http=True, transport_security=transport_security,
-        )),
+        _ConsoleRouterApp(
+            _ApiKeyAuthMiddleware(mcp.streamable_http_app(
+                stateless_http=True, transport_security=transport_security,
+            )),
+            _ConsoleApp(_UI_DIR),
+        ),
         host="0.0.0.0",
         port=9090,
         log_level="info",

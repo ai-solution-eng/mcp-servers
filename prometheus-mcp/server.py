@@ -14,6 +14,11 @@ Tools (all read-only):
   prom_alerts        currently firing / pending alerts
   prom_rules         alerting & recording rules, filterable by state
 
+The streamable-http transport ALSO serves an HPE-branded, read-only web
+UI at / (dashboard, PromQL query, alerts & rules, tool catalog) plus a
+JSON API under /api/* — a human front-end over the same client and caps
+that back these tools (see webui.py).
+
 Configuration (environment variables):
   PROM_URL                  Prometheus base URL (default: the kube-prometheus-
                             stack service: http://kubeprom-prometheus.
@@ -324,16 +329,28 @@ def _build_http_app():
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
+    from webui import build_ui_routes
+
     async def health(_request):
         return JSONResponse({"status": "ok", "prometheus": config.base_url})
 
+    # MCP 2.0 (protocol 2026-07-28) is natively stateless: no initialize
+    # handshake, no Mcp-Session-Id header, so any replica can serve any
+    # request; json_response keeps plain-HTTP clients on single responses.
+    # (The session-manager lifespan wiring below is still required — it runs
+    # the task group that serves requests, stateless or not.)
     http_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
         transport_security=_mcp_transport_security,
     )
     routes = [
         Route("/health", health),
         Route("/healthz", health),
+        # HPE-branded web UI + read-only JSON API at / and /api/* — a human
+        # front-end over the SAME client/config that backs the MCP tools.
+        *build_ui_routes(client, config),
         *list(http_app.routes),
     ]
     return Starlette(

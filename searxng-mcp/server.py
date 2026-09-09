@@ -298,8 +298,14 @@ def main():
         else None
     )
     http_app = (
+        # MCP 2.0 (protocol 2026-07-28) is natively stateless: no initialize
+        # handshake, no Mcp-Session-Id header, so any replica can serve any
+        # request (no "Session not found" failures behind a round-robin LB)
+        # and 2025-era clients keep working.
         mcp.streamable_http_app(
             streamable_http_path="/mcp",
+            stateless_http=True,
+            json_response=True,
             transport_security=_mcp_transport_security,
         )
         if "streamable-http" in transports

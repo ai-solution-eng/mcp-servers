@@ -340,7 +340,7 @@ def main():
     # ── exec_in_pod guard (opt-in tool) ─────────────────────────────────
     print("[exec guard]")
     check("exec_in_pod" not in {t.name for t in asyncio.run(server.mcp.list_tools())},
-          "exec_in_pod absent by default (17 tools)")
+          "exec_in_pod absent by default (18 tools)")
     check(server._exec_command_error(["ps", "aux"]) is None, "allowlisted binary accepted")
     check(server._exec_command_error(["/bin/ps", "-aux"]) is None, "absolute path matches basename")
     check(server._exec_command_error(["/bin/../bin/sh", "-c", "x"]) is not None,
@@ -433,7 +433,7 @@ def main():
     os.environ.pop("K8S_MCP_EXEC_ENABLED", None)
     server = importlib.reload(server)
     check("exec_in_pod" not in {t.name for t in asyncio.run(server.mcp.list_tools())},
-          "exec_in_pod absent again after disabling (17 tools)")
+          "exec_in_pod absent again after disabling (18 tools)")
 
     # ── Automatic exec RBAC provisioning ────────────────────────────────
     print("[exec rbac provisioning]")
@@ -692,6 +692,193 @@ def main():
     check(asyncio.run(server.check_rbac("create", "pods/exec", "kube-system")) == "no",
           "can-i 'no' (rc=1) -> surfaces 'no', not an error")
     server._kubectl_run = _saved_run
+
+    # ── list_virtual_services (read-only, policy-aware) ─────────────────
+    print("[virtualservices]")
+    tool_names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    check("list_virtual_services" in tool_names, "list_virtual_services registered (18 tools)")
+
+    class _VSItem:
+        """ResourceInstance stand-in: dict payload + to_dict()."""
+
+        def __init__(self, d):
+            self._d = d
+
+        def to_dict(self):
+            return self._d
+
+    class _VSListing:
+        def __init__(self, items):
+            self.items = items
+
+    class _VSResource:
+        def __init__(self, items):
+            self._items = items
+
+        def get(self, name=None, namespace=None, **kwargs):
+            if name is not None and namespace is not None:
+                for it in self._items:
+                    m = it.to_dict()["metadata"]
+                    if m["name"] == name and m["namespace"] == namespace:
+                        return it
+                raise _ApiException(reason=f'virtualservices "{name}" not found', status=404)
+            items = [
+                it for it in self._items
+                if namespace is None or it.to_dict()["metadata"]["namespace"] == namespace
+            ]
+            return _VSListing(items)
+
+    class _VSDiscovery:
+        """Stand-in for dyn_client.resources (API-version discovery)."""
+
+        def __init__(self, resource=None, fail=False):
+            self._resource, self._fail = resource, fail
+
+        def get(self, api_version="", plural="", **kwargs):
+            if self._fail:
+                raise sys.modules["kubernetes.dynamic.exceptions"].ResourceNotFoundError(
+                    f"no resource {api_version}/{plural}"
+                )
+            return self._resource
+
+    _vs_defs = [
+        {"metadata": {"name": "checkout", "namespace": "team-a",
+                      "creationTimestamp": "2026-01-01T00:00:00Z"},
+         "spec": {"hosts": ["checkout.example.com"],
+                  "gateways": ["istio-system/ezaf-gateway", "mesh"],
+                  "http": [
+                      {"name": "api",
+                       "match": [{"uri": {"prefix": "/api"}}],
+                       "route": [
+                           {"destination": {"host": "v1.team-a.svc.cluster.local",
+                                            "port": {"number": 8080}}, "weight": 90},
+                           {"destination": {"host": "v2.team-a.svc.cluster.local",
+                                            "port": {"number": 8080}}, "weight": 10},
+                       ]},
+                      {"match": [{"uri": {"prefix": "/old"}}],
+                       "redirect": {"uri": "/new", "redirectCode": 301}},
+                  ],
+                  "tcp": [{"match": [{"port": 9000}],
+                           "route": [{"destination": {"host": "tcp-svc.team-a.svc.cluster.local"}}]}]}},
+        {"metadata": {"name": "other", "namespace": "team-b",
+                      "creationTimestamp": "2026-01-01T00:00:00Z"},
+         "spec": {"hosts": ["other.example.com"], "http": []}},
+    ]
+    _vs_items = [_VSItem(d) for d in _vs_defs]
+    _saved_dyn = server.dyn_client
+    _saved_path = os.environ["PATH"]
+    os.environ["PATH"] = fakebin + ":" + _saved_path   # fake kubectl: no real cluster calls
+    server.dyn_client = types.SimpleNamespace(resources=_VSDiscovery(_VSResource(_vs_items)))
+    try:
+        out = asyncio.run(server.list_virtual_services(namespace="team-a"))
+        check("VIRTUALSERVICES in namespace 'team-a' (1)" in out,
+              "summary header counts one namespace's VirtualServices")
+        check("hosts: checkout.example.com" in out
+              and "gateways: istio-system/ezaf-gateway, mesh" in out,
+              "summary shows hosts and gateways")
+        check("-> v1.team-a.svc.cluster.local:8080 (90%), v2.team-a.svc.cluster.local:8080 (10%)" in out,
+              "weighted http destinations rendered")
+        check("uri-prefix:/api" in out and "-> redirect /new" in out
+              and "tcp[0]: port:9000" in out,
+              "match, redirect, and tcp routes rendered")
+        out = asyncio.run(server.list_virtual_services())
+        check("team-a/checkout" in out and "team-b/other" in out,
+              "empty namespace lists across all namespaces")
+        os.environ["K8S_MCP_BLOCKED_NAMESPACES"] = "team-a"
+        out = asyncio.run(server.list_virtual_services())
+        check("team-a/checkout" not in out and "team-b/other" in out,
+              "blacklisted namespaces filtered from cluster-wide listing")
+        out = asyncio.run(server.list_virtual_services(namespace="team-a"))
+        check(out.startswith("Error:") and "denied by the namespace policy" in out,
+              "denied namespace rejected at the tool boundary")
+        os.environ.pop("K8S_MCP_BLOCKED_NAMESPACES", None)
+        out = asyncio.run(server.list_virtual_services(namespace="team-a", name="checkout"))
+        check('"hosts"' in out and '"checkout"' in out,
+              "name + namespace returns the full definition")
+        out = asyncio.run(server.list_virtual_services(name="other"))
+        check("team-b/other" in out, "name without namespace finds the VS cluster-wide")
+        out = asyncio.run(server.list_virtual_services(namespace="team-a", name="ghost"))
+        check("[get]" in out and "[ghost]" in out and "[-n]" in out and "[team-a]" in out,
+              "missing VS falls back to kubectl with name + -n (fake kubectl echoes argv)")
+        server.dyn_client = types.SimpleNamespace(resources=_VSDiscovery(fail=True))
+        out = asyncio.run(server.list_virtual_services(namespace="team-a"))
+        check("[virtualservices.networking.istio.io]" in out,
+              "discovery failure falls back to kubectl")
+        out = asyncio.run(server.list_virtual_services(name="checkout"))
+        check("[--field-selector]" in out and "[metadata.name=checkout]" in out and "[-A]" in out,
+              "name-without-namespace fallback uses a field selector, not name + -A")
+    finally:
+        os.environ.pop("K8S_MCP_BLOCKED_NAMESPACES", None)
+        server.dyn_client = _saved_dyn
+        os.environ["PATH"] = _saved_path
+
+    # ── Built-in console (static shell on the same pod) ─────────────────
+    print("[console]")
+
+    async def _asgi_collect(app, scope):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request"}
+
+        async def send(msg):
+            sent.append(msg)
+
+        await app(scope, receive, send)
+        return sent
+
+    async def _asgi_get(app, path, scope_type="http"):
+        return await _asgi_collect(app, {"type": scope_type, "path": path})
+
+    def _sent_status(sent):
+        return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+    def _sent_headers(sent):
+        return {k.lower(): v for m in sent if m["type"] == "http.response.start"
+                for k, v in m["headers"]}
+
+    def _sent_body(sent):
+        return b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+
+    console_app = server._ConsoleApp(server._UI_DIR)
+    sent = asyncio.run(_asgi_get(console_app, "/ui/"))
+    check(_sent_status(sent) == 200 and b"HPE Kubernetes Ops Console" in _sent_body(sent),
+          "/ui/ serves the HPE console shell")
+    check(b"content-security-policy" in _sent_headers(sent),
+          "console shell sends CSP headers")
+    sent = asyncio.run(_asgi_get(console_app, "/ui/style.css"))
+    check(_sent_status(sent) == 200 and _sent_headers(sent)[b"content-type"] == b"text/css; charset=utf-8",
+          "static asset served with correct content type")
+    for bad in ("/ui/../../server.py", "/ui/%2e%2e/server.py", "/ui/....//server.py"):
+        sent = asyncio.run(_asgi_get(console_app, bad))
+        check(_sent_status(sent) == 404, f"path traversal guarded: {bad}")
+    os.environ["K8S_MCP_CONSOLE_ENABLED"] = "false"
+    sent = asyncio.run(_asgi_get(console_app, "/ui/"))
+    check(_sent_status(sent) == 404, "K8S_MCP_CONSOLE_ENABLED=false -> console 404")
+    os.environ.pop("K8S_MCP_CONSOLE_ENABLED", None)
+
+    mcp_marker = types.SimpleNamespace(seen=None)
+    ui_marker = types.SimpleNamespace(seen=None)
+
+    class _MarkerApp:
+        def __init__(self, sink):
+            self.sink = sink
+
+        async def __call__(self, scope, receive, send):
+            self.sink.seen = scope.get("path")
+
+    router = server._ConsoleRouterApp(_MarkerApp(mcp_marker), _MarkerApp(ui_marker))
+    asyncio.run(_asgi_collect(router, {"type": "http", "path": "/ui/index.html"}))
+    check(ui_marker.seen == "/ui/index.html" and mcp_marker.seen is None,
+          "router routes /ui/* to the console app only")
+    asyncio.run(_asgi_collect(router, {"type": "http", "path": "/mcp"}))
+    check(mcp_marker.seen == "/mcp",
+          "router passes /mcp to the MCP app (auth middleware wraps it there)")
+    asyncio.run(_asgi_collect(router, {"type": "websocket", "path": "/ws"}))
+    check(mcp_marker.seen == "/ws", "non-http scopes pass through to the MCP app")
+    sent = asyncio.run(_asgi_get(console_app, "/"))
+    check(_sent_status(sent) == 302 and _sent_headers(sent)[b"location"] == b"/ui/",
+          "/ redirects to /ui/")
 
     # ── Startup invariants ─────────────────────────────────────────────
     print("[startup]")

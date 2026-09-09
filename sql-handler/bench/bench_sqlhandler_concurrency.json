@@ -1,0 +1,62 @@
+{
+ "workload": "workload_g2.json",
+ "suites": {
+  "concurrency": [
+   {
+    "engine": "sqlhandler-rest",
+    "level": 1,
+    "calls": 3,
+    "ok": 3,
+    "wall_ms": 464,
+    "qps": 6.47,
+    "p50_ms": 445.0,
+    "p95_ms": 539.2,
+    "max_ms": 539.2
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 2,
+    "calls": 6,
+    "ok": 6,
+    "wall_ms": 526,
+    "qps": 11.41,
+    "p50_ms": 514.2,
+    "p95_ms": 540.6,
+    "max_ms": 540.6
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 4,
+    "calls": 12,
+    "ok": 12,
+    "wall_ms": 2352,
+    "qps": 5.1,
+    "p50_ms": 1268.3,
+    "p95_ms": 2730.1,
+    "max_ms": 2730.1
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 8,
+    "calls": 24,
+    "ok": 24,
+    "wall_ms": 6378,
+    "qps": 3.76,
+    "p50_ms": 3354.8,
+    "p95_ms": 6309.4,
+    "max_ms": 7113.3
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 16,
+    "calls": 48,
+    "ok": 48,
+    "wall_ms": 15850,
+    "qps": 3.03,
+    "p50_ms": 7123.3,
+    "p95_ms": 15316.6,
+    "max_ms": 16624.7
+   }
+  ]
+ }
+}

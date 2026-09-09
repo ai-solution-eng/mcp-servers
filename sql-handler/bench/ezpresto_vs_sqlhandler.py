@@ -233,7 +233,7 @@ class PrestoEngine:
                     return json.loads(r.read().decode())
             raise
 
-    def query(self, sql):
+    def _run(self, sql):
         """POST /v1/statement then poll nextUri; returns (wall_seconds, rows)."""
         t0 = time.monotonic()
         resp = self._fetch(self.url + "/v1/statement", data=sql.encode())
@@ -241,13 +241,22 @@ class PrestoEngine:
         while True:
             if resp.get("error"):
                 raise RuntimeError("presto error: %s" % json.dumps(resp["error"])[:300])
-            for col_list in resp.get("data") or []:
-                rows.append(col_list)
+            for row in resp.get("data") or []:
+                rows.append(row)
             nxt = resp.get("nextUri")
             if not nxt:
                 break
             resp = self._fetch(nxt)
-        return time.monotonic() - t0, len(rows)
+        return time.monotonic() - t0, rows
+
+    def query(self, sql):
+        """Run one query; returns (wall_seconds, rows_returned)."""
+        wall, rows = self._run(sql)
+        return wall, len(rows)
+
+    def query_rows(self, sql):
+        """Run one query; returns (wall_seconds, actual row lists)."""
+        return self._run(sql)
 
 
 # --------------------------------------------------------------------------
@@ -400,8 +409,12 @@ PROBE_SQLS = ["SHOW CATALOGS"]
 
 
 def _make_presto(args):
+    user = args.presto_user
+    if args.bearer:
+        claims = _jwt_claims(args.bearer)
+        user = claims.get("preferred_username") or user
     return PrestoEngine(
-        args.presto_url, args.bearer, args.timeout, args.presto_user,
+        args.presto_url, args.bearer, args.timeout, user,
         refresh_token=args.refresh_token, token_url=args.keycloak_token_url,
         client_id=args.keycloak_client_id, client_secret=args.keycloak_client_secret)
 
@@ -419,7 +432,7 @@ def cmd_probe(args):
     print("\n== EzPresto (%s) ==" % args.presto_url)
     try:
         engine = _make_presto(args)
-        wall, rows = engine.query("SHOW CATALOGS")
+        wall, rows = engine.query_rows("SHOW CATALOGS")
         print("SHOW CATALOGS ok in %.0f ms:" % (wall * 1000))
         print(json.dumps(rows, indent=1))
         catalogs = [r[0] for r in rows]
@@ -427,12 +440,12 @@ def cmd_probe(args):
             if cat.lower() in ("system", "jmx", "network", "cache"):
                 continue
             try:
-                _, schemas = engine.query("SHOW SCHEMAS FROM %s" % cat)
+                _, schemas = engine.query_rows("SHOW SCHEMAS FROM %s" % cat)
                 print("catalog %s schemas: %s" % (cat, [s[0] for s in schemas]))
                 for sch in [s[0] for s in schemas]:
                     if sch in ("information_schema",):
                         continue
-                    _, tables = engine.query("SHOW TABLES FROM %s.%s" % (cat, sch))
+                    _, tables = engine.query_rows("SHOW TABLES FROM %s.%s" % (cat, sch))
                     if tables:
                         print("  %s.%s tables: %s" % (cat, sch, [t[0] for t in tables]))
             except Exception as exc:  # noqa: BLE001
