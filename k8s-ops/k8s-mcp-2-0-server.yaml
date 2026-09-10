@@ -206,7 +206,7 @@ spec:
       # namespace that runs this image (DEPLOYMENT.md → "Private image
       # registry") — a live `kubectl patch` does not survive envsubst applies.
       imagePullSecrets:
-      - name: ghcr-pull
+      - name: k8s-mcp-2-0-ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -215,7 +215,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: k8s-mcp-2-0
-        image: ghcr.io/ai-solution-eng/k8s-mcp:v0.2.12
+        image: ghcr.io/ai-solution-eng/k8s-mcp:v0.3.0
         ports:
         - containerPort: 9090
           name: mcp-2-0-http
