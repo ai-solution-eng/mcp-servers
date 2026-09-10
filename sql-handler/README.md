@@ -400,7 +400,7 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` (when unset, the busiest tables from the previous run are warmed automatically) |
 | `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON/YAML file (table/column descriptions merged into list/describe; hot-reloaded) |
 | `SQLHANDLER_CATALOG_STORE` | Writable path for UI/API catalog uploads (default: `<cache-dir>/semantic-catalog.json`); overrides `SQLHANDLER_CATALOG` while present |
-| `SQLHANDLER_CATALOG_UPLOAD` | `0` disables the `/api/semantic-catalog` upload/clear endpoints (default on) |
+| `SQLHANDLER_CATALOG_UPLOAD` | `0` disables the catalog mutation endpoints (upload/clear **and** the browser editor's apply/remove — reading/editing text still works, applying is refused) (default on) |
 | `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
 | `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
 | `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (default 0 = no timeout) |
@@ -750,6 +750,20 @@ The web UI's **Semantic catalog** panel uploads a `.json`/`.yaml` file (or accep
 | `GET /api/semantic-catalog` | which catalog is live, its source, table count |
 | `POST /api/semantic-catalog` | body = raw JSON **or YAML** text → validated, stored, hot-reloaded |
 | `DELETE /api/semantic-catalog` | remove the uploaded catalog; the configured file takes over |
+| `GET /api/semantic-catalog/content?format=yaml\|json` | the live catalog as editable text (YAML default) |
+| `GET /api/semantic-catalog/table?table=…&format=yaml\|json` | one table's entry (or `found: false`) |
+| `POST /api/semantic-catalog/table` | `{"table", "content"}` — upsert ONE table's entry (merged + stored) |
+| `DELETE /api/semantic-catalog/table?table=…` | drop one table's entry |
+| `POST /api/highlight` | pygments-guessed inline-styled HTML for the editors (`pygmentize -g` semantics) |
+
+#### Editing in the browser (global + per-dataset)
+
+Two ways to edit the live semantic view, both writing through the same validated store as an upload:
+
+- **Global editor** — the *Semantic catalog* panel (lower left) has an **Edit YAML…** button that opens the whole live catalog as editable YAML (JSON is a toggle; a format switch with unsaved edits asks first). Applying re-validates and hot-reloads exactly like a file upload. With no catalog attached the editor starts from a commented starter template.
+- **Per-dataset breakout** — every table gets a **Semantic** tab (next to Query / Schema) showing just that table's entry. Tables with no entry yet open with a skeleton prefilled from the real column list, so documenting a dataset starts from its actual columns. *Apply* upserts only that table's entry (the server keeps the existing entry key — an edit never forks a duplicate); *Remove entry* drops it, and removing the last entry clears the store so the configured file takes back over.
+
+The editor text is syntax-highlighted server-side with the same trick as the `rcat` CLI tool: Pygments guesses the lexer from a (virtual) filename plus content — `pygmentize -g` semantics — and returns inline-styled HTML theme-matched to the UI (dark/light). Without `pygments` installed the editors simply render plain text; highlighting is cosmetic and never gates an edit. All edit endpoints are covered by the same `SQLHANDLER_API_TOKEN` / gateway auth as the rest of `/api/*`, and `SQLHANDLER_CATALOG_UPLOAD=0` disables editing as well as uploading.
 
 ```bash
 curl --data-binary @catalog.yaml -H "Content-Type: text/plain" \

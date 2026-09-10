@@ -66,6 +66,12 @@ BACKENDS = ("auto", "trafilatura", "bs4", "httpx", "curl", "wikipedia")
 # text is shorter than RENDER_MIN_CHARS *and* smells like a JS-only shell
 # gets one render attempt in the sidecar browser.
 RENDER_MIN_CHARS = 250
+# A document at least this big whose extracted text is still under
+# RENDER_MIN_CHARS is treated as a JS-only shell even without explicit
+# markers: scripts inject the content and leave none. Genuine small pages
+# sit far below this; the shell that motivated the rule
+# (quotes.toscrape.com/js/) is 5.8 KB of markup with 96 chars of text.
+RENDER_SHELL_MIN_BYTES = 4000
 JS_PAGE_MARKERS = re.compile(
     r"<noscript[\s>]"
     r"|enable\s+javascript"
@@ -388,7 +394,13 @@ class WebContentFetcher:
         if len(text) >= RENDER_MIN_CHARS:
             return False
         haystack = (html or "")[:8000] + text
-        return bool(JS_PAGE_MARKERS.search(haystack))
+        if JS_PAGE_MARKERS.search(haystack):
+            return True
+        # Marker-less SPA shell: the script bundle fills the page at runtime
+        # and leaves no explicit marker, so a substantial document with
+        # near-empty readable text is only readable after a render. One
+        # bounded attempt; the better extraction of the two is kept either way.
+        return len(html or "") >= RENDER_SHELL_MIN_BYTES
 
     async def _render_via_browser(self, url, ctx, *, with_screenshot=False):
         """Render via the sidecar; every failure degrades to (None, None)

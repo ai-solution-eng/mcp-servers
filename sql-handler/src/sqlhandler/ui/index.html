@@ -318,6 +318,83 @@
   #chart { margin-top: 10px; overflow-x: auto; }
   #chart svg text { font-size: 10px; fill: var(--muted); }
   #chart svg rect { fill: var(--accent); }
+
+  /* ---- SV editor: transparent-text textarea over a pygments-highlighted
+     pre (the rcat approach, server-side). Both layers share identical
+     metrics and never soft-wrap (wrap=off + white-space:pre), so the
+     highlight layer stays aligned with the caret layer at any scroll. */
+  .sv-editor {
+    position: relative;
+    background: var(--editor-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .sv-editor:focus-within { border-color: var(--accent); }
+  .sv-editor pre, .sv-editor textarea {
+    margin: 0;
+    border: 0;
+    padding: 10px 12px;
+    font: 12px/1.5 var(--mono);
+    tab-size: 2;
+    white-space: pre;
+    overflow: auto;
+  }
+  .sv-editor pre {
+    position: absolute;
+    inset: 0;
+    background: transparent;
+    pointer-events: none; /* scrolling + selection belong to the textarea */
+  }
+  .sv-editor pre code { font: inherit; padding: 0; background: none; }
+  .sv-editor textarea {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: transparent;
+    color: transparent;           /* the pre shows the colored text … */
+    caret-color: var(--text);     /* … while the textarea owns the caret */
+    resize: none;
+    outline: none;
+  }
+  .sv-editor textarea::selection { background: rgba(1, 169, 130, 0.30); }
+
+  /* ---- global SV editor modal ---- */
+  .sv-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
+  .sv-modal.hidden { display: none; }
+  .sv-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55); }
+  .sv-dialog {
+    position: relative;
+    width: min(880px, 94vw);
+    height: min(660px, 88vh);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 16px;
+  }
+  .sv-dialog-head { display: flex; align-items: flex-start; gap: 10px; }
+  .sv-dialog-head h2 { margin: 0 0 2px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  .sv-fmt { display: flex; gap: 4px; margin-left: auto; }
+  .sv-fmt button {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 4px 12px;
+    font-size: 12px;
+    border-radius: 6px;
+  }
+  .sv-fmt button.active { color: var(--text); border-color: var(--accent); background: var(--active-bg); }
+  .sv-close { background: none; border: none; color: var(--muted); font-size: 14px; padding: 4px 8px; }
+  .sv-close:hover { color: var(--text); background: none; }
+  .sv-dialog-foot { display: flex; align-items: center; gap: 10px; }
+  .sv-dialog-foot .spacer { flex: 1; }
+  .sv-err { color: var(--red); font-size: 12px; font-family: var(--mono); white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -350,16 +427,13 @@
       <div id="catalog-info" class="empty">loading…</div>
       <input type="file" id="catalog-file" accept=".json,.yaml,.yml,.txt" style="display:none" />
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button id="catalog-upload" class="ghost" style="flex:1" title="Upload a catalog file — JSON or YAML are both accepted">Upload JSON/YAML…</button>
+        <button id="catalog-edit" class="ghost" style="flex:1" title="Edit the live catalog as YAML (JSON switchable) — pygments-highlighted, applied through the same store as an upload">Edit YAML…</button>
         <button id="catalog-clear" class="ghost" title="Remove the uploaded catalog — the configured file takes over again">Remove</button>
       </div>
-      <details style="margin-top:8px">
-        <summary class="hint" style="cursor:pointer">or paste JSON/YAML</summary>
-        <textarea id="catalog-text" rows="7" spellcheck="false"
-          style="width:100%;margin-top:6px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:6px;font:12px/1.5 monospace"
-          placeholder='{"tables": {"workorder/work_order": {"description": "…"}}} — or the same in YAML'></textarea>
-        <button id="catalog-apply" class="ghost" style="margin-top:6px;width:100%">Apply pasted catalog</button>
-      </details>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="catalog-upload" class="ghost" style="flex:1" title="Upload a catalog file — JSON or YAML are both accepted">Upload JSON/YAML…</button>
+      </div>
+      <div class="hint" style="margin-top:8px">Per-dataset docs: select a table → <b>Semantic</b> tab.</div>
     </div>
   </aside>
 
@@ -367,6 +441,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="query">Query</button>
       <button class="tab" data-tab="schema">Schema</button>
+      <button class="tab" data-tab="semantic">Semantic</button>
     </div>
 
     <div id="pane-query" class="pane">
@@ -407,7 +482,56 @@
         <div id="stats-grid"><div class="empty">value ranges, distinct counts and null % — click "Profile table" (scans data)</div></div>
       </div>
     </div>
+
+    <div id="pane-semantic" class="pane hidden">
+      <div class="panel" style="display:flex;flex-direction:column;min-height:0">
+        <div class="sv-dialog-head">
+          <div>
+            <h2 style="margin:0 0 2px">Semantic view — <span id="sv-table-name" style="text-transform:none;color:var(--text)"></span></h2>
+            <div class="hint" id="sv-table-info"></div>
+          </div>
+          <div class="sv-fmt" id="sv-table-fmt">
+            <button type="button" data-fmt="yaml" class="active">YAML</button>
+            <button type="button" data-fmt="json">JSON</button>
+          </div>
+        </div>
+        <div id="sv-table-editor-host" style="margin-top:10px"></div>
+        <div class="sv-dialog-foot" style="margin-top:10px">
+          <span id="sv-table-err" class="sv-err"></span>
+          <span class="spacer"></span>
+          <button id="sv-table-reload" class="ghost" title="Discard edits and reload this entry from the server">Reload</button>
+          <button id="sv-table-remove" class="ghost" title="Remove this table's entry from the catalog">Remove entry</button>
+          <button id="sv-table-apply" title="Apply this table's documentation to the catalog">Apply</button>
+        </div>
+      </div>
+    </div>
   </main>
+</div>
+
+<div id="sv-modal" class="sv-modal hidden" role="dialog" aria-modal="true" aria-label="Semantic catalog editor">
+  <div class="sv-backdrop" id="sv-modal-backdrop"></div>
+  <div class="sv-dialog">
+    <div class="sv-dialog-head">
+      <div>
+        <h2>Semantic catalog editor</h2>
+        <div class="hint" id="sv-modal-info"></div>
+      </div>
+      <div class="sv-fmt" id="sv-modal-fmt">
+        <button type="button" data-fmt="yaml" class="active">YAML</button>
+        <button type="button" data-fmt="json">JSON</button>
+      </div>
+      <button type="button" class="sv-close" id="sv-modal-close" title="Close (Esc)">✕</button>
+    </div>
+    <div id="sv-modal-editor-host" style="flex:1;min-height:0;display:flex">
+      <div id="sv-modal-editor" style="flex:1"></div>
+    </div>
+    <div class="sv-dialog-foot">
+      <span class="hint">Applied edits override the configured catalog file until removed (Remove button, lower left). Documentation only — data stays read-only.</span>
+      <span class="spacer"></span>
+      <span id="sv-modal-err" class="sv-err"></span>
+      <button id="sv-modal-apply">Apply</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -788,6 +912,8 @@ function switchTab(tab) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $("pane-query").classList.toggle("hidden", tab !== "query");
   $("pane-schema").classList.toggle("hidden", tab !== "schema");
+  $("pane-semantic").classList.toggle("hidden", tab !== "semantic");
+  if (tab === "semantic") loadSemanticPane();
 }
 
 // ---- theme toggle ---------------------------------------------------------
@@ -804,6 +930,7 @@ function initThemeToggle() {
     document.documentElement.dataset.theme = t;
     try { localStorage.setItem("sqlhandler-theme", t); } catch (e) { /* ignore */ }
     sync();
+    document.dispatchEvent(new CustomEvent("sv-theme-change"));
     toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
   };
   sync();
@@ -840,7 +967,6 @@ async function refreshCatalog() {
   try {
     const s = await api("/api/semantic-catalog");
     $("catalog-upload").disabled = !s.uploads_enabled;
-    $("catalog-apply").disabled = !s.uploads_enabled;
     $("catalog-clear").disabled = !s.uploaded;
     if (!s.active_path) {
       el.textContent = "No catalog attached — table descriptions off.";
@@ -867,7 +993,6 @@ async function pushCatalog(text, label) {
     });
     toast("Semantic catalog applied: " + res.tables + " table" + (res.tables === 1 ? "" : "s") +
       (label ? " (" + label + ")" : ""));
-    $("catalog-text").value = "";
     refreshCatalog();
   } catch (e) {
     toast(e.message, true);
@@ -882,11 +1007,6 @@ $("catalog-file").onchange = async () => {
   $("catalog-file").value = "";
   await pushCatalog(text, f.name);
 };
-$("catalog-apply").onclick = () => {
-  const text = $("catalog-text").value;
-  if (!text.trim()) { toast("Nothing to apply — paste a catalog first.", true); return; }
-  pushCatalog(text, "pasted text");
-};
 $("catalog-clear").onclick = async () => {
   try {
     await api("/api/semantic-catalog", { method: "DELETE" });
@@ -894,6 +1014,284 @@ $("catalog-clear").onclick = async () => {
     refreshCatalog();
   } catch (e) { toast(e.message, true); }
 };
+
+// ---- SV editor component ----------------------------------------------------
+// A transparent-text textarea layered over a <pre> the SERVER highlights with
+// pygments (lexer guessed from the content — the same `pygmentize -g`
+// approach as the rcat CLI tool). Both layers share identical metrics and
+// never soft-wrap, so they stay in register at any scroll position; the
+// textarea keeps the caret, selection and scrollbars, the pre shows the
+// colors. Without pygments (or over the server's size cap) the highlight
+// layer degrades to plain escaped text — the editor always works.
+function makeSVEditor(mount, sizing) {
+  const ed = document.createElement("div");
+  ed.className = "sv-editor";
+  Object.assign(ed.style, sizing || { height: "320px" });
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  pre.appendChild(code);
+  const ta = document.createElement("textarea");
+  ta.wrap = "off";
+  ta.spellcheck = false;
+  ta.setAttribute("aria-label", "Catalog editor");
+  ed.appendChild(pre);
+  ed.appendChild(ta);
+  mount.appendChild(ed);
+
+  let clean = "";
+  let timer = null;
+  let seq = 0; // ignore stale highlight responses after newer keystrokes
+  let fmt = "yaml"; // seeds the server's -g-style lexer guess (virtual filename)
+
+  const syncScroll = () => { pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; };
+  ta.addEventListener("scroll", syncScroll);
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") { // two spaces — a tab must never move focus out
+      e.preventDefault();
+      const s = ta.selectionStart;
+      ta.value = ta.value.slice(0, s) + "  " + ta.value.slice(ta.selectionEnd);
+      ta.selectionStart = ta.selectionEnd = s + 2;
+      ta.dispatchEvent(new Event("input"));
+    }
+  });
+
+  async function highlightNow() {
+    const text = ta.value;
+    const mine = ++seq;
+    try {
+      const r = await api("/api/highlight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          format: fmt,
+          theme: document.documentElement.dataset.theme === "light" ? "light" : "dark",
+        }),
+      });
+      if (mine !== seq) return;                 // a newer edit already won
+      if (r && r.html) code.innerHTML = r.html; // pygments escapes token text
+      else code.textContent = text;             // no pygments / over cap: plain
+    } catch (err) {
+      if (mine !== seq) return;
+      code.textContent = text;
+    }
+    syncScroll();
+  }
+  const schedule = (ms) => { clearTimeout(timer); timer = setTimeout(highlightNow, ms); };
+  ta.addEventListener("input", () => { schedule(300); if (ed._onchange) ed._onchange(); });
+  document.addEventListener("sv-theme-change", () => schedule(60)); // restyle for the theme
+
+  return {
+    el: ed,
+    get text() { return ta.value; },
+    set text(v) { ta.value = v; code.textContent = v; clean = v; highlightNow(); },
+    get format() { return fmt; },
+    set format(f) { fmt = f; },
+    get dirty() { return ta.value !== clean; },
+    markClean() { clean = ta.value; },
+  };
+}
+
+// ---- global catalog editor (modal, opened from the lower-left panel) -------
+const svModal = { editor: null, format: "yaml" };
+
+function svModalInfoLine(c) {
+  return (c.source === "none"
+    ? "no catalog attached — starter template"
+    : "source: " + c.source + " · " + c.tables + " table" + (c.tables === 1 ? "" : "s")) +
+    (c.uploads_enabled ? "" : " · edits disabled (SQLHANDLER_CATALOG_UPLOAD=0)");
+}
+
+async function openGlobalEditor() {
+  $("sv-modal-err").textContent = "";
+  try {
+    const c = await api("/api/semantic-catalog/content?format=yaml");
+    svModal.format = "yaml";
+    if (!svModal.editor) svModal.editor = makeSVEditor($("sv-modal-editor"), { flex: "1 1 auto", minHeight: "0" });
+    svModal.editor.format = "yaml";
+    svModal.editor.text = c.text;
+    svSyncFmtButtons($("sv-modal-fmt"), "yaml");
+    $("sv-modal-info").textContent = svModalInfoLine(c);
+    $("sv-modal-apply").disabled = !c.uploads_enabled;
+    $("sv-modal").classList.remove("hidden");
+  } catch (e) {
+    toast("Cannot load catalog: " + e.message, true);
+  }
+}
+
+function svSyncFmtButtons(host, fmt) {
+  host.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.fmt === fmt));
+}
+
+function svModalClose(force) {
+  if (!force && svModal.editor && svModal.editor.dirty && !confirm("Discard unsaved edits?")) return;
+  $("sv-modal").classList.add("hidden");
+}
+
+async function svModalSetFormat(fmt) {
+  if (fmt === svModal.format) return;
+  if (svModal.editor && svModal.editor.dirty &&
+      !confirm("Discard unsaved edits and switch to " + fmt.toUpperCase() + "?")) return;
+  try {
+    const c = await api("/api/semantic-catalog/content?format=" + fmt);
+    svModal.format = fmt;
+    svSyncFmtButtons($("sv-modal-fmt"), fmt);
+    svModal.editor.format = fmt;
+    svModal.editor.text = c.text;
+    $("sv-modal-info").textContent = svModalInfoLine(c);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function svModalApply() {
+  const err = $("sv-modal-err");
+  err.textContent = "";
+  try {
+    const res = await api("/api/semantic-catalog", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: svModal.editor.text,
+    });
+    svModal.editor.markClean();
+    toast("Semantic catalog applied: " + res.tables + " table" + (res.tables === 1 ? "" : "s"));
+    refreshCatalog();
+    svModalClose(true);
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+// ---- per-dataset semantic tab ----------------------------------------------
+// One table's breakout of the catalog: its entry as editable YAML (JSON
+// switchable), upserted alone via POST /api/semantic-catalog/table. Editing
+// a table never forks a second entry — the server keeps the existing key.
+const svTable = { editor: null, format: "yaml", loadedFor: null };
+
+function svTableInfoLine(d) {
+  const bits = [];
+  bits.push(d.found ? "editing entry \u201C" + d.key + "\u201D"
+                    : "no entry yet — skeleton prefilled from the schema");
+  if (!d.uploads_enabled) bits.push("edits disabled (SQLHANDLER_CATALOG_UPLOAD=0)");
+  $("sv-table-info").textContent = bits.join(" · ");
+  $("sv-table-apply").disabled = !d.uploads_enabled;
+  $("sv-table-remove").disabled = !d.uploads_enabled || !d.found;
+}
+
+// Skeleton prefilled from the real column list, so documenting a dataset
+// starts from its actual columns rather than a blank editor.
+async function svSkeletonFor(t, fmt) {
+  let cols = null;
+  try {
+    const d = await api("/api/describe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: t.path }),
+    });
+    cols = (d.columns || []).map((c) => c.name);
+  } catch (e) { /* no columns available — bare skeleton */ }
+  if (fmt === "json") {
+    const obj = { description: "", aliases: [], columns: {} };
+    (cols || []).forEach((c) => { obj.columns[c] = ""; });
+    return JSON.stringify(obj, null, 2) + "\n";
+  }
+  const q = (k) => (/^[A-Za-z0-9_.\-]+$/.test(k) ? k : JSON.stringify(k));
+  let y = 'description: ""\naliases: []\n';
+  if (cols && cols.length) {
+    y += "columns:\n" + cols.map((c) => "  " + q(c) + ': ""').join("\n") + "\n";
+  }
+  return y;
+}
+
+async function loadSemanticPane(force) {
+  const t = state.selected;
+  $("sv-table-err").textContent = "";
+  if (!t) {
+    $("sv-table-name").textContent = "(no table selected)";
+    $("sv-table-info").textContent = "Select a dataset in the left panel to view or edit its documentation.";
+    if (svTable.editor) svTable.editor.text = "";
+    svTable.loadedFor = null;
+    return;
+  }
+  // Unsaved edits for THIS table survive a re-click; switching tables with
+  // unsaved edits asks first — one table's docs must never leak into another's.
+  if (svTable.editor && svTable.editor.dirty) {
+    if (svTable.loadedFor === t.path && !force) return;
+    if (!confirm("Discard unsaved edits for " + svTable.loadedFor + "?")) return;
+  }
+  $("sv-table-name").textContent = t.path;
+  $("sv-table-info").textContent = "loading…";
+  try {
+    const d = await api("/api/semantic-catalog/table?table=" + encodeURIComponent(t.path) +
+      "&format=" + svTable.format);
+    svTable.loadedFor = t.path;
+    if (!svTable.editor) svTable.editor = makeSVEditor($("sv-table-editor-host"), { height: "min(420px, 52vh)" });
+    svTable.editor.format = svTable.format;
+    svTable.editor.text = d.found ? d.text : await svSkeletonFor(t, svTable.format);
+    svSyncFmtButtons($("sv-table-fmt"), svTable.format);
+    svTableInfoLine(d);
+  } catch (e) {
+    $("sv-table-info").textContent = "";
+    $("sv-table-err").textContent = e.message;
+  }
+}
+
+async function svTableApply() {
+  const t = state.selected;
+  if (!t || !svTable.editor) return;
+  const err = $("sv-table-err");
+  err.textContent = "";
+  try {
+    const res = await api("/api/semantic-catalog/table", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: t.path, content: svTable.editor.text }),
+    });
+    svTable.editor.markClean();
+    toast("Semantic view updated for " + res.key);
+    svTableInfoLine({ found: true, key: res.key, uploads_enabled: true });
+    refreshCatalog();
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+async function svTableRemove() {
+  const t = state.selected;
+  if (!t) return;
+  if (!confirm("Remove this table's entry from the semantic catalog?")) return;
+  const err = $("sv-table-err");
+  err.textContent = "";
+  try {
+    await api("/api/semantic-catalog/table?table=" + encodeURIComponent(t.path), { method: "DELETE" });
+    toast("Entry removed for " + t.path);
+    refreshCatalog();
+    loadSemanticPane(true);
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+async function svTableSetFormat(fmt) {
+  if (fmt === svTable.format) return;
+  if (svTable.editor && svTable.editor.dirty &&
+      !confirm("Discard unsaved edits and switch to " + fmt.toUpperCase() + "?")) return;
+  svTable.format = fmt;
+  loadSemanticPane(true);
+}
+
+$("catalog-edit").onclick = openGlobalEditor;
+$("sv-modal-close").onclick = () => svModalClose(false);
+$("sv-modal-backdrop").onclick = () => svModalClose(false);
+$("sv-modal-apply").onclick = svModalApply;
+$("sv-modal-fmt").querySelectorAll("button").forEach((b) => (b.onclick = () => svModalSetFormat(b.dataset.fmt)));
+$("sv-table-apply").onclick = svTableApply;
+$("sv-table-remove").onclick = svTableRemove;
+$("sv-table-reload").onclick = () => loadSemanticPane(true);
+$("sv-table-fmt").querySelectorAll("button").forEach((b) => (b.onclick = () => svTableSetFormat(b.dataset.fmt)));
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("sv-modal").classList.contains("hidden")) svModalClose(false);
+});
 
 initThemeToggle();
 refreshStatus();

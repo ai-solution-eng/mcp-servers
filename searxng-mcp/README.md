@@ -114,7 +114,7 @@ nor `NODE_EXTRA_CA_CERTS`). Without the sidecar the server behaves exactly as be
 ```bash
 uv venv --python 3.12 .venv          # or any python ≥3.10
 uv pip install -e . pytest           # or: uv pip install -r <(sed ...) — see pyproject
-.venv/bin/python -m pytest tests/ -v # 55 unit tests (fully mocked, no network)
+.venv/bin/python -m pytest tests/ -v # 58 unit tests (fully mocked, no network)
 
 # Live check against any real SearXNG:
 SEARXNG_URL=https://searxng.example.com SEARXNG_VERIFY_TLS=false \
@@ -217,6 +217,6 @@ searxng_mcp/
 │   └── local/              # per-site values (never committed)
 └── tests/
     ├── test_searxng_mcp.py # 32 unit tests (mocked transport, in-memory MCP)
-    ├── test_browser_render.py # 23 escalation tests (stubbed browser client)
+    ├── test_browser_render.py # 26 escalation tests (stubbed browser client)
     └── live_check.py       # end-to-end check vs a real instance (+ sidecar)
 ```

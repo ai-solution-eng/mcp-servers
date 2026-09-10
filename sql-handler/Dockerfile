@@ -26,7 +26,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN uv pip install --system \
-        pyarrow duckdb azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette \
+        pyarrow duckdb azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette pyyaml pygments \
     && uv pip install --system -e ".[iceberg]"
 
 # Preinstall the external-database scanner extensions (SQLHANDLER_ATTACH):

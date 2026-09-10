@@ -23,6 +23,17 @@ Endpoints (all JSON unless noted):
   POST /api/profile   -> column-level statistics (min/max, null %, distinct, quantiles)
   POST /api/export    -> CSV/Parquet file download of a query or table (attachment)
 
+  Semantic catalog — documentation for agents and humans (the one mutating
+  corner: it writes to the engine's catalog store, never data):
+  GET    /api/semantic-catalog         -> which catalog is live, where from
+  POST   /api/semantic-catalog         -> upload/replace the catalog (JSON or YAML body)
+  DELETE /api/semantic-catalog         -> remove the uploaded catalog
+  GET    /api/semantic-catalog/content -> the live catalog as editable YAML/JSON text
+  GET    /api/semantic-catalog/table   -> one table's entry (?table=, ?format=)
+  POST   /api/semantic-catalog/table   -> upsert one table's entry {table, content}
+  DELETE /api/semantic-catalog/table   -> drop one table's entry (?table=)
+  POST   /api/highlight                -> pygments-guessed HTML (rcat-style -g) for editors
+
 The HTML page is served at ``/`` and ``/ui``.
 """
 
@@ -30,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time as _time
 import uuid
 from collections import OrderedDict
@@ -598,6 +610,141 @@ def api_catalog_clear(engine: SqlEngine) -> dict:
     return {"removed": removed, **engine.catalog_status()}
 
 
+# ---- semantic catalog editor (global + per-table) ----------------------------
+# The editor loads the active catalog as text and writes back through the
+# same upload store a global upload uses, so one precedence rule ("the most
+# recent intentional action wins") covers every path. Per-table edits reuse
+# the store too — the merged catalog is stored, never the fragment alone.
+
+# Syntax highlighting is the rcat approach from the terminal tool: let
+# Pygments GUESS the lexer from filename + content (``pygmentize -g``
+# semantics — a bare content guess misfires on small snippets) seeded by the
+# pane's format, and degrade to plain text — never an error — when pygments
+# is missing or the text is huge.
+try:
+    from pygments import highlight as _pyg_highlight
+    from pygments.formatters import HtmlFormatter as _HtmlFormatter
+    from pygments.lexers import (
+        JsonLexer as _JsonLexer,
+    )
+    from pygments.lexers import (
+        TextLexer as _TextLexer,
+    )
+    from pygments.lexers import (
+        YamlLexer as _YamlLexer,
+    )
+    from pygments.lexers import (
+        guess_lexer_for_filename as _guess_lexer_for_filename,
+    )
+
+    _HAVE_PYGMENTS = True
+except ImportError:  # optional dependency; the editor just shows plain text
+    _HAVE_PYGMENTS = False
+
+# Cap what we are willing to lex per request (client debounces; this guards
+# the server from pathological pastes).
+_HIGHLIGHT_MAX_CHARS = 200_000
+
+# Theme-appropriate pygments styles, overridable like rcat's FV_PYG_STYLE.
+_PYG_STYLES = {
+    "dark": os.environ.get("SQLHANDLER_PYG_STYLE_DARK", "").strip() or "monokai",
+    "light": os.environ.get("SQLHANDLER_PYG_STYLE_LIGHT", "").strip() or "default",
+}
+
+
+def api_catalog_content(engine: SqlEngine, fmt: str = "yaml") -> dict:
+    """GET /api/semantic-catalog/content — the live catalog as editable text.
+
+    YAML is the default user-facing format; ``?format=json`` swaps it.
+    """
+    if fmt not in ("yaml", "json"):
+        raise ValueError("format must be 'yaml' or 'json'")
+    return engine.catalog_content(fmt)
+
+
+def api_catalog_table(engine: SqlEngine, table: str, fmt: str = "yaml") -> dict:
+    """GET /api/semantic-catalog/table — one table's catalog breakout."""
+    if fmt not in ("yaml", "json"):
+        raise ValueError("format must be 'yaml' or 'json'")
+    if not table or not table.strip():
+        raise ValueError("Provide the table to document (?table=...).")
+    return engine.catalog_table_entry(table.strip(), fmt)
+
+
+def api_catalog_table_update(engine: SqlEngine, table: str, content: object) -> dict:
+    """POST /api/semantic-catalog/table — upsert one table's entry.
+
+    Body JSON: ``{"table": <path-or-name>, "content": "<YAML or JSON text>"}``.
+    The fragment replaces that table's entry inside the effective catalog;
+    the merged catalog is stored (uploads disabled -> 400 via ValueError).
+    """
+    if not engine.catalog_uploads_enabled:
+        raise ValueError("Semantic-catalog edits are disabled (SQLHANDLER_CATALOG_UPLOAD=0).")
+    if not isinstance(table, str) or not table.strip():
+        raise ValueError("Provide the table to document.")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Provide the edited catalog entry content.")
+    if len(content) > _CATALOG_UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"Catalog entry too large ({len(content)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES})."
+        )
+    return engine.catalog_update_table(table.strip(), content)
+
+
+def api_catalog_table_remove(engine: SqlEngine, table: str) -> dict:
+    """DELETE /api/semantic-catalog/table — drop one table's entry."""
+    if not engine.catalog_uploads_enabled:
+        raise ValueError("Semantic-catalog edits are disabled (SQLHANDLER_CATALOG_UPLOAD=0).")
+    if not isinstance(table, str) or not table.strip():
+        raise ValueError("Provide the table to remove (?table=...).")
+    return engine.catalog_remove_table(table.strip())
+
+
+def api_highlight(body: dict) -> dict:
+    """POST /api/highlight — pygments-guessed HTML for the editor panes.
+
+    Mirrors rcat: the lexer is GUESSED from filename + content
+    (``pygmentize -g`` = ``guess_lexer_for_filename``, NOT a bare content
+    guess — on small snippets that misfires spectacularly, e.g. Objective-C
+    for YAML). The pane's format seeds the virtual filename. Returns
+    inline-styled HTML (no stylesheet to sync) and degrades to
+    ``highlighted: false`` — never an error — without pygments or over the
+    size cap. The client inserts the HTML into a highlight layer behind a
+    transparent-text textarea.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
+    text = body.get("text")
+    if not isinstance(text, str):
+        raise ValueError("Provide the text to highlight.")  # noqa: TRY004
+    theme = body.get("theme") if body.get("theme") in _PYG_STYLES else "dark"
+    fmt = body.get("format") if body.get("format") in ("yaml", "json") else "yaml"
+    if not _HAVE_PYGMENTS or len(text) > _HIGHLIGHT_MAX_CHARS:
+        return {"html": None, "highlighted": False}
+    try:
+        try:
+            # -g semantics: filename AND content, with a virtual filename.
+            lexer = _guess_lexer_for_filename("sv-edit." + fmt, text)
+        except Exception:
+            lexer = _TextLexer()
+        if isinstance(lexer, _TextLexer):
+            # -g has no opinion (blank/comment-only or unknown content):
+            # sniff so a YAML/JSON pane still colors sensibly.
+            stripped = text.lstrip()
+            lexer = _JsonLexer() if stripped[:1] in ("{", "[") else _YamlLexer()
+        style = _PYG_STYLES[theme]
+        # nowrap: bare token spans (inline colors), NO <div class=highlight><pre>
+        # wrapper — the client inserts this into its own highlight <pre>, whose
+        # metrics must stay identical to the caret textarea layered over it.
+        # The wrapper's inline background/line-height would break that register.
+        html = _pyg_highlight(text, lexer, _HtmlFormatter(noclasses=True, nowrap=True, style=style))
+        return {"html": html, "highlighted": True, "lexer": type(lexer).__name__}
+    except Exception:
+        # Highlighting is cosmetic — a pygments hiccup must never break the
+        # editor; the client falls back to its escaped-plain-text layer.
+        return {"html": None, "highlighted": False}
+
+
 # ---------------------------------------------------------------------------
 # Starlette route wiring
 # ---------------------------------------------------------------------------
@@ -783,6 +930,85 @@ def register_ui(app, engine_getter) -> None:
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    async def semantic_catalog_content(request) -> JSONResponse:
+        try:
+            return JSONResponse(
+                api_catalog_content(engine_getter(), request.query_params.get("format", "yaml"))
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def semantic_catalog_table_get(request) -> JSONResponse:
+        params = request.query_params
+        try:
+            return JSONResponse(
+                api_catalog_table(
+                    engine_getter(), params.get("table", ""), params.get("format", "yaml")
+                )
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def semantic_catalog_table_update(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        try:
+            result = api_catalog_table_update(
+                engine_getter(), body.get("table"), body.get("content")
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse(
+                {
+                    "error": f"Cannot write the catalog store "
+                    f"({engine_getter().catalog_status().get('store_path')}): {exc}. "
+                    "Set SQLHANDLER_CATALOG_STORE to a writable path."
+                },
+                status_code=500,
+            )
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"ok": True, **result})
+
+    async def semantic_catalog_table_delete(request) -> JSONResponse:
+        try:
+            result = api_catalog_table_remove(
+                engine_getter(), request.query_params.get("table", "")
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse({"error": f"Cannot write the catalog store: {exc}"}, status_code=500)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"ok": True, **result})
+
+    async def highlight(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        try:
+            return JSONResponse(api_highlight(body))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
     app.add_route("/api/semantic-catalog", semantic_catalog_get, methods=["GET"])
     app.add_route("/api/semantic-catalog", semantic_catalog_upload, methods=["POST"])
     app.add_route("/api/semantic-catalog", semantic_catalog_delete, methods=["DELETE"])
+    app.add_route("/api/semantic-catalog/content", semantic_catalog_content, methods=["GET"])
+    app.add_route("/api/semantic-catalog/table", semantic_catalog_table_get, methods=["GET"])
+    app.add_route("/api/semantic-catalog/table", semantic_catalog_table_update, methods=["POST"])
+    app.add_route("/api/semantic-catalog/table", semantic_catalog_table_delete, methods=["DELETE"])
+    app.add_route("/api/highlight", highlight, methods=["POST"])

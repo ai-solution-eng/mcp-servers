@@ -571,6 +571,137 @@ def test_catalog_yaml_without_pyyaml_clear_error(tmp_path, monkeypatch):
         eng.set_catalog_text("tables: {}")
 
 
+# ---- catalog editing: content / per-table upsert + remove --------------------
+
+
+def test_catalog_content_yaml_and_json(tmp_path, monkeypatch):
+    """catalog_content serializes the ACTIVE catalog (YAML default, JSON swap)."""
+    p = _write_catalog(tmp_path)
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    eng, _ = _make_engine(tmp_path)
+    y = eng.catalog_content()
+    assert y["format"] == "yaml"
+    assert y["source"] == "configured"
+    assert y["tables"] == 2
+    assert "description: Work order headers" in y["text"]
+    j = eng.catalog_content("json")
+    parsed = json.loads(j["text"])
+    expected = _CATALOG["tables"]["workorder/work_order"]["description"]
+    assert parsed["tables"]["workorder/work_order"]["description"] == expected
+    with pytest.raises(ValueError):
+        eng.catalog_content("xml")
+
+
+def test_catalog_content_starter_when_absent(tmp_path, monkeypatch):
+    """No catalog: the editor gets a starter skeleton, not an empty pane."""
+    monkeypatch.delenv("SQLHANDLER_CATALOG", raising=False)
+    eng, _ = _make_engine(tmp_path)
+    c = eng.catalog_content()
+    assert c["source"] == "none" and c["tables"] == 0
+    assert "tables:" in c["text"]  # the server must be able to parse it back
+    assert eng.catalog_content("json")["text"].lstrip().startswith("{")
+
+
+def test_catalog_table_entry_found_and_missing(tmp_path, monkeypatch):
+    p = _write_catalog(tmp_path)
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    eng, _ = _make_engine(tmp_path)
+    d = eng.catalog_table_entry("workorder/work_order")
+    assert d["found"] is True
+    assert d["key"] == "workorder/work_order"
+    assert "Order class" in d["text"]
+    # a table with no entry: found False, empty text, canonical key = path
+    d2 = eng.catalog_table_entry("workorder/work_order_note")
+    assert d2["found"] is False and d2["text"] == ""
+    assert d2["key"] == "workorder/work_order_note"
+    with pytest.raises(LakehouseError):
+        eng.catalog_table_entry("nope/missing")
+
+
+def test_catalog_update_table_preserves_key(tmp_path, monkeypatch):
+    """An edit updates the key actually being served (bare name here)."""
+    p = _write_catalog(tmp_path, {"tables": {"work_order": {"description": "old"}}})
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    res = eng.catalog_update_table(
+        "workorder/work_order",
+        "description: updated\ncolumns:\n  amount: USD total\n",
+    )
+    assert res["key"] == "work_order"  # the existing bare-name key, not a fork
+    assert res["tables"] == 1
+    assert eng.catalog_status()["active_source"] == "upload"
+    info = next(t for t in eng.list_tables() if t.name == "work_order")
+    assert eng.table_description(info) == "updated"
+
+
+def test_catalog_update_table_creates_and_roundtrips(tmp_path, monkeypatch):
+    """No catalog at all: a per-table edit bootstraps the store; JSON works."""
+    monkeypatch.delenv("SQLHANDLER_CATALOG", raising=False)
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    eng.catalog_update_table(
+        "workorder/work_order", '{"description": "from json", "aliases": ["wo"]}'
+    )
+    d = eng.catalog_table_entry("workorder/work_order")
+    assert d["found"] is True and "from json" in d["text"]
+    # a single-entry `tables:` wrapper is forgiven and unwrapped
+    eng.catalog_update_table(
+        "workorder/work_order", "tables:\n  whatever:\n    description: wrapped\n"
+    )
+    assert eng.catalog_table_entry("workorder/work_order")["text"].startswith("description: wrapped")
+
+
+def test_catalog_update_table_rejects_bad_fragments(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    for frag in (
+        "- just\n- a list\n",  # not a mapping
+        "description: [not, a, string]\n",  # wrong type
+        "aliases: not-a-list\n",
+        "columns:\n  amount: [nope]\n",
+        "",  # empty
+        "tables:\n  a:\n    description: x\n  b:\n    description: y\n",  # multi-entry wrapper
+    ):
+        with pytest.raises(ValueError):
+            eng.catalog_update_table("workorder/work_order", frag)
+    assert not (tmp_path / "store.json").exists()  # nothing was written
+
+
+def test_catalog_update_table_preserves_unknown_keys(tmp_path, monkeypatch):
+    """Hand-written extra fields survive an edit instead of being dropped."""
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    eng.catalog_update_table("workorder/work_order", "description: d\nowner: data-team\n")
+    assert eng._catalog()["workorder/work_order"]["owner"] == "data-team"
+
+
+def test_catalog_remove_table(tmp_path, monkeypatch):
+    p = _write_catalog(tmp_path)  # workorder/work_order + bare work_order
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    # an undocumented table is a no-op
+    assert eng.catalog_remove_table("workorder/work_order_note")["removed"] is False
+    # removing via the table's path drops the path-keyed entry, keeps the rest
+    res = eng.catalog_remove_table("workorder/work_order")
+    assert res == {"removed": True, "key": "workorder/work_order", "tables": 1}
+    # the table is still documented through the bare-name fallback entry
+    d = eng.catalog_table_entry("workorder/work_order")
+    assert d["found"] is True and d["key"] == "work_order"
+    # removing the last remaining entry clears the store entirely — no empty
+    # override shadowing the configured file, which takes back over.
+    assert eng.catalog_remove_table("workorder/work_order") == {
+        "removed": True,
+        "key": "work_order",
+        "tables": 0,
+    }
+    assert not (tmp_path / "store.json").exists()
+    assert eng.catalog_status()["active_source"] == "configured"
+    d = eng.catalog_table_entry("workorder/work_order")
+    assert d["found"] is True and d["key"] == "workorder/work_order"
+
+
 # ---------------------------------------------------------------- did-you-mean
 
 

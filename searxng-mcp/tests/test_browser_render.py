@@ -50,6 +50,62 @@ WEAK_BUT_PRESENT_HTML = """
 """
 
 
+# A marker-less SPA shell in the shape of quotes.toscrape.com/js/ (the live
+# case that motivated the substantial-shell rule): several KB of real markup
+# — meta, stylesheets, empty structural divs, pagination chrome — around a
+# root div that the script bundle fills at runtime. No <noscript>, no
+# challenge markers, and under RENDER_MIN_CHARS of visible text: nothing in
+# the document says "JavaScript required", it just stays empty until rendered.
+def _bare_shell() -> str:
+    pagination = "".join(
+        f'\n        <li class="page-item"><a href="/js/page/{n}/">{n}</a></li>'
+        for n in range(1, 21)
+    )
+    structure = "".join(
+        '\n    <div class="quote" itemscope itemtype="http://schema.org/Quotation">'
+        '<span class="placeholder" data-key="q%d"></span></div>' % n
+        for n in range(1, 21)
+    )
+    head = (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<title>Quotes to Scrape</title>\n'
+        '<link href="/static/bootstrap.min.css" rel="stylesheet">\n'
+        '<link href="/static/docs.min.css" rel="stylesheet">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        '<meta name="description" content="Quotes to Scrape — a sandbox for scraping practice.">\n'
+        '<meta name="csrf-token" content="4f9d2c1e7b6a8f30d51c92e0ab74c6d83f2e91b5">\n'
+        '<meta property="og:title" content="Quotes to Scrape">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:url" content="https://quotes.toscrape.com/js/">\n'
+        '<meta property="og:image" content="https://quotes.toscrape.com/static/og.png">\n'
+        '<link rel="canonical" href="https://quotes.toscrape.com/js/">\n'
+        '<link rel="icon" href="/static/favicon.ico">\n'
+        "</head>\n"
+    )
+    return (
+        head
+        + "<body>\n"
+        '<div class="container">\n'
+        '  <nav class="navbar"><a href="/">Quotes to Scrape</a>'
+        '<a href="/login">Login</a></nav>\n'
+        '  <div class="row header-box"><div class="col-md-8"><h1>'
+        "Quotes to Scrape</h1></div></div>\n"
+        '  <div class="row"><div class="col-md-8" id="quotes">'
+        f"{structure}\n    </div></div>\n"
+        '  <nav aria-label="Page navigation"><ul class="pagination">'
+        f"{pagination}\n  </ul></nav>\n"
+        '  <p class="copyright">Made with \u2764 by Zyte</p>\n'
+        "</div>\n"
+        '<script src="/static/jquery.min.js"></script>\n'
+        '<script src="/js/quotes.js"></script>\n'
+        "</body>\n</html>\n"
+    )
+
+
+BARE_SHELL_HTML = _bare_shell()
+
+
 def rich_page(url="https://spa.example/"):
     return RenderedPage(html=RICH_HTML, final_url=url, title="Rich", status=200)
 
@@ -137,6 +193,14 @@ def test_weak_extraction_js_marker_in_text_escalated():
     assert f._weak_extraction("<html></html>", "Please enable JavaScript to view this page.") is True
 
 
+def test_weak_extraction_bare_spa_shell_escalated():
+    # quotes.toscrape.com/js/ case: a substantial marker-less document whose
+    # readable text is nearly empty — the script bundle injects the content.
+    f = WebContentFetcher(requests_per_minute=1000)
+    assert len(BARE_SHELL_HTML) >= 4000
+    assert f._weak_extraction(BARE_SHELL_HTML, "Quotes to Scrape Login") is True
+
+
 # ---------------------------------------------------------------------------
 # render="auto" escalation behavior
 # ---------------------------------------------------------------------------
@@ -199,6 +263,32 @@ def test_auto_keeps_plain_result_when_browser_text_not_better(monkeypatch):
     out = run(fetcher.fetch_and_parse("https://mixed.example/", DummyCtx()))
     assert len(stub.calls) == 1
     assert "hi" in out
+    assert "(via headless-browser" not in out
+
+
+def test_auto_escalates_on_bare_spa_shell(monkeypatch):
+    # Marker-less shell (no <noscript>, no challenge markers): near-empty
+    # text from a substantial document must still spend a render, and the
+    # rendered extraction wins.
+    fetcher = make_fetcher(monkeypatch, plain_html=BARE_SHELL_HTML)
+    stub = StubBrowserClient(page=rich_page())
+    fetcher._browser = stub
+    out = run(fetcher.fetch_and_parse("https://spa.example/", DummyCtx()))
+    assert len(stub.calls) == 1
+    assert "Headless Browser Rendering" in out
+    assert "(via headless-browser" in out
+
+
+def test_auto_keeps_plain_result_when_render_no_better_on_bare_shell(monkeypatch):
+    # Same shell, but the render produced the same emptiness -> the plain
+    # result is kept and the footer stays browser-free.
+    fetcher = make_fetcher(monkeypatch, plain_html=BARE_SHELL_HTML)
+    empty = RenderedPage(html=BARE_SHELL_HTML, final_url="u", title="App", status=200)
+    stub = StubBrowserClient(page=empty)
+    fetcher._browser = stub
+    out = run(fetcher.fetch_and_parse("https://spa.example/", DummyCtx()))
+    assert len(stub.calls) == 1
+    assert "Quotes to Scrape" in out
     assert "(via headless-browser" not in out
 
 

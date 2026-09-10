@@ -41,7 +41,9 @@ Features that make LLM agents effective against the lake on the first try.
 - Prompts: `explore-data` (list → catalog → profile → SQL) and `analyze-table` (profile-first deep dive on one table).
 
 ### Semantic catalog
-`SQLHANDLER_CATALOG=<file.json>` merges human-written table/column documentation into `list_tables` / `describe_table` / resources. Hot-reloaded on change (cached describes invalidated); a missing/broken file never breaks queries.
+`SQLHANDLER_CATALOG=<file.json|file.yaml>` merges human-written table/column documentation into `list_tables` / `describe_table` / resources. Hot-reloaded on change (cached describes invalidated); a missing/broken file never breaks queries.
+
+- **Browser editing (1.4.0)** — a global **Edit YAML…** editor in the lower-left *Semantic catalog* panel (whole live catalog as YAML, JSON toggle) plus a per-dataset **Semantic** tab on every table (that table's breakout; skeletons prefilled from the real column list; per-entry upsert/remove). Both write through the same validated upload store — YAML default, JSON swap, `pygmentize -g`-style server-side highlighting (graceful plain-text fallback without pygments), `SQLHANDLER_CATALOG_UPLOAD=0` disables applying.
 
 ### Self-correction loops
 - **Did-you-mean errors** — a bad table name in SQL returns the nearest real table names, so the agent self-corrects in one round-trip.

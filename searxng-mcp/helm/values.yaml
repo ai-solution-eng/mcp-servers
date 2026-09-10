@@ -20,7 +20,7 @@ image:
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
-  tag: v1.2.0
+  tag: v1.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -95,7 +95,7 @@ browser:
   enabled: false
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.2.0
+    tag: v1.2.1
     pullPolicy: IfNotPresent
   resources:
     requests:

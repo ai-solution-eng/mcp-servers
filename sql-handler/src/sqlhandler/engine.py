@@ -943,14 +943,30 @@ class SqlEngine:
         )
         return result
 
+    def _write_catalog_store(self, tables: dict) -> str:
+        """Atomically write ``tables`` to the upload store as canonical JSON.
+
+        The store file is always written as canonical JSON (the parsed
+        content re-serialized) so the file on disk stays trivially
+        machine-readable regardless of the format the user edited in.
+        Raises ``OSError`` on an unwritable store (propagates to the API
+        layer, which turns it into an operator-actionable 500).
+        """
+        target = Path(self._catalog_store)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"tables": tables}, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+        # Hot-reload happens on the next _catalog() call (mtime changed), but
+        # resolve it eagerly so a mutation response reflects reality.
+        self._catalog()
+        return str(target)
+
     def set_catalog_text(self, text: str) -> dict:
         """Validate + atomically store an uploaded catalog (JSON or YAML).
 
-        The store file is written as canonical JSON (the parsed content
-        re-serialized) so the file on disk is always trivially
-        machine-readable regardless of the upload format. Raises
-        ``ValueError`` on invalid content; ``OSError`` on an unwritable
-        store propagates to the API layer.
+        Raises ``ValueError`` on invalid content; ``OSError`` on an
+        unwritable store propagates to the API layer.
         """
         data = self._parse_catalog_text(text, "<upload>")
         tables = data.get("tables")
@@ -960,16 +976,9 @@ class SqlEngine:
         for name, entry in tables.items():
             if not isinstance(entry, dict):
                 raise ValueError(f"tables[{name!r}] must be a mapping of documentation fields")  # noqa: TRY004
-        target = Path(self._catalog_store)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, target)
+        target = self._write_catalog_store(tables)
         logger.info("semantic catalog uploaded: %d tables -> %s", len(tables), target)
-        # Hot-reload happens on the next _catalog() call (mtime changed), but
-        # resolve it eagerly so the upload response reflects reality.
-        self._catalog()
-        return {"tables": len(tables), "path": str(target)}
+        return {"tables": len(tables), "path": target}
 
     def clear_catalog(self) -> bool:
         """Remove the uploaded catalog; the configured file takes over again."""
@@ -1019,6 +1028,236 @@ class SqlEngine:
             "active_path": active,
             "active_tables": len(self._catalog()) if active else 0,
         }
+
+    # ---- catalog editing (global + per-table, behind the web UI) ----------
+    # The editor loads the ACTIVE catalog as text, the user edits it, and
+    # applying writes through the same upload store a global upload uses —
+    # so every edit keeps the "most recent intentional action wins"
+    # precedence, the canonical-JSON on-disk format, and hot reload.
+
+    _CATALOG_STARTER_YAML = (
+        "# Semantic catalog — human documentation merged into the MCP and UI\n"
+        "# table/column listings. One entry per table, keyed by its path\n"
+        "# (schema/name), source-qualified name, or bare table name.\n"
+        "tables:\n"
+        "  workorder/work_order:\n"
+        "    description: Maintenance work order headers, one row per order\n"
+        "    aliases: [work orders]\n"
+        "    columns:\n"
+        "      amount: Order total in USD\n"
+        '      kind: "Order class: a=planned, b=unplanned"\n'
+    )
+    _CATALOG_STARTER_JSON = (
+        "{\n"
+        '  "tables": {\n'
+        '    "workorder/work_order": {\n'
+        '      "description": "Maintenance work order headers, one row per order",\n'
+        '      "aliases": ["work orders"],\n'
+        '      "columns": {"amount": "Order total in USD", "kind": "Order class: a=planned, b=unplanned"}\n'
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+    @staticmethod
+    def _serialize_doc(data: dict, fmt: str) -> str:
+        """Serialize catalog content as editable YAML (default) or JSON.
+
+        YAML is the user-facing default (friendlier to hand-edit); JSON is
+        the one-keystroke swap. If pyyaml is missing, YAML falls back to
+        JSON rather than to nothing — the editor must always show text the
+        server can parse back.
+        """
+        if fmt != "yaml":
+            return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        try:
+            import yaml  # optional dependency (pyproject: pyyaml)
+        except ImportError:
+            return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        return yaml.safe_dump(
+            data, sort_keys=False, allow_unicode=True, default_flow_style=False
+        )
+
+    def catalog_content(self, fmt: str = "yaml") -> dict:
+        """The ACTIVE catalog serialized as editable text (YAML by default).
+
+        Serves exactly the mapping ``_catalog()`` merges into describe/list
+        output — the uploaded store first, else the configured
+        SQLHANDLER_CATALOG file — re-serialized in the requested format. With
+        no catalog attached (or an unreadable one) a commented starter
+        template is returned instead, so "edit" on an empty deployment
+        begins from a valid skeleton.
+        """
+        if fmt not in ("yaml", "json"):
+            raise ValueError(f"format must be 'yaml' or 'json', got {fmt!r}")
+        tables = self._catalog()
+        active = self._effective_catalog_file()
+        if active and tables:
+            text = self._serialize_doc({"tables": tables}, fmt)
+            source = "upload" if active == self._catalog_store else "configured"
+        else:
+            text = self._CATALOG_STARTER_JSON if fmt == "json" else self._CATALOG_STARTER_YAML
+            source = "none"
+        return {
+            "format": fmt,
+            "text": text,
+            "tables": len(tables),
+            "source": source,
+            "path": active,
+            "uploads_enabled": self.catalog_uploads_enabled,
+        }
+
+    def _catalog_key_for(self, info: TableInfo) -> str | None:
+        """The catalog key that currently documents ``info`` (None if absent).
+
+        Same precedence as :meth:`_catalog_for` — an edit must update the
+        key that is actually being served, not fork a second entry for the
+        same table under a different spelling.
+        """
+        catalog = self._catalog()
+        for key in (info.path, info.qualified_name, info.name):
+            entry = catalog.get(key)
+            if isinstance(entry, dict):
+                return key
+        return None
+
+    def _resolve_catalog_target(self, table: str) -> TableInfo:
+        """Resolve a table for catalog editing — it must exist in the source.
+
+        Unlike :meth:`_resolve` (which synthesizes a schema/name pair so SQL
+        can address not-yet-listed tables), documenting a table the source
+        does not expose is a user error — a typo would silently create an
+        orphan entry — so it fails loudly instead.
+        """
+        info = self._resolve(table)
+        for t in self.list_tables():
+            if info.qualified_name == t.qualified_name or (info.path, info.name) == (t.path, t.name):
+                return info
+        raise LakehouseError(f"Table '{table}' not found in data source")
+
+    def catalog_table_entry(self, table: str, fmt: str = "yaml") -> dict:
+        """One table's catalog breakout, serialized for the editor.
+
+        ``table`` resolves exactly like a query (path, source-qualified or
+        bare name). When the catalog has no entry for it, ``found`` is False
+        and ``text`` is empty — the UI prefills a skeleton from the table's
+        real schema so documenting a dataset starts from its columns.
+        """
+        if fmt not in ("yaml", "json"):
+            raise ValueError(f"format must be 'yaml' or 'json', got {fmt!r}")
+        info = self._resolve_catalog_target(table)
+        key = self._catalog_key_for(info)
+        entry = self._catalog().get(key) if key is not None else None
+        return {
+            "table": info.path,
+            "found": entry is not None,
+            "key": key if key is not None else info.path,
+            "text": self._serialize_doc(entry, fmt) if entry is not None else "",
+            "uploads_enabled": self.catalog_uploads_enabled,
+        }
+
+    @staticmethod
+    def _validate_catalog_entry(entry: object, origin: str) -> dict:
+        """Validate one table's documentation entry; returns the cleaned copy.
+
+        ``description`` must be a string, ``aliases`` a list of strings and
+        ``columns`` a mapping of column name -> string description. Unknown
+        keys are preserved as-is so hand-written extras survive an edit.
+        Raises ``ValueError`` (user input -> HTTP 400) on wrong types.
+        """
+        if not isinstance(entry, dict):
+            raise ValueError(f"{origin}: entry must be a mapping of documentation fields")  # noqa: TRY004
+        out: dict = {}
+        desc = entry.get("description")
+        if desc is not None:
+            if not isinstance(desc, str):
+                raise ValueError(f"{origin}: 'description' must be a string")
+            out["description"] = desc
+        aliases = entry.get("aliases")
+        if aliases is not None:
+            if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+                raise ValueError(f"{origin}: 'aliases' must be a list of strings")
+            out["aliases"] = aliases
+        columns = entry.get("columns")
+        if columns is not None:
+            if not isinstance(columns, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in columns.items()
+            ):
+                raise ValueError(f"{origin}: 'columns' must map column names to string descriptions")
+            out["columns"] = columns
+        for k, v in entry.items():
+            if k not in out and k not in ("description", "aliases", "columns"):
+                out[k] = v
+        return out
+
+    def _parse_catalog_entry_text(self, text: str) -> dict:
+        """Parse one table's documentation fragment (JSON or YAML).
+
+        Accepts the entry itself (``description``/``aliases``/``columns``);
+        a single-entry ``tables:`` wrapper is also unwrapped, so pasting a
+        slice of a full catalog still lands on the right table.
+        """
+        try:
+            data = json.loads(text)
+        except Exception:
+            try:
+                import yaml  # optional dependency (pyproject: pyyaml)
+            except ImportError:
+                raise ValueError(
+                    "entry is not valid JSON, and PyYAML is not installed "
+                    "(YAML entries need the 'pyyaml' package)"
+                ) from None
+            try:
+                data = yaml.safe_load(text)
+            except Exception as exc:
+                raise ValueError(f"catalog entry is not valid JSON or YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("catalog entry must be a mapping (description / aliases / columns)")  # noqa: TRY004
+        if set(data) == {"tables"} and isinstance(data["tables"], dict):
+            if len(data["tables"]) != 1:
+                raise ValueError(
+                    "a per-table edit takes ONE table's entry — "
+                    "use the global editor for a full catalog"
+                )
+            (data,) = data["tables"].values()
+        return self._validate_catalog_entry(data, "<entry>")
+
+    def catalog_update_table(self, table: str, text: str) -> dict:
+        """Upsert ONE table's documentation from an edited fragment.
+
+        The fragment (JSON or YAML) replaces that table's entry inside the
+        effective catalog and the merged result is written to the upload
+        store — which overrides the operator's configured file, exactly like
+        a global upload. The existing entry key is preserved when the table
+        is already documented, so an edit never forks a duplicate entry.
+        """
+        entry = self._parse_catalog_entry_text(text)
+        info = self._resolve_catalog_target(table)
+        key = self._catalog_key_for(info) or info.path
+        merged = dict(self._catalog())
+        merged[key] = entry
+        target = self._write_catalog_store(merged)
+        logger.info("semantic catalog: updated entry %r -> %s", key, target)
+        return {"tables": len(merged), "key": key, "path": target}
+
+    def catalog_remove_table(self, table: str) -> dict:
+        """Remove ONE table's entry from the effective catalog.
+
+        The remaining entries are written to the upload store. When nothing
+        remains, the store is removed entirely instead of left as an empty
+        override, so the configured file (if any) takes back over.
+        """
+        info = self._resolve_catalog_target(table)
+        key = self._catalog_key_for(info)
+        if key is None:
+            return {"removed": False, "key": info.path, "tables": len(self._catalog())}
+        merged = {k: v for k, v in self._catalog().items() if k != key}
+        if merged:
+            self._write_catalog_store(merged)
+        else:
+            self.clear_catalog()
+        logger.info("semantic catalog: removed entry %r", key)
+        return {"removed": True, "key": key, "tables": len(merged)}
 
     def _catalog_for(self, info: TableInfo) -> dict:
         """The catalog entry for a table, matched by path/qualified/bare name."""

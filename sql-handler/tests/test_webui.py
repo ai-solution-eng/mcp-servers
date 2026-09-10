@@ -7,15 +7,23 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from sqlhandler import webui as webui_module
 from sqlhandler.config import FileConfig
 from sqlhandler.engine import SqlEngine
 from sqlhandler.file import FileProvider
+from sqlhandler.provider import LakehouseError
 from sqlhandler.webui import (
+    _HIGHLIGHT_MAX_CHARS,
     _clamp_limit,
     api_catalog_clear,
+    api_catalog_content,
     api_catalog_status,
+    api_catalog_table,
+    api_catalog_table_remove,
+    api_catalog_table_update,
     api_catalog_upload,
     api_describe,
+    api_highlight,
     api_preview,
     api_query,
     api_status,
@@ -409,3 +417,133 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
     assert client.post("/api/semantic-catalog", content=b"{broken", headers=auth).status_code == 400
     assert client.delete("/api/semantic-catalog", headers=auth).json()["removed"] is True
     assert "description" not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
+
+
+# ---------------------------------------------------------------------------
+# semantic catalog editor: content / per-table upsert + remove / highlight
+# ---------------------------------------------------------------------------
+
+
+def _catalog_engine(tmp_path, monkeypatch):
+    """A file-backend engine with an isolated catalog store."""
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    pq.write_table(pa.table({"id": [1, 2, 3], "qty": [1.0, 2.0, 3.0]}), str(tmp_path / "orders.parquet"))
+    return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
+
+
+def test_catalog_content_api(engine):
+    y = api_catalog_content(engine)
+    assert y["format"] == "yaml" and y["source"] == "none"
+    assert y["uploads_enabled"] is True and "tables:" in y["text"]
+    j = api_catalog_content(engine, "json")
+    assert "tables" in __import__("json").loads(j["text"])
+    with pytest.raises(ValueError):
+        api_catalog_content(engine, "xml")
+
+
+def test_catalog_table_api_roundtrip(tmp_path, monkeypatch):
+    eng = _catalog_engine(tmp_path, monkeypatch)
+    d = api_catalog_table(eng, "orders")
+    assert d["found"] is False and d["text"] == "" and d["key"] == "orders"
+    api_catalog_table_update(eng, "orders", "description: my orders\ncolumns:\n  qty: units\n")
+    d = api_catalog_table(eng, "orders", "json")
+    assert d["found"] is True
+    import json as _json
+
+    assert _json.loads(d["text"])["description"] == "my orders"
+    res = api_catalog_table_remove(eng, "orders")
+    assert res["removed"] is True
+    assert api_catalog_table(eng, "orders")["found"] is False
+    with pytest.raises(ValueError):
+        api_catalog_table(eng, "")
+    with pytest.raises(LakehouseError):  # unknown table
+        api_catalog_table(eng, "missing_table")
+
+
+def test_catalog_table_update_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_CATALOG_UPLOAD", "0")
+    eng = _catalog_engine(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="disabled"):
+        api_catalog_table_update(eng, "orders", "description: x")
+    with pytest.raises(ValueError, match="disabled"):
+        api_catalog_table_remove(eng, "orders")
+
+
+def test_highlight_api():
+    r = api_highlight({"text": "tables:\n  orders:\n    description: x\n", "theme": "dark"})
+    if r["highlighted"]:
+        assert "<span" in r["html"] and "style" in r["html"]
+        # -g semantics with a virtual filename: a YAML pane lexes as YAML
+        # (a bare content guess returns e.g. ObjectiveC/Scdoc here).
+        assert r["lexer"] == "YamlLexer"
+    r2 = api_highlight({"text": '{"tables": {}}', "theme": "light", "format": "json"})
+    if r2["highlighted"]:
+        assert r2["lexer"] == "JsonLexer"
+    with pytest.raises(ValueError):
+        api_highlight({"nope": 1})
+    assert api_highlight({"text": "a" * (_HIGHLIGHT_MAX_CHARS + 1)})["highlighted"] is False
+
+
+def test_highlight_api_fallback_without_pygments(monkeypatch):
+    monkeypatch.setattr(webui_module, "_HAVE_PYGMENTS", False)
+    assert api_highlight({"text": "tables: {}"}) == {"html": None, "highlighted": False}
+
+
+def test_semantic_editor_http_routes(tmp_path, monkeypatch):
+    """The editor endpoints over HTTP: auth, content, per-table, highlight."""
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.server import (
+        _ApiTokenMiddleware,
+        _transport_security,
+    )
+    from sqlhandler.server import (
+        mcp as mcp_server,
+    )
+
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    pq.write_table(pa.table({"id": [1, 2], "amount": [1.0, 2.0]}), str(tmp_path / "orders.parquet"))
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
+
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    register_ui(app, lambda: eng)
+    app.add_middleware(_ApiTokenMiddleware, token="tok-123")
+    client = TestClient(app)
+    auth = {"X-API-Token": "tok-123"}
+
+    # the new routes are behind the same token middleware as the rest of /api
+    assert client.get("/api/semantic-catalog/content").status_code == 401
+    assert client.post("/api/highlight", json={"text": "x: 1"}).status_code == 401
+
+    r = client.get("/api/semantic-catalog/content", headers=auth)
+    assert r.status_code == 200 and r.json()["format"] == "yaml"
+    assert client.get("/api/semantic-catalog/content?format=xml", headers=auth).status_code == 400
+
+    r = client.get("/api/semantic-catalog/table?table=orders", headers=auth)
+    assert r.status_code == 200 and r.json()["found"] is False
+
+    r = client.post(
+        "/api/semantic-catalog/table",
+        json={"table": "orders", "content": "description: via http"},
+        headers=auth,
+    )
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "via http"
+    assert client.post(
+        "/api/semantic-catalog/table", json={"table": "orders"}, headers=auth
+    ).status_code == 400  # missing content
+
+    r = client.post("/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["highlighted"] in (True, False)  # pygments is optional by design
+    if body["highlighted"]:
+        assert "<span" in body["html"]
+
+    r = client.delete("/api/semantic-catalog/table?table=orders", headers=auth)
+    assert r.status_code == 200 and r.json()["removed"] is True
+    assert client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"] is False
