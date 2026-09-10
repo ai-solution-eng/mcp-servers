@@ -1,9 +1,6 @@
 # SearXNG MCP Server
 
-MCP 2.0 server for web search backed by a **self-hosted SearXNG** instance,
-bundled as a sidecar container. Drop-in replacement for `ddgs-lite`: same two
-tools (`search`, `fetch_content`), same output layout — but the metasearch
-part runs on SearXNG's stable JSON API instead of client-side scraping.
+MCP 2.0 server for web search backed by a **self-hosted SearXNG** instance, bundled as a sidecar container. Drop-in replacement for `ddgs-lite`: same two tools (`search`, `fetch_content`), same output layout — but the metasearch part runs on SearXNG's stable JSON API instead of client-side scraping.
 
 ```
 ┌────────────────────────── Pod (searxng-mcp) ──────────────────────────┐
@@ -35,11 +32,7 @@ part runs on SearXNG's stable JSON API instead of client-side scraping.
 | Categories | text only | general, news, images, videos, music, files, it, science, … |
 | Content fetching | ddgs extract (primp TLS impersonation) → httpx → Wikipedia API | trafilatura / bs4+html2text extraction; fetching escalates plain httpx → **curl_cffi (Chrome TLS fingerprint)** → Wikipedia API |
 
-**Note:** TLS fingerprint impersonation is back for *fetching* — via
-`curl_cffi` (a maintained libcurl-impersonate binding), used as an
-escalation when a site 403s plain clients. Unlike ddgs, it impersonates
-only the TLS handshake for page fetches; search itself never scrapes —
-it rides SearXNG's JSON API, so no scraping library is in the search path.
+**Note:** TLS fingerprint impersonation is back for *fetching* — via `curl_cffi` (a maintained libcurl-impersonate binding), used as an escalation when a site 403s plain clients. Unlike ddgs, it impersonates only the TLS handshake for page fetches; search itself never scrapes — it rides SearXNG's JSON API, so no scraping library is in the search path.
 
 ## Tools
 
@@ -58,16 +51,9 @@ search(
 ) -> str
 ```
 
-- `backend="auto"` lets SearXNG fan out over its enabled engines (default).
-  Any other value becomes SearXNG's `engines` parameter, e.g.
-  `backend="wikipedia"` or `backend="google,bing"`.
-- `region` accepts both ddgs-style codes and native SearXNG locales —
-  `us-en` → `en-US`, `de-de` → `de-DE`, `uk-en` → `en-GB`, `wt-wt` → `all`.
-  If SearXNG rejects a code, the client retries once without it.
-- Output mirrors ddgs-lite (`Found N search results:` + numbered
-  title/URL/Summary) plus `Answer:`, `Related searches:`, and a
-  `Note: some engines did not respond: …` line when engines fail — so an
-  agent can distinguish "no such thing" from "engines are down/suspended".
+- `backend="auto"` lets SearXNG fan out over its enabled engines (default). Any other value becomes SearXNG's `engines` parameter, e.g. `backend="wikipedia"` or `backend="google,bing"`.
+- `region` accepts both ddgs-style codes and native SearXNG locales — `us-en` → `en-US`, `de-de` → `de-DE`, `uk-en` → `en-GB`, `wt-wt` → `all`. If SearXNG rejects a code, the client retries once without it.
+- Output mirrors ddgs-lite (`Found N search results:` + numbered title/URL/Summary) plus `Answer:`, `Related searches:`, and a `Note: some engines did not respond: …` line when engines fail — so an agent can distinguish "no such thing" from "engines are down/suspended".
 
 ### `fetch_content`
 
@@ -82,28 +68,13 @@ fetch_content(
 ) -> str
 ```
 
-Same output contract as ddgs-lite, including the
-`[Content info: Showing characters X-Y of Z total. Use start_index=… to see
-more (via …)]` pagination footer.
+Same output contract as ddgs-lite, including the `[Content info: Showing characters X-Y of Z total. Use start_index=… to see more (via …)]` pagination footer.
 
-Fetch escalation: `auto`/`trafilatura`/`bs4` fetch with plain httpx first and
-automatically retry through **curl_cffi impersonating Chrome** when the site
-rejects plain python clients (TLS-fingerprint 403s — wikipedia does this from
-some egress paths). `curl` always uses the impersonated fetch; `wikipedia`
-goes straight to the Wikipedia API. Failures are self-describing — the error
-includes the last attempt's HTTP status or exception.
+Fetch escalation: `auto`/`trafilatura`/`bs4` fetch with plain httpx first and automatically retry through **curl_cffi impersonating Chrome** when the site rejects plain python clients (TLS-fingerprint 403s — wikipedia does this from some egress paths). `curl` always uses the impersonated fetch; `wikipedia` goes straight to the Wikipedia API. Failures are self-describing — the error includes the
+last attempt's HTTP status or exception.
 
-**Headless-browser escalation** (when the sidecar is deployed — see the
-section below): `render="auto"` further escalates to a real Chromium render
-when the plain ladder fails outright or returns a JS-stub shell (near-empty
-text, `<noscript>` markers, challenge interstitials); the rendered DOM flows
-through the same trafilatura → bs4 extraction chain and the
-`(via headless-browser+…)` footer says so. `render="always"` skips plain HTTP
-entirely; `render="never"` keeps the old plain-only behavior.
-`include_screenshot=True` forces a browser render and appends the page
-screenshot as a base64 PNG data URL — pass it to a vision tool as-is. Every
-browser failure degrades gracefully to the plain result with the reason
-logged; the sidecar is never a hard dependency.
+**Headless-browser escalation** (when the sidecar is deployed — see the section below): `render="auto"` further escalates to a real Chromium render when the plain ladder fails outright or returns a JS-stub shell (near-empty text, `<noscript>` markers, challenge interstitials); the rendered DOM flows through the same trafilatura → bs4 extraction chain and the `(via headless-browser+…)` footer says
+so. `render="always"` skips plain HTTP entirely; `render="never"` keeps the old plain-only behavior. `include_screenshot=True` forces a browser render and appends the page screenshot as a base64 PNG data URL — pass it to a vision tool as-is. Every browser failure degrades gracefully to the plain result with the reason logged; the sidecar is never a hard dependency.
 
 ## Configuration (environment variables)
 
@@ -120,27 +91,14 @@ logged; the sidecar is never a hard dependency.
 | `BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Headless-browser sidecar CDP endpoint |
 | `BROWSER_NAV_TIMEOUT_MS` etc. | see `browser_client.py` | Nav timeout, settle wait, max pages, resource blocking |
 
-The search client deliberately ignores environment proxies
-(`trust_env=False`): the sidecar is reached over `localhost`, and nothing
-must intercept that.
+The search client deliberately ignores environment proxies (`trust_env=False`): the sidecar is reached over `localhost`, and nothing must intercept that.
 
 ## Headless browser rendering (optional sidecar)
 
-JS-only pages (SPAs, challenge interstitials) are invisible to plain HTTP
-fetching. The optional `browser` container — Playwright's Chromium headless
-shell — closes that gap. All containers in a pod share a network namespace,
-so the MCP server connects over `http://127.0.0.1:9222` with **no service,
-port, or policy changes** — and because CDP binds loopback only, nothing
-outside the pod can reach it (CDP is unauthenticated
-code-execution-as-browser-user; on a cluster without NetworkPolicies this
-binding is not negotiable — never add `--remote-debugging-address=0.0.0.0`).
+JS-only pages (SPAs, challenge interstitials) are invisible to plain HTTP fetching. The optional `browser` container — Playwright's Chromium headless shell — closes that gap. All containers in a pod share a network namespace, so the MCP server connects over `http://127.0.0.1:9222` with **no service, port, or policy changes** — and because CDP binds loopback only, nothing outside the pod can reach
+it (CDP is unauthenticated code-execution-as-browser-user; on a cluster without NetworkPolicies this binding is not negotiable — never add `--remote-debugging-address=0.0.0.0`).
 
-Build & push (separate image; the MCP image stays slim — only the ~40 MB
-playwright *client* package is added to it). The Playwright version is baked
-into the Dockerfile as the `ARG PLAYWRIGHT_VERSION` default, so no build-arg
-is needed; pass `--build-arg PLAYWRIGHT_VERSION=<ver>` only to override it
-without editing the file (e.g., once a version with official Debian-13
-support lands):
+Build & push (separate image; the MCP image stays slim — only the ~40 MB playwright *client* package is added to it). The Playwright version is baked into the Dockerfile as the `ARG PLAYWRIGHT_VERSION` default, so no build-arg is needed; pass `--build-arg PLAYWRIGHT_VERSION=<ver>` only to override it without editing the file (e.g., once a version with official Debian-13 support lands):
 
 ```bash
 docker buildx build \
@@ -148,14 +106,8 @@ docker buildx build \
   mcp_servers/searxng_mcp/browser --push
 ```
 
-Then enable per site: `browser.enabled: true` (+ resources) in the site
-values. The chart adds the container with CDP `json/version` exec probes,
-turns `proxy.https` into Chromium's `--proxy-server` (Chromium ignores
-`*_PROXY` env vars), and — with `browser.caCert.enabled` — mounts the
-corporate MITM CA ConfigMap into the container trust store at startup
-(Chromium honors neither `SSL_CERT_FILE` nor `NODE_EXTRA_CA_CERTS`). Without
-the sidecar the server behaves exactly as before: escalation is simply
-unavailable and self-describes in tool output.
+Then enable per site: `browser.enabled: true` (+ resources) in the site values. The chart adds the container with CDP `json/version` exec probes, turns `proxy.https` into Chromium's `--proxy-server` (Chromium ignores `*_PROXY` env vars), and — with `browser.caCert.enabled` — mounts the corporate MITM CA ConfigMap into the container trust store at startup (Chromium honors neither `SSL_CERT_FILE`
+nor `NODE_EXTRA_CA_CERTS`). Without the sidecar the server behaves exactly as before: escalation is simply unavailable and self-describes in tool output.
 
 ## Local development
 
@@ -201,22 +153,13 @@ helm upgrade --install searxng-mcp helm/ -n searxng-mcp --create-namespace \
 
 Chart contents:
 
-- `deployment.yaml` — one pod: an init container that copies the settings
-  ConfigMap into an `emptyDir` (SearXNG's entrypoint writes to
-  `/etc/searxng`), the SearXNG sidecar (8080), the MCP server (9090), and —
-  when `browser.enabled` — the headless-browser sidecar (loopback CDP).
-- `configmap.yaml` — renders `settings.yml` from values: JSON format
-  enabled, limiter off (no valkey needed), optional disabled-engine list
-  (default: none), optional
-  `outgoing.proxies` for the corporate proxy.
+- `deployment.yaml` — one pod: an init container that copies the settings ConfigMap into an `emptyDir` (SearXNG's entrypoint writes to `/etc/searxng`), the SearXNG sidecar (8080), the MCP server (9090), and — when `browser.enabled` — the headless-browser sidecar (loopback CDP).
+- `configmap.yaml` — renders `settings.yml` from values: JSON format enabled, limiter off (no valkey needed), optional disabled-engine list (default: none), optional `outgoing.proxies` for the corporate proxy.
 - `service.yaml` — ports `mcp` (9090) and `searxng` (8080).
-- `virtualservice.yaml` — `/mcp` → 9090 (MCP), `/` → 8080 (**the normal
-  SearXNG web page**), behind the EZAF gateway.
+- `virtualservice.yaml` — `/mcp` → 9090 (MCP), `/` → 8080 (**the normal SearXNG web page**), behind the EZAF gateway.
 - `kyverno.yaml` — vendor label policy (same as ddgs-lite).
 
-On HPE-network clusters set `hpe_proxies: true` — this wires the corporate
-proxy into both SearXNG's engine requests (settings.yml) and the MCP
-container's `fetch_content` egress (env), matching the ddgs-lite convention.
+On HPE-network clusters set `hpe_proxies: true` — this wires the corporate proxy into both SearXNG's engine requests (settings.yml) and the MCP container's `fetch_content` egress (env), matching the ddgs-lite convention.
 
 ### MCP client registration
 
@@ -241,44 +184,19 @@ Or through the gateway (oauth2-proxy protected):
 
 1. Deploy this chart to its own namespace (e.g. `searxng-mcp`).
 2. Verify: `curl -s http://searxng-mcp-service.searxng-mcp.svc.cluster.local:9090/mcp`.
-3. Flip the MCP client entry `mcp-duck-duck-go` (ddgs-lite) to the
-   `mcp-searxng` entry above — tool names and signatures are unchanged, so
-   agents keep working; only `backend` values change meaning
-   (engine allowlist instead of ddgs backend names).
+3. Flip the MCP client entry `mcp-duck-duck-go` (ddgs-lite) to the `mcp-searxng` entry above — tool names and signatures are unchanged, so agents keep working; only `backend` values change meaning (engine allowlist instead of ddgs backend names).
 4. Decommission the ddgs-lite release when confident.
 
 ## SearXNG settings notes
 
-- `search.formats` **must** include `json` — the MCP server uses
-  `format=json`, and SearXNG returns 403 otherwise (the client surfaces a
-  targeted hint when that happens).
-- **Engine overrides go at the TOP LEVEL of settings.yml** (`engines:`), not
-  under `search.engines:`. SearXNG's settings loader
-  (`searx/settings_loader.py`) reads `user_settings['engines']` only — a
-  `search.engines` key is silently ignored. (The pre-existing `searxng`
-  namespace deployment made exactly this mistake: its ConfigMap "disabled"
-  brave/duckduckgo/startpage, but `/config` showed them enabled and failing
-  for 12 days.)
-- **Sidecar image pinning.** The chart pins SearXNG to the dated tag that
-  Docker Hub's `latest` resolved to when the chart was last touched (never
-  the mutable `latest` tag itself — pods rescheduled later would silently
-  get different engines/settings). To refresh the pin: look up the newest
-  dated tag on Docker Hub, bump `searxng.image.tag` in values, and upgrade.
-  For a fully immutable reference, use the digest form
-  (`image: searxng/searxng@sha256:…`). The MCP server side is decoupled
-  from SearXNG releases — it speaks the JSON API, whose schema has been
-  stable for years — so sidecar upgrades are low-risk; validate with
-  `GET /config` and one search call after upgrading.
-- `server.limiter: false` keeps the limiter off for internal API use — no
-  valkey/redis required. Add valkey only if you ever expose this publicly.
-- **Default: no engines are disabled.** All default SearXNG engines stay on,
-  including ddg/brave/startpage. SearXNG auto-suspends engines that fail
-  repeatedly (transient, self-recovers) and the search tool reports
-  `some engines did not respond: …` per query — so an engine being flaky
-  costs a little latency, never correctness. If one proves *consistently*
-  dead on a given network (startpage showed a hard CAPTCHA wall on the HPE
-  proxy during testing), add it to `searxng.disabledEngines` in values and
-  `helm upgrade`; verify with `GET /config` afterwards.
+- `search.formats` **must** include `json` — the MCP server uses `format=json`, and SearXNG returns 403 otherwise (the client surfaces a targeted hint when that happens).
+- **Engine overrides go at the TOP LEVEL of settings.yml** (`engines:`), not under `search.engines:`. SearXNG's settings loader (`searx/settings_loader.py`) reads `user_settings['engines']` only — a `search.engines` key is silently ignored. (The pre-existing `searxng` namespace deployment made exactly this mistake: its ConfigMap "disabled" brave/duckduckgo/startpage, but `/config` showed them
+  enabled and failing for 12 days.)
+- **Sidecar image pinning.** The chart pins SearXNG to the dated tag that Docker Hub's `latest` resolved to when the chart was last touched (never the mutable `latest` tag itself — pods rescheduled later would silently get different engines/settings). To refresh the pin: look up the newest dated tag on Docker Hub, bump `searxng.image.tag` in values, and upgrade. For a fully immutable reference,
+  use the digest form (`image: searxng/searxng@sha256:…`). The MCP server side is decoupled from SearXNG releases — it speaks the JSON API, whose schema has been stable for years — so sidecar upgrades are low-risk; validate with `GET /config` and one search call after upgrading.
+- `server.limiter: false` keeps the limiter off for internal API use — no valkey/redis required. Add valkey only if you ever expose this publicly.
+- **Default: no engines are disabled.** All default SearXNG engines stay on, including ddg/brave/startpage. SearXNG auto-suspends engines that fail repeatedly (transient, self-recovers) and the search tool reports `some engines did not respond: …` per query — so an engine being flaky costs a little latency, never correctness. If one proves *consistently* dead on a given network (startpage showed a
+  hard CAPTCHA wall on the HPE proxy during testing), add it to `searxng.disabledEngines` in values and `helm upgrade`; verify with `GET /config` afterwards.
 
 ## Files
 

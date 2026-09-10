@@ -41,6 +41,8 @@
     --err-border: #5a2430;
     --err-text: #ffb3b3;
     --shadow: rgba(0, 0, 0, 0.4);
+    --grp-a: rgba(255, 255, 255, 0.04);
+    --grp-b: rgba(255, 255, 255, 0.10);
     --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
   }
   /* Light theme: opt in via <html data-theme="light">, set before first paint
@@ -68,6 +70,8 @@
     --err-border: #f3c1c1;
     --err-text: #b91c1c;
     --shadow: rgba(15, 23, 42, 0.15);
+    --grp-a: rgba(1, 169, 130, 0.06);
+    --grp-b: rgba(1, 169, 130, 0.13);
   }
   * { box-sizing: border-box; }
   @font-face {
@@ -409,6 +413,35 @@
   .step-list { margin: 0; padding-left: 18px; font-size: 13px; }
   .step-list li { margin: 6px 0; }
   .step-list code { font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+  /* GPU tab: NVLink domain cards + per-GPU tiles */
+  .gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+  .gpu-domain { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .gpu-domain-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; flex-wrap: wrap; }
+  .gpu-domain-name { font-weight: 700; font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .gpu-domain-stats { color: var(--muted); font-size: 11px; margin-bottom: 10px; font-family: var(--mono); }
+  .wl-chip {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px; padding: 1px 7px;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--panel);
+    color: var(--muted); margin: 1px 2px 1px 0; white-space: nowrap;
+  }
+  .gpu-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .gpu-tile { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+  .gpu-tile-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .gpu-tile-head b { font-family: var(--mono); font-size: 12.5px; }
+  .gbar { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 10px; color: var(--muted); }
+  .gbar > span:first-child { width: 28px; text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; }
+  .gbar .hbar-track { height: 10px; }
+  .gbar-val { font-family: var(--mono); font-size: 11px; color: var(--text); min-width: 38px; text-align: right; }
+  .gpu-tile-foot { margin-top: 7px; font-size: 10.5px; line-height: 1.7; }
+  .gpu-tile-foot .warn { color: var(--red); font-weight: 700; }
+  /* Sortable tables + deployment group banding (a lighter/darker swap when
+     the group changes, so rows of one workload/deployment read as a block) */
+  th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sortable:hover { color: var(--accent); }
+  th.sortable .arrow { font-size: 9px; color: var(--accent); margin-left: 3px; }
+  tr.grp-a td { background: var(--grp-a); }
+  tr.grp-b td { background: var(--grp-b); }
+  .grp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -440,6 +473,7 @@
   <main>
     <div class="tabs">
       <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="gpu">GPU</button>
       <button class="tab" data-tab="query">Query</button>
       <button class="tab" data-tab="alerts">Alerts &amp; Rules</button>
       <button class="tab" data-tab="tools">MCP Tools</button>
@@ -453,6 +487,8 @@
         <div class="card"><div class="card-label">Up targets</div><div class="card-value green" id="card-up">—</div><div class="card-sub" id="card-up-sub"></div></div>
         <div class="card"><div class="card-label">Node CPU</div><div class="card-value" id="card-cpu">—</div><div class="card-sub" id="card-cpu-sub">cluster avg, 5m</div></div>
         <div class="card"><div class="card-label">Node memory</div><div class="card-value" id="card-mem">—</div><div class="card-sub" id="card-mem-sub">cluster avg</div></div>
+        <div class="card"><div class="card-label">GPU util</div><div class="card-value" id="card-gpu-util">—</div><div class="card-sub" id="card-gpu-util-sub">DCGM avg</div></div>
+        <div class="card"><div class="card-label">GPU memory</div><div class="card-value" id="card-gpu-mem">—</div><div class="card-sub" id="card-gpu-mem-sub">framebuffer</div></div>
         <div class="card"><div class="card-label">Running pods</div><div class="card-value" id="card-pods">—</div><div class="card-sub" id="card-pods-sub"></div></div>
       </div>
 
@@ -470,6 +506,11 @@
       </div>
 
       <div class="panel">
+        <h2>Top GPU workloads by memory <span class="hint">DCGM framebuffer · attributed per pod · details in the GPU tab</span></h2>
+        <div id="chart-top-gpu-mem"><div class="loading">loading…</div></div>
+      </div>
+
+      <div class="panel">
         <h2>Cluster trends <span class="hint">last 3h · cluster totals</span></h2>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
           <div><div class="hint" style="margin-bottom:4px">CPU usage (cores)</div><div id="chart-cpu-trend"><div class="loading">loading…</div></div></div>
@@ -480,6 +521,41 @@
       <div class="panel">
         <h2>Active alerts <span class="hint">first 12 · full list in Alerts &amp; Rules</span></h2>
         <div id="dash-alerts"><div class="loading">loading…</div></div>
+      </div>
+    </div>
+
+    <!-- ============ GPU (NVIDIA DCGM) ============ -->
+    <div id="pane-gpu" class="pane hidden">
+      <div class="cards">
+        <div class="card"><div class="card-label">GPUs</div><div class="card-value green" id="gpu-card-count">—</div><div class="card-sub" id="gpu-card-count-sub"></div></div>
+        <div class="card"><div class="card-label">GPU util</div><div class="card-value" id="gpu-card-util">—</div><div class="card-sub" id="gpu-card-util-sub">cluster avg</div></div>
+        <div class="card"><div class="card-label">GPU memory</div><div class="card-value" id="gpu-card-mem">—</div><div class="card-sub" id="gpu-card-mem-sub">framebuffer used</div></div>
+        <div class="card"><div class="card-label">Power draw</div><div class="card-value" id="gpu-card-power">—</div><div class="card-sub" id="gpu-card-power-sub">all GPUs</div></div>
+        <div class="card"><div class="card-label">Hottest GPU</div><div class="card-value" id="gpu-card-temp">—</div><div class="card-sub" id="gpu-card-temp-sub">max across GPUs</div></div>
+        <div class="card"><div class="card-label">NVLink traffic</div><div class="card-value" id="gpu-card-nvlink">—</div><div class="card-sub" id="gpu-card-nvlink-sub">summed across GPUs</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>NVLink domains <span class="hint">per-node GPU islands · grouped tiles</span>
+          <span class="spacer"></span>
+          <label class="hint" style="text-transform:none"><input type="checkbox" id="gpu-auto-refresh" checked /> auto 30s</label>
+          <button id="gpu-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="gpu-domains-note" class="hint" style="margin-bottom:8px"></div>
+        <div id="gpu-domains"><div class="loading">loading…</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>GPU trends <span class="hint">last 3h · per node</span></h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+          <div><div class="hint" style="margin-bottom:4px">GPU utilization (avg %)</div><div id="chart-gpu-util-trend"><div class="loading">loading…</div></div></div>
+          <div><div class="hint" style="margin-bottom:4px">GPU memory used (framebuffer)</div><div id="chart-gpu-mem-trend"><div class="loading">loading…</div></div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>All GPUs <span class="hint">util · framebuffer · thermals · NVLink · workload</span></h2>
+        <div id="gpu-table"><div class="loading">loading…</div></div>
       </div>
     </div>
 
@@ -610,6 +686,13 @@ const PRESETS = [
   { cat: "Nodes", name: "Node CPU %", mode: "instant", q: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))' },
   { cat: "Nodes", name: "Node memory %", mode: "instant", q: "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)" },
   { cat: "Nodes", name: "Node disk usage %", mode: "instant", q: '100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})' },
+  { cat: "GPU", name: "GPU utilization %", mode: "instant", q: "DCGM_FI_DEV_GPU_UTIL", note: "per-GPU SM activity, 16 GPUs across 2 nodes" },
+  { cat: "GPU", name: "GPU memory used %", mode: "instant", q: "100 * DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)" },
+  { cat: "GPU", name: "Top GPU workloads", mode: "instant", q: 'topk(8, sum by (exported_namespace, exported_pod) (DCGM_FI_DEV_FB_USED{exported_pod!=""}))', note: "exported_pod = the workload holding the GPU (operator pod mapping)" },
+  { cat: "GPU", name: "NVLink traffic by GPU", mode: "instant", q: "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL", note: "KiB/s — nonzero GPUs are in an active NVLink island" },
+  { cat: "GPU", name: "GPU temperature", mode: "instant", q: "DCGM_FI_DEV_GPU_TEMP" },
+  { cat: "GPU", name: "GPU power draw", mode: "instant", q: "DCGM_FI_DEV_POWER_USAGE" },
+  { cat: "GPU", name: "GPU XID errors", mode: "instant", q: "DCGM_FI_DEV_XID_ERRORS > 0", note: "nonzero = last driver/hardware error code" },
   { cat: "Errors", name: "HTTP 5xx rate by pod", mode: "instant", q: 'sum by (pod) (rate(http_requests_total{status=~"5.."}[5m]))', note: "only if workloads export it" },
   { cat: "Errors", name: "Error ratio %", mode: "instant", q: '100 * sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))', note: "only if workloads export it" },
 ];
@@ -758,6 +841,87 @@ function lineChart(hostId, seriesArr, opts) {
   host.innerHTML = '<div class="legend">' + legend + "</div>" + svg;
 }
 
+// ---- sortable tables + group banding ---------------------------------------------
+// Every data table renders through here: click any header to sort (click
+// again to flip), nulls always sink, and rows sharing a "group" (a
+// deployment/workload) are banded with alternating lighter/darker tints —
+// the band swaps each time the group changes, so a deployment's rows read
+// as one block regardless of sort order.
+const tableSort = {}; // hostId -> {key, dir}
+
+function setTableSort(hostId, key, dir) {
+  tableSort[hostId] = { key, dir: dir === -1 ? -1 : 1 };
+}
+
+function groupColor(name) {
+  let h = 0;
+  const s = String(name);
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+
+function renderSortableTable(hostId, columns, rows, opts) {
+  opts = opts || {};
+  const st = tableSort[hostId] || { key: columns[0].key, dir: 1 };
+  const col = columns.find((c) => c.key === st.key) || columns[0];
+  const fallback = opts.fallback || (() => 0);
+  const cellVal = (c, r) => (c.sortVal ? c.sortVal(r) : r[c.key]);
+  const cmp = (a, b) => {
+    const va = cellVal(col, a), vb = cellVal(col, b);
+    const na = va === null || va === undefined || va === "";
+    const nb = vb === null || vb === undefined || vb === "";
+    if (na && nb) return 0;
+    if (na) return 1; // nulls sink, regardless of direction
+    if (nb) return -1;
+    if (typeof va === "number" || typeof vb === "number") {
+      const fa = parseFloat(va), fb = parseFloat(vb);
+      const faOk = isFinite(fa), fbOk = isFinite(fb);
+      if (!faOk && !fbOk) return String(va).localeCompare(String(vb));
+      if (!faOk) return 1;
+      if (!fbOk) return -1;
+      return fa < fb ? -1 : fa > fb ? 1 : 0;
+    }
+    return String(va).localeCompare(String(vb));
+  };
+  const sorted = [...(rows || [])].sort((a, b) => {
+    const primary = cmp(a, b);
+    return primary !== 0 ? primary * st.dir : fallback(a, b);
+  });
+  let html = '<div style="overflow:auto;max-height:52vh;border:1px solid var(--border);border-radius:8px;">' +
+    '<table class="grid sortable"><thead><tr>' +
+    columns.map((c) => {
+      const active = c.key === st.key;
+      const arrow = active ? '<span class="arrow">' + (st.dir === 1 ? "▲" : "▼") + "</span>" : "";
+      return '<th class="sortable" data-key="' + esc(c.key) + '" title="sort by ' + esc(c.label) + '">' + esc(c.label) + arrow + "</th>";
+    }).join("") + "</tr></thead><tbody>";
+  let prevGroup = null, band = 0;
+  sorted.forEach((r) => {
+    let tint = "", runStart = false, group = null;
+    if (opts.groupBy) {
+      group = opts.groupBy(r);
+      if (group !== prevGroup) {
+        if (group != null) band = 1 - band;
+        runStart = group != null;
+        prevGroup = group;
+      }
+      tint = group == null ? "" : band ? " class='grp-b'" : " class='grp-a'";
+    }
+    const ctx = { group, runStart };
+    html += "<tr" + tint + ">" + columns.map((c) => c.render(r, ctx)).join("") + "</tr>";
+  });
+  html += "</tbody></table></div>";
+  const host = $(hostId);
+  host.innerHTML = html;
+  host.querySelectorAll("th.sortable").forEach((th) => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      const cur = tableSort[hostId];
+      tableSort[hostId] = { key, dir: cur && cur.key === key ? -cur.dir : 1 };
+      renderSortableTable(hostId, columns, rows, opts);
+    };
+  });
+}
+
 // ---- dashboard ----------------------------------------------------------------
 async function loadOverview() {
   let d;
@@ -765,7 +929,8 @@ async function loadOverview() {
   catch (e) {
     markPromBad();
     setCard("card-up", "?", ""); setCard("card-firing", "?", "prometheus unreachable");
-    ["chart-top-cpu", "chart-top-mem", "chart-cpu-trend", "chart-mem-trend"].forEach((id) => {
+    setCard("card-gpu-util", "?", ""); setCard("card-gpu-mem", "?", "");
+    ["chart-top-cpu", "chart-top-mem", "chart-top-gpu-mem", "chart-cpu-trend", "chart-mem-trend"].forEach((id) => {
       $(id).innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
     });
     $("dash-alerts").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
@@ -780,6 +945,8 @@ async function loadOverview() {
   setCard("card-up", c("up_targets").value ?? "—", c("up_total").value != null ? "of " + c("up_total").value + " scrape targets" : "");
   setCard("card-cpu", pct("node_cpu_pct"), "");
   setCard("card-mem", pct("node_mem_pct"), "");
+  setCard("card-gpu-util", pct("gpu_util_pct"), c("gpu_count").value != null ? c("gpu_count").value + " GPUs avg" : "");
+  setCard("card-gpu-mem", pct("gpu_mem_pct"), "");
   setCard("card-pods", c("pods_running").value ?? "—", "");
   const al = d.alerts || {};
   const counts = al.counts || {};
@@ -800,6 +967,12 @@ async function loadOverview() {
       $(id).innerHTML = '<div class="empty">' + esc(trunc(block.error, 140)) + "</div>";
     }
   });
+  const gpuTop = d.top && d.top.top_gpu_mem;
+  const gpuItems = gpuTop.error ? [] : (gpuTop.items || []).map((it) => ({ label: it.label, value: (parseFloat(it.value) || 0) * 1048576 }));
+  barList("chart-top-gpu-mem", gpuItems, { bytes: true });
+  if (gpuTop.error && !$("chart-top-gpu-mem").querySelector(".hbar-row")) {
+    $("chart-top-gpu-mem").innerHTML = '<div class="empty">' + esc(trunc(gpuTop.error, 140)) + "</div>";
+  }
   const trends = d.trends || {};
   const cpuT = trends.cpu_trend, memT = trends.mem_trend;
   const fill = (id, block, bytes) => {
@@ -836,22 +1009,206 @@ function markPromBad() {
 
 function renderAlertsTable(hostId, items) {
   if (!items.length) { $(hostId).innerHTML = '<div class="empty">no alerts match</div>'; return; }
-  let html = '<div style="overflow:auto;max-height:52vh;border:1px solid var(--border);border-radius:8px;">' +
-    '<table class="grid"><thead><tr><th>state</th><th>alert</th><th>severity</th><th>active</th><th>labels</th><th>summary</th></tr></thead><tbody>';
-  items.forEach((a) => {
-    html += "<tr><td><span class='badge " + esc(a.state) + "'>" + esc(a.state) + "</span></td>" +
-      "<td>" + esc(a.alertname) + "</td>" +
-      "<td>" + (a.severity ? "<span class='badge " + esc(a.severity) + "'>" + esc(a.severity) + "</span>" : "<span class='badge none'>—</span>") + "</td>" +
-      "<td title='" + esc(a.activeAt) + "'>" + esc(fmtAge(a.activeAt)) + "</td>" +
-      "<td title='" + esc(JSON.stringify(a.labels)) + "'>" + esc(trunc(Object.entries(a.labels || {}).map(([k, v]) => k + "=" + v).join(", "), 60)) + "</td>" +
-      "<td>" + esc(trunc(a.summary || a.description || "", 90)) + "</td></tr>";
+  renderSortableTable(hostId, [
+    { key: "state", label: "state",
+      sortVal: (a) => ({ firing: 0, pending: 1, inactive: 2 }[a.state] ?? 3),
+      render: (a) => "<td><span class='badge " + esc(a.state) + "'>" + esc(a.state) + "</span></td>" },
+    { key: "alertname", label: "alert",
+      render: (a, ctx) => "<td>" + (ctx.runStart ? "<span class='grp-dot' style='background:" + groupColor(ctx.group) + "'></span>" : "") + esc(a.alertname) + "</td>" },
+    { key: "severity", label: "severity",
+      sortVal: (a) => ({ critical: 0, warning: 1, info: 2, none: 3 }[a.severity] ?? 4),
+      render: (a) => "<td>" + (a.severity ? "<span class='badge " + esc(a.severity) + "'>" + esc(a.severity) + "</span>" : "<span class='badge none'>—</span>") + "</td>" },
+    { key: "activeAt", label: "active",
+      sortVal: (a) => Date.parse(a.activeAt) || Infinity,
+      render: (a) => "<td title='" + esc(a.activeAt) + "'>" + esc(fmtAge(a.activeAt)) + "</td>" },
+    { key: "labels", label: "labels",
+      sortVal: (a) => Object.entries(a.labels || {}).map(([k, v]) => k + "=" + v).join(", "),
+      render: (a) => "<td title='" + esc(JSON.stringify(a.labels)) + "'>" + esc(trunc(Object.entries(a.labels || {}).map(([k, v]) => k + "=" + v).join(", "), 60)) + "</td>" },
+    { key: "summary", label: "summary",
+      sortVal: (a) => a.summary || a.description || "",
+      render: (a) => "<td>" + esc(trunc(a.summary || a.description || "", 90)) + "</td>" },
+  ], items, {
+    // same alert across many rows reads as one banded block
+    groupBy: (a) => a.alertname || null,
+    fallback: (a, b) =>
+      (({ firing: 0, pending: 1, inactive: 2 }[a.state] ?? 3) - ({ firing: 0, pending: 1, inactive: 2 }[b.state] ?? 3)) ||
+      String(a.alertname).localeCompare(String(b.alertname)),
   });
-  html += "</tbody></table></div>";
-  $(hostId).innerHTML = html;
 }
 
 function renderDashAlerts(items) {
   renderAlertsTable("dash-alerts", items);
+}
+
+// ---- GPU tab (NVIDIA DCGM) --------------------------------------------------------
+function hostShort(h) { return String(h || "").split(".")[0]; }
+
+function fmtPct(v) {
+  const f = parseFloat(v);
+  return isFinite(f) ? f.toFixed(1) + "%" : "—";
+}
+
+function fmtPower(w) {
+  return w >= 1000 ? (w / 1000).toFixed(2) + " kW" : Math.round(w) + " W";
+}
+
+function utilColor(pct) {
+  if (pct == null || !isFinite(pct)) return "var(--muted)";
+  return pct >= 85 ? "var(--red)" : pct >= 60 ? "var(--yellow)" : "var(--green)";
+}
+
+function gpuRange(idx) {
+  if (!idx || !idx.length) return "";
+  if (idx.length === 1) return String(idx[0]);
+  const contiguous = idx.every((v, i) => i === 0 || v === idx[i - 1] + 1);
+  return contiguous ? idx[0] + "–" + idx[idx.length - 1] : idx.join(", ");
+}
+
+function gbar(label, pct, unit) {
+  const p = pct == null ? null : Math.max(0, Math.min(100, pct));
+  return '<div class="gbar"><span>' + esc(label) + "</span>" +
+    '<div class="hbar-track"><div class="hbar-fill" style="width:' + (p == null ? 0 : Math.max(p, 1.5)) + "%;background:" + utilColor(p) + '"></div></div>' +
+    '<span class="gbar-val">' + (p == null ? "—" : p.toFixed(0) + unit) + "</span></div>";
+}
+
+function renderGpuDomains(d) {
+  const host = $("gpu-domains");
+  const domains = d.domains || [];
+  if (!domains.length) { host.innerHTML = '<div class="empty">no GPU domain data</div>'; return; }
+  const tilesByDomain = {};
+  (d.gpus || []).forEach((g) => {
+    if (g.domain == null) return;
+    const k = g.hostname + "#" + g.domain;
+    (tilesByDomain[k] = tilesByDomain[k] || []).push(g);
+  });
+  let html = '<div class="gpu-grid">';
+  domains.forEach((dom) => {
+    const tiles = (tilesByDomain[dom.hostname + "#" + dom.domain] || []).sort((a, b) => a.gpu - b.gpu);
+    const wl = (dom.workloads || []).map((w) =>
+      '<span class="wl-chip" title="' + esc((w.namespace ? w.namespace + "/" : "") + w.pod + " → GPUs " + w.gpus.join(", ")) + '">' +
+      esc(trunc(w.pod, 26)) + " · GPU " + gpuRange(w.gpus) + "</span>"
+    ).join(" ");
+    let tileHtml = "";
+    tiles.forEach((g) => {
+      tileHtml += '<div class="gpu-tile">' +
+        '<div class="gpu-tile-head"><b>GPU ' + g.gpu + "</b><span class='hint'>" + esc(g.device || "") + "</span></div>" +
+        gbar("util", g.util_pct, "%") +
+        gbar("mem", g.mem_pct, "%") +
+        '<div class="gpu-tile-foot hint">' +
+        (g.temp_c != null ? Math.round(g.temp_c) + "°C · " : "") +
+        (g.power_w != null ? Math.round(g.power_w) + " W · " : "") +
+        (g.nvlink_kib_s ? "NVLink " + fmtBytes(g.nvlink_kib_s * 1024) + "/s · " : "") +
+        (g.xid ? "<span class='warn'>XID " + g.xid + "</span> · " : "") +
+        (g.pod
+          ? "<span class='wl-chip' title='" + esc((g.namespace ? g.namespace + "/" : "") + g.pod) + "'>" + esc(trunc(g.pod, 24)) + "</span>"
+          : "<span>idle / unattributed</span>") +
+        "</div></div>";
+    });
+    html += '<div class="gpu-domain">' +
+      '<div class="gpu-domain-head"><span class="gpu-domain-name">' + esc(hostShort(dom.hostname)) + " · Domain " + dom.domain + "</span>" +
+      '<span class="hint">GPUs ' + gpuRange(dom.gpus) + " · " + dom.gpu_count + " GPUs</span></div>" +
+      '<div class="gpu-domain-stats">avg util ' + fmtPct(dom.util_pct) + " · mem " + fmtPct(dom.mem_pct) +
+      (dom.power_w != null ? " · " + fmtPower(dom.power_w) : "") +
+      (dom.nvlink_kib_s ? " · NVLink " + fmtBytes(dom.nvlink_kib_s * 1024) + "/s" : "") +
+      (dom.xid_gpus ? " · <span style='color:var(--red)'>" + dom.xid_gpus + " GPU(s) with XID</span>" : "") +
+      "</div>" +
+      (wl ? "<div style='margin-bottom:8px'>" + wl + "</div>" : "") +
+      '<div class="gpu-tiles">' + tileHtml + "</div></div>";
+  });
+  host.innerHTML = html + "</div>";
+}
+
+function renderGpuTable(gpus) {
+  if (!gpus.length) { $("gpu-table").innerHTML = '<div class="empty">no GPUs reporting (DCGM exporter absent?)</div>'; return; }
+  const wlLabel = (g) => (g.pod ? (g.namespace ? g.namespace + "/" : "") + g.pod : "");
+  renderSortableTable("gpu-table", [
+    { key: "hostname", label: "node",
+      render: (g) => "<td>" + esc(hostShort(g.hostname)) + "</td>", sortVal: (g) => g.hostname },
+    { key: "domain", label: "domain",
+      render: (g) => "<td>" + (g.domain == null ? "—" : "D" + g.domain) + "</td>", sortVal: (g) => g.domain },
+    { key: "gpu", label: "GPU",
+      render: (g) => "<td><b>" + g.gpu + "</b> <span class='hint'>" + esc(g.device || "") + "</span></td>", sortVal: (g) => g.gpu },
+    { key: "util_pct", label: "util",
+      render: (g) => "<td style='color:" + utilColor(g.util_pct) + "'>" + (g.util_pct != null ? g.util_pct + "%" : "—") + "</td>", sortVal: (g) => g.util_pct },
+    { key: "mem_used_mib", label: "mem used",
+      render: (g) => "<td>" + (g.mem_used_mib != null ? fmtBytes(g.mem_used_mib * 1048576) + " / " + (g.mem_total_mib != null ? fmtBytes(g.mem_total_mib * 1048576) : "?") : "—") + "</td>", sortVal: (g) => g.mem_used_mib },
+    { key: "mem_pct", label: "mem %",
+      render: (g) => "<td>" + (g.mem_pct != null ? g.mem_pct + "%" : "—") + "</td>", sortVal: (g) => g.mem_pct },
+    { key: "temp_c", label: "temp",
+      render: (g) => "<td>" + (g.temp_c != null ? Math.round(g.temp_c) + "°C" : "—") + "</td>", sortVal: (g) => g.temp_c },
+    { key: "power_w", label: "power",
+      render: (g) => "<td>" + (g.power_w != null ? Math.round(g.power_w) + " W" : "—") + "</td>", sortVal: (g) => g.power_w },
+    { key: "nvlink_kib_s", label: "NVLink",
+      render: (g) => "<td>" + (g.nvlink_kib_s != null ? fmtBytes(g.nvlink_kib_s * 1024) + "/s" : "—") + "</td>", sortVal: (g) => g.nvlink_kib_s },
+    { key: "xid", label: "xid",
+      render: (g) => "<td>" + (g.xid ? "<span class='badge critical'>" + g.xid + "</span>" : "<span class='hint'>0</span>") + "</td>", sortVal: (g) => g.xid },
+    { key: "workload", label: "workload",
+      render: (g, ctx) => {
+        const wl = wlLabel(g);
+        const dot = ctx.runStart ? "<span class='grp-dot' style='background:" + groupColor(ctx.group) + "'></span>" : "";
+        return "<td title='" + esc(wl) + "'>" + dot + esc(trunc(wl || "idle", 40)) + "</td>";
+      }, sortVal: (g) => wlLabel(g) || "~idle" },
+  ], gpus, {
+    // rows of one deployment (same ns/pod) band together wherever they sit
+    groupBy: (g) => (g.pod ? (g.namespace || "") + "/" + g.pod : null),
+    fallback: (a, b) =>
+      String(a.hostname).localeCompare(String(b.hostname)) || (a.gpu ?? 0) - (b.gpu ?? 0),
+  });
+}
+
+async function loadGpuTrends() {
+  const fill = async (id, query, bytes) => {
+    try {
+      const d = await api("/api/query_range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, start: "now-3h", end: "now" }),
+      });
+      const rows = (d.result || []).map((r) => ({ name: (r.labels && r.labels.Hostname) || r.series, values: r.values }));
+      if (rows.length) lineChart(id, rows, { bytes });
+      else $(id).innerHTML = '<div class="empty">no trend data</div>';
+    } catch (e) {
+      $(id).innerHTML = '<div class="empty">' + esc(trunc(e.message, 140)) + "</div>";
+    }
+  };
+  await Promise.all([
+    fill("chart-gpu-util-trend", "avg by (Hostname) (DCGM_FI_DEV_GPU_UTIL)", false),
+    fill("chart-gpu-mem-trend", "sum by (Hostname) (DCGM_FI_DEV_FB_USED) * 1048576", true),
+  ]);
+}
+
+async function loadGpu() {
+  const blocks = ["gpu-domains", "gpu-table", "chart-gpu-util-trend", "chart-gpu-mem-trend"];
+  const gpuCards = ["gpu-card-count", "gpu-card-util", "gpu-card-mem", "gpu-card-power", "gpu-card-temp", "gpu-card-nvlink"];
+  let d;
+  try { d = await api("/api/gpu"); }
+  catch (e) {
+    blocks.forEach((id) => { $(id).innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+    gpuCards.forEach((id) => setCard(id, "?", ""));
+    return;
+  }
+  if (d.error) {
+    // Whole-tab fail soft: the cluster has no DCGM exporter.
+    blocks.forEach((id) => { $(id).innerHTML = '<div class="empty">' + esc(trunc(d.error, 160)) + "</div>"; });
+    gpuCards.forEach((id) => setCard(id, "—", "no DCGM data"));
+    return;
+  }
+  const s = d.summary || {};
+  setCard("gpu-card-count", s.gpus ?? "—", s.model || "");
+  setCard("gpu-card-util", fmtPct(s.util_pct), s.nodes ? s.nodes + " GPU nodes" : "");
+  setCard("gpu-card-mem", fmtPct(s.mem_pct), s.mem_used_mib != null ? fmtBytes(s.mem_used_mib * 1048576) + " of " + fmtBytes((s.mem_total_mib || 0) * 1048576) : "");
+  setCard("gpu-card-power", s.power_w != null ? fmtPower(s.power_w) : "—", "");
+  setCard("gpu-card-temp", s.max_temp_c != null ? Math.round(s.max_temp_c) + "°C" : "—", "");
+  setCard("gpu-card-nvlink", s.nvlink_kib_s != null ? fmtBytes(s.nvlink_kib_s * 1024) + "/s" : "—", "");
+  renderGpuDomains(d);
+  renderGpuTable(d.gpus || []);
+  $("gpu-domains-note").textContent =
+    d.domains_source === "env"
+      ? "Grouping override from PROM_UI_GPU_NVLINK_DOMAINS: " + JSON.stringify(d.domains_config)
+      : d.domains_source === "detected"
+        ? "NVLink islands auto-detected from nvidia_gpu_nvlink_domain (nvlink-topology DaemonSet → pushgateway, one run per node boot) — override any time with PROM_UI_GPU_NVLINK_DOMAINS"
+        : "H200 NVL default: two 4-GPU NVLink islands per node (auto-detect not reporting yet) — override with PROM_UI_GPU_NVLINK_DOMAINS='[[0,1,2,3],[4,5,6,7]]' if your topology differs";
+  loadGpuTrends();
 }
 
 // ---- alerts & rules tab ---------------------------------------------------------
@@ -1232,12 +1589,14 @@ function switchTab(tab) {
   state.tab = tab;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $("pane-dashboard").classList.toggle("hidden", tab !== "dashboard");
+  $("pane-gpu").classList.toggle("hidden", tab !== "gpu");
   $("pane-query").classList.toggle("hidden", tab !== "query");
   $("pane-alerts").classList.toggle("hidden", tab !== "alerts");
   $("pane-tools").classList.toggle("hidden", tab !== "tools");
   // Lazy-load the heavier lists on first open (the live cluster can have
   // thousands of alerts — no reason to fetch them before they are wanted).
   if (tab === "alerts" && !state.alertsLoaded) { state.alertsLoaded = true; loadAlerts(); loadRules(); }
+  if (tab === "gpu" && !state.gpuLoaded) { state.gpuLoaded = true; loadGpu(); }
 }
 
 // ---- theme toggle ----------------------------------------------------------------------
@@ -1268,6 +1627,7 @@ $("promql").addEventListener("keydown", (e) => {
 document.querySelectorAll("input[name=mode]").forEach((r) => (r.onchange = syncModeInputs));
 $("filter").oninput = renderPresets;
 $("dash-refresh").onclick = loadOverview;
+$("gpu-refresh").onclick = loadGpu;
 $("alerts-refresh").onclick = loadAlerts;
 $("rules-refresh").onclick = loadRules;
 $("alert-filter").oninput = renderAlertsFiltered;
@@ -1284,7 +1644,9 @@ $("auto-refresh").onchange = () => {
 
 function startAuto() {
   state.autoTimer = setInterval(() => {
-    if (state.tab === "dashboard" && !document.hidden && $("auto-refresh").checked) loadOverview();
+    if (document.hidden) return;
+    if (state.tab === "dashboard" && $("auto-refresh").checked) loadOverview();
+    if (state.tab === "gpu" && $("gpu-auto-refresh").checked) loadGpu();
   }, 30000);
 }
 

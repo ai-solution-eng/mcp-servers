@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -603,12 +604,13 @@ class SqlEngine:
         # per table (0 = check on every reuse).
         self._version_checked_at: dict[str, float] = {}
         self._lock = threading.RLock()
-        # Semantic catalog (SQLHANDLER_CATALOG): an optional JSON file of
-        # human-written table/column descriptions merged into describe /
-        # list output so agents see business meaning, not just dtypes.
-        # Hot-reloaded on mtime change; a missing/broken file degrades to an
-        # empty catalog (never an error).
+        # Semantic catalog (SQLHANDLER_CATALOG): an optional JSON **or YAML**
+        # file of human-written table/column descriptions merged into
+        # describe / list output so agents see business meaning, not just
+        # dtypes. Hot-reloaded on mtime change; a missing/broken file degrades
+        # to an empty catalog (never an error).
         self._catalog_path = os.environ.get("SQLHANDLER_CATALOG", "").strip() or None
+        self._catalog_file: str | None = None
         self._catalog_mtime: float | None = None
         self._catalog_data: dict = {}
         # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
@@ -641,6 +643,25 @@ class SqlEngine:
         self._cache_dir = cache_dir or (env_cache_dir or None)
         if self._cache_dir and self.cache_ttl > 0:
             self._load_cache_from_disk()
+        # Uploadable catalog store (POST /api/semantic-catalog): a WRITABLE
+        # catalog file that OVERRIDES the operator's SQLHANDLER_CATALOG file
+        # while it exists — the most recent intentional action wins. Defaults
+        # next to the disk cache, which is writable in every supported
+        # deployment (the chart's hardened profile backs /tmp with an
+        # emptyDir); point SQLHANDLER_CATALOG_STORE at a PVC path to make
+        # uploads survive pod rescheduling. SQLHANDLER_CATALOG_UPLOAD=0
+        # disables the upload/clear API (read-only catalog posture).
+        self.catalog_uploads_enabled = os.environ.get(
+            "SQLHANDLER_CATALOG_UPLOAD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._catalog_store = (
+            os.environ.get("SQLHANDLER_CATALOG_STORE", "").strip()
+            or (
+                str(Path(self._cache_dir) / "semantic-catalog.json")
+                if self._cache_dir
+                else str(Path(tempfile.gettempdir()) / "sqlhandler-semantic-catalog.json")
+            )
+        )
         if self._async_list:
             threading.Thread(
                 target=self._auto_refresh_loop,
@@ -829,43 +850,175 @@ class SqlEngine:
             logger.debug("disk cache save skipped", exc_info=True)
 
     # ------------------------------------------------------------- catalog
+    @staticmethod
+    def _parse_catalog_text(text: str, origin: str) -> dict:
+        """Parse catalog text as JSON, falling back to YAML (pyyaml).
+
+        Both formats carry the same shape: an object whose ``tables`` key
+        maps table keys to their documentation. JSON is tried first (it is
+        the documented format), YAML second so hand-written catalogs can use
+        the friendlier syntax. Raises ``ValueError`` with a precise message
+        on invalid content — callers decide whether that means "reject the
+        upload" (API) or "ignore the file" (engine load).
+        """
+        try:
+            data = json.loads(text)
+        except Exception:
+            try:
+                import yaml  # optional dependency (pyproject: pyyaml)
+            except ImportError:
+                raise ValueError(
+                    f"{origin}: not valid JSON, and PyYAML is not installed "
+                    "(YAML catalogs need the 'pyyaml' package)"
+                ) from None
+            try:
+                data = yaml.safe_load(text)
+            except Exception as exc:
+                raise ValueError(f"{origin}: not valid JSON or YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            # ValueError on purpose: wrong-typed catalog content is user
+            # input to reject with HTTP 400, not an internal type bug.
+            raise ValueError(f"{origin}: catalog must be an object with a 'tables' mapping")  # noqa: TRY004
+        return data
+
+    def _effective_catalog_file(self) -> str | None:
+        """The catalog file the engine currently serves.
+
+        An uploaded catalog (the writable store) overrides the operator's
+        SQLHANDLER_CATALOG file for as long as it exists; deleting it (DELETE
+        /api/semantic-catalog) falls back to the configured file.
+        """
+        if self._catalog_store:
+            try:
+                if os.path.exists(self._catalog_store):
+                    return self._catalog_store
+            except OSError:
+                pass
+        return self._catalog_path
+
     def _catalog(self) -> dict:
         """Return the semantic catalog's ``tables`` mapping (hot-reloaded).
 
-        The file is re-read whenever its mtime changes, so editing the
-        catalog (hand-written or seeded by auto-profiling) takes effect
-        without a restart. Any problem reading/parsing it logs a warning
-        and yields an empty catalog — a broken catalog must never break
-        queries.
+        The active file (uploaded store, else SQLHANDLER_CATALOG) is re-read
+        whenever its path or mtime changes — or whenever it disappears — so
+        editing, uploading, or clearing the catalog takes effect without a
+        restart. Any problem reading/parsing it logs a warning and yields an
+        empty catalog — a broken catalog must never break queries.
         """
-        path = self._catalog_path
-        if not path:
-            return {}
+        path = self._effective_catalog_file()
         try:
-            mtime = os.stat(path).st_mtime
+            mtime = os.stat(path).st_mtime if path else None
         except OSError:
             return {}
-        if mtime != self._catalog_mtime:
-            try:
-                data = json.loads(Path(path).read_text(encoding="utf-8"))
-                tables = data.get("tables") if isinstance(data, dict) else None
-                self._catalog_data = tables if isinstance(tables, dict) else {}
-                logger.info(
-                    "semantic catalog loaded: %d table entr%s from %s",
-                    len(self._catalog_data),
-                    "y" if len(self._catalog_data) == 1 else "ies",
-                    path,
-                )
-            except Exception:
-                logger.warning("semantic catalog %s unreadable; ignoring it", path, exc_info=True)
+        if (path, mtime) != (self._catalog_file, self._catalog_mtime):
+            if path:
+                try:
+                    self._catalog_data = self._load_catalog_file(path)
+                except Exception:
+                    logger.warning("semantic catalog %s unreadable; ignoring it", path, exc_info=True)
+                    self._catalog_data = {}
+            else:
+                # The catalog went away entirely (upload cleared, env file
+                # removed) — the empty mapping is the new truth.
                 self._catalog_data = {}
+            self._catalog_file = path
             self._catalog_mtime = mtime
             # Catalog documentation is merged INTO cached describe results,
-            # so a catalog edit must invalidate them or the old wording
+            # so a catalog change must invalidate them or the old wording
             # would keep being served until the TTL expires.
             with self._lock:
                 self._describe_cache.clear()
         return self._catalog_data
+
+    def _load_catalog_file(self, path: str) -> dict:
+        """Read + parse one catalog file; returns its ``tables`` mapping."""
+        data = self._parse_catalog_text(Path(path).read_text(encoding="utf-8"), path)
+        tables = data.get("tables")
+        result = tables if isinstance(tables, dict) else {}
+        logger.info(
+            "semantic catalog loaded: %d table entr%s from %s",
+            len(result),
+            "y" if len(result) == 1 else "ies",
+            path,
+        )
+        return result
+
+    def set_catalog_text(self, text: str) -> dict:
+        """Validate + atomically store an uploaded catalog (JSON or YAML).
+
+        The store file is written as canonical JSON (the parsed content
+        re-serialized) so the file on disk is always trivially
+        machine-readable regardless of the upload format. Raises
+        ``ValueError`` on invalid content; ``OSError`` on an unwritable
+        store propagates to the API layer.
+        """
+        data = self._parse_catalog_text(text, "<upload>")
+        tables = data.get("tables")
+        if not isinstance(tables, dict):
+            # ValueError on purpose: user input -> HTTP 400 (see _parse_catalog_text).
+            raise ValueError("catalog must contain a top-level 'tables' mapping")  # noqa: TRY004
+        for name, entry in tables.items():
+            if not isinstance(entry, dict):
+                raise ValueError(f"tables[{name!r}] must be a mapping of documentation fields")  # noqa: TRY004
+        target = Path(self._catalog_store)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+        logger.info("semantic catalog uploaded: %d tables -> %s", len(tables), target)
+        # Hot-reload happens on the next _catalog() call (mtime changed), but
+        # resolve it eagerly so the upload response reflects reality.
+        self._catalog()
+        return {"tables": len(tables), "path": str(target)}
+
+    def clear_catalog(self) -> bool:
+        """Remove the uploaded catalog; the configured file takes over again."""
+        try:
+            existed = os.path.exists(self._catalog_store)
+        except OSError:
+            return False
+        if existed:
+            os.remove(self._catalog_store)
+            logger.info("semantic catalog upload removed: %s", self._catalog_store)
+            self._catalog()  # eager reload back to the configured file
+        return existed
+
+    def catalog_status(self) -> dict:
+        """Current semantic-catalog state for the API/UI.
+
+        Reports both sources (the configured file and the upload store) with
+        their parsed table counts where readable, so the UI can show exactly
+        which documentation is live and where it came from.
+        """
+
+        def _peek(path: str | None) -> dict | None:
+            if not path:
+                return None
+            info: dict = {"path": path}
+            try:
+                info["exists"] = os.path.exists(path)
+            except OSError:
+                info["exists"] = False
+            if info["exists"]:
+                try:
+                    info["tables"] = len(self._load_catalog_file(path))
+                except Exception as exc:
+                    info["tables"] = None
+                    info["error"] = str(exc)
+            return info
+
+        active = self._effective_catalog_file()
+        return {
+            "uploads_enabled": self.catalog_uploads_enabled,
+            "store_path": self._catalog_store,
+            "configured": _peek(self._catalog_path),
+            "uploaded": _peek(self._catalog_store),
+            "active_source": ("upload" if active == self._catalog_store else "configured")
+            if active
+            else None,
+            "active_path": active,
+            "active_tables": len(self._catalog()) if active else 0,
+        }
 
     def _catalog_for(self, info: TableInfo) -> dict:
         """The catalog entry for a table, matched by path/qualified/bare name."""

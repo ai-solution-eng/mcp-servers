@@ -394,7 +394,14 @@ def test_streamable_http_smoke_serves_mcp_after_lifespan():
             timeout=10,
         )
         assert r.status_code == 200, f"/mcp failed: {r.status_code} {r.text[:200]}"
-        assert "mcp-session-id" in {k.lower() for k in r.headers}
+        # MCP 2.0 runs STATELESS (server.py: no initialize handshake, no
+        # Mcp-Session-Id — any replica can serve any request). Assert the
+        # real contract: a valid JSON-RPC initialize result comes back and
+        # no session header is required.
+        body = r.json()
+        assert body.get("jsonrpc") == "2.0" and "result" in body, body
+        assert body["result"].get("serverInfo", {}).get("name") == "prometheus-mcp"
+        assert "mcp-session-id" not in {k.lower() for k in r.headers}
     finally:
         proc.terminate()
         proc.wait(timeout=10)

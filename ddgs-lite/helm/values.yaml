@@ -1,18 +1,30 @@
-image:
-  repository: ghcr.io/ai-solution-eng/ddgs-mcp
-  tag: v1.0
-  pullPolicy: IfNotPresent
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
 
-service:
-  type: ClusterIP
-  port: 9090
-  targetPort: 9090
+# ddgs-lite — DuckDuckGo MCP server: metasearch via ddgs (9 engines) plus
+# a content fetcher, over MCP for PCAI (HPE Ezmeral Unified Analytics),
+# exposed at /mcp through the PCAI Istio gateway.
 
+# -- Deployment ----------------------------------------------------------------
 deployment:
   name: ddgs-lite
   appName: ddgs-lite
   replicaCount: 1
 
+# -- Image ------------------------------------------------------------------------
+image:
+  repository: ghcr.io/ai-solution-eng/ddgs-mcp
+  tag: v1.0
+  pullPolicy: IfNotPresent
+
+# -- Service exposure ------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9090
+  targetPort: 9090
+
+# -- Resources -----------------------------------------------------------------------------
 resources:
   requests:
     cpu: 200m
@@ -21,10 +33,12 @@ resources:
     cpu: "1"
     memory: 512Mi
 
+# -- Environment ------------------------------------------------------------------------------
 env:
   - name: DDG_REGION
     value: ""
 
+# -- HPE corporate proxy -----------------------------------------------------------------------
 # Route outbound HTTP(S) traffic through the HPE corporate proxy.
 # Default false: open-internet systems must NOT use the proxy (DNS/egress
 # failures). Set true (and configure proxy.*) only behind the HPE proxy.
@@ -35,6 +49,7 @@ proxy:
   https: http://hpeproxy.its.hpecorp.net:8080
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
 
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"

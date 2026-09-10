@@ -32,6 +32,18 @@ spec:
             # (the v0.1.0 release queried a hostname that was literally that).
             - name: PROM_URL
               value: {{ .Values.prometheusUrl | quote }}
+            {{- with .Values.gpuNvlinkDomains }}
+            # GPU-tab NVLink island grouping (see values.yaml). Accepts the
+            # JSON string the server parses or a native YAML list — both
+            # render to the same env value. Omitted when empty so the
+            # server default applies.
+            - name: PROM_UI_GPU_NVLINK_DOMAINS
+              {{- if kindIs "string" . }}
+              value: {{ . | quote }}
+              {{- else }}
+              value: {{ . | toJson | quote }}
+              {{- end }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health

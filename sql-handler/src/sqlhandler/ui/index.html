@@ -344,6 +344,23 @@
       <input type="search" id="filter" placeholder="Filter tables…" autocomplete="off" />
     </div>
     <div id="table-list"></div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>Semantic catalog <span class="hint" id="catalog-state"></span></h2>
+      <div id="catalog-info" class="empty">loading…</div>
+      <input type="file" id="catalog-file" accept=".json,.yaml,.yml,.txt" style="display:none" />
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="catalog-upload" class="ghost" style="flex:1" title="Upload a catalog file — JSON or YAML are both accepted">Upload JSON/YAML…</button>
+        <button id="catalog-clear" class="ghost" title="Remove the uploaded catalog — the configured file takes over again">Remove</button>
+      </div>
+      <details style="margin-top:8px">
+        <summary class="hint" style="cursor:pointer">or paste JSON/YAML</summary>
+        <textarea id="catalog-text" rows="7" spellcheck="false"
+          style="width:100%;margin-top:6px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:6px;font:12px/1.5 monospace"
+          placeholder='{"tables": {"workorder/work_order": {"description": "…"}}} — or the same in YAML'></textarea>
+        <button id="catalog-apply" class="ghost" style="margin-top:6px;width:100%">Apply pasted catalog</button>
+      </details>
+    </div>
   </aside>
 
   <main>
@@ -817,9 +834,71 @@ $("sql").addEventListener("keydown", (e) => {
 $("save-query").onclick = saveCurrentQuery;
 $("load-stats").onclick = loadColumnStats;
 
+// ---- semantic catalog ------------------------------------------------------
+async function refreshCatalog() {
+  const el = $("catalog-info");
+  try {
+    const s = await api("/api/semantic-catalog");
+    $("catalog-upload").disabled = !s.uploads_enabled;
+    $("catalog-apply").disabled = !s.uploads_enabled;
+    $("catalog-clear").disabled = !s.uploaded;
+    if (!s.active_path) {
+      el.textContent = "No catalog attached — table descriptions off.";
+      $("catalog-state").textContent = "";
+      return;
+    }
+    const src = s.active_source === "upload" ? "uploaded" : "configured file";
+    el.innerHTML = s.active_tables
+      ? "<b>" + s.active_tables + "</b> table" + (s.active_tables === 1 ? "" : "s") +
+        " documented <span class='hint'>(" + esc(src) + ")</span>"
+      : "attached but empty <span class='hint'>(" + esc(src) + ")</span>";
+    $("catalog-state").textContent = s.active_tables ? s.active_tables + " tables" : "";
+  } catch (e) {
+    el.textContent = "status unavailable: " + e.message;
+  }
+}
+
+async function pushCatalog(text, label) {
+  try {
+    const res = await api("/api/semantic-catalog", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: text,
+    });
+    toast("Semantic catalog applied: " + res.tables + " table" + (res.tables === 1 ? "" : "s") +
+      (label ? " (" + label + ")" : ""));
+    $("catalog-text").value = "";
+    refreshCatalog();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("catalog-upload").onclick = () => $("catalog-file").click();
+$("catalog-file").onchange = async () => {
+  const f = $("catalog-file").files[0];
+  if (!f) return;
+  const text = await f.text();
+  $("catalog-file").value = "";
+  await pushCatalog(text, f.name);
+};
+$("catalog-apply").onclick = () => {
+  const text = $("catalog-text").value;
+  if (!text.trim()) { toast("Nothing to apply — paste a catalog first.", true); return; }
+  pushCatalog(text, "pasted text");
+};
+$("catalog-clear").onclick = async () => {
+  try {
+    await api("/api/semantic-catalog", { method: "DELETE" });
+    toast("Uploaded catalog removed.");
+    refreshCatalog();
+  } catch (e) { toast(e.message, true); }
+};
+
 initThemeToggle();
 refreshStatus();
 refreshTables();
+refreshCatalog();
 renderSaved();
 renderHistory();
 </script>

@@ -185,6 +185,97 @@ function inferWidget(propName, prop) {
   return "text";
 }
 
+/* ── Searchable combobox (ModelDownloader-style) ────────────────────────
+   A text input that filters its option list as you type; picking an option
+   or pressing Enter commits it; the typed term itself is a valid value
+   (free text always wins — "leaves only the search term"). The wrapper
+   carries data-param/data-kind/data-combo plus the committed value in
+   dataset.value — readForm reads that, prefillForm writes via
+   setComboValue, and dynamic dependants (pod picker) hook wrap.__onchange. */
+function makeCombo({ name, kind, options, value, placeholder }) {
+  const wrap = document.createElement("div");
+  wrap.className = "combo";
+  wrap.dataset.param = name;
+  wrap.dataset.kind = kind || "text";
+  wrap.dataset.combo = "1";
+  wrap.dataset.value = value || "";
+
+  const inp = document.createElement("input");
+  inp.type = "text";
+  inp.className = "combo-input";
+  inp.placeholder = placeholder || "type to filter…";
+  const list = document.createElement("div");
+  list.className = "combo-list hidden";
+  wrap.appendChild(inp);
+  wrap.appendChild(list);
+
+  const labelOf = (v) => {
+    const hit = opts.find((o) => o.value === v);
+    return hit ? hit.label : (v || "");
+  };
+  const opts = (options || []).map((o) => {
+    const el = document.createElement("div");
+    el.className = "combo-opt";
+    el.dataset.value = o.value;
+    el.textContent = o.label;
+    el.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();                          // pick lands before blur
+      commit(o.value, o.label);
+    });
+    list.appendChild(el);
+    return { value: o.value, label: o.label, el };
+  });
+
+  let isOpen = false;
+  const render = (needle) => {
+    const q = (needle || "").toLowerCase();
+    for (const o of opts) {
+      const hit = !q || o.label.toLowerCase().includes(q) || o.value.toLowerCase().includes(q);
+      o.el.classList.toggle("hidden", !hit);
+    }
+  };
+  const close = () => { isOpen = false; list.classList.add("hidden"); };
+  const commit = (v, label, silent) => {
+    wrap.dataset.value = v;
+    inp.value = label !== undefined ? label : labelOf(v);
+    close();
+    if (!silent && typeof wrap.__onchange === "function") wrap.__onchange(v);
+  };
+  const openList = () => {
+    isOpen = true;
+    render(inp.value === labelOf(wrap.dataset.value) ? "" : inp.value);
+    list.classList.remove("hidden");
+  };
+
+  inp.addEventListener("focus", openList);
+  inp.addEventListener("input", () => { isOpen = true; render(inp.value); list.classList.remove("hidden"); });
+  inp.addEventListener("blur", () => {
+    // the typed term itself becomes the value if it changed
+    if (inp.value !== labelOf(wrap.dataset.value)) commit(inp.value, inp.value);
+    setTimeout(close, 120);
+  });
+  inp.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();                          // never submit the tool form from here
+      const first = opts.find((o) => !o.el.classList.contains("hidden"));
+      if (isOpen && first) commit(first.value, first.label);
+      else commit(inp.value, inp.value);
+    } else if (ev.key === "Escape") {
+      close();
+      inp.value = labelOf(wrap.dataset.value);
+    }
+  });
+  return wrap;
+}
+
+function setComboValue(comboEl, v) {
+  comboEl.dataset.value = v;
+  const inp = comboEl.querySelector(".combo-input");
+  if (!inp) return;
+  const hit = [...comboEl.querySelectorAll(".combo-opt")].find((o) => o.dataset.value === v);
+  inp.value = hit ? hit.textContent : v;
+}
+
 function widgetFor(name, prop, override) {
   const w = override || inferWidget(name, prop);
   const wrap = document.createElement("div");
@@ -207,35 +298,36 @@ function widgetFor(name, prop, override) {
   }
   wrap.appendChild(label);
 
-  let input;
+  // Searchable comboboxes for the big/choice-heavy fields — the typed term
+  // itself is always a valid value, so nothing is ever locked out.
   if (w.kind === "namespace") {
-    const names = state.namespaces || [];
-    if (names.length) {
-      // obvious dropdown, populated from the cluster (list_namespaces)
-      input = document.createElement("select");
-      input.className = "combo";
-      input.title = "Namespace — choose from the cluster";
-      if (!w.required) {
-        const all = document.createElement("option");
-        all.value = ""; all.textContent = "(all namespaces)";
-        input.appendChild(all);
-      }
-      for (const n of names) {
-        const o = document.createElement("option");
-        o.value = o.textContent = n;
-        input.appendChild(o);
-      }
-      if (w.required) input.value = names[0];
-    } else {
-      // namespaces not fetched yet (or the call failed): combobox fallback
-      input = document.createElement("input");
-      input.type = "text";
-      input.setAttribute("list", "ns-options");
-      input.placeholder = "(empty = all namespaces)";
-    }
-  } else if (w.kind === "resourcetype") {
-    input = buildResourceTypeSelect(prop);   // dataset.param/kind set by widgetFor
-  } else if (w.kind === "verb") {
+    const options = [];
+    if (!w.required) options.push({ value: "", label: "(all namespaces)" });
+    for (const n of state.namespaces || []) options.push({ value: n, label: n });
+    wrap.appendChild(makeCombo({
+      name, kind: "namespace", options,
+      value: w.required ? (state.namespaces[0] || "") : "",
+      placeholder: "type to filter namespaces…",
+    }));
+    return wrap;
+  }
+  if (w.kind === "resourcetype") {
+    const options = [];
+    for (const [, items] of COMMON_RESOURCES)
+      for (const r of items) options.push({ value: r, label: r });
+    const seen = new Set(options.map((o) => o.value));
+    for (const r of state.apiResources || [])
+      if (!seen.has(r)) { options.push({ value: r, label: r }); seen.add(r); }
+    wrap.appendChild(makeCombo({
+      name, kind: "resourcetype", options,
+      value: String(prop.default || "pods"),
+      placeholder: "type to filter — or type a CRD name",
+    }));
+    return wrap;
+  }
+
+  let input;
+  if (w.kind === "verb") {
     input = document.createElement("select");
     for (const v of READ_VERBS) {
       const o = document.createElement("option");
@@ -293,58 +385,6 @@ function widgetFor(name, prop, override) {
 
 /* Object-of-interest dropdown: curated groups first, then everything the
    cluster reported (api-resources — CRDs included), plus a type-it escape. */
-function buildResourceTypeSelect(prop) {
-  const sel = document.createElement("select");
-  sel.className = "combo";
-  sel.title = "Object of interest — choose, or pick ✎ other";
-  const groups = new Map();                       // label → optgroup
-  const group = (label) => {
-    let g = groups.get(label);
-    if (!g) {
-      g = document.createElement("optgroup");
-      g.label = label; sel.appendChild(g); groups.set(label, g);
-    }
-    return g;
-  };
-  const seen = new Set();
-  for (const [label, items] of COMMON_RESOURCES) {
-    for (const r of items) {
-      const o = document.createElement("option");
-      o.value = o.textContent = r;
-      group(label).appendChild(o);
-      seen.add(r);
-    }
-  }
-  const extra = (state.apiResources || []).filter((r) => !seen.has(r)).sort();
-  for (const r of extra) {
-    const o = document.createElement("option");
-    o.value = o.textContent = r;
-    group("Discovered on the cluster (api-resources)").appendChild(o);
-    seen.add(r);
-  }
-  const other = document.createElement("option");
-  other.value = "__custom__";
-  other.textContent = "✎ other / CRD (type it)";
-  sel.appendChild(other);
-  sel.value = String(prop.default || "pods");
-  if (sel.selectedIndex === -1) sel.value = "pods";
-  // ✎ other → swap the dropdown for a free-text field. dataset.param/kind
-  // are assigned by widgetFor right after this returns, so read them
-  // lazily inside the handler.
-  sel.addEventListener("change", () => {
-    if (sel.value !== "__custom__") return;
-    const inp = document.createElement("input");
-    inp.type = "text";
-    inp.setAttribute("list", "rt-options");
-    inp.placeholder = "resource type, e.g. inferenceservices";
-    inp.dataset.param = sel.dataset.param;
-    inp.dataset.kind = sel.dataset.kind;
-    sel.replaceWith(inp);
-    inp.focus();
-  });
-  return sel;
-}
-
 function buildForm(toolName, overrides) {
   const def = state.tools.get(toolName);
   if (!def) return null;
@@ -407,6 +447,11 @@ function readForm() {
   for (const el of $("form").querySelectorAll("[data-param]")) {
     const name = el.dataset.param, kind = el.dataset.kind;
     if (name.startsWith("__")) continue;          // internal widgets (tool picker)
+    if (el.dataset.combo) {                       // searchable combobox
+      const v = (el.dataset.value || "").trim();
+      if (v !== "") args[name] = kind === "number" ? Number(v) : v;
+      continue;
+    }
     if (kind === "command") {
       const bin = el.querySelector("select");
       const rest = el.querySelector("input");
@@ -611,6 +656,7 @@ function prefillForm(prefill) {
     const el = $("form").querySelector(`[data-param="${CSS.escape(k)}"]`);
     if (!el) continue;
     const kind = el.dataset.kind;
+    if (el.dataset.combo) { setComboValue(el, String(v)); continue; }
     if (kind === "command") {
       const parts = Array.isArray(v) ? v.slice() : String(v).split(/\s+/);
       const bin = el.querySelector("select");
@@ -637,14 +683,52 @@ function prefillForm(prefill) {
 /* ── Pod dropdown (logs/exec) ─────────────────────────────────────────── */
 
 const podCache = new Map();                       // namespace → [{name, phase}]
+const containerCache = new Map();                 // "ns/pod" → [container names]
+
+// Multi-container pods (queue-proxy + the model container, etc.) need an
+// explicit container for pods/log — fetch the pod spec once and swap the
+// container field for a select when there is a real choice to make.
+async function wireContainerPicker(ns, pod) {
+  const cEl = $("form").querySelector('[data-param="container"]');
+  if (!cEl || cEl.dataset.combo || !ns || !pod) return;
+  const ck = ns + "/" + pod;
+  let names = containerCache.get(ck);
+  if (!names) {
+    try {
+      // jsonpath on purpose: a KServe predictor's full pod JSON is ~56KB and
+      // get_resource truncates at ~50k — JSON.parse would throw and the
+      // picker would silently never appear. This returns just the names.
+      const namesText = await callTool("get_resource", {
+        resource_type: "pods", name: pod, namespace: ns,
+        output: "jsonpath={.spec.containers[*].name}",
+      });
+      names = namesText.trim().split(/\s+/).filter(Boolean);
+      containerCache.set(ck, names);
+    } catch { return; }                           // callTool already reported it
+  }
+  if (!names || names.length < 2) return;         // single container: server default is right
+  // Smart default: EZAF/KServe predictors always name their model container
+  // "kserve-container" — preselect it when present (that's what kubectl logs
+  // makes you type by hand anyway), keep the sidecars one click away.
+  const main = names.includes("kserve-container") ? "kserve-container" : null;
+  const options = [];
+  if (!main) options.push({ value: "", label: "(server default)" });
+  for (const n of (main ? [main, ...names.filter((n) => n !== main)] : names))
+    options.push({ value: n, label: n });
+  cEl.replaceWith(makeCombo({
+    name: "container", kind: "text", options,
+    value: main || "", placeholder: "type to filter containers…",
+  }));
+}
 
 async function wirePodPicker() {
   const nsEl = $("form").querySelector('[data-param="namespace"]');
-  const podEl = $("form").querySelector('[data-param="pod_name"]');
-  if (!nsEl || !podEl) return;
+  if (!nsEl || !nsEl.dataset.combo) return;       // combobox-only flow
   const load = async () => {
-    const ns = (nsEl.value || "").trim();
-    if (!ns) return;                              // "(all namespaces)" → type it
+    const ns = (nsEl.dataset.value || "").trim();
+    const podEl = $("form").querySelector('[data-param="pod_name"]');
+    if (!podEl) return;
+    if (!ns) return;                              // "(all namespaces)" → type a name
     let pods = podCache.get(ns);
     if (!pods) {
       try {
@@ -653,41 +737,15 @@ async function wirePodPicker() {
         podCache.set(ns, pods);
       } catch { return; }                         // callTool already reported it
     }
-    const cur = $("form").querySelector('[data-param="pod_name"]');
-    if (!cur || cur.tagName !== "INPUT" || !pods.length) return;
-    const sel = document.createElement("select");
-    sel.className = "combo";
-    sel.dataset.param = "pod_name";
-    sel.dataset.kind = "text";
-    const prev = cur.value;
-    for (const p of pods) {
-      const o = document.createElement("option");
-      o.value = p.name; o.textContent = `${p.name} (${p.phase})`;
-      sel.appendChild(o);
-    }
-    const other = document.createElement("option");
-    other.value = "__custom__"; other.textContent = "✎ type a pod name";
-    sel.appendChild(other);
-    if (prev && !pods.some((p) => p.name === prev)) {
-      const o = document.createElement("option");
-      o.value = o.textContent = prev;
-      sel.insertBefore(o, other);
-    }
-    sel.value = prev || (pods[0] ? pods[0].name : "__custom__");
-    if (sel.selectedIndex === -1) sel.value = "__custom__";
-    cur.replaceWith(sel);
-    sel.addEventListener("change", () => {
-      if (sel.value !== "__custom__") return;
-      const inp = document.createElement("input");
-      inp.type = "text";
-      inp.dataset.param = "pod_name";
-      inp.dataset.kind = "text";
-      inp.placeholder = "pod name";
-      sel.replaceWith(inp);
-      inp.focus();
-    });
+    const prev = podEl.dataset.combo ? (podEl.dataset.value || "") : (podEl.value || "");
+    podEl.replaceWith(makeCombo({
+      name: "pod_name", kind: "text",
+      options: pods.map((p) => ({ value: p.name, label: `${p.name} (${p.phase})` })),
+      value: prev, placeholder: "type to filter pods…",
+    }));
+    await wireContainerPicker(ns, prev || (pods[0] ? pods[0].name : ""));
   };
-  nsEl.addEventListener("change", load);
+  nsEl.__onchange = load;                         // namespace combo commits → refresh pods
   await load();
 }
 
@@ -708,7 +766,9 @@ async function navigate(screenId, prefill, autoRun) {
   prefillForm(prefill);
 
   if (screen.exec) prepareExecScreen(prefill);
-  if (screen.tool === "get_pod_logs" || screen.tool === "exec_in_pod") wirePodPicker();
+  // await: the pod/container pickers must land BEFORE the auto-run, or the
+  // first logs call fires without a container and 400s on multi-container pods.
+  if (screen.tool === "get_pod_logs" || screen.tool === "exec_in_pod") await wirePodPicker();
 
   if (autoRun || screen.auto) runCurrent();
 }
@@ -871,6 +931,11 @@ function wire() {
   $("btn-copy").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(state.lastText); toast("Copied to clipboard"); }
     catch { toast("Clipboard unavailable", true); }
+  });
+  $("btn-full").addEventListener("click", () => {
+    const w = $("output-wrap");
+    const on = w.classList.toggle("fullscreen");
+    $("btn-full").textContent = on ? "✕ Exit full screen" : "⛶ Full screen";
   });
   $("btn-raw").addEventListener("click", () => {
     const cur = $("output").textContent || "";

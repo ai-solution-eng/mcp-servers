@@ -243,12 +243,20 @@ def api_tables(engine: SqlEngine) -> dict:
 
 def api_describe(engine: SqlEngine, table: str) -> dict:
     info = engine.describe_table(table)
-    return {
+    out = {
         "table": table,
         "uri": info["uri"],
         "columns": info["columns"],
         "n_columns": info["n_columns"],
     }
+    # Semantic-catalog documentation, when a catalog is attached and covers
+    # this table (the MCP surface has always carried it; the web API + UI get
+    # it too so an uploaded catalog is visible where it was uploaded).
+    if info.get("description"):
+        out["description"] = info["description"]
+    if info.get("aliases"):
+        out["aliases"] = info["aliases"]
+    return out
 
 
 def api_query(engine: SqlEngine, sql: str, limit: int | None = None, params: object | None = None) -> dict:
@@ -543,6 +551,53 @@ def api_export(engine: SqlEngine, body: dict) -> dict:
     return {"content": content, "media_type": media_type, "filename": f"{name}.{fmt}"}
 
 
+# ---- semantic catalog (status / upload / clear) ------------------------------
+# The one mutating corner of the API: it writes documentation (table/column
+# descriptions) to the engine's catalog store — never data. Guarded by the
+# same layers as every /api route (SQLHANDLER_API_TOKEN / gateway auth), and
+# switchable off entirely with SQLHANDLER_CATALOG_UPLOAD=0.
+
+# Catalogs are documentation; anything near a megabyte is abuse or a mistake.
+_CATALOG_UPLOAD_MAX_BYTES = 1_000_000
+
+
+def api_catalog_status(engine: SqlEngine) -> dict:
+    """GET /api/semantic-catalog — which catalog is live, where it came from."""
+    return engine.catalog_status()
+
+
+def api_catalog_upload(engine: SqlEngine, body: bytes) -> dict:
+    """POST /api/semantic-catalog — validate + store an uploaded catalog.
+
+    The body is the raw file contents, JSON or YAML (the UI reads the file
+    client-side and POSTs the text — no multipart dependency; curl works too
+    via --data-binary). Raises ValueError (-> 400) on invalid content and
+    OSError (-> 500) on an unwritable store.
+    """
+    if not engine.catalog_uploads_enabled:
+        raise ValueError("Semantic-catalog upload is disabled (SQLHANDLER_CATALOG_UPLOAD=0).")
+    if len(body) > _CATALOG_UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"Catalog upload too large ({len(body)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES})."
+        )
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Catalog upload must be UTF-8 text (JSON or YAML).") from exc
+    if not text.strip():
+        raise ValueError("Catalog upload is empty.")
+    return engine.set_catalog_text(text)
+
+
+def api_catalog_clear(engine: SqlEngine) -> dict:
+    """DELETE /api/semantic-catalog — remove the uploaded catalog.
+
+    Falls back to the configured SQLHANDLER_CATALOG file (if any).
+    """
+    removed = engine.clear_catalog()
+    return {"removed": removed, **engine.catalog_status()}
+
+
 # ---------------------------------------------------------------------------
 # Starlette route wiring
 # ---------------------------------------------------------------------------
@@ -693,3 +748,41 @@ def register_ui(app, engine_getter) -> None:
     app.add_route("/api/preview", preview, methods=["POST"])
     app.add_route("/api/profile", profile, methods=["POST"])
     app.add_route("/api/export", export, methods=["POST"])
+
+    # ---- semantic catalog: status / upload (JSON or YAML) / clear ----
+    async def semantic_catalog_get(_request) -> JSONResponse:
+        try:
+            return JSONResponse(api_catalog_status(engine_getter()))
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def semantic_catalog_upload(request) -> JSONResponse:
+        body = await request.body()
+        try:
+            return JSONResponse({"ok": True, **api_catalog_upload(engine_getter(), body)})
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            # Unwritable store (read-only fs, bad path) — operator-actionable.
+            return JSONResponse(
+                {
+                    "error": f"Cannot write the catalog store "
+                    f"({engine_getter().catalog_status().get('store_path')}): {exc}. "
+                    "Set SQLHANDLER_CATALOG_STORE to a writable path."
+                },
+                status_code=500,
+            )
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def semantic_catalog_delete(_request) -> JSONResponse:
+        try:
+            return JSONResponse({"ok": True, **api_catalog_clear(engine_getter())})
+        except OSError as exc:
+            return JSONResponse({"error": f"Cannot remove the uploaded catalog: {exc}"}, status_code=500)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    app.add_route("/api/semantic-catalog", semantic_catalog_get, methods=["GET"])
+    app.add_route("/api/semantic-catalog", semantic_catalog_upload, methods=["POST"])
+    app.add_route("/api/semantic-catalog", semantic_catalog_delete, methods=["DELETE"])

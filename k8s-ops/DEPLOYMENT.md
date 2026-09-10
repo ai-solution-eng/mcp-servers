@@ -1,29 +1,21 @@
 # Deploying k8s-mcp-2-0-server
 
-A read-only Kubernetes ops MCP server (MCP 2.0 / protocol `2026-07-28`) with
-API-key auth, optional namespace governance, an opt-in hardened exec tool, a
-built-in HPE ops console at `/ui/`, and a Helm chart with two profiles.
+A read-only Kubernetes ops MCP server (MCP 2.0 / protocol `2026-07-28`) with API-key auth, optional namespace governance, an opt-in hardened exec tool, a built-in HPE ops console at `/ui/`, and a Helm chart with two profiles.
 
 ## Prerequisites
 
 - `kubectl` configured against your cluster
 - `docker` (to build/push the image)
-- A gateway for external exposure — every PCAI cluster ships the ezaf-gateway;
-  the chart's `ezua:` block deploys the Istio VirtualService against it
+- A gateway for external exposure — every PCAI cluster ships the ezaf-gateway; the chart's `ezua:` block deploys the Istio VirtualService against it
 - `helm` (only for the chart path)
 
 ## 0. Helm — the recommended path (two charts: trusted + locked)
 
-Two charts, one image. `helm/` is the trusted-operator chart — every security
-knob is values/frontend-configurable. `helm-customer/` is the customer
-distribution — **structurally locked**: the security keys do not exist in its
-values and its templates never read them, so anything pasted into the PCAI
-frontend is inert (no guards to bypass — there is no `lockdown` flag at all).
-`bump_version.sh` covers both automatically via the `helm*` glob and the
-version-suffix convention (`0.2.2`, `0.2.1-customer`).
+Two charts, one image. `helm/` is the trusted-operator chart — every security knob is values/frontend-configurable. `helm-customer/` is the customer distribution — **structurally locked**: the security keys do not exist in its values and its templates never read them, so anything pasted into the PCAI frontend is inert (no guards to bypass — there is no `lockdown` flag at all). `bump_version.sh`
+covers both automatically via the `helm*` glob and the version-suffix convention (`0.2.2`, `0.2.1-customer`).
 
 ```bash
-docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.6 . --push
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.12 . --push
 
 # ── INTERNAL (HPE cluster): every knob lives in values ─────────────────
 # 1. edit helm/local/values-internal.yaml (endpoint! blocked ns! exec!)
@@ -57,16 +49,11 @@ Chart semantics:
 | API key | out-of-band Secret (both charts — never in values) | out-of-band Secret |
 | day-2 knobs | values upgrade (`helm upgrade`) or `kubectl set env` | `kubectl set env` (+ manual exec RBAC; NOTES prints every command) |
 
-Why the split: with one chart, the customer owns the `lockdown` flag itself,
-so any values-based guard was advisory. With two charts the locked posture is
-structural — there is nothing to flip. (`lockdown` values key: removed in
-chart v0.2.2.)
+Why the split: with one chart, the customer owns the `lockdown` flag itself, so any values-based guard was advisory. With two charts the locked posture is structural — there is nothing to flip. (`lockdown` values key: removed in chart v0.2.2.)
 
-Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
-RuntimeDefault seccomp) is fixed in both charts — not values-overridable.
+Container hardening (non-root 10001, read-only rootfs, dropped capabilities, RuntimeDefault seccomp) is fixed in both charts — not values-overridable.
 
-Release flow (toolkit is hardlinked from `pcai_utils` at the repo root —
-edit shared files in `pcai_utils`, never re-copy them):
+Release flow (toolkit is hardlinked from `pcai_utils` at the repo root — edit shared files in `pcai_utils`, never re-copy them):
 
 ```bash
 ./bump_version.sh 0.3.0     # BOTH charts: helm/ (0.3.0) + helm-customer/
@@ -77,34 +64,23 @@ helm package helm-customer/ # → k8s-mcp-customer-0.3.0-customer.tgz
 ./prune_charts.py           # keep only the newest archive per chart
 ```
 
-Manual stragglers the bumper doesn't touch: the image tag inside
-`k8s-mcp-2-0-server.yaml` and `VERSION` in `server.py`.
-Delivery to `pcai-solutions/mcp-servers/k8s-mcp/` (the git repo) is via
-`hardlinker.py` — see `helm/local/adopt_pcai_utils.sh` and the pcai_utils README.
+Manual stragglers the bumper doesn't touch: the image tag inside `k8s-mcp-2-0-server.yaml` and `VERSION` in `server.py`. Delivery to `pcai-solutions/mcp-servers/k8s-mcp/` (the git repo) is via `hardlinker.py` — see `helm/local/adopt_pcai_utils.sh` and the pcai_utils README.
 
 ## 1. Build & push (legacy envsubst path uses the same image)
 
 ```bash
 # Dockerfile lives at the repo root — no -f needed (buildx auto-detects it).
 docker login ghcr.io   # once, if not already logged in
-docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.6 . --push
+docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v0.2.12 . --push
 ```
 
-kubectl is pinned + checksum-verified inside the Dockerfile — no extra steps.
-`TARGETARCH` is picked up automatically, so `--platform linux/amd64` (or
-multi-arch builds) fetch the matching kubectl binary.
+kubectl is pinned + checksum-verified inside the Dockerfile — no extra steps. `TARGETARCH` is picked up automatically, so `--platform linux/amd64` (or multi-arch builds) fetch the matching kubectl binary.
 
 ### Private image registry (ghcr)
 
-Packages pushed to ghcr.io **with a personal-access token are PRIVATE by
-default** (packages pushed from CI with `GITHUB_TOKEN` inherit the repo's
-visibility instead). Verify/flip visibility under
-`github.com → <user/org> → Packages → k8s-mcp → Package settings`. A private
-package needs a pull credential in the cluster:
+Packages pushed to ghcr.io **with a personal-access token are PRIVATE by default** (packages pushed from CI with `GITHUB_TOKEN` inherit the repo's visibility instead). Verify/flip visibility under `github.com → <user/org> → Packages → k8s-mcp → Package settings`. A private package needs a pull credential in the cluster:
 
-1. **Get the key**: GitHub → Settings → Developer settings → Personal access
-   tokens (classic) → generate a token with the **`read:packages`** scope.
-   That PAT is the pull password (read-only; it cannot push).
+1. **Get the key**: GitHub → Settings → Developer settings → Personal access tokens (classic) → generate a token with the **`read:packages`** scope. That PAT is the pull password (read-only; it cannot push).
 2. **Create the pull secret** in the server's namespace:
 
    ```bash
@@ -115,16 +91,10 @@ package needs a pull credential in the cluster:
      --docker-email=you@example.com
    ```
 
-3. **Reference it**: uncomment `imagePullSecrets: [{name: ghcr-pull}]` in
-   `k8s-mcp-2-0-server.yaml` and re-apply, then
-   `kubectl -n $NAMESPACE rollout restart deploy/k8s-mcp-2-0-server`.
-4. Symptom check: `ErrImagePull` / `401 Unauthorized` on ghcr.io in pod
-   events means the secret is missing, wrong, or the PAT lacks
-   `read:packages` — or the package is private and step 3 wasn't done.
+3. **Reference it**: uncomment `imagePullSecrets: [{name: ghcr-pull}]` in `k8s-mcp-2-0-server.yaml` and re-apply, then `kubectl -n $NAMESPACE rollout restart deploy/k8s-mcp-2-0-server`.
+4. Symptom check: `ErrImagePull` / `401 Unauthorized` on ghcr.io in pod events means the secret is missing, wrong, or the PAT lacks `read:packages` — or the package is private and step 3 wasn't done.
 
-This pull credential is unrelated to the MCP API key below: it authenticates
-the **cluster against ghcr**, the API key authenticates **MCP clients against
-the server**.
+This pull credential is unrelated to the MCP API key below: it authenticates the **cluster against ghcr**, the API key authenticates **MCP clients against the server**.
 
 ## 2. Deploy (one command + one secret)
 
@@ -145,8 +115,7 @@ kubectl -n $NAMESPACE create secret generic k8s-mcp-2-0-apikey \
 envsubst < k8s-mcp-2-0-server.yaml | kubectl apply -f -
 ```
 
-The table below mentions the Secret — it is created by the command above, not
-by the manifest apply.
+The table below mentions the Secret — it is created by the command above, not by the manifest apply.
 
 What gets installed:
 
@@ -160,14 +129,8 @@ What gets installed:
 | Deployment `k8s-mcp-2-0-server` | non-root, read-only rootfs, dropped capabilities, seccomp |
 | Service + VirtualService | exposure on `mcp-k8s-2-0-server.${DOMAIN_NAME}` |
 
-All `K8S_MCP_*` knobs are envsubst-driven: you can export them at deploy time
-(`K8S_MCP_ALLOWED_NAMESPACES`, `K8S_MCP_BLOCKED_NAMESPACES`,
-`K8S_MCP_EXEC_ENABLED`, `K8S_MCP_EXEC_NAMESPACES`,
-`K8S_MCP_EXEC_REQUIRE_LABEL`, `K8S_MCP_EXEC_AUTO_RBAC`, `K8S_MCP_CLIENTS`)
-and they land in the Deployment on first apply; unset exports mean the
-documented defaults (all namespaces readable, exec disabled). Changing them
-later via `kubectl set env` works identically (it triggers a rollout, and
-exec RBAC re-provisions at startup).
+All `K8S_MCP_*` knobs are envsubst-driven: you can export them at deploy time (`K8S_MCP_ALLOWED_NAMESPACES`, `K8S_MCP_BLOCKED_NAMESPACES`, `K8S_MCP_EXEC_ENABLED`, `K8S_MCP_EXEC_NAMESPACES`, `K8S_MCP_EXEC_REQUIRE_LABEL`, `K8S_MCP_EXEC_AUTO_RBAC`, `K8S_MCP_CLIENTS`) and they land in the Deployment on first apply; unset exports mean the documented defaults (all namespaces readable, exec disabled).
+Changing them later via `kubectl set env` works identically (it triggers a rollout, and exec RBAC re-provisions at startup).
 
 ## 3. Verify
 
@@ -191,8 +154,7 @@ curl -s https://mcp-k8s-2-0-server.$DOMAIN_NAME/mcp \
 
 ## 4. Connect an MCP client
 
-Retrieve the API key from the cluster Secret (the value you exported as
-`API_KEY` at apply time — same value either way):
+Retrieve the API key from the cluster Secret (the value you exported as `API_KEY` at apply time — same value either way):
 
 ```bash
 kubectl -n $NAMESPACE get secret k8s-mcp-2-0-apikey \
@@ -224,14 +186,11 @@ kubectl -n $NAMESPACE set env deploy/k8s-mcp-2-0-server \
 # blacklist (always wins): K8S_MCP_BLOCKED_NAMESPACES="kube-system,kube-public"
 ```
 
-The set env triggers a rollout automatically. Read tools filter cluster-wide
-results to the allowed namespaces; kubectl-backed tools require `-n` and
-rewrite/reject `-A` per the policy.
+The set env triggers a rollout automatically. Read tools filter cluster-wide results to the allowed namespaces; kubectl-backed tools require `-n` and rewrite/reject `-A` per the policy.
 
 ## 6. Exec in certain namespaces (opt-in)
 
-Exec is **off by default** — the tool doesn't even exist for clients. Turning
-it on is two variables, and the RBAC follows automatically:
+Exec is **off by default** — the tool doesn't even exist for clients. Turning it on is two variables, and the RBAC follows automatically:
 
 ```bash
 kubectl -n $NAMESPACE set env deploy/k8s-mcp-2-0-server \
@@ -239,30 +198,22 @@ kubectl -n $NAMESPACE set env deploy/k8s-mcp-2-0-server \
   K8S_MCP_EXEC_NAMESPACES="debug-*,team-a"
 ```
 
-On startup the server **provisions the pods/exec RoleBindings itself** for
-every namespace on the list (globs expanded against the live namespaces) and
-logs the summary:
+On startup the server **provisions the pods/exec RoleBindings itself** for every namespace on the list (globs expanded against the live namespaces) and logs the summary:
 
 ```
 RBAC provisioning: SA mcp-ns/k8s-mcp-2-0-sa bound to 'k8s-mcp-pods-exec' —
 created: ['team-a']; already present: none; skipped: [('debug-*', 'no live namespaces matched')]; refused: none
 ```
 
-**How the automatic RBAC stays safe** — the provisioner permission is
-scoped so it cannot escalate:
+**How the automatic RBAC stays safe** — the provisioner permission is scoped so it cannot escalate:
 
-- it may reference **only** the `k8s-mcp-pods-exec` template (`bind` is
-  `resourceNames`-restricted) — never `cluster-admin` or any other role;
+- it may reference **only** the `k8s-mcp-pods-exec` template (`bind` is `resourceNames`-restricted) — never `cluster-admin` or any other role;
 - it cannot create or modify role *content*;
 - it never creates ClusterRoleBindings;
-- it skips namespaces the general namespace policy blocks and namespaces that
-  don't exist;
+- it skips namespaces the general namespace policy blocks and namespaces that don't exist;
 - it never touches an existing binding with a different roleRef.
 
-The four gates that must agree before an exec succeeds: **exec list →
-general namespace policy → RoleBinding (RBAC) → pod label
-`k8s-mcp.io/exec: "true"`** (drop the label gate with
-`K8S_MCP_EXEC_REQUIRE_LABEL=false` — discouraged).
+The four gates that must agree before an exec succeeds: **exec list → general namespace policy → RoleBinding (RBAC) → pod label `k8s-mcp.io/exec: "true"`** (drop the label gate with `K8S_MCP_EXEC_REQUIRE_LABEL=false` — discouraged).
 
 Optional knobs:
 
@@ -273,10 +224,7 @@ K8S_MCP_EXEC_AUTO_RBAC=false    # disable auto-provisioning → bind manually (b
 
 ### Per-user keys: exec scoping per person/team (optional)
 
-Handing everyone the shared key makes the exec list an all-or-nothing
-affair. Instead, issue **per-user keys with their own exec namespace
-assignment** via `K8S_MCP_CLIENTS` (format `name:key[:exec-ns-patterns];…`,
-entries `;`-separated, patterns comma-separated globs):
+Handing everyone the shared key makes the exec list an all-or-nothing affair. Instead, issue **per-user keys with their own exec namespace assignment** via `K8S_MCP_CLIENTS` (format `name:key[:exec-ns-patterns];…`, entries `;`-separated, patterns comma-separated globs):
 
 ```yaml
 env:
@@ -284,21 +232,12 @@ env:
   value: "alice:<alice-key>:debug-*,team-a;bob:<bob-key>:team-b;ops:<ops-key>"
 ```
 
-- `alice` can exec in `debug-*` and `team-a` only; `bob` only in `team-b`;
-  `ops` (no third field) inherits the deployment-wide exec list.
-- Users connect with their own key — no client-side configuration beyond the
-  normal Authorization header, and **they cannot widen their own scope**
-  (capabilities travel with the credential).
-- The optional `X-Exec-Namespaces: team-a` request header lets a client
-  further NARROW its own requests (self-restriction for specific MCP client
-  profiles); it is intersected with the key's assignment and can never widen
-  it. Invalid patterns → 400.
-- The shared `K8S_MCP_API_KEY` (if still set) keeps working with the
-  deployment-wide ceiling.
-- Every exec AUDIT line records the calling client's name — per-user
-  attribution without JWT infrastructure.
-- RBAC provisioning binds the **union** of the deployment list and all client
-  assignments (restart after changing the map).
+- `alice` can exec in `debug-*` and `team-a` only; `bob` only in `team-b`; `ops` (no third field) inherits the deployment-wide exec list.
+- Users connect with their own key — no client-side configuration beyond the normal Authorization header, and **they cannot widen their own scope** (capabilities travel with the credential).
+- The optional `X-Exec-Namespaces: team-a` request header lets a client further NARROW its own requests (self-restriction for specific MCP client profiles); it is intersected with the key's assignment and can never widen it. Invalid patterns → 400.
+- The shared `K8S_MCP_API_KEY` (if still set) keeps working with the deployment-wide ceiling.
+- Every exec AUDIT line records the calling client's name — per-user attribution without JWT infrastructure.
+- RBAC provisioning binds the **union** of the deployment list and all client assignments (restart after changing the map).
 
 ### Manual RBAC fallback (`K8S_MCP_EXEC_AUTO_RBAC=false`)
 
@@ -318,15 +257,11 @@ EOF
 done
 ```
 
-(Standalone pre-provisioning is also available without starting the server:
-`kubectl -n $NAMESPACE exec deploy/k8s-mcp-2-0-server -- python server.py --provision-rbac`,
-or run it locally with SA env overrides.)
+(Standalone pre-provisioning is also available without starting the server: `kubectl -n $NAMESPACE exec deploy/k8s-mcp-2-0-server -- python server.py --provision-rbac`, or run it locally with SA env overrides.)
 
 ### Moving the server to a dedicated namespace
 
-Recommended — the server is cluster-scoped in effect (its ClusterRoles and
-cross-namespace bindings), so a dedicated namespace (e.g. `k8s-mcp-ops`)
-beats a personal project one. Migration (v0.1.2+):
+Recommended — the server is cluster-scoped in effect (its ClusterRoles and cross-namespace bindings), so a dedicated namespace (e.g. `k8s-mcp-ops`) beats a personal project one. Migration (v0.1.2+):
 
 ```bash
 export OLD_NS=project-user-andrew-bydlon
@@ -344,12 +279,8 @@ kubectl -n $NAMESPACE rollout status deploy/k8s-mcp-2-0-server
 What happens automatically:
 
 - The same API key is reused (clients keep working).
-- The provisioner ClusterRoleBinding and the Deployment/Secret/Service/
-  VirtualService are created in (or updated to) the new namespace.
-- At startup, provisioning **repoints** all existing exec RoleBindings from
-  the old ServiceAccount to the new one — look for
-  `AUDIT rbac provisioning repointed ...` lines; no manual binding cleanup is
-  needed (v0.1.2+; earlier versions would leave them stale).
+- The provisioner ClusterRoleBinding and the Deployment/Secret/Service/ VirtualService are created in (or updated to) the new namespace.
+- At startup, provisioning **repoints** all existing exec RoleBindings from the old ServiceAccount to the new one — look for `AUDIT rbac provisioning repointed ...` lines; no manual binding cleanup is needed (v0.1.2+; earlier versions would leave them stale).
 
 Then remove the leftovers of the old install:
 
@@ -361,9 +292,7 @@ kubectl -n $OLD_NS delete deployment/k8s-mcp-2-0-server service/k8s-mcp-2-0-svc 
 kubectl delete clusterrolebinding k8s-mcp-2-0-viewer-${OLD_NS}
 ```
 
-Since the server no longer lives in your personal namespace, you can drop it
-from `K8S_MCP_BLOCKED_NAMESPACES` (making your own workloads debuggable) and
-blacklist the new dedicated one instead: `kube-system,kube-public,k8s-mcp-ops`.
+Since the server no longer lives in your personal namespace, you can drop it from `K8S_MCP_BLOCKED_NAMESPACES` (making your own workloads debuggable) and blacklist the new dedicated one instead: `kube-system,kube-public,k8s-mcp-ops`.
 
 ### Removing exec
 
@@ -371,8 +300,7 @@ blacklist the new dedicated one instead: `kube-system,kube-public,k8s-mcp-ops`.
 kubectl -n $NAMESPACE set env deploy/k8s-mcp-2-0-server K8S_MCP_EXEC_ENABLED=false
 ```
 
-The tool disappears on the next rollout. Leftover RoleBindings are harmless
-(the tool that would use them is gone) but can be removed:
+The tool disappears on the next rollout. Leftover RoleBindings are harmless (the tool that would use them is gone) but can be removed:
 
 ```bash
 for NS in team-a debug-x; do kubectl -n "$NS" delete rolebinding k8s-mcp-2-0-exec; done
@@ -380,17 +308,10 @@ for NS in team-a debug-x; do kubectl -n "$NS" delete rolebinding k8s-mcp-2-0-exe
 
 ## 7. Operations
 
-- **API key rotation**: `kubectl -n $NAMESPACE create secret generic
-  k8s-mcp-2-0-apikey --from-literal=api-key=<new> --dry-run=client -o yaml |
-  kubectl apply -f -` then `kubectl -n $NAMESPACE rollout restart
-  deploy/k8s-mcp-2-0-server`; update clients.
-- **Changing the exec list / namespace policy**: `kubectl set env …` (rolls
-  automatically; provisioning re-runs at startup).
-- **Audit trail**: `kubectl -n $NAMESPACE logs deploy/k8s-mcp-2-0-server |
-  grep AUDIT` — every exec allow/deny and RBAC provisioning action.
-- Changing `K8S_MCP_EXEC_NAMESPACES` does **not** delete RoleBindings for
-  removed namespaces (idempotent ensure, not a reconciler) — remove them with
-  the loop above if you want the RBAC pruned.
+- **API key rotation**: `kubectl -n $NAMESPACE create secret generic k8s-mcp-2-0-apikey --from-literal=api-key=<new> --dry-run=client -o yaml | kubectl apply -f -` then `kubectl -n $NAMESPACE rollout restart deploy/k8s-mcp-2-0-server`; update clients.
+- **Changing the exec list / namespace policy**: `kubectl set env …` (rolls automatically; provisioning re-runs at startup).
+- **Audit trail**: `kubectl -n $NAMESPACE logs deploy/k8s-mcp-2-0-server | grep AUDIT` — every exec allow/deny and RBAC provisioning action.
+- Changing `K8S_MCP_EXEC_NAMESPACES` does **not** delete RoleBindings for removed namespaces (idempotent ensure, not a reconciler) — remove them with the loop above if you want the RBAC pruned.
 
 ## Troubleshooting
 

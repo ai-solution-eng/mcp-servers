@@ -1,6 +1,18 @@
+# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
+# SearXNG sidecar (optional headless-browser render sidecar) for PCAI.
 apiVersion: v2
 name: searxng-mcp
-description: SearXNG MCP Server — MCP 2.0 metasearch + content fetcher backed by a bundled SearXNG sidecar
+description: >-
+  SearXNG MCP Server — MCP 2.0 metasearch + content fetcher backed by a
+  bundled SearXNG sidecar, behind the PCAI Istio gateway.
 type: application
 version: 1.2.0
 appVersion: "v1.2.0"
+keywords:
+  - mcp
+  - search
+  - searxng
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

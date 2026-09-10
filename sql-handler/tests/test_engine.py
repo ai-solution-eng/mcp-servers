@@ -8,6 +8,7 @@ for real while nothing touches the network.
 import json
 import threading
 import time
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.dataset as pad
@@ -469,6 +470,105 @@ def test_table_description_for_list(tmp_path, monkeypatch):
     assert eng.table_description(target).startswith("Work order headers")
     other = next(t for t in tables if t.path == "workorder/work_order_note")
     assert eng.table_description(other) == ""
+
+
+def test_catalog_yaml_file_loaded(tmp_path, monkeypatch):
+    """The engine accepts YAML catalog files, not just JSON (JSON tried first)."""
+    p = tmp_path / "catalog.yaml"
+    p.write_text(
+        "tables:\n"
+        "  workorder/work_order:\n"
+        "    description: Work order headers (YAML)\n"
+        "    aliases:\n"
+        "      - work orders\n"
+        "    columns:\n"
+        "      amount: Order total in USD\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    eng, _ = _make_engine(tmp_path)
+    d = eng.describe_table("workorder/work_order")
+    assert d["description"] == "Work order headers (YAML)"
+    assert d["aliases"] == ["work orders"]
+    cols = {c["name"]: c for c in d["columns"]}
+    assert cols["amount"]["description"] == "Order total in USD"
+
+
+def test_catalog_store_upload_overrides_configured(tmp_path, monkeypatch):
+    """An uploaded catalog wins over the configured file until cleared."""
+    p = _write_catalog(tmp_path)
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    assert (
+        eng.describe_table("workorder/work_order")["description"]
+        == "Work order headers, one row per maintenance order"
+    )
+    # Upload as YAML text — the friendlier format must work end to end.
+    res = eng.set_catalog_text(
+        "tables:\n  workorder/work_order:\n    description: uploaded\n"
+    )
+    assert res["tables"] == 1
+    assert eng.describe_table("workorder/work_order")["description"] == "uploaded"
+    status = eng.catalog_status()
+    assert status["active_source"] == "upload"
+    assert status["uploaded"]["tables"] == 1
+    # The store file is canonical JSON regardless of upload format.
+    data = json.loads(Path(status["uploaded"]["path"]).read_text(encoding="utf-8"))
+    assert data["tables"]["workorder/work_order"]["description"] == "uploaded"
+
+
+def test_catalog_clear_falls_back_to_configured(tmp_path, monkeypatch):
+    p = _write_catalog(tmp_path)
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(p))
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    eng.set_catalog_text('{"tables": {"workorder/work_order": {"description": "uploaded"}}}')
+    assert eng.catalog_status()["active_source"] == "upload"
+    assert eng.clear_catalog() is True
+    status = eng.catalog_status()
+    assert status["active_source"] == "configured"
+    assert (
+        eng.describe_table("workorder/work_order")["description"]
+        == "Work order headers, one row per maintenance order"
+    )
+    assert eng.clear_catalog() is False  # nothing left to remove
+
+
+def test_set_catalog_text_rejects_invalid(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    eng, _ = _make_engine(tmp_path)
+    bad_inputs = [
+        "{not json or yaml",                    # neither format parses
+        "[1, 2]",                               # valid YAML but not an object
+        '"a scalar"',                           # valid JSON but not an object
+        '{"no_tables_key": {}}',                # missing the tables mapping
+        '{"tables": {"t": "not-a-mapping"}}',   # entry must be a mapping
+    ]
+    for text in bad_inputs:
+        with pytest.raises(ValueError):
+            eng.set_catalog_text(text)
+    status = eng.catalog_status()
+    assert status["uploaded"] is not None  # peeked, but
+    assert not status["uploaded"].get("exists")  # nothing was written
+
+
+def test_catalog_yaml_without_pyyaml_clear_error(tmp_path, monkeypatch):
+    """Without pyyaml, YAML uploads fail with an actionable message."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("No module named 'yaml'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    monkeypatch.setattr(builtins, "__import__", _no_yaml)
+    eng, _ = _make_engine(tmp_path)
+    with pytest.raises(ValueError, match="PyYAML is not installed"):
+        eng.set_catalog_text("tables: {}")
 
 
 # ---------------------------------------------------------------- did-you-mean

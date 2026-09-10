@@ -1,9 +1,6 @@
 # SQLhandler
 
-Fast, direct SQL access to columnar data, exposed as an **MCP server** — a
-drop-in **EzPresto / PrestoDB replacement**. It reads tabular data **directly**
-from the source with pyarrow and queries it with **DuckDB** over the exposed
-pyarrow datasets, pushing predicates / column projection into the scan.
+Fast, direct SQL access to columnar data, exposed as an **MCP server** — a drop-in **EzPresto / PrestoDB replacement**. It reads tabular data **directly** from the source with pyarrow and queries it with **DuckDB** over the exposed pyarrow datasets, pushing predicates / column projection into the scan.
 
 Four backends are supported (selected by `SQLHANDLER_BACKEND`):
 
@@ -12,15 +9,11 @@ Four backends are supported (selected by `SQLHANDLER_BACKEND`):
 - **iceberg** — Apache Iceberg tables through a catalog (REST or SQL), Parquet data files
 - **nfs** — a mounted directory (NFS / PVC / hostPath): Delta Lake **and** Parquet
 
-They all share the same SQL engine, caches, MCP tools, and backend-aware
-readiness probe; only the `DataProvider` behind them differs. See
-[Backend comparison](#backend-comparison-onelake-fabric-vs-s3-minio).
+They all share the same SQL engine, caches, MCP tools, and backend-aware readiness probe; only the `DataProvider` behind them differs. See [Backend comparison](#backend-comparison-onelake-fabric-vs-s3-minio).
 
 ## Backend comparison: OneLake (Fabric) vs S3 (MinIO)
 
-Both backends speak the same MCP tools and SQL engine. The differences are
-only in *where* the data lives, how you authenticate, and how tables are
-discovered:
+Both backends speak the same MCP tools and SQL engine. The differences are only in *where* the data lives, how you authenticate, and how tables are discovered:
 
 | Aspect | OneLake (`onelake`) | S3 / MinIO (`s3`) |
 |---|---|---|
@@ -63,14 +56,10 @@ sqlhandler --transport streamable-http --port 9097
 
 **Which one?**
 
-- Use **onelake** when the data already lives in Microsoft Fabric (as the
-  Toromont lakehouse does) — zero copying, Delta's transactional metadata.
-- Use **s3** when your data is Parquet in object storage (MinIO on-prem, AWS
-  S3, GCS-interop) or you want a plain-file lake that any tool can dump into.
-- Use **iceberg** when you have a real lakehouse catalog — schema/time-travel
-  management, concurrent writers, cross-engine reads.
-- Both onelake and s3 work through the same Helm chart (`backend:` value in
-  `values.yaml`); see the deployment sections below.
+- Use **onelake** when the data already lives in Microsoft Fabric (as the Toromont lakehouse does) — zero copying, Delta's transactional metadata.
+- Use **s3** when your data is Parquet in object storage (MinIO on-prem, AWS S3, GCS-interop) or you want a plain-file lake that any tool can dump into.
+- Use **iceberg** when you have a real lakehouse catalog — schema/time-travel management, concurrent writers, cross-engine reads.
+- Both onelake and s3 work through the same Helm chart (`backend:` value in `values.yaml`); see the deployment sections below.
 ## Why it's faster
 
 | Approach | What happens on a 40M-row table |
@@ -102,28 +91,17 @@ Components:
 - `src/sqlhandler/iceberg.py`    — Iceberg (catalog + Parquet) provider
 - `src/sqlhandler/file.py`        — NFS/local filesystem (Delta + Parquet) provider
 - `src/sqlhandler/webui.py`       — read-only web UI + JSON API (`/`, `/ui`, `/api/*`)
-- `src/sqlhandler/server.py`    — the MCP server (`list_tables`, `describe_table`,
-                                  `run_sql`, `scan_table`)
+- `src/sqlhandler/server.py`    — the MCP server (`list_tables`, `describe_table`, `run_sql`, `scan_table`)
 
 ## OneLake access notes
 
-- Table discovery uses the **DFS REST API** (`?resource=filesystem`) — OneLake
-  does not implement the ADLS Gen2 *blob* list API that `pyarrow.AzureFileSystem`
-  uses, so `fs.get_file_info`-style listing fails with `501 Not Implemented`.
-- Tables live under schema folders: `Tables/<schema>/<table>` (e.g.
-  `Tables/workorder/work_order_header`). `list_tables` returns a flat list keyed
-  by `<schema>/<table>`; queries may reference the bare name or
-  `<schema>_<name>`.
-- The ABFS account is the workspace GUID; `deltalake` is configured with
-  `account_name=onelake` + the service principal via `azure_tenant_id` /
-  `azure_client_id` / `azure_client_secret`, plus the `onelake.dfs...` endpoints.
+- Table discovery uses the **DFS REST API** (`?resource=filesystem`) — OneLake does not implement the ADLS Gen2 *blob* list API that `pyarrow.AzureFileSystem` uses, so `fs.get_file_info`-style listing fails with `501 Not Implemented`.
+- Tables live under schema folders: `Tables/<schema>/<table>` (e.g. `Tables/workorder/work_order_header`). `list_tables` returns a flat list keyed by `<schema>/<table>`; queries may reference the bare name or `<schema>_<name>`.
+- The ABFS account is the workspace GUID; `deltalake` is configured with `account_name=onelake` + the service principal via `azure_tenant_id` / `azure_client_id` / `azure_client_secret`, plus the `onelake.dfs...` endpoints.
 
 ## S3 / MinIO (Parquet) backend
 
-Set `SQLHANDLER_BACKEND=s3` (or `minio`) and point it at an S3-compatible
-store. Everything else — SQL engine, caches, MCP tools — is unchanged.
-To query **multiple buckets or paths** from one endpoint, see
-[Federated multi-source](#federated-multi-source-multiple-buckets--sources).
+Set `SQLHANDLER_BACKEND=s3` (or `minio`) and point it at an S3-compatible store. Everything else — SQL engine, caches, MCP tools — is unchanged. To query **multiple buckets or paths** from one endpoint, see [Federated multi-source](#federated-multi-source-multiple-buckets--sources).
 
 ```bash
 cd SQLhandler
@@ -136,8 +114,7 @@ SQLHANDLER_BACKEND=s3 \
 
 ### How tables are discovered
 
-Under `S3_BUCKET` (+ optional `S3_PREFIX`), every Parquet file or folder of
-Parquet files becomes a table:
+Under `S3_BUCKET` (+ optional `S3_PREFIX`), every Parquet file or folder of Parquet files becomes a table:
 
 | Layout | Table | SQL name |
 |---|---|---|
@@ -146,34 +123,23 @@ Parquet files becomes a table:
 | `<prefix>/sales/customers/*.parquet` | schema `sales`, table `customers` | `customers` or `sales_customers` |
 | `<prefix>/hr/employees/year=2024/*.parquet` | schema `hr`, table `employees` | `employees` or `hr_employees` |
 
-Hive partition folders (`key=value`) inside a table folder are folded into
-the table; hidden folders (starting with `.`) are ignored. Filtering and
-projection push down to the Parquet scan exactly as with the OneLake backend.
+Hive partition folders (`key=value`) inside a table folder are folded into the table; hidden folders (starting with `.`) are ignored. Filtering and projection push down to the Parquet scan exactly as with the OneLake backend.
 
 ### Delta tables on S3 (`S3_FORMAT`)
 
-Parquet buckets whose tables already carry a Delta `_delta_log` (transactions,
-time travel) are read directly — no copying:
+Parquet buckets whose tables already carry a Delta `_delta_log` (transactions, time travel) are read directly — no copying:
 
-- `S3_FORMAT=auto` (default) — folders containing a `_delta_log` are read as
-  Delta tables (deltalake over the same S3 credentials); everything else stays
-  plain Parquet. Delta data files are not re-discovered as separate tables.
+- `S3_FORMAT=auto` (default) — folders containing a `_delta_log` are read as Delta tables (deltalake over the same S3 credentials); everything else stays plain Parquet. Delta data files are not re-discovered as separate tables.
 - `S3_FORMAT=delta` — every discovered table is treated as Delta.
 - `S3_FORMAT=parquet` — plain Parquet only (Delta logs ignored).
 
-Delta-on-S3 tables support `version_as_of` time travel; the engine's
-snapshot-version check uses the `_delta_log` listing, so ETL commits are
-picked up without waiting out the TTL. In `SQLHANDLER_SOURCES`, each source
-accepts `"format": "auto" | "parquet" | "delta"`.
+Delta-on-S3 tables support `version_as_of` time travel; the engine's snapshot-version check uses the `_delta_log` listing, so ETL commits are picked up without waiting out the TTL. In `SQLHANDLER_SOURCES`, each source accepts `"format": "auto" | "parquet" | "delta"`.
 
 ### MinIO specifics
 
-- pyarrow (already a dependency) talks to S3 directly — **no extra pip
-  dependency** (no boto3 / s3fs).
-- `S3_ENDPOINT_URL` may omit the scheme; `http` is assumed unless
-  `S3_USE_SSL=true`.
-- Path-style addressing is the default (`S3_PATH_STYLE=true`), which is what
-  MinIO uses.
+- pyarrow (already a dependency) talks to S3 directly — **no extra pip dependency** (no boto3 / s3fs).
+- `S3_ENDPOINT_URL` may omit the scheme; `http` is assumed unless `S3_USE_SSL=true`.
+- Path-style addressing is the default (`S3_PATH_STYLE=true`), which is what MinIO uses.
 - `S3_ANONYMOUS=true` serves a public bucket without keys.
 
 ### Quick local test
@@ -190,21 +156,15 @@ SQLHANDLER_TEST_MINIO=1 SQLHANDLER_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
 
 ## Federated multi-source (multiple buckets / sources)
 
-Need to query **several S3 buckets (or paths) at once** — or mix S3 with
-OneLake/NFS/Iceberg? Set `SQLHANDLER_SOURCES` (a JSON array) and SQLhandler
-federates every source behind **one endpoint**: same MCP tools, one shared
-cache, and `JOIN` across sources in a single `run_sql`. When set, it overrides
-`SQLHANDLER_BACKEND`.
+Need to query **several S3 buckets (or paths) at once** — or mix S3 with OneLake/NFS/Iceberg? Set `SQLHANDLER_SOURCES` (a JSON array) and SQLhandler federates every source behind **one endpoint**: same MCP tools, one shared cache, and `JOIN` across sources in a single `run_sql`. When set, it overrides `SQLHANDLER_BACKEND`.
 
 ### How it works
 
-A `MultiProvider` wraps one `DataProvider` per source and presents them as a
-single logical engine:
+A `MultiProvider` wraps one `DataProvider` per source and presents them as a single logical engine:
 
 - Every table is tagged with its **source** name.
 - `describe_table`, `run_sql`, `scan_table` route to the owning source.
-- The table list, describe results and open dataset handles are cached
-  per-source in the shared in-process cache (async list refresh included).
+- The table list, describe results and open dataset handles are cached per-source in the shared in-process cache (async list refresh included).
 
 ### Configuration (environment)
 
@@ -218,12 +178,8 @@ export SQLHANDLER_SOURCES='[
 ]'
 ```
 
-- Each entry accepts any backend (`s3`/`minio`, `onelake`, `nfs`, `iceberg`);
-  the fields mirror that backend's env vars (`bucket`/`prefix`/`endpointUrl`/
-  `region`/`accessKey`/`secretKey`/`anonymous`/`useSsl`, `abfssUrl`,
-  `rootDir`, `catalogUri`, …).
-- `name` is the **source label** and must be unique; it is the top-level
-  namespace for everything that source exposes.
+- Each entry accepts any backend (`s3`/`minio`, `onelake`, `nfs`, `iceberg`); the fields mirror that backend's env vars (`bucket`/`prefix`/`endpointUrl`/ `region`/`accessKey`/`secretKey`/`anonymous`/`useSsl`, `abfssUrl`, `rootDir`, `catalogUri`, …).
+- `name` is the **source label** and must be unique; it is the top-level namespace for everything that source exposes.
 
 ### Configuration (Helm chart)
 
@@ -254,10 +210,7 @@ sources:
 | source `inventory`, flat `invoices.parquet` | `inventory_invoices` | `inventory/invoices` |
 
 - `list_tables` (MCP) lists **all** sources, source-qualified.
-- `describe_table`/`run_sql` accept the qualified name (preferred) or the bare
-  name **only when that name is unique across every source** — ambiguous bare
-  names are deliberately not registered as DuckDB views, so they raise a
-  clear "table not found" instead of silently returning the wrong source.
+- `describe_table`/`run_sql` accept the qualified name (preferred) or the bare name **only when that name is unique across every source** — ambiguous bare names are deliberately not registered as DuckDB views, so they raise a clear "table not found" instead of silently returning the wrong source.
 
 ### Cross-source SQL
 
@@ -271,32 +224,18 @@ ORDER BY total DESC
 
 ### Caching & freshness
 
-The federated engine shares the same caches as single-source mode, keyed per
-source: list refresh (async), describe and dataset handles — so the
-`SQLHANDLER_CACHE_TTL` / `SQLHANDLER_LIST_ASYNC_REFRESH` knobs behave exactly
-as documented above.
+The federated engine shares the same caches as single-source mode, keyed per source: list refresh (async), describe and dataset handles — so the `SQLHANDLER_CACHE_TTL` / `SQLHANDLER_LIST_ASYNC_REFRESH` knobs behave exactly as documented above.
 
 ### Caveats & limitations
 
-- **Source labels must be unique and DuckDB-identifier-safe** (letters,
-  digits, underscores). This is validated at startup — a duplicate or unsafe
-  label raises a `ValueError` instead of silently shadowing a source.
-  Avoid names that collide with table names.
-- **Credentials**: each source carries its own credentials. When set via
-  `values.yaml` `sources:`, keys land in the ConfigMap as JSON — in
-  production mount `SQLHANDLER_SOURCES` from a Secret instead.
-- **Deep folder nesting** follows the S3 discovery rule: only the leaf folder
-  (table) + its parent (schema) become the name; anything above that only
-  lives in the storage path (`finance/b/c` → `b_c`, `finance` dropped).
-- The per-source table list is cached like any other source; new files appear
-  after the async refresh (see caching & freshness).
+- **Source labels must be unique and DuckDB-identifier-safe** (letters, digits, underscores). This is validated at startup — a duplicate or unsafe label raises a `ValueError` instead of silently shadowing a source. Avoid names that collide with table names.
+- **Credentials**: each source carries its own credentials. When set via `values.yaml` `sources:`, keys land in the ConfigMap as JSON — in production mount `SQLHANDLER_SOURCES` from a Secret instead.
+- **Deep folder nesting** follows the S3 discovery rule: only the leaf folder (table) + its parent (schema) become the name; anything above that only lives in the storage path (`finance/b/c` → `b_c`, `finance` dropped).
+- The per-source table list is cached like any other source; new files appear after the async refresh (see caching & freshness).
 
 ## External databases (read-only attach)
 
-The engine is a *lake* engine — but some questions need the **system of
-record** behind the lake. Configure one or more external Postgres/MySQL
-servers and their tables become queryable (and join-able with lake tables in
-the SAME query) as `<db-alias>.<schema>.<table>`:
+The engine is a *lake* engine — but some questions need the **system of record** behind the lake. Configure one or more external Postgres/MySQL servers and their tables become queryable (and join-able with lake tables in the SAME query) as `<db-alias>.<schema>.<table>`:
 
 ```bash
 export SQLHANDLER_ATTACH='[
@@ -313,34 +252,16 @@ JOIN work_order_header w ON w.id = o.id  -- registered lake table
 GROUP BY 1
 ```
 
-- `list_tables` gains an "Attached databases" section with the qualified
-  table names; `describe_table` / `profile_table` accept
-  `<db-alias>.<schema>.<table>` directly (profile runs `SUMMARIZE` on the
-  server, bounded by `SQLHANDLER_PROFILE_MAX_ROWS`).
-- **Read-only is enforced by DuckDB itself** — every `ATTACH` carries
-  `READ_ONLY`, so writes against the attached catalog fail at the engine
-  level, not by convention.
-- **Secrets hygiene**: the config carries env-var *names* (`password_env`);
-  a literal `password` key is rejected at startup, and resolved passwords
-  are scrubbed from every error message. (Trust-auth over a unix socket:
-  `"password_env": ""`.)
-- **The filesystem lockdown stays on**: attaching a database does not
-  re-open DuckDB file reads — `read_parquet('/etc/passwd')` still fails on
-  attached-DB connections. The scanner extensions (`postgres_scanner`,
-  `mysql_scanner`) are preinstalled in the image and loaded explicitly;
-  runtime extension downloads stay disabled.
-- A database that is down does not fail the lake: `list_tables` reports it
-  as unavailable, and queries touching only the lake never attach anything.
-- The catalog alias must be DuckDB-identifier-safe and unique; malformed
-  config fails loudly at startup by design.
+- `list_tables` gains an "Attached databases" section with the qualified table names; `describe_table` / `profile_table` accept `<db-alias>.<schema>.<table>` directly (profile runs `SUMMARIZE` on the server, bounded by `SQLHANDLER_PROFILE_MAX_ROWS`).
+- **Read-only is enforced by DuckDB itself** — every `ATTACH` carries `READ_ONLY`, so writes against the attached catalog fail at the engine level, not by convention.
+- **Secrets hygiene**: the config carries env-var *names* (`password_env`); a literal `password` key is rejected at startup, and resolved passwords are scrubbed from every error message. (Trust-auth over a unix socket: `"password_env": ""`.)
+- **The filesystem lockdown stays on**: attaching a database does not re-open DuckDB file reads — `read_parquet('/etc/passwd')` still fails on attached-DB connections. The scanner extensions (`postgres_scanner`, `mysql_scanner`) are preinstalled in the image and loaded explicitly; runtime extension downloads stay disabled.
+- A database that is down does not fail the lake: `list_tables` reports it as unavailable, and queries touching only the lake never attach anything.
+- The catalog alias must be DuckDB-identifier-safe and unique; malformed config fails loudly at startup by design.
 
 ## Iceberg (catalog) backend
 
-Set `SQLHANDLER_BACKEND=iceberg` to query **Apache Iceberg** tables through a
-catalog. Iceberg keeps its table metadata (snapshots, manifests with per-file
-stats) next to the Parquet data files, so a table is a first-class entity:
-real schemas, time travel, concurrent writers, cross-engine reads. This
-server reads the manifest-listed Parquet files with the same pyarrow engine.
+Set `SQLHANDLER_BACKEND=iceberg` to query **Apache Iceberg** tables through a catalog. Iceberg keeps its table metadata (snapshots, manifests with per-file stats) next to the Parquet data files, so a table is a first-class entity: real schemas, time travel, concurrent writers, cross-engine reads. This server reads the manifest-listed Parquet files with the same pyarrow engine.
 
 ```bash
 export SQLHANDLER_BACKEND=iceberg
@@ -356,15 +277,10 @@ sqlhandler --transport streamable-http --port 9097
 
 Two catalog types are supported:
 
-- **`rest`** (default) — an Iceberg REST catalog (Dremio, Nessie, Amazon S3
-  Tables). `ICEBERG_CATALOG_URI` is the REST endpoint.
-- **`sql`** — a SQL catalog (SQLite/Postgres) for local dev/tests:
-  `ICEBERG_CATALOG_TYPE=sql` and `ICEBERG_CATALOG_URI=sqlite:///path/catalog.db`.
-  Writers and readers must use the same `ICEBERG_CATALOG_NAME`.
+- **`rest`** (default) — an Iceberg REST catalog (Dremio, Nessie, Amazon S3 Tables). `ICEBERG_CATALOG_URI` is the REST endpoint.
+- **`sql`** — a SQL catalog (SQLite/Postgres) for local dev/tests: `ICEBERG_CATALOG_TYPE=sql` and `ICEBERG_CATALOG_URI=sqlite:///path/catalog.db`. Writers and readers must use the same `ICEBERG_CATALOG_NAME`.
 
-Tables are addressed as `<namespace>/<name>` and read as Parquet; `run_sql` /
-`scan_table` push predicates/projections into the Parquet scan as with the
-other backends. Install the optional dependency first:
+Tables are addressed as `<namespace>/<name>` and read as Parquet; `run_sql` / `scan_table` push predicates/projections into the Parquet scan as with the other backends. Install the optional dependency first:
 
 ```bash
 pip install 'sqlhandler[iceberg]'
@@ -379,17 +295,12 @@ SQLHANDLER_TEST_ICEBERG=1 pytest tests/test_iceberg_integration.py -q
 
 ## NFS / local filesystem backend
 
-Set `SQLHANDLER_BACKEND=nfs` (or `file`/`local`) to read tables from a
-directory mounted into the machine — NFS via a PV/PVC, a hostPath, or any
-volume. Backed by pyarrow's `LocalFileSystem`, it needs no credentials or
-endpoint, and it auto-detects both formats:
+Set `SQLHANDLER_BACKEND=nfs` (or `file`/`local`) to read tables from a directory mounted into the machine — NFS via a PV/PVC, a hostPath, or any volume. Backed by pyarrow's `LocalFileSystem`, it needs no credentials or endpoint, and it auto-detects both formats:
 
-- **Delta Lake** tables (any folder containing a `_delta_log/`) — read with
-  `deltalake`, with snapshot-version-aware cache invalidation (see caching).
+- **Delta Lake** tables (any folder containing a `_delta_log/`) — read with `deltalake`, with snapshot-version-aware cache invalidation (see caching).
 - **Parquet** files/folders — same conventions as the S3 backend.
 
-Parquet data files *inside* a Delta folder are folded into that Delta table,
-never exposed as separate tables; hidden (`.`) paths are skipped.
+Parquet data files *inside* a Delta folder are folded into that Delta table, never exposed as separate tables; hidden (`.`) paths are skipped.
 
 ```bash
 export SQLHANDLER_BACKEND=nfs
@@ -408,8 +319,7 @@ sqlhandler --transport streamable-http --port 9097
 
 ### Kubernetes / PCAI (NFS)
 
-Mount a PVC (or hostPath) with the tables and point the chart at it. Import
-the `sqlhandler` chart in PCAI and set these values:
+Mount a PVC (or hostPath) with the tables and point the chart at it. Import the `sqlhandler` chart in PCAI and set these values:
 
 ```yaml
 # values.yaml — the keys PCAI renders from
@@ -423,20 +333,12 @@ nfs:
     pvcName: my-data-pvc
 ```
 
-The chart sets `NFS_ROOT`, mounts the PVC read-only at `/data`, and the
-readiness probe verifies the mount is present.
+The chart sets `NFS_ROOT`, mounts the PVC read-only at `/data`, and the readiness probe verifies the mount is present.
 
 ### Caching & freshness (NFS Delta)
 
-Like every backend, the NFS backend reuses open Dataset handles for
-`SQLHANDLER_DATASET_CACHE_TTL` and pre-warms schemas via
-`cache.prewarmTables`. On top of that, Delta Lake tables on NFS get
-**snapshot-version-aware invalidation**: the engine re-checks the table's
-`_delta_log` version and reopens the dataset when an ETL commit bumps it, so
-new rows appear without a restart. The re-check is throttled by
-`cache.versionCheckInterval` (values.yaml) / `SQLHANDLER_VERSION_CHECK_INTERVAL`
-(default `10` seconds; `0` = re-check on every query). ETL jobs writing to the
-mount therefore show up within a few seconds on a cached replica.
+Like every backend, the NFS backend reuses open Dataset handles for `SQLHANDLER_DATASET_CACHE_TTL` and pre-warms schemas via `cache.prewarmTables`. On top of that, Delta Lake tables on NFS get **snapshot-version-aware invalidation**: the engine re-checks the table's `_delta_log` version and reopens the dataset when an ETL commit bumps it, so new rows appear without a restart. The re-check is
+throttled by `cache.versionCheckInterval` (values.yaml) / `SQLHANDLER_VERSION_CHECK_INTERVAL` (default `10` seconds; `0` = re-check on every query). ETL jobs writing to the mount therefore show up within a few seconds on a cached replica.
 ## Setup
 
 ```bash
@@ -446,8 +348,7 @@ uv sync                               # or: pip install -e .
 sqlhandler --transport stdio          # run as MCP server (stdio)
 ```
 
-To run as a streamable HTTP server (**MCP 2.0 SDK**, `mcp>=2.0.0`,
-stateless streamable-http) on a port:
+To run as a streamable HTTP server (**MCP 2.0 SDK**, `mcp>=2.0.0`, stateless streamable-http) on a port:
 
 ```bash
 sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
@@ -497,7 +398,9 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_MAX_OUTPUT_ROWS` | Max rows rendered as markdown to a client (default `1000`) |
 | `SQLHANDLER_READINESS_CHECK` | `0` to disable the backend-aware `/ready` connectivity probe |
 | `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` (when unset, the busiest tables from the previous run are warmed automatically) |
-| `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON file (table/column descriptions merged into list/describe; hot-reloaded) |
+| `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON/YAML file (table/column descriptions merged into list/describe; hot-reloaded) |
+| `SQLHANDLER_CATALOG_STORE` | Writable path for UI/API catalog uploads (default: `<cache-dir>/semantic-catalog.json`); overrides `SQLHANDLER_CATALOG` while present |
+| `SQLHANDLER_CATALOG_UPLOAD` | `0` disables the `/api/semantic-catalog` upload/clear endpoints (default on) |
 | `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
 | `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
 | `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (default 0 = no timeout) |
@@ -511,48 +414,22 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 
 ## Performance & caching
 
-`list_tables` (DFS REST / S3 listing / catalog) and `describe_table` (Delta
-`_delta_log` or Parquet footers — backend-dependent) are the calls agents/OWUI
-repeat on every session, and both hit the lakehouse every time. The server
-now keeps both in an in-process cache:
+`list_tables` (DFS REST / S3 listing / catalog) and `describe_table` (Delta `_delta_log` or Parquet footers — backend-dependent) are the calls agents/OWUI repeat on every session, and both hit the lakehouse every time. The server now keeps both in an in-process cache:
 
-- A single process-wide handler is reused (previously a new handler was
-  built per tool call, silently discarding the table-list cache).
-- `list_tables` is served from the cache immediately. When the cached list
-  is stale it is refreshed on a background thread (default
-  `SQLHANDLER_LIST_ASYNC_REFRESH=true`) and a daemon timer re-lists every
-  `SQLHANDLER_CACHE_TTL` seconds, so a newly uploaded file appears without
-  restarting and callers never block on the S3/DFS listing.
-- `describe_table` results are cached per table for `SQLHANDLER_CACHE_TTL`
-  seconds, so the frequently-described tables return from memory (~ms)
-  instead of re-reading the Delta log (~8s).
-- `SQLHANDLER_PREWARM_TABLES` warms those schemas in a background thread at
-  first request, so even the first describe is a hit.
-- Open Delta datasets are reused per table for `SQLHANDLER_DATASET_CACHE_TTL`
-  (default `3600`) seconds, LRU-bounded by `SQLHANDLER_DATASET_CACHE_TABLES`
-  (default `8`). This removes the per-query Delta `_delta_log` re-open (the
-  serialized part of every call) so concurrent queries stop piling up on it —
-  the rows themselves are still fetched from the source on every scan, so
-  query results are never cached.
-- **Delta snapshot-version-aware invalidation**: for Delta Lake tables (nfs
-  and onelake) the engine stores the table's snapshot version with the cached
-  handle and re-checks it on reuse (`SQLHANDLER_VERSION_CHECK_INTERVAL`,
-  default `10`s). When an ETL commit bumps the version, the cached dataset is
-  reopened so new rows appear without waiting out the TTL and without a restart.
+- A single process-wide handler is reused (previously a new handler was built per tool call, silently discarding the table-list cache).
+- `list_tables` is served from the cache immediately. When the cached list is stale it is refreshed on a background thread (default `SQLHANDLER_LIST_ASYNC_REFRESH=true`) and a daemon timer re-lists every `SQLHANDLER_CACHE_TTL` seconds, so a newly uploaded file appears without restarting and callers never block on the S3/DFS listing.
+- `describe_table` results are cached per table for `SQLHANDLER_CACHE_TTL` seconds, so the frequently-described tables return from memory (~ms) instead of re-reading the Delta log (~8s).
+- `SQLHANDLER_PREWARM_TABLES` warms those schemas in a background thread at first request, so even the first describe is a hit.
+- Open Delta datasets are reused per table for `SQLHANDLER_DATASET_CACHE_TTL` (default `3600`) seconds, LRU-bounded by `SQLHANDLER_DATASET_CACHE_TABLES` (default `8`). This removes the per-query Delta `_delta_log` re-open (the serialized part of every call) so concurrent queries stop piling up on it — the rows themselves are still fetched from the source on every scan, so query results are never
+  cached.
+- **Delta snapshot-version-aware invalidation**: for Delta Lake tables (nfs and onelake) the engine stores the table's snapshot version with the cached handle and re-checks it on reuse (`SQLHANDLER_VERSION_CHECK_INTERVAL`, default `10`s). When an ETL commit bumps the version, the cached dataset is reopened so new rows appear without waiting out the TTL and without a restart.
 
-The caches are **in-process**: a new replica starts fresh (and pre-warms).
-They only cache metadata — query results are never cached, so you always see
-the latest rows. Set the TTL envs to `0` to disable.
+The caches are **in-process**: a new replica starts fresh (and pre-warms). They only cache metadata — query results are never cached, so you always see the latest rows. Set the TTL envs to `0` to disable.
 
 ## PCAI / MCP 2.0 deployment
 
-SQLhandler ships as a **PCAI (HPE Ezmeral Unified Analytics) MCP 2.0** server —
-it is built on the **`mcp>=2.0.0` SDK's low-level `Server`** and serves the
-**standard MCP protocol** (initialize handshake) over stateless
-streamable-http at `/mcp`, so any standard MCP client can connect (DSH,
-official Python/TS SDKs, MCP Inspector, OWUI). The `helm/` chart wires it
-into the PCAI platform (Istio gateway, oauth2-proxy auth, vendor-service
-discovery labels) exactly like the MultimodalRAG and AgentBuilder charts.
+SQLhandler ships as a **PCAI (HPE Ezmeral Unified Analytics) MCP 2.0** server — it is built on the **`mcp>=2.0.0` SDK's low-level `Server`** and serves the **standard MCP protocol** (initialize handshake) over stateless streamable-http at `/mcp`, so any standard MCP client can connect (DSH, official Python/TS SDKs, MCP Inspector, OWUI). The `helm/` chart wires it into the PCAI platform (Istio
+gateway, oauth2-proxy auth, vendor-service discovery labels) exactly like the MultimodalRAG and AgentBuilder charts.
 
 > **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You
 > import the packaged chart (`.tar.gz`) into PCAI once, then drive the whole
@@ -570,8 +447,7 @@ discovery labels) exactly like the MultimodalRAG and AgentBuilder charts.
 
 ### Deploy (OneLake / Fabric backend)
 
-Import the packaged `sqlhandler` chart in PCAI, then set these values in the
-*Helm Values* editor:
+Import the packaged `sqlhandler` chart in PCAI, then set these values in the *Helm Values* editor:
 
 ```yaml
 # values.yaml — the keys PCAI renders from
@@ -613,9 +489,9 @@ cache:
 >
 > ```yaml
 > security:
->   networkPolicy:
->     enabled: true
->     allowedNamespaces: ["<client-namespace>"]
+> networkPolicy:
+> enabled: true
+> allowedNamespaces: ["<client-namespace>"]
 > ```
 >
 > Flipping `enabled` back to `true` is exactly what re-breaks in-cluster
@@ -656,14 +532,11 @@ s3:
       secretKey: "<s3-secret-key>"
 ```
 
-The chart wires `SQLHANDLER_BACKEND=s3` and the S3 env vars, and injects
-`S3_ACCESS_KEY` / `S3_SECRET_KEY` from the `s3-credentials` Secret. For a
-public bucket set `s3.anonymous: true` (no credential Secret needed).
+The chart wires `SQLHANDLER_BACKEND=s3` and the S3 env vars, and injects `S3_ACCESS_KEY` / `S3_SECRET_KEY` from the `s3-credentials` Secret. For a public bucket set `s3.anonymous: true` (no credential Secret needed).
 
 #### Deploy multi-source (federated)
 
-To serve several S3 buckets (or mixed backends) from one deployment, use the
-`sources:` list instead of `backend:`:
+To serve several S3 buckets (or mixed backends) from one deployment, use the `sources:` list instead of `backend:`:
 
 ```yaml
 # (omit `backend:` and the single `s3:` block)
@@ -681,10 +554,30 @@ sources:
     prefix: "raw"
 ```
 
-The chart renders `SQLHANDLER_SOURCES` (JSON) into the ConfigMap. For
-production, mount that env var from a Secret instead of embedding keys in
-`values.yaml`. Everything else — service, probes, Istio, cache knobs — is
-unchanged.
+The chart renders `SQLHANDLER_SOURCES` (JSON) into the ConfigMap. For production, mount that env var from a Secret instead of embedding keys in `values.yaml`. Everything else — service, probes, Istio, cache knobs — is unchanged.
+
+#### Enable the semantic catalog (semantic view)
+
+Any backend. Paste a `semanticCatalog` block into the same *Helm Values* editor values — as **native YAML, no stringification** — that is the whole deployment procedure (no `kubectl`, no out-of-band objects):
+
+```yaml
+semanticCatalog:
+  enabled: true
+  tables:
+    workorder/work_order:
+      description: Maintenance work order headers, one row per order
+      aliases: [work orders]
+      columns:
+        amount: Order total in USD
+        kind: Order class: a=planned, b=unplanned
+```
+
+The chart renders the structure to canonical JSON, stores it in a ConfigMap mounted read-only at `/etc/sqlhandler/semantic-catalog.json`, and sets `SQLHANDLER_CATALOG` to it. Because the engine hot-reloads the file on mtime change, editing the catalog and re-deploying updates `list`/`describe` output **without a pod restart** — in-flight tool calls are not disrupted. Keys match the logical
+`schema/name` (source-qualified or bare names also work); see [Semantic catalog — business meaning for tables/columns](#semantic-catalog--business-meaning-for-tablescolumns) for the full schema. Two alternatives: `semanticCatalog.json` takes the same document as an inline JSON **string** (machine-generated catalogs; mutually exclusive with `tables` — setting both non-empty fails the render), and
+`semanticCatalog.existingConfigMap` mounts a ConfigMap you own that carries a `semantic-catalog.json` key.
+
+**Even simpler — no values at all:** once deployed, anyone with UI access can enable it from the **Semantic catalog** panel of the data explorer (`/ui`): upload a `.json` or `.yaml` catalog file (or paste it) and it takes effect immediately, no restart. By default that upload is per-replica and pod-local; add one values line — `semanticCatalog.store.enabled: true` (a 1Gi RWX PVC shared by all
+replicas) — and uploads become durable and cross-pod while staying hot-reloaded. A catalog that must be durable/auditable *without* trusting someone's downloads folder still belongs in values. The upload API can be turned off with `SQLHANDLER_CATALOG_UPLOAD=0`.
 
 ### Deploy the Iceberg backend
 
@@ -707,28 +600,16 @@ iceberg:
       secretKey: "<s3-secret-key>"
 ```
 
-The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars,
-injecting the REST token and S3 storage keys from the `iceberg-credentials`
-Secret. `ICEBERG_CATALOG_TYPE=sql` (a local SQL catalog) needs no Secret at
-all when the warehouse is local.
-The OneLake/Fabric Secret wiring is only rendered when `backend: onelake`,
-so an S3-only deployment needs no Fabric credential at all.
-The chart renders, when `ezua.enabled=true` (default):
+The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars, injecting the REST token and S3 storage keys from the `iceberg-credentials` Secret. `ICEBERG_CATALOG_TYPE=sql` (a local SQL catalog) needs no Secret at all when the warehouse is local. The OneLake/Fabric Secret wiring is only rendered when `backend: onelake`, so an S3-only deployment needs no Fabric credential at all. The
+chart renders, when `ezua.enabled=true` (default):
 
 - `Deployment` + `Service` (port `9097`, MCP at `/mcp`)
-- Istio `VirtualService` routing `/mcp` to the service with a **long timeout**
-  (3600s default) for agent loops / streaming, and a short timeout elsewhere
+- Istio `VirtualService` routing `/mcp` to the service with a **long timeout** (3600s default) for agent loops / streaming, and a short timeout elsewhere
 - Istio `AuthorizationPolicy` (oauth2-proxy) so PCAI clients authenticate
-- a Kyverno `ClusterPolicy` that tags the workload `hpe-ezua/type:
-  vendor-service` + `hpe-ezua/app: sqlhandler` for PCAI discovery/monitoring
-- liveness probe against `/health`, and a **backend-aware readiness probe**
-  against `/ready` — it performs a cheap connectivity check on the selected
-  backend (OneLake DFS token+list, S3 list, Iceberg catalog, NFS root) and
-  returns 503 when the data source is unreachable, so broken-credential pods
-  are drained from the Service instead of serving errors
+- a Kyverno `ClusterPolicy` that tags the workload `hpe-ezua/type: vendor-service` + `hpe-ezua/app: sqlhandler` for PCAI discovery/monitoring
+- liveness probe against `/health`, and a **backend-aware readiness probe** against `/ready` — it performs a cheap connectivity check on the selected backend (OneLake DFS token+list, S3 list, Iceberg catalog, NFS root) and returns 503 when the data source is unreachable, so broken-credential pods are drained from the Service instead of serving errors
 
-Set `ezua.enabled=false` to disable the PCAI integration (VirtualService,
-AuthorizationPolicy, Kyverno) and deploy as a plain MCP server.
+Set `ezua.enabled=false` to disable the PCAI integration (VirtualService, AuthorizationPolicy, Kyverno) and deploy as a plain MCP server.
 
 ### Connect an MCP client
 
@@ -745,27 +626,18 @@ AuthorizationPolicy, Kyverno) and deploy as a plain MCP server.
 
 ## Web UI (read-only data explorer)
 
-SQLhandler bundles a small, dependency-free web UI (a single self-contained
-`index.html` — no build step, no CDN) that gives humans the same data the MCP
-agents query, through the same engine and caches:
+SQLhandler bundles a small, dependency-free web UI (a single self-contained `index.html` — no build step, no CDN) that gives humans the same data the MCP agents query, through the same engine and caches:
 
-- **Table list** (searchable, shows format badges; in federated multi-source
-  mode each entry is labeled `source/schema/name`, e.g. `sales/orders`)
+- **Table list** (searchable, shows format badges; in federated multi-source mode each entry is labeled `source/schema/name`, e.g. `sales/orders`)
 - **Schema view** per table — columns + types + table URI (+ catalog docs)
-- **Column stats** — lazy per-table profiling panel (min/max, distinct≈, null
-  %, quartiles) via "Profile table"; scans a capped sample
+- **Column stats** — lazy per-table profiling panel (min/max, distinct≈, null %, quartiles) via "Profile table"; scans a capped sample
 - **SQL editor** — run read-only queries (Ctrl+Enter), with a row limit
 - **Results table** — rendered with row/column counts, timing, and copy-CSV
 - **Charts** — one-click inline SVG bar chart of the first numeric column
-- **Export** — download the current query (or a preview) as **CSV or Parquet**
-  (`POST /api/export`; capped by `SQLHANDLER_EXPORT_MAX_ROWS`, default 100k)
-- **Saved queries + history** — stored per browser (localStorage): save a
-  query with 💾, click to reload, one-click delete; history records the last
-  30 successful runs
-- **Light/dark theme** — header toggle, persisted per browser, defaults to the
-  OS preference
-- **HPE branding** — Hewlett Packard Enterprise wordmark with the HPE green
-  brand element in the header; HPE green accent throughout, in both themes
+- **Export** — download the current query (or a preview) as **CSV or Parquet** (`POST /api/export`; capped by `SQLHANDLER_EXPORT_MAX_ROWS`, default 100k)
+- **Saved queries + history** — stored per browser (localStorage): save a query with 💾, click to reload, one-click delete; history records the last 30 successful runs
+- **Light/dark theme** — header toggle, persisted per browser, defaults to the OS preference
+- **HPE branding** — Hewlett Packard Enterprise wordmark with the HPE green brand element in the header; HPE green accent throughout, in both themes
 
 It is served by the same server process, so it needs **no extra deployment**:
 
@@ -783,92 +655,47 @@ It is served by the same server process, so it needs **no extra deployment**:
 | `POST /api/export` | download a query or table as CSV / Parquet |
 | `GET  /metrics` | Prometheus metrics |
 
-The UI is deliberately **read-only**: every statement is parsed with DuckDB's
-own grammar and only plain `SELECT` queries (plus `EXPLAIN SELECT`) are
-accepted — writes, `PRAGMA`/`SET`, and `COPY` are rejected, so it cannot
-modify the data source or mutate engine settings. It reuses the process-wide
-`SqlEngine` — the same list/describe caches and DuckDB query path the MCP
-tools use — and clamps results to the same row cap (`SQLHANDLER_MAX_ROWS`,
-default 1000; when that is `0`/unlimited the UI still caps at 1000 to keep
-the JSON payload bounded).
+The UI is deliberately **read-only**: every statement is parsed with DuckDB's own grammar and only plain `SELECT` queries (plus `EXPLAIN SELECT`) are accepted — writes, `PRAGMA`/`SET`, and `COPY` are rejected, so it cannot modify the data source or mutate engine settings. It reuses the process-wide `SqlEngine` — the same list/describe caches and DuckDB query path the MCP tools use — and clamps
+results to the same row cap (`SQLHANDLER_MAX_ROWS`, default 1000; when that is `0`/unlimited the UI still caps at 1000 to keep the JSON payload bounded).
 
-In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is
-already authenticated. The Helm chart routes `/api` with the same long timeout
-as `/mcp` (long-running queries), while the page itself uses the short timeout.
+In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is already authenticated. The Helm chart routes `/api` with the same long timeout as `/mcp` (long-running queries), while the page itself uses the short timeout.
 
 ## Security notes
 
-- **The read-only filter guards the web API only.** The MCP `run_sql` tool is
-  for trusted agent callers and accepts arbitrary SQL (it is the point of the
-  tool).
-- **DuckDB file access is locked down by default** on every query connection
-  (MCP and web): `read_csv`/`read_parquet`/`COPY ... TO` of local files and
-  extension-based URL fetches fail closed, while the registered pyarrow
-  datasets scan normally — all object-store IO (S3/ABFS/NFS) is done by
-  pyarrow outside DuckDB, so nothing legitimate is lost. Set
-  `SQLHANDLER_DUCKDB_FILE_ACCESS=1` if a query genuinely needs DuckDB's own
-  file/table functions.
-- **Table names are traversal-guarded**: `schema/name` values containing
-  `..` or absolute paths are rejected, and the NFS backend verifies every
-  table path stays inside `NFS_ROOT` (symlinks included).
-- **Network posture** (helm chart, `security.hardened: true` default):
-  non-root read-only container, no ServiceAccount token, and an optional
-  pod-level AuthorizationPolicy. The ingress NetworkPolicy is **off by
-  default** so in-cluster callers work with zero friction; the ClusterIP
-  Service exposes nothing outside the cluster. Enable it for production /
-  real-data deployments (`security.networkPolicy.enabled: true`) and
-  allowlist direct callers via `allowedNamespaces`. External access is
-  authenticated at the gateway by the oauth2-proxy AuthorizationPolicy —
-  keep `ezua.authorizationPolicy.enabled: true`.
-- **Credentials**: create Kubernetes Secrets out-of-band (never in values
-  files); see `helm/local/README.md` for create/read/rotate commands.
-  `SQLHANDLER_SOURCES` with embedded keys is for development only.
-- **In-cluster callers** need nothing while the NetworkPolicy is off
-  (default). Once it is enabled, direct calls from another namespace require
-  that namespace in `security.networkPolicy.allowedNamespaces` — no
-  client-side change.
+- **The read-only filter guards the web API only.** The MCP `run_sql` tool is for trusted agent callers and accepts arbitrary SQL (it is the point of the tool).
+- **DuckDB file access is locked down by default** on every query connection (MCP and web): `read_csv`/`read_parquet`/`COPY ... TO` of local files and extension-based URL fetches fail closed, while the registered pyarrow datasets scan normally — all object-store IO (S3/ABFS/NFS) is done by pyarrow outside DuckDB, so nothing legitimate is lost. Set `SQLHANDLER_DUCKDB_FILE_ACCESS=1` if a query
+  genuinely needs DuckDB's own file/table functions.
+- **Table names are traversal-guarded**: `schema/name` values containing `..` or absolute paths are rejected, and the NFS backend verifies every table path stays inside `NFS_ROOT` (symlinks included).
+- **Network posture** (helm chart, `security.hardened: true` default): non-root read-only container, no ServiceAccount token, and an optional pod-level AuthorizationPolicy. The ingress NetworkPolicy is **off by default** so in-cluster callers work with zero friction; the ClusterIP Service exposes nothing outside the cluster. Enable it for production / real-data deployments
+  (`security.networkPolicy.enabled: true`) and allowlist direct callers via `allowedNamespaces`. External access is authenticated at the gateway by the oauth2-proxy AuthorizationPolicy — keep `ezua.authorizationPolicy.enabled: true`.
+- **Credentials**: create Kubernetes Secrets out-of-band (never in values files); see `helm/local/README.md` for create/read/rotate commands. `SQLHANDLER_SOURCES` with embedded keys is for development only.
+- **In-cluster callers** need nothing while the NetworkPolicy is off (default). Once it is enabled, direct calls from another namespace require that namespace in `security.networkPolicy.allowedNamespaces` — no client-side change.
 
 ## Observability & ops (0.9.0)
 
 ### Prometheus metrics
 
-`GET /metrics` renders the Prometheus text exposition (no extra dependency):
-query counters by outcome (`ok`/`error`/`cancelled`), a query-duration
-histogram, rows returned, cache hit/miss counters per cache type, and gauges
-for the table count, process RSS and the container memory limit.
+`GET /metrics` renders the Prometheus text exposition (no extra dependency): query counters by outcome (`ok`/`error`/`cancelled`), a query-duration histogram, rows returned, cache hit/miss counters per cache type, and gauges for the table count, process RSS and the container memory limit.
 
 ### Audit log
 
-Set `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` and every query outcome is
-appended as one JSON line (`ts`, `sql`, `state`, `duration_ms`, `n_rows`,
-`error`) — a compliance-grade record of every SQL executed against the lake,
-ready for SIEM tailing. Writes are best-effort and never break a query.
+Set `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` and every query outcome is appended as one JSON line (`ts`, `sql`, `state`, `duration_ms`, `n_rows`, `error`) — a compliance-grade record of every SQL executed against the lake, ready for SIEM tailing. Writes are best-effort and never break a query.
 
 ### API token (non-gateway deployments)
 
-When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it
-(`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time
-compared) — for deployments where the JSON API is not already behind the PCAI
-oauth2-proxy gateway. `/mcp`, `/ui`, `/health` and `/ready` are unaffected;
-note the in-browser UI does not send the token, so leave it unset when the UI
-must work without gateway auth.
+When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it (`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time compared) — for deployments where the JSON API is not already behind the PCAI oauth2-proxy gateway. `/mcp`, `/ui`, `/health` and `/ready` are unaffected; note the in-browser UI does not send the token, so leave it unset when the UI must work without
+gateway auth.
 
 ## MCP tools
 
-- `list_tables`       — enumerate tables in the configured source (any backend);
-                        annotated with catalog descriptions when configured
+- `list_tables`       — enumerate tables in the configured source (any backend); annotated with catalog descriptions when configured
 - `search_tables`     — keyword search over table/column names + catalog docs
 - `describe_table`    — columns/types/URI for a table (+ catalog docs)
-- `profile_table`     — column statistics: min/max, distinct≈, null %, avg/std,
-                        q25/q50/q75, row count (cached like describe)
-- `run_sql`           — run SQL via DuckDB (aggregations/joins); markdown (default),
-                        JSON or CSV output; optional bind `params` and time travel
-- `scan_table`        — pull columns/rows via pyarrow with a row limit; same
-                        output formats and time travel
+- `profile_table`     — column statistics: min/max, distinct≈, null %, avg/std, q25/q50/q75, row count (cached like describe)
+- `run_sql`           — run SQL via DuckDB (aggregations/joins); markdown (default), JSON or CSV output; optional bind `params` and time travel
+- `scan_table`        — pull columns/rows via pyarrow with a row limit; same output formats and time travel
 
-In federated multi-source mode, tables are source-qualified: `list_tables`
-returns all sources, and `describe_table` / `run_sql` take names like
-`sales_orders` or `inventory_raw_customers` (bare names only when unique).
+In federated multi-source mode, tables are source-qualified: `list_tables` returns all sources, and `describe_table` / `run_sql` take names like `sales_orders` or `inventory_raw_customers` (bare names only when unique).
 
 ## Agent ergonomics (0.9.0)
 
@@ -876,17 +703,14 @@ Features that make LLM agents effective against the lake on the first try:
 
 ### profile_table — statistics before SQL
 
-`describe_table` gives names/types; `profile_table` gives *values*: min/max,
-approximate distinct counts, null %, avg/std and quartiles per column, plus the
-exact row count (from Parquet/Delta metadata). Agents use it to pick correct
-predicates without trial-and-error queries. Profiling scans a bounded sample
-(`SQLHANDLER_PROFILE_MAX_ROWS`, default 1M; 0 = full table) and is cached like
-describe.
+`describe_table` gives names/types; `profile_table` gives *values*: min/max, approximate distinct counts, null %, avg/std and quartiles per column, plus the exact row count (from Parquet/Delta metadata). Agents use it to pick correct predicates without trial-and-error queries. Profiling scans a bounded sample (`SQLHANDLER_PROFILE_MAX_ROWS`, default 1M; 0 = full table) and is cached like describe.
 
 ### Semantic catalog — business meaning for tables/columns
 
-Point `SQLHANDLER_CATALOG` at a JSON file of human-written documentation and it
-is merged into `list_tables` / `describe_table` output (and MCP resources):
+> 📄 **Shareable spec for data owners:** [`docs/semantic-catalog.md`](docs/semantic-catalog.md) —
+> the JSON/YAML format, table-key rules, all attach routes, and troubleshooting.
+
+Point `SQLHANDLER_CATALOG` at a JSON **or YAML** file of human-written documentation and it is merged into `list_tables` / `describe_table` output (and MCP resources):
 
 ```json
 {
@@ -903,10 +727,38 @@ is merged into `list_tables` / `describe_table` output (and MCP resources):
 }
 ```
 
-Keys match the logical `schema/name` path (a bare name or the source-qualified
-name also work). The file is hot-reloaded on change (cached describes are
-invalidated so new wording appears immediately); a missing/broken file never
-breaks queries.
+The same document in YAML is accepted everywhere a catalog file is read (JSON is tried first, YAML second — the extension doesn't matter):
+
+```yaml
+tables:
+  workorder/work_order:
+    description: Maintenance work order headers, one row per order
+    aliases: [work orders]
+    columns:
+      amount: Order total in USD
+      kind: Order class: a=planned, b=unplanned
+```
+
+Keys match the logical `schema/name` path (a bare name or the source-qualified name also work). The file is hot-reloaded on change (cached describes are invalidated so new wording appears immediately); a missing/broken file never breaks queries.
+
+#### Upload through the UI / API (no file access needed)
+
+The web UI's **Semantic catalog** panel uploads a `.json`/`.yaml` file (or accepts pasted text) straight from the browser; the same operations are available as JSON API endpoints for scripts:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/semantic-catalog` | which catalog is live, its source, table count |
+| `POST /api/semantic-catalog` | body = raw JSON **or YAML** text → validated, stored, hot-reloaded |
+| `DELETE /api/semantic-catalog` | remove the uploaded catalog; the configured file takes over |
+
+```bash
+curl --data-binary @catalog.yaml -H "Content-Type: text/plain" \
+  https://sqlhandler.<domain>/api/semantic-catalog
+```
+
+Uploads land in the **catalog store** (`SQLHANDLER_CATALOG_STORE`, by default next to the disk-warm cache — a writable path in every supported deployment) and take precedence over the configured `SQLHANDLER_CATALOG` file until deleted. Uploaded content is validated (JSON object with a `tables` mapping, ≤1 MB) and re-stored as canonical JSON; YAML requires the `pyyaml` package (bundled since
+1.4.0). By default the store is on the pod's tmp emptyDir, so uploads are **per-replica** and last only until rescheduling — for durable, cross-pod uploads set `semanticCatalog.store.enabled: true` in the chart (1Gi RWX PVC shared by all replicas; uploads from any replica reach every replica and still hot-reload — no rollout. RWX is required whenever replicas can exceed 1, and the chart refuses to
+render an RWO store for a scale-out deployment). The values/ConfigMap route remains the most auditable option; uploads are a *mutating* endpoint covered by `SQLHANDLER_API_TOKEN` / gateway auth like the rest of `/api/*`, and `SQLHANDLER_CATALOG_UPLOAD=0` disables them entirely.
 
 ### MCP resources + prompts
 
@@ -916,27 +768,19 @@ Resource-capable clients get read-only context without tool calls:
 - `sqlhandler://table/<percent-encoded path>/schema` — one table's schema + column docs
 - `sqlhandler://query-memory` — recent successful queries (see below)
 
-Prompts: `explore-data` (list → catalog → profile → SQL workflow) and
-`analyze-table` (deep-dive one table, profile-first).
+Prompts: `explore-data` (list → catalog → profile → SQL workflow) and `analyze-table` (deep-dive one table, profile-first).
 
 ### Self-improving loops
 
-- **Query memory** — the engine records the last 50 query outcomes
-  (`SQLHANDLER_QUERY_MEMORY_SIZE`); the `sqlhandler://query-memory` resource lets
-  later agent sessions reuse proven SQL patterns instead of rediscovering them.
-- **Did-you-mean errors** — a bad table name in SQL comes back with the nearest
-  real table names attached ("Did you mean one of: workorder_work_order, …"), so
-  the agent self-corrects in one round-trip.
-- **Usage-driven prewarm** — when `SQLHANDLER_PREWARM_TABLES` is unset, the
-  busiest tables of the previous run (usage counts persisted with the disk-warm
-  cache) are prewarmed on restart. The server teaches itself what to warm.
+- **Query memory** — the engine records the last 50 query outcomes (`SQLHANDLER_QUERY_MEMORY_SIZE`); the `sqlhandler://query-memory` resource lets later agent sessions reuse proven SQL patterns instead of rediscovering them.
+- **Did-you-mean errors** — a bad table name in SQL comes back with the nearest real table names attached ("Did you mean one of: workorder_work_order, …"), so the agent self-corrects in one round-trip.
+- **Usage-driven prewarm** — when `SQLHANDLER_PREWARM_TABLES` is unset, the busiest tables of the previous run (usage counts persisted with the disk-warm cache) are prewarmed on restart. The server teaches itself what to warm.
 
 ## Query engine capabilities (0.9.0)
 
 ### Parameterized queries
 
-`run_sql` accepts bind `params` — an object for named `$placeholders` or an
-array for positional `?` — so reusable query templates stay injection-safe:
+`run_sql` accepts bind `params` — an object for named `$placeholders` or an array for positional `?` — so reusable query templates stay injection-safe:
 
 ```json
 {"sql": "SELECT * FROM work_order WHERE kind = $k", "params": {"k": "a"}}
@@ -944,17 +788,11 @@ array for positional `?` — so reusable query templates stay injection-safe:
 
 ### Time travel (`version_as_of`)
 
-`run_sql` and `scan_table` accept `version_as_of` (a non-negative integer) to
-read a historical snapshot — a **Delta snapshot version** (nfs / onelake /
-Delta-on-S3) or an **Iceberg snapshot id**. It applies to every versionable
-table the query touches; plain-Parquet tables in the same query are a clear
-error. Historical datasets are cached per version (a snapshot never changes).
+`run_sql` and `scan_table` accept `version_as_of` (a non-negative integer) to read a historical snapshot — a **Delta snapshot version** (nfs / onelake / Delta-on-S3) or an **Iceberg snapshot id**. It applies to every versionable table the query touches; plain-Parquet tables in the same query are a clear error. Historical datasets are cached per version (a snapshot never changes).
 
 ### Query timeout
 
-`SQLHANDLER_QUERY_TIMEOUT` (seconds; 0 = off, the default) interrupts a query
-inside DuckDB when it runs too long — no leaked threads, a clean error to the
-caller. Applies to MCP `run_sql` and the web API alike.
+`SQLHANDLER_QUERY_TIMEOUT` (seconds; 0 = off, the default) interrupts a query inside DuckDB when it runs too long — no leaked threads, a clean error to the caller. Applies to MCP `run_sql` and the web API alike.
 
 ### Async queries (web API)
 
@@ -967,22 +805,15 @@ For long-running queries the JSON API supports submit/poll/paginate/cancel:
 | `GET  /api/query/{id}/rows?offset=&limit=` | paginated rows (page cap 1000) |
 | `DELETE /api/query/{id}` | cancel a running query (DuckDB interrupt) |
 
-Finished jobs are kept for `SQLHANDLER_ASYNC_JOB_TTL` seconds (default 900), up
-to 100 tracked jobs; the registry refuses (HTTP 429) when full of running jobs.
-The same row caps and read-only guard apply.
+Finished jobs are kept for `SQLHANDLER_ASYNC_JOB_TTL` seconds (default 900), up to 100 tracked jobs; the registry refuses (HTTP 429) when full of running jobs. The same row caps and read-only guard apply.
 
 ### Concurrency cap
 
-`SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8; 0 = unlimited) bounds the
-simultaneous DuckDB queries per pod; excess queries queue up to
-`SQLHANDLER_QUEUE_TIMEOUT` seconds (default 30) and then fail with a clear
-error instead of piling up on the container.
+`SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8; 0 = unlimited) bounds the simultaneous DuckDB queries per pod; excess queries queue up to `SQLHANDLER_QUEUE_TIMEOUT` seconds (default 30) and then fail with a clear error instead of piling up on the container.
 
 ## Other data sources / roadmap
 
-The DataProvider interface is the only thing a new source touches - new
-backends are a subclass plus one make_provider branch. In rough order of
-value for large-scale data access:
+The DataProvider interface is the only thing a new source touches - new backends are a subclass plus one make_provider branch. In rough order of value for large-scale data access:
 
 | Source | What it gives you | Cost |
 |---|---|---|
@@ -995,14 +826,10 @@ value for large-scale data access:
 | Hive / HMS catalog | If a Hive Metastore already owns the metadata, list/describe through it and read the underlying Parquet. | Medium |
 | Trino / BigQuery / Snowflake | A distributed engine as the source - only needed when object-store reads alone cannot carry the concurrency or the compute already lives there. | Medium-high - new SQL bridge |
 
-Rule of thumb: if the data is (or can be) columnar Parquet/Delta in an object
-store, pointing a DataProvider at it beats round-tripping rows through a
-JDBC/engine bridge - which is exactly why SQLhandler replaced EzPresto.
+Rule of thumb: if the data is (or can be) columnar Parquet/Delta in an object store, pointing a DataProvider at it beats round-tripping rows through a JDBC/engine bridge - which is exactly why SQLhandler replaced EzPresto.
 ## Security note
 
-The temporary service principal credential from Toromont was delivered in
-plaintext email. Keep it only in `config/.env` (git-ignored) or the deployment
-secret store, and **rotate it** once the integration is confirmed.
+The temporary service principal credential from Toromont was delivered in plaintext email. Keep it only in `config/.env` (git-ignored) or the deployment secret store, and **rotate it** once the integration is confirmed.
 
 ## Dev
 

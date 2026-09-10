@@ -38,6 +38,7 @@ auth/policy layer above. Disable with K8S_MCP_CONSOLE_ENABLED=false.
 """
 
 import asyncio
+import ast
 import base64
 import contextvars
 import datetime
@@ -753,9 +754,34 @@ async def get_pod_logs(
         if previous:
             kwargs["previous"] = True
         logs = await asyncio.to_thread(v1.read_namespaced_pod_log, **kwargs)
+        # Some kubernetes-client versions return the log subresource as raw
+        # BYTES; returning those as-is makes the MCP layer render a Python
+        # bytes repr (b'...\n...') — every newline escaped, one flat line.
+        if isinstance(logs, bytes):
+            logs = logs.decode("utf-8", "replace")
+        elif isinstance(logs, str) and logs.startswith(("b'", 'b"')):
+            # defensive: a bytes-repr leaked through — restore real newlines
+            try:
+                decoded = ast.literal_eval(logs)
+                if isinstance(decoded, bytes):
+                    logs = decoded.decode("utf-8", "replace")
+            except (ValueError, SyntaxError):
+                pass
         return _truncate(logs) if logs else "No logs found."
     except ApiException as e:
-        return f"Error reading logs: {e.reason}"
+        # Surface the API's detail: the classic case is a multi-container pod
+        # where the API lists the choices in its 400 message.
+        detail = ""
+        try:
+            detail = str((json.loads(e.body) or {}).get("message", "") or "")
+        except Exception:
+            detail = ""
+        m = re.search(r"choose one of: \[([^\]]+)\]", detail)
+        if m:
+            names = ", ".join(n.strip() for n in m.group(1).split(",") if n.strip())
+            return (f"Error reading logs: pod {pod_name!r} runs multiple containers — "
+                    f"set container to one of: {names}")
+        return f"Error reading logs: {e.reason}" + (f" ({detail})" if detail else "")
 
 
 # ─── Events ──────────────────────────────────────────────────────────────

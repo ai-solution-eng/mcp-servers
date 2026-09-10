@@ -2,29 +2,37 @@
 # Email: andrew.bydlon@hpe.com
 # Prefer: Slack
 
-# ═══════════════════════════════════════════════════════════════════════
-# CUSTOMER DISTRIBUTION — STRUCTURALLY LOCKED.
+# k8s-mcp-customer — customer distribution of the Kubernetes ops MCP
+# server, for PCAI (HPE Ezmeral Unified Analytics).
 #
-# This chart is the locked twin of helm/ (the trusted-operator chart). The
-# security knobs — exec, namespace policy, per-user keys, RBAC scope and
-# extra groups — DO NOT EXIST in these values, and the templates never read
-# them. Pasting `exec: {enabled: true}` into the PCAI frontend is inert:
-# nothing in this chart consumes that key. Day-2 security changes are a
-# platform action, from the kube command line (NOTES.txt prints the exact
-# commands); the exec Role is NOT minted by this chart, so exec stays
-# impossible until the operator creates it deliberately.
+# CUSTOMER DISTRIBUTION — STRUCTURALLY LOCKED. This chart is the locked
+# twin of helm/ (the trusted-operator chart). The security knobs — exec,
+# namespace policy, per-user keys, RBAC scope and extra groups — DO NOT
+# EXIST in these values, and the templates never read them. Pasting
+# `exec: {enabled: true}` into the PCAI frontend is inert: nothing in this
+# chart consumes that key. Day-2 security changes are a platform action,
+# from the kube command line (NOTES.txt prints the exact commands); the
+# exec Role is NOT minted by this chart, so exec stays impossible until
+# the operator creates it deliberately.
 #
 # What the frontend CAN configure below is deliberately limited to benign
 # wiring: image, naming, service, exposure endpoint, API-key Secret
 # reference, console toggle.
-# ═══════════════════════════════════════════════════════════════════════
 
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: k8s-mcp-customer
+  appName: k8s-mcp-customer
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
   # Keep in lockstep with Chart.yaml appVersion (same image as the internal
   # chart — the locking lives in this chart, not the binary).
-  tag: v0.2.6
+  tag: v0.3.0
   pullPolicy: IfNotPresent
+
 # Only needed if the GHCR package stays PRIVATE (public packages pull
 # anonymously). Per-namespace secret:
 #   kubectl create secret docker-registry ghcr-pull -n <ns> \
@@ -32,16 +40,13 @@ image:
 #     --docker-password=<gh-PAT-with-read:packages>
 imagePullSecrets: []
 
+# -- Service exposure -------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9090        # MCP (streamable-http at /mcp) + ops console (/ui/)
   targetPort: 9090
 
-deployment:
-  name: k8s-mcp-customer
-  appName: k8s-mcp-customer
-  replicaCount: 1
-
+# -- Resources -------------------------------------------------------------------------------
 resources:
   requests:
     cpu: 100m
@@ -50,7 +55,12 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# ── MCP server app config (benign keys only) ─────────────────────────────
+# -- Service account ------------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""                   # empty = deployment.name (it is the RBAC subject)
+
+# -- MCP server app config (benign keys only) --------------------------------------------------------
 # The API key is NEVER created by this chart and NEVER inlined in values —
 # reference an out-of-band Secret; the Deployment fails loud until it exists.
 apiKey:
@@ -60,18 +70,25 @@ apiKey:
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
 
-serviceAccount:
-  create: true
-  name: ""                   # empty = deployment.name (it is the RBAC subject)
-
-# ── RBAC: BAKED, NOT VALUES-DRIVEN ───────────────────────────────────────
+# -- RBAC: BAKED, NOT VALUES-DRIVEN ---------------------------------------------------------------------
 # templates/rbac-readonly.yaml carries a $scope chart constant ("cluster") —
 # read-only, cluster-wide, the same posture validated on the internal
 # cluster. To clamp a tenant to its own namespace, switch that constant to
 # "namespace" and repackage: a deliberate platform action, deliberately NOT
 # a frontend edit. This chart never mints exec RBAC.
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------
+# -- Pod annotations / node placement ------------------------------------------------------------------------
+# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
+# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
+# — it is the audited baseline.
+podAnnotations:
+  sidecar.istio.io/inject: "false"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------------------------------------------
 # Deploys the Istio VirtualService so MCP clients reach the server through
 # the ezaf-gateway. The endpoint doubles as MCP_HOSTNAME (DNS-rebinding
 # pin) — MUST be unique per release on the shared gateway.
@@ -88,14 +105,3 @@ ezua:
     enabled: false
     namespace: "istio-system"
     providerName: "oauth2-proxy"
-
-podAnnotations:
-  sidecar.istio.io/inject: "false"
-
-# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
-# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
-# — it is the audited baseline.
-
-nodeSelector: {}
-tolerations: []
-affinity: {}

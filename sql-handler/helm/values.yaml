@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v1.3.0
+  tag: v1.4.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -383,6 +383,83 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
+
+# -- Semantic catalog ----------------------------------------------------------
+# The "semantic view": human-written table/column descriptions merged into
+# list_tables / describe_table output (and the MCP resources), so agents see
+# business meaning, not just dtypes. Full spec + shareable data-owner guide:
+# docs/semantic-catalog.md (README: "Semantic catalog").
+#
+# Deploy = set enabled: true and paste your catalog AS NATIVE YAML under
+# `tables:` below — no stringification, it is ordinary values structure. The
+# chart renders it into a ConfigMap, mounts it read-only at
+# <mountPath>/semantic-catalog.json, and points SQLHANDLER_CATALOG at it.
+# The engine hot-reloads the file on change (mtime), so a catalog edit via
+# `helm upgrade` (or a PCAI re-deploy) updates the docs WITHOUT a pod
+# restart. A broken catalog never breaks queries — it degrades to empty.
+#
+# Zero-values alternative: deploy as-is, then upload a .json/.yaml catalog
+# from the data explorer's "Semantic catalog" panel (POST
+# /api/semantic-catalog; store defaults next to cache.cacheDir). Uploads are
+# per-replica and pod-local (emptyDir) unless SQLHANDLER_CATALOG_STORE points
+# at a PVC — the values route below is the durable, all-replica one.
+semanticCatalog:
+  enabled: false
+  # Directory inside the pod where the catalog ConfigMap is mounted (the
+  # file lands at <mountPath>/semantic-catalog.json). Rarely changed.
+  mountPath: /etc/sqlhandler
+  # The catalog as NATIVE values — paste plain YAML, no stringification:
+  #   tables:
+  #     <schema/name | source-qualified | bare>:
+  #       description: ...
+  #       aliases: [...]
+  #       columns: {col: doc}
+  # Rendered to canonical JSON into the ConfigMap. Entry shapes are validated
+  # at render time (each table entry must be a mapping) — operator-authored
+  # config must not fail silently (same philosophy as SQLHANDLER_ATTACH).
+  tables: {}
+  # Alternative: the catalog as an inline JSON STRING ({"tables": {...}}) —
+  # for machine-generated catalogs. Mutually exclusive with `tables` and
+  # `yaml` (setting more than one non-empty fails the render).
+  json: ""
+  # Alternative: the catalog as an inline YAML STRING — verbatim paste of a
+  # semantic-catalog.yaml file, no re-indenting needed. The engine reads YAML
+  # natively, so the string is stored as-is. Mutually exclusive with `tables`
+  # and `json`.
+  yaml: ""
+  # Alternative for teams managing the catalog out-of-band (like credential
+  # Secrets): name of an EXISTING ConfigMap carrying a `semantic-catalog.json`
+  # key. When set, the chart renders no ConfigMap of its own but still mounts
+  # it and wires the env var.
+  existingConfigMap: ""
+  # -- Upload store: persisted + cross-pod --------------------------------------
+  # By default UI/API catalog uploads land next to the disk cache on the pod's
+  # tmp emptyDir: per-replica, and gone on reschedule. Enable the store to
+  # back uploads with a PVC instead — an upload from any replica then reaches
+  # every replica and survives rescheduling, still with NO rollout (the
+  # engine hot-reloads the file on mtime change). Works standalone too (with
+  # enabled: false above): deploy, then seed the catalog from the UI. Until a
+  # first upload exists, the values catalog above — if any — is what every
+  # pod serves.
+  # REQUIREMENT: ReadWriteMany storage whenever replicas can exceed 1. RWO
+  # classes (EBS, local-path, ...) attach on one node only and strand the
+  # other replicas Pending — the render fails loudly on that mismatch.
+  store:
+    enabled: false
+    # When set, mount this existing PVC (no PVC is created). Leave "" to
+    # have the chart create one named <release>-catalog.
+    existingClaim: ""
+    # Catalog content is KBs of text — 1Gi is ~100x headroom.
+    size: 1Gi
+    # "" = cluster default StorageClass; it must offer the access mode below.
+    storageClass: ""
+    # [ReadWriteOnce] ONLY for single-replica deployments (replicaCount: 1,
+    # autoscaling off) — PVC access modes are immutable once created.
+    accessModes: [ReadWriteMany]
+    # Where the store volume is mounted; SQLHANDLER_CATALOG_STORE points at
+    # <mountPath>/semantic-catalog.json. The upload API writes here, so the
+    # mount is read-write (unlike the values-catalog ConfigMap mount).
+    mountPath: /var/lib/sqlhandler-catalog
 
 # -- Runtime arguments for the sqlhandler entrypoint --------------------------
 containerArgs:

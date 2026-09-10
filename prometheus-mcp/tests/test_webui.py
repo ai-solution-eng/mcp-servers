@@ -5,6 +5,8 @@ pass a stub client (same pattern as the MCP wire tests) and drive the
 Starlette app with TestClient.
 """
 
+from typing import ClassVar
+
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -108,7 +110,7 @@ def test_ui_serves_hpe_branding_and_tabs():
     assert "hpe-element" in html  # the green parallelogram mark
     assert "prometheus-theme" in html  # no-flash theme script + persistence
     assert "Prometheus MCP" in html
-    for tab in ("Dashboard", "Query", "Alerts", "MCP Tools"):
+    for tab in ("Dashboard", "GPU", "Query", "Alerts", "MCP Tools"):
         assert tab in html
     # tool catalog is rendered client-side from this embedded array
     for tool in ("prom_query", "prom_query_range", "prom_series", "prom_label_values", "prom_alerts", "prom_rules"):
@@ -124,6 +126,16 @@ def test_ui_html_fallback_when_asset_missing(monkeypatch):
     html = webui._load_html()
     assert "UI asset not found" in html
     assert "PROM_UI_HTML" in html
+
+
+def test_ui_has_no_duplicate_element_ids():
+    # getElementById silently resolves to the FIRST match — duplicated ids
+    # would leave one of the two panels rendering "—" forever.
+    import re
+
+    ids = re.findall(r'id="([^"]+)"', webui._load_html())
+    dupes = {i for i in ids if ids.count(i) > 1}
+    assert not dupes, f"duplicate element ids: {sorted(dupes)}"
 
 
 def test_status_endpoint_reports_caps():
@@ -241,10 +253,24 @@ def test_overview_aggregates_all_blocks():
     assert data["duration_ms"] >= 0
 
 
+def test_overview_gpu_cards_and_top_workloads():
+    c = make_client()
+    data = c.get("/api/overview").json()
+    # The stub returns raw series (it does not evaluate count()/avg()), so
+    # assert structure + the exact canned query each card runs.
+    assert data["cards"]["gpu_count"]["query"] == "count(DCGM_FI_DEV_GPU_UTIL)"
+    assert data["cards"]["gpu_util_pct"]["query"] == "avg(DCGM_FI_DEV_GPU_UTIL)"
+    assert "100 * sum(DCGM_FI_DEV_FB_USED)" in data["cards"]["gpu_mem_pct"]["query"]
+    # top_gpu_mem aggregates by (exported_namespace, exported_pod); the stub
+    # has neither, so the label falls back to the bare pod name
+    assert data["top"]["top_gpu_mem"]["items"][0]["label"] == "p0"
+    assert "DCGM_FI_DEV_FB_USED" in data["top"]["top_gpu_mem"]["query"]
+
+
 def test_overview_fails_soft_per_card():
     class PartialClient(StubClient):
         async def instant_query(self, query, ts=None):
-            if "node_" in query or "kube_pod" in query:
+            if "node_" in query or "kube_pod" in query or "DCGM_" in query:
                 raise PrometheusError("parse error: unknown metric")
             return await StubClient.instant_query(self, query, ts)
 
@@ -252,8 +278,138 @@ def test_overview_fails_soft_per_card():
     app = Starlette(routes=webui.build_ui_routes(PartialClient(), cfg))
     data = TestClient(app).get("/api/overview").json()
     assert "error" in data["cards"]["node_cpu_pct"]
+    assert "error" in data["cards"]["gpu_util_pct"]  # no DCGM on this cluster
     assert data["cards"]["up_targets"]["value"] == "0"  # healthy cards still answer
     assert data["alerts"]["counts"]["firing"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GPU (DCGM) endpoint: domain grouping, workload attribution, fail-soft
+# ---------------------------------------------------------------------------
+
+GPU_HOST = "pcai-se-scs04.hst.lab"
+
+
+def _dcgm(metric, gpu_idx, value, extra=None, host=GPU_HOST):
+    labels = {
+        "__name__": metric,
+        "Hostname": host,
+        "gpu": str(gpu_idx),
+        "device": f"nvidia{gpu_idx}",
+        "UUID": f"GPU-test-{gpu_idx}",
+        "modelName": "NVIDIA H200 NVL",
+        "container": "nvidia-dcgm-exporter",
+    }
+    labels.update(extra or {})
+    return {"metric": labels, "value": [1757337600, str(value)]}
+
+
+class GpuClient(StubClient):
+    """DCGM-shaped stub: one 8-GPU H200 NVL host, islands 0-3 idle / 4-7 busy."""
+
+    async def instant_query(self, query, ts=None):
+        result = []
+        for i in range(8):
+            busy = i >= 4
+            wl = (
+                {
+                    "exported_namespace": "team-x",
+                    "exported_pod": "infer-predictor-abc",
+                    "exported_container": "kserve-container",
+                }
+                if busy
+                else {}
+            )
+            spec = {
+                "DCGM_FI_DEV_GPU_UTIL": 90 if busy else 0,
+                "DCGM_FI_DEV_FB_USED": 100000,
+                "DCGM_FI_DEV_FB_FREE": 20000,
+                "DCGM_FI_DEV_GPU_TEMP": 60 + i,
+                "DCGM_FI_DEV_POWER_USAGE": 300.5,
+                "DCGM_FI_DEV_MEM_COPY_UTIL": 10,
+                "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL": 1000 if busy else 0,
+                "DCGM_FI_DEV_XID_ERRORS": 0,
+            }
+            if query in spec:
+                result.append(_dcgm(query, i, spec[query], wl))
+            else:
+                return await StubClient.instant_query(self, query, ts)
+        return {"resultType": "vector", "result": result}
+
+
+def _gpu_client():
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    return TestClient(Starlette(routes=webui.build_ui_routes(GpuClient(), cfg)))
+
+
+def test_gpu_endpoint_assembles_domains_and_workloads():
+    data = _gpu_client().get("/api/gpu").json()
+    s = data["summary"]
+    assert s["gpus"] == 8 and s["nodes"] == 1
+    assert s["model"] == "NVIDIA H200 NVL"
+    assert s["util_pct"] == 45.0  # half idle, half at 90
+    assert s["mem_used_mib"] == 800000.0 and s["mem_total_mib"] == 960000.0
+    assert s["mem_pct"] == 83.3
+    assert s["power_w"] == 2404.0  # 8 × 300.5
+    assert s["max_temp_c"] == 67.0
+    # the two 4-GPU NVLink islands, per node
+    assert [(d["domain"], d["gpus"]) for d in data["domains"]] == [(0, [0, 1, 2, 3]), (1, [4, 5, 6, 7])]
+    busy = data["domains"][1]
+    assert busy["util_pct"] == 90.0
+    assert busy["nvlink_kib_s"] == 4000.0  # 4 × 1000 KiB/s
+    assert busy["workloads"] == [{"namespace": "team-x", "pod": "infer-predictor-abc", "gpus": [4, 5, 6, 7]}]
+    # idle island: REAL zero NVLink must survive (not collapse to null)
+    assert data["domains"][0]["nvlink_kib_s"] == 0.0
+    assert data["domains"][0]["workloads"] == []
+    g4 = next(g for g in data["gpus"] if g["gpu"] == 4)
+    assert g4["domain"] == 1 and g4["mem_pct"] == 83.3
+    assert g4["namespace"] == "team-x" and g4["device"] == "nvidia4" and g4["uuid"].startswith("GPU-")
+    assert data["domains_source"] == "default"
+    assert set(data["queries"]) == {name for name, _ in webui._GPU_QUERIES} | {"nvlink_domain_info"}
+
+
+def test_gpu_endpoint_fails_soft_without_dcgm():
+    class NoGpu(StubClient):
+        async def instant_query(self, query, ts=None):
+            if query.startswith("DCGM_"):
+                raise PrometheusError("query error: unknown metric DCGM_FI_DEV_GPU_UTIL")
+            return await StubClient.instant_query(self, query, ts)
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    c = TestClient(Starlette(routes=webui.build_ui_routes(NoGpu(), cfg)))
+    data = c.get("/api/gpu").json()
+    assert c.get("/api/gpu").status_code == 200  # soft, never breaks the tab
+    assert "GPU metrics unavailable" in data["error"]
+    assert data["domains_config"] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_gpu_endpoint_partial_metrics_degrade_to_nulls():
+    class Partial(GpuClient):
+        async def instant_query(self, query, ts=None):
+            if query == "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL":
+                raise PrometheusError("metric missing")
+            return await GpuClient.instant_query(self, query, ts)
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    data = TestClient(Starlette(routes=webui.build_ui_routes(Partial(), cfg))).get("/api/gpu").json()
+    assert "error" not in data  # util + fb_used still answer -> tab works
+    assert data["summary"]["nvlink_kib_s"] is None  # that metric absent
+    assert data["summary"]["util_pct"] == 45.0
+
+
+def test_gpu_domain_env_override(monkeypatch):
+    groups, source = webui._gpu_domains({"PROM_UI_GPU_NVLINK_DOMAINS": "[[0,4],[1,5],[2,6],[3,7]]"})
+    assert source == "env" and groups == ((0, 4), (1, 5), (2, 6), (3, 7))
+    # invalid payloads silently fall back to the default grouping
+    for bad in ("not json", "[[0,1],[1,2]]", "[[0],[0]]", "[]", '[["a"]]'):
+        groups, source = webui._gpu_domains({"PROM_UI_GPU_NVLINK_DOMAINS": bad})
+        assert source == "default" and groups == webui._DEFAULT_GPU_DOMAINS
+    assert webui._gpu_domains({}) == (webui._DEFAULT_GPU_DOMAINS, "default")
+
+    monkeypatch.setenv("PROM_UI_GPU_NVLINK_DOMAINS", "[[0,4],[1,5],[2,6],[3,7]]")
+    data = _gpu_client().get("/api/gpu").json()
+    assert data["domains_source"] == "env"
+    assert [d["gpus"] for d in data["domains"]] == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
 # ---------------------------------------------------------------------------
@@ -266,4 +422,113 @@ def test_server_mounts_ui_routes():
 
     app = server._build_http_app()
     paths = {getattr(r, "path", None) for r in app.routes}
-    assert {"/", "/ui", "/api/status", "/api/overview", "/health", "/mcp"} <= paths
+    assert {"/", "/ui", "/api/status", "/api/overview", "/api/gpu", "/health", "/mcp"} <= paths
+
+
+# ---------------------------------------------------------------------------
+# GPU: auto-detected NVLink islands (nvlink-topology DaemonSet metric)
+# ---------------------------------------------------------------------------
+
+
+def _domain_sample(host, gpu_idx, dom):
+    return {
+        "metric": {
+            "__name__": "nvidia_gpu_nvlink_domain",
+            "hostname": host,  # k8s node name — short, no domain suffix
+            "gpu": str(gpu_idx),
+            "domain": str(dom),
+            "peers": "n/a",
+        },
+        "value": [1757337600, "1"],
+    }
+
+
+class DetectedClient(GpuClient):
+    """GpuClient fleet + detected topology with DIFFERENT shapes per host:
+    scs04 = two 4-GPU islands (H200 NVL), scs05 = one 8-way NVSwitch island.
+    Detected hostnames are the short node name; DCGM reports the fqdn — the
+    consumer must join them via the first dot-label.
+    """
+
+    HOST2 = "pcai-se-scs05.hst.lab"
+    H2: ClassVar[dict] = {
+        "DCGM_FI_DEV_GPU_UTIL": 50,
+        "DCGM_FI_DEV_FB_USED": 60000,
+        "DCGM_FI_DEV_FB_FREE": 80000,
+        "DCGM_FI_DEV_GPU_TEMP": 50,
+        "DCGM_FI_DEV_POWER_USAGE": 200.0,
+        "DCGM_FI_DEV_MEM_COPY_UTIL": 5,
+        "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL": 0,
+        "DCGM_FI_DEV_XID_ERRORS": 0,
+    }
+
+    async def instant_query(self, query, ts=None):
+        if query == webui._NVLINK_DOMAIN_QUERY:
+            result = [_domain_sample(GPU_HOST, i, 1 if i >= 4 else 0) for i in range(8)]
+            result += [_domain_sample(self.HOST2, i, 0) for i in range(8)]
+            return {"resultType": "vector", "result": result}
+        data = await GpuClient.instant_query(self, query, ts)
+        if query in self.H2:
+            for i in range(8):
+                data["result"].append(_dcgm(query, i, self.H2[query], host=self.HOST2))
+        return data
+
+
+def test_gpu_detected_islands_beat_default_and_are_per_host():
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    c = TestClient(Starlette(routes=webui.build_ui_routes(DetectedClient(), cfg)))
+    data = c.get("/api/gpu").json()
+    assert data["domains_source"] == "detected"
+    scs04 = [d for d in data["domains"] if d["hostname"] == GPU_HOST]
+    scs05 = [d for d in data["domains"] if d["hostname"] == DetectedClient.HOST2]
+    assert [(d["domain"], d["gpus"]) for d in scs04] == [(0, [0, 1, 2, 3]), (1, [4, 5, 6, 7])]
+    # per-host shapes: scs05 is ONE island — the default map would have split it
+    assert [(d["domain"], d["gpus"]) for d in scs05] == [(0, [0, 1, 2, 3, 4, 5, 6, 7])]
+    assert data["domains_detected"]["pcai-se-scs04"] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert data["domains_detected"]["pcai-se-scs05"] == [[0, 1, 2, 3, 4, 5, 6, 7]]
+    # hostname join: detected short name matched against DCGM fqdn records
+    g7 = next(g for g in data["gpus"] if g["hostname"] == DetectedClient.HOST2 and g["gpu"] == 7)
+    assert g7["domain"] == 0
+    assert data["queries"]["nvlink_domain_info"] == "nvidia_gpu_nvlink_domain"
+
+
+def test_gpu_env_override_beats_detection(monkeypatch):
+    monkeypatch.setenv("PROM_UI_GPU_NVLINK_DOMAINS", "[[0,1],[2,3],[4,5],[6,7]]")
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    c = TestClient(Starlette(routes=webui.build_ui_routes(DetectedClient(), cfg)))
+    data = c.get("/api/gpu").json()
+    assert data["domains_source"] == "env"
+    scs04 = [d["gpus"] for d in data["domains"] if d["hostname"] == GPU_HOST]
+    assert scs04 == [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+
+def test_gpu_malformed_detection_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("PROM_UI_GPU_NVLINK_DOMAINS", raising=False)
+
+    class Malformed(DetectedClient):
+        async def instant_query(self, query, ts=None):
+            if query == webui._NVLINK_DOMAIN_QUERY:
+                return {"resultType": "vector", "result": [_domain_sample(GPU_HOST, "x", 0)]}
+            return await DetectedClient.instant_query(self, query, ts)
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    data = TestClient(Starlette(routes=webui.build_ui_routes(Malformed(), cfg))).get("/api/gpu").json()
+    assert data["domains_source"] == "default"  # unusable detection -> built-in map
+    assert data["domains_detected"] is None
+
+
+def test_gpu_duplicate_domain_claim_skips_host():
+    class Dupes(DetectedClient):
+        async def instant_query(self, query, ts=None):
+            if query == webui._NVLINK_DOMAIN_QUERY:
+                return {"resultType": "vector", "result": [
+                    _domain_sample(GPU_HOST, 0, 0),
+                    _domain_sample(GPU_HOST, 0, 1),  # same GPU claimed twice — bad data
+                    _domain_sample(GPU_HOST, 1, 0),
+                ]}
+            return await DetectedClient.instant_query(self, query, ts)
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    data = TestClient(Starlette(routes=webui.build_ui_routes(Dupes(), cfg))).get("/api/gpu").json()
+    assert data["domains_source"] == "default"
+    assert data["domains_detected"] is None

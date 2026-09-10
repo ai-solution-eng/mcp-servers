@@ -1,6 +1,20 @@
+# k8s-mcp — Kubernetes ops MCP server: read-only cluster inspection,
+# hardened exec (opt-in), namespace governance, and an HPE ops console,
+# for PCAI.
 apiVersion: v2
 name: k8s-mcp
-description: K8s ops MCP server — read-only Kubernetes inspection, hardened exec, namespace governance and an HPE ops console over MCP 2.0
+description: >-
+  K8s ops MCP server — read-only Kubernetes inspection, hardened exec,
+  namespace governance and an HPE ops console over MCP 2.0, behind the
+  PCAI Istio gateway.
 type: application
-version: 0.2.6
-appVersion: "v0.2.6"
+version: 0.3.0
+appVersion: "v0.3.0"
+keywords:
+  - mcp
+  - kubernetes
+  - ops
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

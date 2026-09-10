@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlhandler"
-version = "1.3.0"
+version = "1.4.0"
 description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,7 @@ dependencies = [
     "azure-storage-file-datalake>=12.14",  # OneLake ABFS data-plane client (keep aligned with the Dockerfile)
     "uvicorn>=0.30.0",      # streamable-http (MCP 2.0) + health endpoints
     "starlette>=0.40.0",    # ASGI app for /health, /ready and /mcp
+    "pyyaml>=6.0",          # YAML semantic catalogs (uploads accept JSON or YAML)
 ]
 
 [project.optional-dependencies]

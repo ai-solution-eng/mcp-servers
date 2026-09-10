@@ -136,12 +136,30 @@ spec:
                   key: {{ printf "SQLHANDLER_DB_PW_%s" (upper .name) }}
             {{- end }}
             {{- end }}
+            {{- if .Values.semanticCatalog.enabled }}
+            # Semantic catalog (README: Semantic catalog) — the ConfigMap is
+            # mounted read-only below and the engine hot-reloads the file on
+            # mtime change, so catalog edits need no pod restart.
+            - name: SQLHANDLER_CATALOG
+              value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.mountPath | default "/etc/sqlhandler") | quote }}
+            {{- end }}
+            {{- if .Values.semanticCatalog.store.enabled }}
+            # Upload store on the shared PVC (values: semanticCatalog.store):
+            # UI/API uploads become cross-pod + durable and still hot-reload.
+            # Falls back to SQLHANDLER_CATALOG until a first upload exists.
+            - name: SQLHANDLER_CATALOG_STORE
+              value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog") | quote }}
+            {{- end }}
           {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
-                 backend additionally mounts its PVC. One merged block so the
-                 YAML key is never emitted twice. */}}
+                 backend additionally mounts its PVC; the semantic catalog
+                 mounts its ConfigMap read-only; the upload store mounts its
+                 PVC read-write (the upload API writes there). One merged
+                 block so the YAML key is never emitted twice. */}}
           {{- $needTmp := and .Values.security.hardened .Values.security.readOnlyRootFilesystem }}
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
-          {{- if or $needTmp $needData }}
+          {{- $needCatalog := .Values.semanticCatalog.enabled }}
+          {{- $needStore := .Values.semanticCatalog.store.enabled }}
+          {{- if or $needTmp $needData $needCatalog $needStore }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
@@ -151,6 +169,22 @@ spec:
             - name: data
               mountPath: {{ .Values.nfs.mount.mountPath | default "/data" | quote }}
               readOnly: {{ .Values.nfs.mount.readOnly }}
+            {{- end }}
+            {{- if $needCatalog }}
+            {{- /* Directory mount, NOT subPath: the kubelet only propagates
+                   ConfigMap edits into non-subPath mounts, and the engine
+                   hot-reloads on mtime — so a catalog edit reaches the pod
+                   without a restart. */}}
+            - name: semantic-catalog
+              mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
+              readOnly: true
+            {{- end }}
+            {{- if $needStore }}
+            {{- /* Read-write on purpose: the upload API writes the store file
+                   here; every replica sees it via the shared volume and
+                   hot-reloads. */}}
+            - name: catalog-store
+              mountPath: {{ .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
             {{- end }}
           {{- end }}
           # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
@@ -198,7 +232,9 @@ spec:
           {{- end }}
       {{- $needTmp := and .Values.security.hardened .Values.security.readOnlyRootFilesystem }}
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
-      {{- if or $needTmp $needData }}
+      {{- $needCatalog := .Values.semanticCatalog.enabled }}
+      {{- $needStore := .Values.semanticCatalog.store.enabled }}
+      {{- if or $needTmp $needData $needCatalog $needStore }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
@@ -208,6 +244,21 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Values.nfs.mount.pvcName | required "nfs.mount.pvcName is required when nfs.mount.enabled" }}
+        {{- end }}
+        {{- if $needCatalog }}
+        {{- /* The chart's own ConfigMap, or one managed out-of-band via
+               semanticCatalog.existingConfigMap (must carry the
+               `semantic-catalog.json` key). */}}
+        - name: semantic-catalog
+          configMap:
+            name: {{ .Values.semanticCatalog.existingConfigMap | default (printf "%s-semantic-catalog" (include "sqlhandler.fullname" .)) }}
+        {{- end }}
+        {{- if $needStore }}
+        {{- /* The chart-created <release>-catalog PVC, or an existing claim
+               via semanticCatalog.store.existingClaim. */}}
+        - name: catalog-store
+          persistentVolumeClaim:
+            claimName: {{ .Values.semanticCatalog.store.existingClaim | default (printf "%s-catalog" (include "sqlhandler.fullname" .)) }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

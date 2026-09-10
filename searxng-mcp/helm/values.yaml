@@ -2,14 +2,27 @@
 # Email: andrew.bydlon@hpe.com
 # Prefer: Slack
 
+# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
+# SearXNG sidecar, for PCAI (HPE Ezmeral Unified Analytics). The
+# VirtualService root serves the SearXNG web UI; /mcp routes to the MCP
+# server (streamable-http + SSE) through the PCAI Istio gateway.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: searxng-mcp
+  appName: searxng-mcp
+  replicaCount: 1
+
+# -- Images ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
-  # this default is what a helm install WITHOUT -f values.se-g2.yaml deploys,
-  # and a stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
+  # this default is what a deploy WITHOUT a site values file uses, and a
+  # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
   tag: v1.2.0
   pullPolicy: IfNotPresent
+
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
 # ddgs-mcp convention) pull anonymously. Create with:
 #   kubectl create secret docker-registry ghcr-pull -n searxng-mcp \
@@ -18,15 +31,15 @@ image:
 imagePullSecrets: []
 
 # Bundled SearXNG sidecar.
-# Pinned to the dated tag that Docker Hub 'latest' resolved to when the
-# chart was updated (2026-09-08) — a mutable 'latest' tag would give
-# different images per node/restart. To re-pin later:
-#   curl -s https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=5 | jq -r '.results[].name' | head -3
-# For a fully immutable reference, switch to the digest form:
-#   image: docker.io/searxng/searxng@sha256:3547509b419cd6a67333d6d68bd1ffad8d46d3669d82e7a7bd538f7b45827432
 searxng:
   image:
     repository: docker.io/searxng/searxng
+    # Pinned to the dated tag that Docker Hub 'latest' resolved to when the
+    # chart was updated (2026-09-08) — a mutable 'latest' tag would give
+    # different images per node/restart. To re-pin later:
+    #   curl -s https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=5 | jq -r '.results[].name' | head -3
+    # For a fully immutable reference, switch to the digest form:
+    #   image: docker.io/searxng/searxng@sha256:3547509b419cd6a67333d6d68bd1ffad8d46d3669d82e7a7bd538f7b45827432
     tag: "2026.9.8-3fdc6d753"
     pullPolicy: IfNotPresent
   # Secret key used by SearXNG for session/crypto. CHANGE THIS for any real
@@ -44,7 +57,7 @@ searxng:
   # search tool reports per-query which engines did not respond, so leaving
   # them on is cheap. If one proves consistently dead on a given network
   # (startpage showed a hard CAPTCHA wall on the HPE proxy), add its name
-  # here and helm upgrade.
+  # here and re-deploy.
   disabledEngines: []
   resources:
     requests:
@@ -54,17 +67,14 @@ searxng:
       cpu: "1"
       memory: 1Gi
 
+# -- Service exposure -------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9090        # MCP server (streamable-http + SSE at /mcp)
   targetPort: 9090
   searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
 
-deployment:
-  name: searxng-mcp
-  appName: searxng-mcp
-  replicaCount: 1
-
+# -- Resources (MCP container) ----------------------------------------------------------------
 resources:
   requests:
     cpu: 200m
@@ -73,14 +83,14 @@ resources:
     cpu: "1"
     memory: 512Mi
 
-# Optional headless-browser sidecar: lets fetch_content render JavaScript
-# pages (auto-escalation when plain HTTP fails or returns a JS-stub shell,
-# render="always", and include_screenshot). The image is built from
-# ./browser/Dockerfile (Playwright Chromium headless shell). Disabled by
-# default: adds ~512Mi memory and a second image to maintain, while plain
-# HTTP + curl_cffi already covers most sites. The MCP container reaches the
-# browser on http://127.0.0.1:9222 (pod-localhost, loopback-only binding) —
-# no service, port, or policy changes needed.
+# -- Headless-browser sidecar (optional) ----------------------------------------------------------
+# Lets fetch_content render JavaScript pages (auto-escalation when plain HTTP
+# fails or returns a JS-stub shell, render="always", and include_screenshot).
+# The image is built from ./browser/Dockerfile (Playwright Chromium headless
+# shell). Disabled by default: adds ~512Mi memory and a second image to
+# maintain, while plain HTTP + curl_cffi already covers most sites. The MCP
+# container reaches the browser on http://127.0.0.1:9222 (pod-localhost,
+# loopback-only binding) — no service, port, or policy changes needed.
 browser:
   enabled: false
   image:
@@ -107,10 +117,12 @@ browser:
   # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
   extraArgs: ""
 
+# -- Environment ------------------------------------------------------------------------------------
 env:
   - name: SEARXNG_URL
     value: "http://localhost:8080"
 
+# -- HPE corporate proxy -------------------------------------------------------------------------------
 # Route outbound HTTP(S) traffic through the HPE corporate proxy.
 # Default false: open-internet systems must NOT use the proxy (DNS/egress
 # failures). Set true (and configure proxy.*) only behind the HPE proxy.
@@ -123,6 +135,7 @@ proxy:
   https: http://hpeproxy.its.hpecorp.net:8080
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
 
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"

@@ -1,6 +1,18 @@
+# ddgs-lite — DuckDuckGo MCP server: metasearch via ddgs (9 engines) plus
+# a content fetcher, for PCAI.
 apiVersion: v2
 name: ddgs-lite
-description: DuckDuckGo MCP Server — metasearch via ddgs (9 engines) + content fetcher
+description: >-
+  DuckDuckGo MCP Server — metasearch via ddgs (9 engines) + content
+  fetcher, exposed over MCP behind the PCAI Istio gateway.
 type: application
 version: 1.0.0
 appVersion: "v1.0"
+keywords:
+  - mcp
+  - search
+  - metasearch
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

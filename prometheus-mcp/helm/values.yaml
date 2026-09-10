@@ -2,6 +2,19 @@
 # Email: andrew.bydlon@hpe.com
 # Prefer: Slack
 
+# prometheus-mcp — read-only Prometheus observation over MCP (PromQL
+# queries, series discovery, alerts, rules) for PCAI (HPE Ezmeral Unified
+# Analytics), exposed at /mcp through the PCAI Istio gateway so MCP clients
+# outside the cluster (DSH runs locally on the operator's laptop) can
+# reach it.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: prometheus-mcp
+  appName: prometheus-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
   # REALITY NOTE: tag v0.1.0 was OVERWRITTEN in the registry with the
@@ -10,27 +23,104 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.2.1
+  tag: v0.4.0
   pullPolicy: Always
+
 # Only needed if the GHCR package stays PRIVATE (public packages pull
 # anonymously, the ddgs-mcp convention).
 imagePullSecrets: []
 
-# Prometheus to query. Default: the kube-prometheus-stack's Prometheus
-# service (verified present on the G2 cluster in the `prometheus` namespace).
-# In-cluster plain HTTP; no RBAC needed (raw HTTP API, read-only endpoints).
+# -- Prometheus target ------------------------------------------------------------------
+# Default: the kube-prometheus-stack's Prometheus service (verified present
+# on the G2 cluster in the `prometheus` namespace). In-cluster plain HTTP;
+# no RBAC needed (raw HTTP API, read-only endpoints).
 prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
 
+# PROM_URL is rendered by deployment.yaml from .Values.prometheusUrl (Helm
+# does not template inside values files — see the template comment).
+
+# -- GPU tab: NVLink domain grouping ----------------------------------------------
+# The UI's GPU tab groups each node's GPUs into NVLink islands (domains).
+# DCGM exposes NVLink TRAFFIC, not topology, so the grouping comes from a
+# per-node GPU-index map — with the auto-detector below (enabled by
+# default) the map comes from the hardware itself. Precedence:
+#   1. this override (explicit operator escape hatch)
+#   2. auto-detected islands (nvlinkAutodetect, from nvidia-smi topo -m)
+#   3. built-in default: two 4-GPU islands (0-3, 4-7) per 8-GPU node —
+#      matches H200 NVL-class hosts, verified on the SE-G2 cluster.
+#
+# Accepts either a JSON string or a native YAML list of index groups:
+#   gpuNvlinkDomains: "[[0, 1, 2, 3], [4, 5, 6, 7]]"   # the default, explicit
+#   gpuNvlinkDomains: [[0, 1, 2, 3], [4, 5, 6, 7]]     # same, as YAML
+#   gpuNvlinkDomains: "[[0, 1, 2, 3, 4, 5, 6, 7]]"     # e.g. one 8-way NVSwitch island
+# Empty/omitted -> fall through to detection/default. GPUs outside any group
+# still render in the "All GPUs" table with domain "—"; an invalid value
+# falls back to the default server-side (it never breaks the pod).
+gpuNvlinkDomains: ""
+
+# -- GPU tab: NVLink topology auto-detection ----------------------------------------
+# Detects the REAL NVLink islands on every GPU node: a TWO-container
+# DaemonSet pod — initContainer (the cluster's NVIDIA driver image,
+# privileged) writes `nvidia-smi topo -m` to a shared emptyDir, and the
+# python sidecar parses it and pushes
+# nvidia_gpu_nvlink_domain{gpu,domain,peers,hostname} to the pushgateway,
+# where the GPU tab picks it up. DaemonSet pods only support
+# restartPolicy: Always, so the python sidecar supervises itself: retry
+# every 60s on failure, sleep for the pod's lifetime on success. Detection
+# happens once per pod lifetime (= node boot — the pod is recreated on
+# reboot, which re-detects; topology is hardware-fixed). Steady state: one
+# ~0-CPU Running pod per GPU node; a node whose pod logs failures every
+# 60s needs its driver access looked at — the UI keeps working with the
+# default/override grouping regardless, so this sidecar can never break
+# the page.
+nvlinkAutodetect:
+  enabled: true
+  # TWO-container pod, ONE image (python:3.12-slim) — NO driver-image
+  # pinning anywhere:
+  #   initContainer `topo`: runs the HOST-INSTALLED driver's nvidia-smi —
+  #   the GPU operator installs the full user-space into host
+  #   /run/nvidia/driver on every GPU node it manages (its own privileged
+  #   validator depends on that exact tree), and privileged: true exposes
+  #   the host /dev/nvidia* device nodes NVML needs (same pattern as the
+  #   operator's own dcgm-exporter pods). Writes `topo -m` to a shared
+  #   emptyDir. Fails loudly (pod restart w/ backoff) if the driver tree
+  #   is missing.
+  #   container `push`: parses topo.txt and pushes the metric; retries
+  #   every 60s on failure. LIFECYCLE — the CHECK is once per node boot
+  #   (the init container terminates permanently after one run; the
+  #   architecture never changes, so there is no re-detection). The POD
+  #   itself cannot die: DaemonSets force restartPolicy: Always, and the
+  #   platform pushgateway's --metric.timetolive=30s means a dead pod's
+  #   metric evaporates — so `push` idles at ~0 CPU re-stating the
+  #   unchanged answer every pushInterval seconds. That is the entire
+  #   steady state; it performs no detection of its own.
+  # Version story: PCAI/AIE upgrades reinstall the driver into
+  # /run/nvidia/driver via the operator's own DaemonSet, and the detector
+  # uses whatever is there at pod start — nothing to update in this chart.
+  image: python:3.12-slim
+  privileged: true
+  # Host path of the GPU operator's driver install (mounted read-only;
+  # probed for usr/bin/nvidia-smi, nvidia-smi, plus host /usr/bin).
+  driverInstallDir: /run/nvidia/driver
+  # Refresh cadence for the push container. IMPORTANT: the G2 pushgateway
+  # runs with --metric.timetolive=30s — pushed groups VANISH unless
+  # re-pushed, so this MUST stay well under 30s (HPE's own license pusher
+  # refreshes every ~60s with a longer allowance; 20s is safe margin).
+  pushInterval: 20
+  # Defaults match the kube-prometheus-stack pushgateway service name.
+  pushgatewayUrl: http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091
+  # Targets GPU-operator-labeled nodes. Set to {} to run everywhere (the
+  # script exits 0, quietly, on nodes without an NVIDIA driver).
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+# -- Service exposure ---------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9095
   targetPort: 9095
 
-deployment:
-  name: prometheus-mcp
-  appName: prometheus-mcp
-  replicaCount: 1
-
+# -- Resources --------------------------------------------------------------------------------
 resources:
   requests:
     cpu: 100m
@@ -38,14 +128,9 @@ resources:
   limits:
     memory: 512Mi
 
-# PROM_URL is rendered by deployment.yaml from .Values.prometheusUrl (Helm
-# does not template inside values files — see the template comment).
-
-# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------
-# Deploys the Istio VirtualService so MCP clients OUTSIDE the cluster (DSH
-# runs locally on the operator's laptop) reach the server through the
-# ezaf-gateway. The MCP path uses a long timeout (range queries over wide
-# windows can run for minutes).
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# Deploys the Istio VirtualService through the ezaf-gateway. The MCP path
+# uses a long timeout (range queries over wide windows can run for minutes).
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"

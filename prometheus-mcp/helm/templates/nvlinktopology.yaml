@@ -1,0 +1,165 @@
+{{- if .Values.nvlinkAutodetect.enabled }}
+# NVLink topology auto-detection — detect at pod start (= node boot).
+#
+# TWO-container pod, ONE image (python:3.12-slim), NO driver-image pinning:
+#   * initContainer `topo`: runs the HOST-INSTALLED driver's nvidia-smi —
+#     the GPU operator installs the full user-space into host
+#     /run/nvidia/driver on every GPU node it manages (its own privileged
+#     validator depends on that exact tree), and privileged: true exposes
+#     the host /dev/nvidia* device nodes NVML needs (same pattern as the
+#     operator's dcgm-exporter pods). Writes `topo -m` to a shared
+#     emptyDir. Probes a few layouts; fails LOUDLY (exit 1 -> pod restart
+#     with backoff) if the driver tree is missing.
+#   * container `push`: parses topo.txt and pushes
+#     nvidia_gpu_nvlink_domain{gpu,domain,peers,hostname} to the
+#     pushgateway for the prometheus-mcp GPU tab (detected grouping beats
+#     the built-in default; explicit gpuNvlinkDomains /
+#     PROM_UI_GPU_NVLINK_DOMAINS still wins). Retries every 60s on
+#     failure; sleeps for the pod's lifetime on success.
+#
+# Lifecycle — READ THIS BEFORE CHANGING IT:
+#   * The CHECK runs exactly once per pod lifetime (= once per node boot):
+#     the initContainer terminates (Completed) after its single topo
+#     capture and never re-runs unless the node reboots. NVLink topology
+#     is hardware-fixed — there is intentionally NO re-detection.
+#   * The POD cannot terminate-and-stay-done: Kubernetes DaemonSet pods
+#     only allow restartPolicy: Always (OnFailure/Never are rejected by
+#     the API), and an exiting container would be restarted immediately,
+#     re-running nvidia-smi every ~2s — strictly worse than idling.
+#   * The PUSH cannot stop either: the platform pushgateway runs with
+#     --metric.timetolive=30s, so a metric from a dead pod evaporates in
+#     30 seconds. The push sidecar therefore re-states the UNCHANGED
+#     result every pushInterval seconds at ~0 CPU. It performs no
+#     detection of its own — it is a re-publisher of the init's one-shot
+#     answer, nothing more.
+#
+# Version story: NO image or driver tag is pinned anywhere. PCAI/AIE
+# upgrades reinstall the driver into /run/nvidia/driver via the operator's
+# own DaemonSet, and the detector simply uses whatever is there at pod
+# start.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvlink-topology-script
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: nvlink-topology
+data:
+  detect_nvlink.py: |-
+{{ .Files.Get "files/detect_nvlink.py" | indent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvlink-topology
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: nvlink-topology
+spec:
+  selector:
+    matchLabels:
+      app: nvlink-topology
+  template:
+    metadata:
+      labels:
+        app: nvlink-topology
+    spec:
+      {{- with .Values.nvlinkAutodetect.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 5
+      initContainers:
+        - name: topo
+          image: {{ .Values.nvlinkAutodetect.image | quote }}
+          {{- if .Values.nvlinkAutodetect.privileged }}
+          # Host /dev/nvidia* device nodes are what NVML actually needs;
+          # privileged exposes them without per-node device-list guessing
+          # (same pattern as the GPU operator's own dcgm-exporter pods).
+          securityContext:
+            privileged: true
+          {{- end }}
+          # Probe the operator's driver install dir first (guaranteed by
+          # the driver DaemonSet on every GPU node), then host /usr/bin.
+          # GOTCHA (live-learned): point LD_LIBRARY_PATH at a clean dir with
+          # ONLY the NVIDIA libs copied in — never at the install tree's
+          # lib dir itself, whose libc.so.6 (GLIBC_PRIVATE, version-locked)
+          # poisons the container's own loader with
+          # "undefined symbol: __nptl_change_stack_perm".
+          command:
+            - sh
+            - -c
+            - >-
+              mkdir -p /shared/nvlibs;
+              cp -L /run/nvidia/driver/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 /shared/nvlibs/ 2>/dev/null || true;
+              cp -L /run/nvidia/driver/usr/lib/x86_64-linux-gnu/libnvidia-cfg.so.1 /shared/nvlibs/ 2>/dev/null || true;
+              export LD_LIBRARY_PATH="/shared/nvlibs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}";
+              for smi in "/run/nvidia/driver/usr/bin/nvidia-smi" "/run/nvidia/driver/nvidia-smi" "/usr/bin/nvidia-smi"; do
+              if [ -x "$smi" ]; then "$smi" topo -m > /shared/topo.txt 2>&1;
+              cat /shared/topo.txt;
+              exit 0; fi;
+              done;
+              echo "nvlink-topology: nvidia-smi not found under {{ .Values.nvlinkAutodetect.driverInstallDir }} or /usr/bin — is the GPU operator's driver DaemonSet running on this node?" >&2;
+              exit 1
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: driver-install-dir
+              mountPath: {{ .Values.nvlinkAutodetect.driverInstallDir }}
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      containers:
+        - name: push
+          image: {{ .Values.nvlinkAutodetect.image | quote }}
+          # Continuous refresh: this cluster's pushgateway runs with
+          # --metric.timetolive=30s, so pushed groups VANISH unless
+          # re-pushed. Re-parse the (static) topo file and re-push every
+          # pushInterval seconds — cheaper than the scrape interval.
+          command:
+            - sh
+            - -c
+            - >-
+              while true; do
+              python3 /detect/detect_nvlink.py || echo "nvlink-topology: push failed, retrying in {{ .Values.nvlinkAutodetect.pushInterval }}s" >&2;
+              sleep {{ .Values.nvlinkAutodetect.pushInterval }};
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PUSHGATEWAY_URL
+              value: {{ .Values.nvlinkAutodetect.pushgatewayUrl | quote }}
+            - name: TOPO_FILE
+              value: /shared/topo.txt
+          volumeMounts:
+            - name: script
+              mountPath: /detect
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: script
+          configMap:
+            name: nvlink-topology-script
+            defaultMode: 0555
+        - name: shared
+          emptyDir: {}
+        - name: driver-install-dir
+          hostPath:
+            path: {{ .Values.nvlinkAutodetect.driverInstallDir | quote }}
+            type: DirectoryOrCreate
+{{- end }}

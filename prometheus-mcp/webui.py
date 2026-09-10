@@ -15,6 +15,10 @@ Endpoints (all JSON unless noted):
   GET  /api/overview    -> dashboard aggregate (cards, top-N, trends, alerts)
                            each item fails SOFT: {"error": "..."} per card,
                            because metric names differ between stacks
+  GET  /api/gpu         -> NVIDIA GPU aggregate (DCGM exporter): per-GPU
+                           util/memory/temp/power/NVLink, grouped into the
+                           per-node NVLink domains, plus node + cluster
+                           summaries — fails soft on clusters without DCGM
   GET  /api/alerts      -> {"alerts": [...], "n_total", "n_shown", "counts"}
   GET  /api/rules       -> {"groups": [...], "n_total"} (state/search filters)
   POST /api/query       -> instant query  {"query", "time"?}
@@ -32,6 +36,7 @@ model's context window.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -72,6 +77,13 @@ _OVERVIEW_CARDS = (
         "100 * (1 - sum(node_memory_MemAvailable_bytes) / sum(node_memory_MemTotal_bytes))",
     ),
     ("pods_running", 'sum(kube_pod_status_phase{phase="Running"})'),
+    # GPU cards (DCGM exporter). Absent on clusters without DCGM -> fail soft.
+    ("gpu_count", "count(DCGM_FI_DEV_GPU_UTIL)"),
+    ("gpu_util_pct", "avg(DCGM_FI_DEV_GPU_UTIL)"),
+    (
+        "gpu_mem_pct",
+        "100 * sum(DCGM_FI_DEV_FB_USED) / (sum(DCGM_FI_DEV_FB_USED) + sum(DCGM_FI_DEV_FB_FREE))",
+    ),
 )
 _OVERVIEW_TOP = (
     (
@@ -81,6 +93,10 @@ _OVERVIEW_TOP = (
     (
         "top_mem",
         'topk(8, sum by (pod) (container_memory_working_set_bytes{container!="",image!=""}))',
+    ),
+    (
+        "top_gpu_mem",
+        'topk(8, sum by (exported_namespace, exported_pod) (DCGM_FI_DEV_FB_USED{exported_pod!=""}))',
     ),
 )
 _OVERVIEW_TRENDS = (
@@ -95,6 +111,287 @@ _OVERVIEW_TRENDS = (
         "now-3h",
     ),
 )
+
+# NVIDIA GPU (dcgm-exporter) canned queries for /api/gpu. Names are the
+# dcgm-exporter defaults; FB_* are MiB, POWER_USAGE watts, NVLink KiB/s.
+# On clusters without DCGM every block fails soft and the GPU tab shows "—".
+_GPU_QUERIES = (
+    ("util", "DCGM_FI_DEV_GPU_UTIL"),
+    ("fb_used", "DCGM_FI_DEV_FB_USED"),
+    ("fb_free", "DCGM_FI_DEV_FB_FREE"),
+    ("temp", "DCGM_FI_DEV_GPU_TEMP"),
+    ("power", "DCGM_FI_DEV_POWER_USAGE"),
+    ("mem_copy", "DCGM_FI_DEV_MEM_COPY_UTIL"),
+    ("nvlink", "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"),
+    ("xid", "DCGM_FI_DEV_XID_ERRORS"),
+)
+# H200 NVL (and most 8-GPU NVL-class hosts) ship as two 4-GPU NVLink islands
+# per node — verified live on G2: tensor-parallel workloads move NVLink
+# traffic exactly on GPUs 4-7 while 0-3 idle. Indices apply identically on
+# every GPU node. Override via env (JSON list of index groups), e.g.
+#   PROM_UI_GPU_NVLINK_DOMAINS='[[0,1,2,3],[4,5,6,7]]'
+_DEFAULT_GPU_DOMAINS = ((0, 1, 2, 3), (4, 5, 6, 7))
+
+
+def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[int, ...], str]:
+    """Parse the NVLink domain grouping (env override > default)."""
+    env = os.environ if environ is None else environ
+    raw = env.get("PROM_UI_GPU_NVLINK_DOMAINS", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            groups = tuple(tuple(int(g) for g in group) for group in parsed)
+            flat = [g for grp in groups for g in grp]
+            if groups and all(groups) and len(set(flat)) == len(flat):
+                return groups, "env"
+        except (ValueError, TypeError):
+            pass  # fall through to the default
+    return _DEFAULT_GPU_DOMAINS, "default"
+
+
+# Auto-detected NVLink topology: the chart's `nvlink-topology` DaemonSet runs
+# `nvidia-smi topo -m` once per GPU-node boot and pushes this info metric to
+# the pushgateway. Precedence in /api/gpu: explicit PROM_UI_GPU_NVLINK_DOMAINS
+# (operator escape hatch) > detected islands > built-in default.
+_NVLINK_DOMAIN_QUERY = "nvidia_gpu_nvlink_domain"
+
+
+def _host_key(host: str) -> str:
+    """Normalize a hostname for joining: first dot-label, lowercased.
+
+    DCGM reports the fqdn (``pcai-se-scs04.hst.lab``); the topology DaemonSet
+    pushes the k8s node name (``spec.nodeName`` — identical on G2, but be
+    robust to either form).
+    """
+    return str(host).split(".", 1)[0].strip().lower()
+
+
+def _nvlink_domains_from_metrics(data) -> dict[str, tuple[tuple[int, ...], ...]] | None:
+    """nvidia_gpu_nvlink_domain series -> per-host island groups (or None).
+
+    Returns None when the metric is absent or unusable so callers fall back
+    to env/default — detection is strictly additive, never a hard dependency.
+    """
+    if not isinstance(data, dict):
+        return None
+    per_host: dict[str, dict[int, set[int]]] = {}
+    for r in data.get("result", []):
+        labels = r.get("metric") or {}
+        host = (
+            labels.get("hostname")
+            or labels.get("Hostname")
+            or labels.get("instance")
+            or labels.get("exported_instance")
+        )
+        try:
+            gpu, dom = int(labels.get("gpu", "")), int(labels.get("domain", ""))
+        except (TypeError, ValueError):
+            continue
+        if host:
+            per_host.setdefault(_host_key(host), {}).setdefault(dom, set()).add(gpu)
+    out: dict[str, tuple[tuple[int, ...], ...]] = {}
+    for host, doms in per_host.items():
+        groups = tuple(tuple(sorted(gpus)) for _d, gpus in sorted(doms.items()))
+        flat = [g for grp in groups for g in grp]
+        # a GPU claimed by two domains is malformed data — skip that host
+        if groups and len(set(flat)) == len(flat):
+            out[host] = groups
+    return out or None
+
+
+def _gpu_join_key(labels: dict) -> tuple | None:
+    """(Hostname, gpu-index) from a DCGM sample; falls back to device=nvidiaN."""
+    host = labels.get("Hostname") or labels.get("hostname") or labels.get("instance")
+    if not host:
+        return None
+    idx = labels.get("gpu")
+    if idx is None or not str(idx).strip().lstrip("-").isdigit():
+        m = re.search(r"nvidia(\d+)$", str(labels.get("device", "")))
+        idx = m.group(1) if m else None
+    if idx is None:
+        return None
+    return (str(host), int(idx))
+
+
+def _gpu_block(data: dict) -> dict:
+    """instant-query data -> {'series': {(host, idx): (float, labels)}, 'models': {host: model}}."""
+    series: dict = {}
+    models: dict = {}
+    for r in data.get("result", []):
+        labels = r.get("metric") or {}
+        key = _gpu_join_key(labels)
+        if key is None:
+            continue
+        try:
+            value = float(r.get("value", [None, None])[1])
+        except (TypeError, ValueError):
+            continue
+        series[key] = (value, labels)
+        if labels.get("modelName"):
+            models[key[0]] = str(labels["modelName"])
+    return {"series": series, "models": models}
+
+
+def _r(value, nd: int = 1):
+    """Round for JSON, preserving None (unknown) — the UI renders '—'."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+def _avg(values: list) -> float | None:
+    values = [v for v in values if v is not None]
+    return sum(values) / len(values) if values else None
+
+
+def _sum_or_none(values: list) -> float | None:
+    """Sum the present values; None only when NOTHING was reported.
+
+    (A plain ``sum(...) or None`` would erase genuine zeros — an idle NVLink
+    island reports 0 traffic, which the UI should show as 0, not "—".)
+    """
+    present = [v for v in values if v is not None]
+    return _r(sum(present)) if present else None
+
+
+def _gpu_snapshot(
+    blocks: dict,
+    default_domains: tuple[tuple[int, ...], ...],
+    overrides: dict[str, tuple[tuple[int, ...], ...]],
+    source: str,
+) -> dict:
+    """Assemble the /api/gpu payload from per-metric blocks (fail-soft).
+
+    ``blocks`` maps each _GPU_QUERIES name to either an error dict
+    (``{"error", "query"}``) or a ``_gpu_block`` result. ``default_domains``
+    is the fallback index map (explicit env override or the built-in
+    default); ``overrides`` carries the auto-detected islands per host
+    (keyed by _host_key) and wins per host when present. The GPU tab only
+    hard-fails when BOTH util and fb_used are missing — every other metric
+    degrades to ``null`` fields the UI renders as "—".
+    """
+
+    def groups_for(host: str) -> tuple[tuple[int, ...], ...]:
+        return overrides.get(host) or overrides.get(_host_key(host)) or default_domains
+
+    def dom_of(host: str, idx: int) -> int | None:
+        for di, grp in enumerate(groups_for(host)):
+            if idx in grp:
+                return di
+        return None
+
+    util_b, used_b = blocks.get("util", {}), blocks.get("fb_used", {})
+    if "error" in util_b and "error" in used_b:
+        first_err = next((b["error"] for b in blocks.values() if "error" in b), "no data")
+        return {
+            "error": f"GPU metrics unavailable ({first_err})",
+            "domains_source": source,
+            "domains_config": [list(grp) for grp in default_domains],
+            "domains_detected": {h: [list(g) for g in v] for h, v in overrides.items()} or None,
+        }
+
+    def val(name: str, key) -> float | None:
+        series = blocks.get(name, {}).get("series", {})
+        return series.get(key, (None, None))[0]
+
+    keys = sorted({*util_b.get("series", {}), *used_b.get("series", {})}, key=lambda k: (k[0], k[1]))
+    gpus, by_host = [], {}
+    for key in keys:
+        host, idx = key
+        labels = (util_b.get("series", {}).get(key) or used_b.get("series", {}).get(key) or (None, {}))[1]
+        used, free = val("fb_used", key), val("fb_free", key)
+        total = (used or 0) + (free or 0) if used is not None or free is not None else None
+        xid = val("xid", key)
+        rec = {
+            "hostname": host,
+            "gpu": idx,
+            "device": labels.get("device"),
+            "uuid": labels.get("UUID"),
+            "model": labels.get("modelName"),
+            "domain": dom_of(host, idx),
+            "util_pct": _r(val("util", key)),
+            "mem_copy_pct": _r(val("mem_copy", key)),
+            "mem_used_mib": _r(used),
+            "mem_total_mib": _r(total),
+            "mem_pct": _r(100 * used / total, 1) if used is not None and total else None,
+            "temp_c": _r(val("temp", key)),
+            "power_w": _r(val("power", key)),
+            "nvlink_kib_s": _r(val("nvlink", key)),
+            "xid": int(xid) if xid else 0,
+            "namespace": labels.get("exported_namespace") or labels.get("namespace"),
+            "pod": labels.get("exported_pod") or labels.get("pod"),
+            "container": labels.get("exported_container") or labels.get("container"),
+        }
+        gpus.append(rec)
+        by_host.setdefault(host, []).append(rec)
+
+    def aggregate(records: list) -> dict:
+        used = [r["mem_used_mib"] for r in records if r["mem_used_mib"] is not None]
+        total = [r["mem_total_mib"] for r in records if r["mem_total_mib"] is not None]
+        return {
+            "gpu_count": len(records),
+            "util_pct": _r(_avg([r["util_pct"] for r in records])),
+            "mem_used_mib": _r(sum(used)) if used else None,
+            "mem_total_mib": _r(sum(total)) if total else None,
+            "mem_pct": _r(100 * sum(used) / sum(total), 1) if used and total and sum(total) else None,
+            "power_w": _sum_or_none([r["power_w"] for r in records]),
+            "max_temp_c": _r(max((r["temp_c"] for r in records if r["temp_c"] is not None), default=None)),
+            "nvlink_kib_s": _sum_or_none([r["nvlink_kib_s"] for r in records]),
+            "xid_gpus": sum(1 for r in records if r["xid"]),
+        }
+
+    nodes = []
+    for host in sorted(by_host):
+        recs = by_host[host]
+        models = {r["model"] for r in recs if r["model"]}
+        agg = aggregate(recs)
+        agg.update({"hostname": host, "model": models.pop() if len(models) == 1 else ("mixed" if models else None)})
+        nodes.append(agg)
+
+    domains_out = []
+    for host in sorted(by_host):
+        for di, grp in enumerate(groups_for(host)):
+            recs = [r for r in by_host[host] if r["gpu"] in grp]
+            if not recs:
+                continue
+            agg = aggregate(recs)
+            workloads: dict = {}
+            for r in recs:
+                if r["pod"]:
+                    workloads.setdefault((r["namespace"], r["pod"]), []).append(r["gpu"])
+            agg.update(
+                {
+                    "hostname": host,
+                    "domain": di,
+                    "gpus": sorted(grp),
+                    "workloads": [
+                        {"namespace": ns, "pod": pod, "gpus": sorted(idx)}
+                        for (ns, pod), idx in sorted(workloads.items(), key=lambda kv: -len(kv[1]))
+                    ],
+                }
+            )
+            domains_out.append(agg)
+
+    summary = aggregate(gpus) if gpus else {}
+    models = {n["model"] for n in nodes if n["model"]}
+    summary.update(
+        {
+            "gpus": len(gpus),
+            "nodes": len(by_host),
+            "model": models.pop() if len(models) == 1 else ("mixed" if models else None),
+        }
+    )
+    return {
+        "summary": summary,
+        "nodes": nodes,
+        "domains": domains_out,
+        "gpus": gpus,
+        "domains_source": source,
+        "domains_config": [list(grp) for grp in default_domains],
+    }
 
 
 def _load_html() -> str:
@@ -269,6 +566,52 @@ def build_ui_routes(client, config) -> list[Route]:
             }
         )
 
+    async def gpu(_request):
+        """NVIDIA GPU (DCGM) aggregate: per-GPU + NVLink-domain + node views.
+
+        One instant query per metric family (plus the optional nvlink
+        topology info metric), gathered concurrently, then assembled
+        client-agnostically by _gpu_snapshot. Fails soft: a cluster without
+        DCGM returns ``{"error": ...}`` (HTTP 200) so the tab can render an
+        honest empty state instead of breaking.
+        """
+        started = time.perf_counter()
+        env_domains, env_source = _gpu_domains()
+
+        async def fetch(name_query):
+            name, query = name_query
+            try:
+                return name, {"query": query, **_gpu_block(await client.instant_query(query))}
+            except Exception as exc:
+                return name, {"error": str(exc), "query": query}
+
+        async def fetch_domain_info():
+            try:
+                return await client.instant_query(_NVLINK_DOMAIN_QUERY)
+            except Exception:
+                return None  # absent / unreachable -> default grouping
+
+        fetched, domain_info = None, None
+        results = await asyncio.gather(*(fetch(nq) for nq in _GPU_QUERIES), fetch_domain_info())
+        fetched, domain_info = results[:-1], results[-1]
+        blocks = dict(fetched)
+        detected = _nvlink_domains_from_metrics(domain_info)
+        # Precedence: explicit operator override wins over ground truth wins
+        # over the built-in default.
+        if env_source == "env":
+            payload = _gpu_snapshot(blocks, env_domains, {}, "env")
+        elif detected:
+            payload = _gpu_snapshot(blocks, _DEFAULT_GPU_DOMAINS, detected, "detected")
+        else:
+            payload = _gpu_snapshot(blocks, env_domains, {}, env_source)
+        payload["generated_at"] = int(time.time())
+        payload["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        payload["queries"] = {**{name: query for name, query in _GPU_QUERIES}, "nvlink_domain_info": _NVLINK_DOMAIN_QUERY}
+        payload["domains_detected"] = (
+            {h: [list(g) for g in grps] for h, grps in detected.items()} if detected else None
+        )
+        return JSONResponse(payload)
+
     async def alerts(_request):
         try:
             alerts = await client.alerts()
@@ -432,6 +775,7 @@ def build_ui_routes(client, config) -> list[Route]:
         Route("/ui", ui),
         Route("/api/status", status),
         Route("/api/overview", overview),
+        Route("/api/gpu", gpu),
         Route("/api/alerts", alerts),
         Route("/api/rules", rules),
         Route("/api/query", query, methods=["POST"]),
@@ -442,8 +786,17 @@ def build_ui_routes(client, config) -> list[Route]:
 
 
 def _short_top_label(metric: dict) -> str:
-    """Prefer the pod/instance label for top-N charts, fall back to series id."""
-    for key in ("pod", "instance", "namespace"):
+    """Prefer a readable workload label for top-N charts.
+
+    Workload-attributed series (DCGM ``exported_*`` and cAdvisor) carry both
+    namespace and pod — render them as ``ns/pod``; fall back to the bare
+    pod/instance label, then the full series id.
+    """
+    ns = metric.get("exported_namespace") or metric.get("namespace")
+    pod = metric.get("exported_pod") or metric.get("pod")
+    if pod and ns:
+        return f"{ns}/{pod}"
+    for key in ("exported_pod", "pod", "instance"):
         if metric.get(key):
             return str(metric[key])
     return _series_id(metric)

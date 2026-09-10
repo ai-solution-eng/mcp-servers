@@ -1,0 +1,67 @@
+{{- if .Values.semanticCatalog.enabled }}
+{{- /* Semantic catalog ConfigMap (SQLHANDLER_CATALOG) — README "Semantic catalog".
+       Four sources, exactly one must be set:
+         1. semanticCatalog.tables           — NATIVE values map: paste plain
+            YAML as values structure, no stringification; rendered to
+            canonical JSON below
+         2. semanticCatalog.json             — catalog as an inline JSON string
+         3. semanticCatalog.yaml             — catalog as an inline YAML string
+            (verbatim paste of a semantic-catalog.yaml file)
+         4. semanticCatalog.existingConfigMap — a ConfigMap you own (key:
+            semantic-catalog.json); nothing is rendered here
+       The engine sniffs content (JSON first, YAML fallback), so all three
+       render-time forms land as interchangeable files. Validation fails the
+       render loudly at every step: a typo'd catalog should never deploy as a
+       silent empty one. */}}
+{{- if not .Values.semanticCatalog.existingConfigMap }}
+{{- $tables := .Values.semanticCatalog.tables | default dict }}
+{{- $json := .Values.semanticCatalog.json | default "" | trim }}
+{{- $yamlStr := .Values.semanticCatalog.yaml | default "" | trim }}
+{{- $payload := "" }}
+{{- $n := 0 }}
+{{- if gt (len $tables) 0 }}{{- $n = add1 $n }}{{- end }}
+{{- if ne $json "" }}{{- $n = add1 $n }}{{- end }}
+{{- if ne $yamlStr "" }}{{- $n = add1 $n }}{{- end }}
+{{- if gt $n 1 }}
+{{- fail "semanticCatalog: set only ONE of tables (native YAML structure), json (JSON string), yaml (YAML string)" }}
+{{- else if eq $n 0 }}
+{{- fail "semanticCatalog.enabled requires semanticCatalog.tables (native YAML), semanticCatalog.json (JSON string), semanticCatalog.yaml (YAML string), or semanticCatalog.existingConfigMap" }}
+{{- else if gt (len $tables) 0 }}
+{{- range $name, $entry := $tables }}
+{{- if not (kindIs "map" $entry) }}
+{{- fail (printf "semanticCatalog.tables[%q] must be a mapping of documentation fields (description/aliases/columns)" $name) }}
+{{- end }}
+{{- end }}
+{{- $payload = dict "tables" $tables | toJson }}
+{{- else if ne $json "" }}
+{{- $catalog := mustFromJson $json }}
+{{- if not (and $catalog (hasKey $catalog "tables")) }}
+{{- fail (printf "semanticCatalog.json must be a JSON object with a top-level 'tables' mapping (got %T)" $catalog) }}
+{{- end }}
+{{- $payload = $json }}
+{{- else }}
+{{- $parsed := fromYaml $yamlStr }}
+{{- if hasKey $parsed "Error" }}
+{{- fail (printf "semanticCatalog.yaml is not valid YAML: %s" (get $parsed "Error")) }}
+{{- end }}
+{{- if not (and $parsed (hasKey $parsed "tables")) }}
+{{- fail "semanticCatalog.yaml must be a YAML object with a top-level 'tables' mapping" }}
+{{- end }}
+{{- $payload = $yamlStr }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-semantic-catalog
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+data:
+  # Key name = file name in the mounted directory; SQLHANDLER_CATALOG points
+  # at <semanticCatalog.mountPath>/semantic-catalog.json (deployment.yaml).
+  # The engine sniffs content (JSON first, YAML fallback), so the format on
+  # disk is interchangeable.
+  semantic-catalog.json: |
+    {{- $payload | nindent 4 }}
+{{- end }}
+{{- end }}

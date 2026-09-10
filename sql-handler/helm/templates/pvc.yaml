@@ -1,0 +1,35 @@
+{{- if .Values.semanticCatalog.store.enabled }}
+{{- /* Persistent volume backing the semantic-catalog upload store
+       (SQLHANDLER_CATALOG_STORE) — README "Semantic catalog". A shared RWX
+       volume makes UI/API uploads cross-pod and durable, still hot-reloaded
+       (no rollout). Skipped entirely when an existingClaim is given.
+
+       Render-time guard: ReadWriteMany is REQUIRED whenever replicas can
+       exceed 1 (autoscaling or replicaCount > 1). RWO claims attach on one
+       node only — the other replicas would sit Pending with no error inside
+       the pod, which is exactly the failure this chart refuses to ship.
+       Operator-authored values that cannot work should not render. */}}
+{{- $store := .Values.semanticCatalog.store }}
+{{- $multi := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) }}
+{{- if and $multi (not (has "ReadWriteMany" ($store.accessModes | default list))) }}
+{{- fail "semanticCatalog.store: ReadWriteMany access is required when replicas can exceed 1 (autoscaling.enabled or replicaCount > 1) — a ReadWriteOnce claim strands the extra pods Pending. Use an RWX StorageClass, or set accessModes: [ReadWriteOnce] ONLY for single-replica deployments." }}
+{{- end }}
+{{- if not $store.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-catalog
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml ($store.accessModes | default (list "ReadWriteMany")) | nindent 4 }}
+  {{- if $store.storageClass }}
+  storageClassName: {{ $store.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $store.size | default "1Gi" }}
+{{- end }}
+{{- end }}

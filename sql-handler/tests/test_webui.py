@@ -12,6 +12,9 @@ from sqlhandler.engine import SqlEngine
 from sqlhandler.file import FileProvider
 from sqlhandler.webui import (
     _clamp_limit,
+    api_catalog_clear,
+    api_catalog_status,
+    api_catalog_upload,
     api_describe,
     api_preview,
     api_query,
@@ -19,6 +22,7 @@ from sqlhandler.webui import (
     api_tables,
     arrow_to_payload,
     assert_readonly,
+    register_ui,
 )
 
 # ---------------------------------------------------------------------------
@@ -297,3 +301,111 @@ def _engine(tmp_path):
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
     return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+
+
+# ---------------------------------------------------------------------------
+# semantic catalog: status / upload (JSON or YAML) / clear
+# ---------------------------------------------------------------------------
+
+
+_YAML_CATALOG = (
+    b"tables:\n"
+    b"  orders:\n"
+    b"    description: Order headers (uploaded)\n"
+    b"    columns:\n"
+    b"      qty: Quantity in units\n"
+)
+
+
+def test_catalog_upload_yaml_then_json_roundtrip(engine, tmp_path):
+    """Upload wins over 'no catalog'; a JSON upload replaces a YAML one."""
+    res = api_catalog_upload(engine, _YAML_CATALOG)
+    assert res["tables"] == 1
+    status = api_catalog_status(engine)
+    assert status["active_source"] == "upload"
+    assert status["active_tables"] == 1
+    # Descriptions flow through describe_table immediately (hot-reloaded).
+    assert api_describe(engine, "orders")["description"] == "Order headers (uploaded)"
+    # A JSON upload replaces the YAML one — same endpoint, both formats.
+    api_catalog_upload(engine, b'{"tables": {"orders": {"description": "v2"}}}')
+    assert api_describe(engine, "orders")["description"] == "v2"
+    # The store file itself is always canonical JSON.
+    import json as _json
+    from pathlib import Path as _Path
+
+    store = _Path(api_catalog_status(engine)["active_path"])
+    assert _json.loads(store.read_text(encoding="utf-8"))["tables"]["orders"]["description"] == "v2"
+    # Clearing removes the upload; the engine goes back to no catalog.
+    cleared = api_catalog_clear(engine)
+    assert cleared["removed"] is True
+    assert api_catalog_status(engine)["active_path"] is None
+    assert "description" not in api_describe(engine, "orders")
+    assert api_catalog_clear(engine)["removed"] is False  # idempotent
+
+
+def test_catalog_upload_rejections(engine, tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    with pytest.raises(ValueError, match="empty"):
+        api_catalog_upload(engine, b"   \n")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        api_catalog_upload(engine, b"{oops")
+    with pytest.raises(ValueError, match="UTF-8"):
+        api_catalog_upload(engine, b"\xff\xfe\x00bad")
+    with pytest.raises(ValueError, match="tables"):
+        api_catalog_upload(engine, b'{"foo": {"description": "no tables key"}}')
+    with pytest.raises(ValueError, match="too large"):
+        api_catalog_upload(engine, b"x" * 1_000_001)
+
+
+def test_catalog_upload_disabled_by_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_CATALOG_UPLOAD", "0")
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    pq.write_table(pa.table({"a": [1]}), str(tmp_path / "t.parquet"))
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+    assert eng.catalog_uploads_enabled is False
+    assert api_catalog_status(eng)["uploads_enabled"] is False
+    with pytest.raises(ValueError, match="disabled"):
+        api_catalog_upload(eng, b'{"tables": {}}')
+
+
+def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
+    """Route wiring end to end: auth, upload, describe merge, clear."""
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.server import (
+        _ApiTokenMiddleware,
+        _transport_security,
+    )
+    from sqlhandler.server import (
+        mcp as mcp_server,
+    )
+
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    pq.write_table(pa.table({"id": [1, 2], "amount": [1.0, 2.0]}), str(tmp_path / "orders.parquet"))
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
+
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    register_ui(app, lambda: eng)
+    app.add_middleware(_ApiTokenMiddleware, token="tok-123")
+    client = TestClient(app)
+    auth = {"X-API-Token": "tok-123"}
+
+    assert client.post("/api/semantic-catalog", content=b"tables: {}").status_code == 401
+
+    yaml_catalog = b"tables:\n  orders:\n    description: over HTTP\n"
+    assert client.post("/api/semantic-catalog", content=yaml_catalog, headers=auth).json()["tables"] == 1
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "over HTTP"
+    assert client.get("/api/semantic-catalog", headers=auth).json()["active_source"] == "upload"
+
+    assert client.post(
+        "/api/semantic-catalog", content=b'{"tables": {"orders": {"description": "v2"}}}', headers=auth
+    ).status_code == 200
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "v2"
+
+    assert client.post("/api/semantic-catalog", content=b"{broken", headers=auth).status_code == 400
+    assert client.delete("/api/semantic-catalog", headers=auth).json()["removed"] is True
+    assert "description" not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()

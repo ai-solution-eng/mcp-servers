@@ -1,6 +1,22 @@
+# k8s-mcp-customer — customer distribution of the K8s ops MCP server.
+# Structurally locked: security knobs (exec, namespace policy, per-user
+# keys, RBAC) do not exist in values and cannot be configured from the
+# PCAI frontend.
 apiVersion: v2
 name: k8s-mcp-customer
-description: Customer distribution of the K8s ops MCP server — structurally locked; security knobs (exec, namespace policy, per-user keys, RBAC) do not exist in values and cannot be configured from the PCAI frontend
+description: >-
+  Customer distribution of the K8s ops MCP server — structurally locked;
+  security knobs (exec, namespace policy, per-user keys, RBAC) do not
+  exist in values and cannot be configured from the PCAI frontend.
 type: application
-version: 0.2.6-customer
-appVersion: "v0.2.6"
+version: 0.3.0-customer
+appVersion: "v0.3.0"
+keywords:
+  - mcp
+  - kubernetes
+  - ops
+  - customer
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

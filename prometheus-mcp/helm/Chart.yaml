@@ -1,6 +1,18 @@
+# prometheus-mcp — read-only Prometheus observation over MCP (PromQL,
+# series discovery, alerts, rules) for PCAI.
 apiVersion: v2
 name: prometheus-mcp
-description: Prometheus MCP Server — read-only PromQL queries, series discovery, alerts and rules over MCP
+description: >-
+  Prometheus MCP Server — read-only PromQL queries, series discovery,
+  alerts and rules over MCP, behind the PCAI Istio gateway.
 type: application
-version: 0.2.1
-appVersion: "v0.2.1"
+version: 0.4.0
+appVersion: "v0.4.0"
+keywords:
+  - mcp
+  - prometheus
+  - monitoring
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering
