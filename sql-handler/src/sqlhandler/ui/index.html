@@ -523,7 +523,10 @@
       <button type="button" class="sv-close" id="sv-modal-close" title="Close (Esc)">✕</button>
     </div>
     <div id="sv-modal-editor-host" style="flex:1;min-height:0;display:flex">
-      <div id="sv-modal-editor" style="flex:1"></div>
+      <!-- display:flex here too: the .sv-editor is sized with flex, and its
+           absolutely-positioned pre/textarea layers collapse to 0px inside a
+           plain block parent (the empty-editor bug). -->
+      <div id="sv-modal-editor" style="flex:1;min-height:0;display:flex"></div>
     </div>
     <div class="sv-dialog-foot">
       <span class="hint">Applied edits override the configured catalog file until removed (Remove button, lower left). Documentation only — data stays read-only.</span>
@@ -1107,7 +1110,7 @@ async function openGlobalEditor() {
   try {
     const c = await api("/api/semantic-catalog/content?format=yaml");
     svModal.format = "yaml";
-    if (!svModal.editor) svModal.editor = makeSVEditor($("sv-modal-editor"), { flex: "1 1 auto", minHeight: "0" });
+    if (!svModal.editor) svModal.editor = makeSVEditor($("sv-modal-editor"), { flex: "1 1 auto", minHeight: "220px" });
     svModal.editor.format = "yaml";
     svModal.editor.text = c.text;
     svSyncFmtButtons($("sv-modal-fmt"), "yaml");

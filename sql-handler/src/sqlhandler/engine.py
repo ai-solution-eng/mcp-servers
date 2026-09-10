@@ -21,6 +21,7 @@ Design notes (kept from the original OneLake handler):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -949,14 +950,24 @@ class SqlEngine:
         The store file is always written as canonical JSON (the parsed
         content re-serialized) so the file on disk stays trivially
         machine-readable regardless of the format the user edited in.
+        The temp file is created exclusively per write (``mkstemp``) — on a
+        SHARED store (RWX PVC, replicas > 1) a fixed ``.tmp`` name would let
+        two replicas applying at once interleave into one temp file and
+        publish corrupt JSON. Publication itself stays atomic ``os.replace``.
         Raises ``OSError`` on an unwritable store (propagates to the API
         layer, which turns it into an operator-actionable 500).
         """
         target = Path(self._catalog_store)
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"tables": tables}, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, target)
+        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"tables": tables}, indent=2, ensure_ascii=False))
+            os.replace(tmp_name, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)  # never leave a stray temp on failure
+            raise
         # Hot-reload happens on the next _catalog() call (mtime changed), but
         # resolve it eagerly so a mutation response reflects reality.
         self._catalog()
