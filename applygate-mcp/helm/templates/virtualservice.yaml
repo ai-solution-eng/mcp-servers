@@ -1,0 +1,46 @@
+{{- if .Values.ezua.enabled }}
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: {{ .Values.deployment.name }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    hpe-ezua/app: {{ .Values.deployment.appName }}
+    hpe-ezua/type: vendor-service
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required !" }}
+  http:
+    # MCP clients: streamable-http + SSE at /mcp -> MCP server (9102).
+    # NOTE: this is a WRITE-path MCP — expose it through the gateway only
+    # with real gateway auth in front (ezua.authorizationPolicy / SSO), and
+    # only after the namespace allowlist is configured.
+    - match:
+        - uri:
+            prefix: /mcp
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    {{- if .Values.webui.enabled }}
+    # Read-only web console (/ and /ui) + its JSON API (/api/*) -> the same
+    # service. Strictly read-only: plan previews (always dry-run), resource
+    # status, audit tail, effective policy — it exposes NO apply/delete
+    # endpoints, so the gateway surface gains no mutation path. Still route
+    # it only behind real gateway auth.
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    {{- end }}
+{{- end }}

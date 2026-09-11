@@ -1,0 +1,151 @@
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack
+
+# workbench-mcp — persistent per-agent scratch workspaces for agent
+# harnesses (opencode, DSH): named directories on a PVC, path-confined
+# file tools, a per-workspace env store, and bounded argv command
+# execution with audit. Exposed through the PCAI Istio gateway so MCP
+# clients outside the cluster (harnesses run locally) can reach it: /mcp
+# is the stateless MCP endpoint, / the HPE-branded web UI (webui.enabled).
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: workbench-mcp
+  appName: workbench-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+image:
+  repository: ghcr.io/ai-solution-eng/workbench-mcp
+  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
+  # this default is what a deploy WITHOUT a site values file uses, and a
+  # stale default is how an "old MCP server" pod happens.
+  tag: v0.1.2
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously, the ddgs-mcp convention).
+imagePullSecrets: []
+
+# -- Web UI -------------------------------------------------------------------------------
+# HPE-branded browser console served at / by the same container: workspace
+# switcher, file tree + viewer/saver, per-workspace env table editor, a
+# run-command console, and an audit tail. The /api/* endpoints call the
+# SAME core functions the MCP tools use — path confinement, size caps, the
+# argv allowlist/denylist and the JSONL audit all still apply; the UI gets
+# NO new powers. It is read/write and unauthenticated at the pod: the
+# endpoint must sit behind gateway authn (PCAI Istio gateway). Rendered
+# into the container as WORKBENCH_UI_ENABLED by deployment.yaml.
+webui:
+  enabled: true
+
+# -- Workbench configuration --------------------------------------------------------
+# Rendered into the container env by deployment.yaml (Helm does not template
+# inside values files — the prometheus-mcp lesson). WORKBENCH_ROOT MUST match
+# persistence.mountPath (both default /data): the PVC is where every
+# workspace lives. Full knob documentation in README.md.
+workbench:
+  # Root directory holding all workspaces (= the PVC mount).
+  root: /data
+  # argv[0] allowlist for run_command (comma-separated). Anything not on
+  # the list is refused — no shells by design.
+  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  # Hard deny (WINS over the allowlist): network/escalation binaries.
+  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
+  # Per-command timeout bounds (seconds).
+  execTimeoutDefault: 60
+  execTimeoutMax: 600
+  # write_file cap (bytes, 8 MiB).
+  maxFileBytes: 8388608
+  # stdout/stderr cap per run_command (bytes, 200 KiB).
+  maxOutputBytes: 204800
+  # Max entries per list_files response.
+  maxListEntries: 500
+  logLevel: INFO
+
+# -- HPE corporate proxy --------------------------------------------------------------------------
+# Route outbound HTTP(S) traffic through the HPE corporate proxy. Default
+# false: open-internet systems must NOT use the proxy (DNS/egress failures).
+# Set true (and configure proxy.*) only behind the HPE proxy. When true the
+# proxy env lands on the pod AND the server passes those variables through
+# to run_command children — this is what makes `pip install ...` work inside
+# a workspace on a g2 cluster with no direct internet egress.
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  # Standard cluster-local exclusions (searxng-mcp convention) — never send
+  # in-cluster traffic through the corporate proxy.
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- Corporate MITM CA ---------------------------------------------------------------------------
+# The HPE proxy re-terminates TLS; pip/requests inside run_command need the
+# PCAI root CA to trust it. When enabled, mounts the namespace's
+# `ezaf-root-ca` ConfigMap (present on EzUA clusters — copy it into the
+# release namespace if needed, see searxng-mcp helm/values.yaml for the
+# kubectl recipe) and points SSL_CERT_FILE / REQUESTS_CA_BUNDLE / PIP_CERT
+# at it for the container AND every run_command child. Default false.
+caCert:
+  enabled: false
+  configMap: "ezaf-root-ca"
+  configMapKey: "ezaf-root-ca.crt"
+
+# -- Kyverno vendor-label policy -------------------------------------------------------------------
+# ClusterPolicy (pre-install hook) that stamps the hpe-ezua/* vendor labels
+# onto Pods/Deployments/Services in the release namespace — the same policy
+# the searxng-mcp and prometheus-mcp charts ship. OFF by default here so
+# the default render is unchanged (and clusters without the kyverno CRD
+# still install); flip on where the EzUA vendor-label convention applies.
+kyverno:
+  enabled: false
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9103
+  targetPort: 9103
+
+# -- Resources (modest: a scratch pad, not a compute node) -------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- Security context -----------------------------------------------------------------
+# Scratch pad by design: non-root (matches the image's uid-10001 user), and
+# fsGroup 10001 so the mounted PVC is writable by that user.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+# -- Persistence ---------------------------------------------------------------------
+# THE point of the workbench: workspaces must survive pod restarts. RWX so
+# every replica sees the same workspaces (MCP is stateless — any replica
+# serves any request). Single-replica clusters without an RWX class can
+# drop to ReadWriteOnce with replicaCount: 1.
+persistence:
+  enabled: true
+  size: 10Gi
+  mountPath: /data
+  accessModes:
+    - ReadWriteMany
+  # storageClass: ""    # uncomment to pin a class; default cluster class otherwise
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# Deploys the Istio VirtualService through the ezaf-gateway. OFF by default:
+# flip it on in a site values file (helm/local convention) with the literal
+# cluster domain. The /mcp timeout is generous because run_command can
+# legitimately run to WORKBENCH_EXEC_TIMEOUT_MAX (600s default).
+ezua:
+  enabled: false
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "workbench-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s

@@ -1,0 +1,43 @@
+{{- if .Values.ezua.enabled }}
+{{- /*
+Ported from the fleet charts (searxng-mcp / prometheus-mcp): a generic
+pre-install Kyverno ClusterPolicy that stamps the PCAI vendor labels onto
+this release's workloads, so the EzUA platform can recognize the vendor
+service (the VirtualService carries the same labels).
+
+searxng/prometheus ship it UNGATED; here it is gated on ezua.enabled because
+the labels only mean anything on a PCAI deployment (logsearch's ezua
+integration defaults to false, and the chart's default render must stay
+unchanged for non-PCAI installs). Enabling ezua reproduces exactly what the
+other charts do on a PCAI site.
+*/}}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  background: false
+  rules:
+  - name: add-vendor-app-labels
+    match:
+      any:
+      - resources:
+          # list all namespaces defined by the chart here
+          # if there are no namespace resource defined leave only .Release.Namespace
+          namespaces:
+          - {{ .Release.Namespace }}
+          kinds:
+          - Pod
+          - Deployment
+          - Service
+    mutate:
+      patchStrategicMerge:
+        metadata:
+            labels:
+              "hpe-ezua/type": vendor-service
+              "hpe-ezua/app": {{ .Chart.Name }}
+{{- end }}

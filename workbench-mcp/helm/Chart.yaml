@@ -1,0 +1,22 @@
+# workbench-mcp — persistent per-agent scratch workspaces over MCP
+# (PVC-backed files, per-workspace env, bounded argv command execution)
+# for PCAI.
+apiVersion: v2
+name: workbench-mcp
+description: >-
+  Workbench MCP Server — persistent per-agent scratch workspaces: named
+  directories on a PVC, path-confined file tools, a per-workspace env
+  store, and bounded argv command execution with audit, behind the PCAI
+  Istio gateway.
+type: application
+version: 0.1.2
+appVersion: "v0.1.2"
+keywords:
+  - mcp
+  - workbench
+  - agent-scratchpad
+  - persistence
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

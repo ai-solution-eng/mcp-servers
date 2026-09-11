@@ -208,9 +208,7 @@ class QueryJob:
         # no job exists.
         _query_gate.acquire()
         self._gate_held = True
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="sqlhandler-query"
-        )
+        self._thread = threading.Thread(target=self._run, daemon=True, name="sqlhandler-query")
         self._thread.start()
 
     # ---------------------------------------------------------- execution
@@ -258,9 +256,7 @@ class QueryJob:
                     self._state = "done"
                     self._elapsed_ms = (time.monotonic() - self._t0) * 1000
             if self._state == "done":
-                self._engine._record_outcome(
-                    self.sql, self._elapsed_ms, arrow_table.num_rows, state="ok"
-                )
+                self._engine._record_outcome(self.sql, self._elapsed_ms, arrow_table.num_rows, state="ok")
         except Exception as exc:
             elapsed = (time.monotonic() - self._t0) * 1000
             with self._lock:
@@ -272,9 +268,7 @@ class QueryJob:
                     self._state = "error"
                     hinted = _with_hints(self._engine, self.sql, exc)
                     self._error = f"DuckDB query failed: {hinted}"
-            self._engine._record_outcome(
-                self.sql, elapsed, None, state=self._state, error=self._error
-            )
+            self._engine._record_outcome(self.sql, elapsed, None, state=self._state, error=self._error)
         finally:
             try:
                 con.close()
@@ -496,8 +490,7 @@ def _validate_params(params: object) -> object | None:
     for v in values:
         if v is not None and not isinstance(v, scalars):
             raise ValueError(
-                "Query params must be scalars (str/int/float/bool/datetime/Decimal/None); "
-                f"got {type(v).__name__}."
+                f"Query params must be scalars (str/int/float/bool/datetime/Decimal/None); got {type(v).__name__}."
             )
     return params
 
@@ -534,9 +527,7 @@ def _with_hints(engine: SqlEngine, sql: str, exc: Exception) -> Exception:
             names = [i.qualified_name for i in engine.list_tables()]
             hints = _suggest(m.group(1), names)
             if hints:
-                exc = LakehouseError(
-                    f"{msg}\nDid you mean one of: {', '.join(hints)}?"
-                )
+                exc = LakehouseError(f"{msg}\nDid you mean one of: {', '.join(hints)}?")
             return exc
         m = _COLUMN_ERROR.search(msg)
         if m:
@@ -614,6 +605,12 @@ class SqlEngine:
         self._catalog_file: str | None = None
         self._catalog_mtime: float | None = None
         self._catalog_data: dict = {}
+        # Virtual-table definitions (catalog entries with a `definition`):
+        # validation verdicts memoized per distinct definition text, so a
+        # hot-reloaded catalog re-parses only the definitions it changed.
+        self._definition_verdicts: dict[str, str | None] = {}
+        # and the rewritten (Snowflake -> DuckDB) SQL, memoized the same way.
+        self._definition_rewrites: dict[str, str] = {}
         # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
         # config parses loudly at startup (operator-authored, security
         # relevant — a typo should kill the pod, not silently skip a source).
@@ -652,16 +649,16 @@ class SqlEngine:
         # emptyDir); point SQLHANDLER_CATALOG_STORE at a PVC path to make
         # uploads survive pod rescheduling. SQLHANDLER_CATALOG_UPLOAD=0
         # disables the upload/clear API (read-only catalog posture).
-        self.catalog_uploads_enabled = os.environ.get(
-            "SQLHANDLER_CATALOG_UPLOAD", "1"
-        ).strip().lower() not in ("0", "false", "no", "off")
-        self._catalog_store = (
-            os.environ.get("SQLHANDLER_CATALOG_STORE", "").strip()
-            or (
-                str(Path(self._cache_dir) / "semantic-catalog.json")
-                if self._cache_dir
-                else str(Path(tempfile.gettempdir()) / "sqlhandler-semantic-catalog.json")
-            )
+        self.catalog_uploads_enabled = os.environ.get("SQLHANDLER_CATALOG_UPLOAD", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        self._catalog_store = os.environ.get("SQLHANDLER_CATALOG_STORE", "").strip() or (
+            str(Path(self._cache_dir) / "semantic-catalog.json")
+            if self._cache_dir
+            else str(Path(tempfile.gettempdir()) / "sqlhandler-semantic-catalog.json")
         )
         if self._async_list:
             threading.Thread(
@@ -672,6 +669,20 @@ class SqlEngine:
 
     # ---------------------------------------------------------------- list
     def list_tables(self) -> list[TableInfo]:
+        """Every addressable table: the provider's physical tables plus the
+        semantic catalog's virtual tables (entries carrying a ``definition``).
+
+        Virtual tables are appended after the physical ones (sorted by name)
+        and carry ``format="virtual"`` — they are computed at query time from
+        their definitions and are backed by no storage at all (see
+        ``_register_schema``). The disk-warm cache and the provider caches
+        below stay physical-only: virtual tables always derive live from the
+        hot-reloaded catalog.
+        """
+        tables = self._provider_tables()
+        return tables + self._virtual_infos(tables)
+
+    def _provider_tables(self) -> list[TableInfo]:
         """List the tables the provider exposes (cached for cache_ttl).
 
         With async refresh (the default) the cached list is returned
@@ -798,9 +809,7 @@ class SqlEngine:
                     if isinstance(row, list) and len(row) == 3:
                         try:
                             key = (str(row[0]), str(row[1]))
-                            self._table_usage[key] = max(
-                                self._table_usage.get(key, 0), int(row[2])
-                            )
+                            self._table_usage[key] = max(self._table_usage.get(key, 0), int(row[2]))
                             restored += 1
                         except (TypeError, ValueError):
                             continue
@@ -837,10 +846,7 @@ class SqlEngine:
                         }
                         for (source, path), (_, result) in self._describe_cache.items()
                     ],
-                    "usage": [
-                        [source, path, count]
-                        for (source, path), count in self._table_usage.items()
-                    ],
+                    "usage": [[source, path, count] for (source, path), count in self._table_usage.items()],
                 }
             cache_dir = Path(self._cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -869,8 +875,7 @@ class SqlEngine:
                 import yaml  # optional dependency (pyproject: pyyaml)
             except ImportError:
                 raise ValueError(
-                    f"{origin}: not valid JSON, and PyYAML is not installed "
-                    "(YAML catalogs need the 'pyyaml' package)"
+                    f"{origin}: not valid JSON, and PyYAML is not installed (YAML catalogs need the 'pyyaml' package)"
                 ) from None
             try:
                 data = yaml.safe_load(text)
@@ -1033,9 +1038,7 @@ class SqlEngine:
             "store_path": self._catalog_store,
             "configured": _peek(self._catalog_path),
             "uploaded": _peek(self._catalog_store),
-            "active_source": ("upload" if active == self._catalog_store else "configured")
-            if active
-            else None,
+            "active_source": ("upload" if active == self._catalog_store else "configured") if active else None,
             "active_path": active,
             "active_tables": len(self._catalog()) if active else 0,
         }
@@ -1085,9 +1088,7 @@ class SqlEngine:
             import yaml  # optional dependency (pyproject: pyyaml)
         except ImportError:
             return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        return yaml.safe_dump(
-            data, sort_keys=False, allow_unicode=True, default_flow_style=False
-        )
+        return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
     def catalog_content(self, fmt: str = "yaml") -> dict:
         """The ACTIVE catalog serialized as editable text (YAML by default).
@@ -1201,6 +1202,104 @@ class SqlEngine:
                 out[k] = v
         return out
 
+    # ------------------------------------------------------------- virtual
+    # Virtual tables: semantic-catalog entries that carry a ``definition`` —
+    # a SELECT/WITH query — instead of pointing at stored data. They appear
+    # in list/describe/search like any table (marked ``format="virtual"``)
+    # and are constructed on the fly at query time as a DuckDB view over the
+    # base tables their definition references, so user filters and
+    # projections still push down into the physical scans. Definitions run
+    # on exactly the same locked-down, read-only connections as any other
+    # query and are validated up front: a single, parseable, read-only
+    # statement. The virtual-table surface adds no new capability (the SQL
+    # endpoints already execute read-only queries with these guardrails) —
+    # it adds *reusable* query shapes that data owners curate.
+
+    _VIRTUAL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def _virtual_entries(self) -> dict[str, dict]:
+        """Catalog entries that define a virtual table, keyed by table name.
+
+        An entry qualifies when its key is a clean bare identifier and it
+        carries a non-empty string ``definition`` that parses as a single
+        read-only statement (validated once per distinct definition text —
+        see ``_definition_error``). Anything else carrying a ``definition``
+        is skipped with a warning: a broken catalog entry must never break
+        queries. ``virtual: true`` WITHOUT a definition is a plain
+        documentation marker, not an error.
+        """
+        out: dict[str, dict] = {}
+        for key, entry in self._catalog().items():
+            if not isinstance(entry, dict) or not entry.get("definition"):
+                continue
+            if not isinstance(key, str) or "/" in key or not self._VIRTUAL_NAME_RE.match(key):
+                logger.warning(
+                    "semantic catalog: virtual-table key %r invalid (must be a bare identifier); skipping",
+                    key,
+                )
+                continue
+            definition = entry["definition"]
+            if not isinstance(definition, str) or not definition.strip():
+                logger.warning("semantic catalog: virtual table %r has an empty definition; skipping", key)
+                continue
+            error = self._definition_error(definition)
+            if error:
+                logger.warning("semantic catalog: virtual table %r rejected: %s", key, error)
+                continue
+            out[key] = entry
+        return out
+
+    def _definition_error(self, definition: str) -> str | None:
+        """Validate a definition with DuckDB's own parser (memoized by text).
+
+        Must be exactly one statement and a plain read-only SELECT (WITH /
+        VALUES parse as SELECT — the same rule the web API's
+        ``assert_readonly`` applies). A definition is stored as a view body,
+        so it could only ever execute with the guardrails of a regular
+        query, but rejecting non-SELECT text up front gives the catalog
+        author a clear log line instead of a runtime surprise. Returns None
+        when the definition is valid.
+        """
+        if definition in self._definition_verdicts:
+            return self._definition_verdicts[definition]
+        if len(self._definition_verdicts) > 128:  # bound the memo (edits churn texts)
+            self._definition_verdicts.clear()
+        verdict: str | None
+        try:
+            import duckdb
+
+            types = [str(s.type).split(".")[-1] for s in duckdb.extract_statements(definition)]
+        except Exception as exc:
+            verdict = f"definition does not parse: {exc}"
+        else:
+            if len(types) != 1:
+                verdict = f"definition must be exactly one statement, found {len(types)}"
+            elif types[0] != "SELECT":
+                verdict = f"definition must be a single read-only SELECT (WITH ...) statement, not {types[0]}"
+            else:
+                verdict = None
+        self._definition_verdicts[definition] = verdict
+        return verdict
+
+    def _virtual_infos(self, physical: list[TableInfo]) -> list[TableInfo]:
+        """TableInfo records for the catalog's virtual tables (name-sorted).
+
+        A virtual table whose name collides with a physical table is dropped:
+        stored data wins over documentation — a catalog edit must never
+        shadow a real table into something else. ``physical`` is the caller's
+        already-fetched provider list (never re-listed here).
+        """
+        taken: set[str] = set()
+        for info in physical:
+            taken.update((info.name, info.path, info.qualified_name))
+        return [
+            info
+            for info in (
+                TableInfo(name=name, schema="default", format="virtual") for name in sorted(self._virtual_entries())
+            )
+            if info.name not in taken and info.path not in taken and info.qualified_name not in taken
+        ]
+
     def _parse_catalog_entry_text(self, text: str) -> dict:
         """Parse one table's documentation fragment (JSON or YAML).
 
@@ -1215,8 +1314,7 @@ class SqlEngine:
                 import yaml  # optional dependency (pyproject: pyyaml)
             except ImportError:
                 raise ValueError(
-                    "entry is not valid JSON, and PyYAML is not installed "
-                    "(YAML entries need the 'pyyaml' package)"
+                    "entry is not valid JSON, and PyYAML is not installed (YAML entries need the 'pyyaml' package)"
                 ) from None
             try:
                 data = yaml.safe_load(text)
@@ -1226,10 +1324,7 @@ class SqlEngine:
             raise ValueError("catalog entry must be a mapping (description / aliases / columns)")  # noqa: TRY004
         if set(data) == {"tables"} and isinstance(data["tables"], dict):
             if len(data["tables"]) != 1:
-                raise ValueError(
-                    "a per-table edit takes ONE table's entry — "
-                    "use the global editor for a full catalog"
-                )
+                raise ValueError("a per-table edit takes ONE table's entry — use the global editor for a full catalog")
             (data,) = data["tables"].values()
         return self._validate_catalog_entry(data, "<entry>")
 
@@ -1369,9 +1464,7 @@ class SqlEngine:
         version = None if version is not None else self._safe_version(info)
         # One access = one bump, whether the open was fresh or revalidated.
         with self._lock:
-            self._table_usage[(info.source, info.path)] = (
-                self._table_usage.get((info.source, info.path), 0) + 1
-            )
+            self._table_usage[(info.source, info.path)] = self._table_usage.get((info.source, info.path), 0) + 1
             self._unsaved_opens += 1
         with self._lock:
             self._dataset_misses += 1
@@ -1395,6 +1488,8 @@ class SqlEngine:
         if ext is not None:
             return self._describe_external(*ext)
         info = self._resolve(table)
+        if info.format == "virtual":
+            return self._describe_virtual(info, table)
         key = (info.source, info.path)
         now = time.monotonic()
         # Poll the catalog's mtime BEFORE the cache lookup: catalog
@@ -1419,18 +1514,78 @@ class SqlEngine:
         # description plus per-column notes. LLMs write far better SQL with
         # the business meaning attached, and the catalog is optional — no
         # entry means the output is exactly as before.
-        entry = self._catalog_for(info)
-        if entry:
-            if entry.get("description"):
-                result["description"] = str(entry["description"])
-            if entry.get("aliases"):
-                result["aliases"] = [str(a) for a in entry["aliases"]][:8]
-            col_docs = entry.get("columns")
-            if isinstance(col_docs, dict):
-                for col in result["columns"]:
-                    doc = col_docs.get(col["name"])
-                    if doc:
-                        col["description"] = str(doc)
+        self._merge_catalog_docs(self._catalog_for(info), result)
+        with self._lock:
+            self._describe_misses += 1
+            if self.cache_ttl > 0:
+                self._describe_cache[key] = (time.monotonic(), result)
+        self._save_cache_to_disk()
+        return result
+
+    @staticmethod
+    def _merge_catalog_docs(entry: dict | None, result: dict) -> None:
+        """Merge semantic-catalog documentation into a describe result (in place).
+
+        Table-level description, aliases (capped like the MCP output) and
+        per-column notes for the columns the result actually has.
+        """
+        if not entry:
+            return
+        if entry.get("description"):
+            result["description"] = str(entry["description"])
+        if entry.get("aliases"):
+            result["aliases"] = [str(a) for a in entry["aliases"]][:8]
+        col_docs = entry.get("columns")
+        if isinstance(col_docs, dict):
+            for col in result["columns"]:
+                doc = col_docs.get(col["name"])
+                if doc:
+                    col["description"] = str(doc)
+
+    def _describe_virtual(self, info: TableInfo, table: str) -> dict:
+        """Describe a virtual table: derive its real schema from the definition.
+
+        The definition is created as a view on a throwaway locked-down
+        connection and DESCRIBEd — DuckDB binds views lazily, so the
+        (potentially expensive) definition does NOT run; only its output
+        schema is computed against the registered base tables. Types come
+        from the engine, not from the catalog's ``columns`` docs (those merge
+        in as documentation, exactly like physical tables). Results cache and
+        invalidate with the catalog's mtime like every other describe.
+        """
+        key = (info.source, info.path)
+        now = time.monotonic()
+        # Poll the catalog's mtime BEFORE the cache lookup — a virtual table's
+        # schema AND docs both derive from the catalog (see _catalog()).
+        if self._effective_catalog_file():
+            self._catalog()
+        with self._lock:
+            hit = self._describe_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._describe_hits += 1
+                return hit[1]
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+            # The registration SQL is only matched for table references, never
+            # executed — it exists to pull in this virtual table's closure.
+            self._register_schema(con, f"SELECT * FROM {_safe_ident(info.name)}")
+            rows = con.sql(f"DESCRIBE {_safe_ident(info.name)}").fetchall()
+        except Exception as exc:
+            raise LakehouseError(f"Describing virtual table '{info.name}' failed: {exc}") from exc
+        finally:
+            con.close()
+        result = {
+            "table": table,
+            "uri": f"virtual://{info.name}",
+            "virtual": True,
+            "columns": [{"name": r[0], "type": r[1]} for r in rows],
+            "n_columns": len(rows),
+        }
+        self._merge_catalog_docs(self._catalog_for(info), result)
         with self._lock:
             self._describe_misses += 1
             if self.cache_ttl > 0:
@@ -1520,10 +1675,7 @@ class SqlEngine:
                     "ORDER BY table_schema, table_name",
                     [spec.name],
                 ).fetchall()
-                entry["tables"] = [
-                    {"qualified": f"{spec.name}.{s}.{t}", "schema": s, "name": t}
-                    for s, t in rows[:500]
-                ]
+                entry["tables"] = [{"qualified": f"{spec.name}.{s}.{t}", "schema": s, "name": t} for s, t in rows[:500]]
                 if len(rows) > 500:
                     entry["truncated"] = len(rows) - 500
             except Exception as exc:
@@ -1552,9 +1704,7 @@ class SqlEngine:
         try:
             rows = con.execute(f"DESCRIBE SELECT * FROM {qualified}").fetchall()
         except Exception as exc:
-            raise LakehouseError(
-                f"Describing attached table '{qualified}' failed: {exc}"
-            ) from exc
+            raise LakehouseError(f"Describing attached table '{qualified}' failed: {exc}") from exc
         finally:
             con.close()
         result = {
@@ -1572,9 +1722,7 @@ class SqlEngine:
         self._save_cache_to_disk()
         return result
 
-    def _profile_external(
-        self, spec: AttachSpec, qualified: str, columns: Sequence[str] | None = None
-    ) -> dict:
+    def _profile_external(self, spec: AttachSpec, qualified: str, columns: Sequence[str] | None = None) -> dict:
         """profile_table for an attached-database table.
 
         ``SUMMARIZE`` runs against the live server (bounded by
@@ -1602,9 +1750,7 @@ class SqlEngine:
             if isinstance(summary, pa.RecordBatchReader):
                 summary = summary.read_all()
         except Exception as exc:
-            raise LakehouseError(
-                f"Profiling attached table '{qualified}' failed: {exc}"
-            ) from exc
+            raise LakehouseError(f"Profiling attached table '{qualified}' failed: {exc}") from exc
         finally:
             con.close()
         result = {
@@ -1690,9 +1836,7 @@ class SqlEngine:
                 if any(t in hay_docs for t in terms):
                     score += 30
                 matched_cols = [
-                    c
-                    for c, doc in col_index.items()
-                    if any(t in c.lower() or t in str(doc).lower() for t in terms)
+                    c for c, doc in col_index.items() if any(t in c.lower() or t in str(doc).lower() for t in terms)
                 ]
                 if matched_cols:
                     score += 30
@@ -1740,6 +1884,8 @@ class SqlEngine:
         if ext is not None:
             return self._profile_external(*ext, columns=columns)
         info = self._resolve(table)
+        if info.format == "virtual":
+            return self._profile_virtual(info, table, columns)
         col_key = tuple(columns) if columns else ()
         key = (info.source, info.path, col_key)
         now = time.monotonic()
@@ -1788,23 +1934,87 @@ class SqlEngine:
             "profiled_rows": profiled_rows,
             "profile_max_rows": cap,
             "n_columns": len(summary),
-            "columns": [
-                {
-                    "name": str(r.get("column_name", "")),
-                    "type": str(r.get("column_type", "")),
-                    "min": r.get("min"),
-                    "max": r.get("max"),
-                    "approx_unique": r.get("approx_unique"),
-                    "null_pct": r.get("null_percentage"),
-                    "avg": r.get("avg"),
-                    "std": r.get("std"),
-                    "q25": r.get("q25"),
-                    "q50": r.get("q50"),
-                    "q75": r.get("q75"),
-                    "non_null": r.get("count"),
-                }
-                for r in summary.to_pylist()
-            ],
+            "columns": self._summarize_columns(summary),
+        }
+        with self._lock:
+            self._profile_misses += 1
+            if self.cache_ttl > 0:
+                self._profile_cache[key] = (time.monotonic(), result)
+        return result
+
+    @staticmethod
+    def _summarize_columns(summary: pa.Table) -> list[dict]:
+        """Shape a DuckDB ``SUMMARIZE`` result into the profile column dicts."""
+        return [
+            {
+                "name": str(r.get("column_name", "")),
+                "type": str(r.get("column_type", "")),
+                "min": r.get("min"),
+                "max": r.get("max"),
+                "approx_unique": r.get("approx_unique"),
+                "null_pct": r.get("null_percentage"),
+                "avg": r.get("avg"),
+                "std": r.get("std"),
+                "q25": r.get("q25"),
+                "q50": r.get("q50"),
+                "q75": r.get("q75"),
+                "non_null": r.get("count"),
+            }
+            for r in summary.to_pylist()
+        ]
+
+    def _profile_virtual(self, info: TableInfo, table: str, columns: Sequence[str] | None) -> dict:
+        """Profile a virtual table by running its definition under SUMMARIZE.
+
+        Unlike physical profiling there is no metadata shortcut: both the row
+        count and the summary execute the definition — the same locked-down
+        DuckDB path as run_sql, with the summary bounded by
+        ``SQLHANDLER_PROFILE_MAX_ROWS``. Cached like the physical path, so
+        repeated profiling pays the definition cost once per TTL.
+        """
+        col_key = tuple(columns) if columns else ()
+        key = (info.source, info.path, col_key)
+        now = time.monotonic()
+        with self._lock:
+            hit = self._profile_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._profile_hits += 1
+                return hit[1]
+        import duckdb
+
+        cap = _profile_max_rows()
+        target = _safe_ident(info.name)
+        con = duckdb.connect()
+        try:
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+            self._register_schema(con, f"SELECT * FROM {target}")
+            try:
+                counted = con.sql(f"SELECT count(*) FROM {target}").fetchone()
+                n_rows: int | None = int(counted[0]) if counted else None
+            except Exception:
+                n_rows = None  # the summary below still works on a sample
+            col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+            inner = f"SELECT {col_sel} FROM {target}"
+            if cap > 0:
+                inner = f"SELECT * FROM ({inner}) LIMIT {cap}"
+            summary = con.sql(f"SUMMARIZE {inner}").arrow()
+            if isinstance(summary, pa.RecordBatchReader):
+                summary = summary.read_all()
+        except Exception as exc:
+            raise LakehouseError(f"Profiling failed for virtual table '{info.name}': {exc}") from exc
+        finally:
+            con.close()
+        profiled_rows = n_rows if (n_rows is None or cap <= 0) else min(n_rows, cap)
+        result = {
+            "table": table,
+            "uri": f"virtual://{info.name}",
+            "virtual": True,
+            "n_rows": n_rows,
+            "profiled_rows": profiled_rows,
+            "profile_max_rows": cap,
+            "n_columns": len(summary),
+            "columns": self._summarize_columns(summary),
         }
         with self._lock:
             self._profile_misses += 1
@@ -1851,7 +2061,9 @@ class SqlEngine:
         with self._lock:
             return list(self._query_memory)
 
-    def _record_outcome(self, sql: str, duration_ms: float | None, n_rows: int | None, state: str, error: str | None = None) -> None:
+    def _record_outcome(
+        self, sql: str, duration_ms: float | None, n_rows: int | None, state: str, error: str | None = None
+    ) -> None:
         """Single outcome choke point: query memory + metrics + audit log.
 
         Called by QueryJob for every finished query (ok, error, cancelled);
@@ -1859,9 +2071,7 @@ class SqlEngine:
         break a query.
         """
         self.note_query(sql, duration_ms or 0.0, n_rows, error)
-        observability.metrics.record_query(
-            state, (duration_ms or 0.0) / 1000.0, n_rows
-        )
+        observability.metrics.record_query(state, (duration_ms or 0.0) / 1000.0, n_rows)
         observability.audit_query(sql, state, duration_ms, n_rows, error)
 
     # ------------------------------------------------------------- scans
@@ -1882,6 +2092,8 @@ class SqlEngine:
         Iceberg snapshot id) instead of the current one.
         """
         info = self._resolve(table)
+        if info.format == "virtual":
+            return self._scan_virtual(info, columns, filters, limit, version_as_of)
         _validate_snapshot_version(version_as_of, "Time travel") if version_as_of is not None else None
         dset = self._open_dataset(info, version_as_of)
 
@@ -1899,6 +2111,35 @@ class SqlEngine:
             # first load the ENTIRE table into memory.
             return scan.head(limit)
         return scan.to_table()
+
+    def _scan_virtual(
+        self,
+        info: TableInfo,
+        columns: Sequence[str] | None,
+        filters: Sequence | None,
+        limit: int | None,
+        version_as_of: int | None,
+    ) -> pa.Table:
+        """Scan a virtual table through the SQL path (it has no Dataset).
+
+        Column projection and row limits translate into SQL; pyarrow filter
+        expressions have no equivalent without parsing, so they are refused
+        with a pointer to run_sql (whose predicates push down into the
+        definition's base scans anyway). Time travel passes through: the
+        definition's base tables are then read at the requested snapshot.
+        """
+        if filters:
+            raise LakehouseError(
+                f"scan_table filters cannot push into virtual table '{info.name}' — "
+                "use run_sql with a WHERE clause instead"
+            )
+        target = _safe_ident(info.name)
+        col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+        return self.query_duckdb(
+            f"SELECT {col_sel} FROM {target}",
+            limit=limit if (limit is not None and limit >= 0) else None,
+            version_as_of=version_as_of,
+        )
 
     # ------------------------------------------------------------ duckdb
     def query_duckdb(
@@ -1948,9 +2189,7 @@ class SqlEngine:
                 # the connection is closed instead of leaking.
                 job.cancel()
                 job.wait(_CANCEL_GRACE_SECONDS)
-                raise LakehouseError(
-                    f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled."
-                )
+                raise LakehouseError(f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
         else:
             job.wait()
         return job.result
@@ -1978,13 +2217,24 @@ class SqlEngine:
         same-named tables across federated sources (or schemas) can't silently
         shadow each other. Queries should prefer qualified names.
 
+        Virtual tables (semantic-catalog ``definition`` entries) register as
+        real DuckDB views built from their definition SQL, created AFTER the
+        physical views so the definition's base tables resolve. Those base
+        tables are usually not referenced by the user's SQL directly, so they
+        are pulled in transitively from the definitions themselves (see
+        ``_expand_query_tables``), and virtual views are created in
+        dependency order so virtual-on-virtual definitions compose. DuckDB
+        pushes predicates/projections through the views into the base scans.
+
         ``version`` (time travel) opens every versionable table at that
-        historical snapshot instead of the current one.
+        historical snapshot instead of the current one (virtual views then
+        read their base tables at that same snapshot for free).
         """
         name_counts: dict[str, int] = {}
         for info in self.list_tables():
             name_counts[info.name] = name_counts.get(info.name, 0) + 1
-        for info in self._referenced_tables(sql):
+        physical, virtuals = self._expand_query_tables(self._referenced_tables(sql))
+        for info in physical:
             views = {_safe_ident(info.qualified_name)}
             if name_counts.get(info.name, 0) <= 1:
                 views.add(_safe_ident(info.name))
@@ -2004,6 +2254,244 @@ class SqlEngine:
                     con.register(view, dset)
                 except Exception:
                     logger.debug("Could not register view %s from %s", view, info.path)
+        if not virtuals:
+            return
+        self._apply_compat_macros(con)
+        for info in virtuals:
+            definition = self._definition_sql(info.name)
+            views = [_safe_ident(info.qualified_name)]
+            if name_counts.get(info.name, 0) <= 1:
+                views.append(_safe_ident(info.name))
+            for view in views:
+                try:
+                    # OR REPLACE: for schema-less tables the bare and qualified
+                    # names coincide — same SQL body, one view either way.
+                    con.execute(f"CREATE OR REPLACE VIEW {view} AS ({definition})")
+                except Exception as exc:
+                    # The definition parsed at catalog load, so a failure here
+                    # is a binding problem (missing base table, type clash):
+                    # fail the query with the real reason instead of letting a
+                    # bare "table not found" mislead the caller.
+                    raise LakehouseError(
+                        f"virtual table '{info.name}' could not be built from its catalog definition: {exc}"
+                    ) from exc
+
+    @staticmethod
+    def _apply_compat_macros(con) -> None:
+        """Define scalar helpers DuckDB lacks but Snowflake-flavored virtual
+        definitions use, so definitions port with minimal edits.
+
+        Per-connection (ephemeral) and best-effort: a name DuckDB already
+        provides always wins. Currently: ``iff(c, t, e)`` — Snowflake's
+        ternary, exactly ``CASE WHEN c THEN t ELSE e END`` (NULL condition →
+        ELSE branch, matching Snowflake). ``ARRAY_CONSTRUCT_COMPACT`` cannot
+        be shimmed this way (DuckDB macros don't overload by arity) — it is
+        rewritten textually instead (see ``_rewrite_snowflake_constructs``).
+        """
+        try:
+            con.execute("CREATE MACRO iff(c, t, e) AS CASE WHEN c THEN t ELSE e END")
+        except Exception:
+            pass  # already defined this connection, or macro support absent
+
+    # Snowflake constructs rewritten textually at registration time. Matched
+    # case-insensitively on word boundaries, string-literal-aware; arguments
+    # may contain nested calls with their own commas/parens.
+    _COMPACT_RE = re.compile(r"\barray_construct_compact\s*\(", re.IGNORECASE)
+
+    def _definition_sql(self, name: str) -> str:
+        """Executable SQL for virtual table ``name``: the catalog definition
+        with Snowflake-only constructs rewritten to DuckDB (memoized per
+        distinct text — see ``_rewrite_snowflake_constructs``)."""
+        definition = self._virtual_entries()[name]["definition"]
+        if "array_construct_compact" not in definition.lower():
+            return definition
+        with self._lock:
+            rewritten = self._definition_rewrites.get(definition)
+        if rewritten is None:
+            rewritten = self._rewrite_snowflake_constructs(definition)
+            with self._lock:
+                if len(self._definition_rewrites) > 128:
+                    self._definition_rewrites.clear()
+                self._definition_rewrites[definition] = rewritten
+        return rewritten
+
+    @classmethod
+    def _rewrite_snowflake_constructs(cls, sql: str) -> str:
+        """Rewrite ``ARRAY_CONSTRUCT_COMPACT(...)`` calls to DuckDB.
+
+        Becomes ``list_filter([...], __compact_val -> __compact_val IS NOT
+        NULL)`` — same semantics (elements kept, NULLs dropped). The
+        argument list is split on top-level commas only (paren- and
+        quote-aware), and an unbalanced call or a token inside a string
+        literal is copied through untouched so the SQL parser reports the
+        real problem. DuckDB list literals need one common element type —
+        CAST heterogeneous args.
+        """
+        out: list[str] = []
+        i, n = 0, len(sql)
+        while i < n:
+            match = cls._COMPACT_RE.search(sql, i)
+            if not match:
+                out.append(sql[i:])
+                break
+            start = match.start()
+            prefix = sql[i:start]
+            if cls._in_open_string(prefix):
+                # token appears inside a string literal — copy verbatim and
+                # resume scanning after the first quote of that literal
+                out.append(prefix + sql[start])
+                i = start + 1
+                continue
+            open_paren = match.end() - 1
+            close = cls._matching_paren(sql, open_paren)
+            if close is None:
+                out.append(prefix)
+                i = start + 1  # unbalanced: let the SQL parser report it
+                continue
+            args = cls._split_top_level(sql[open_paren + 1 : close])
+            items = ", ".join(a.strip() for a in args if a.strip())
+            out.append(prefix)
+            out.append(f"list_filter([{items}], __compact_val -> __compact_val IS NOT NULL)")
+            i = close + 1
+        return "".join(out)
+
+    @staticmethod
+    def _in_open_string(sql: str) -> bool:
+        """True when ``sql`` ends inside an unclosed single-quoted string."""
+        i, n = 0, len(sql)
+        while i < n:
+            if sql[i] == "'":
+                i += 1
+                closed = False
+                while i < n:
+                    if sql[i] == "'":
+                        if i + 1 < n and sql[i + 1] == "'":
+                            i += 2  # escaped quote ('')
+                            continue
+                        closed = True
+                        i += 1
+                        break
+                    i += 1
+                if not closed:
+                    return True
+            else:
+                i += 1
+        return False
+
+    @staticmethod
+    def _matching_paren(sql: str, open_at: int) -> int | None:
+        """Index of the ')' matching the '(' at ``open_at`` (quote-aware)."""
+        depth = 0
+        i, n = open_at, len(sql)
+        while i < n:
+            ch = sql[i]
+            if ch == "'":
+                i += 1
+                while i < n:
+                    if sql[i] == "'":
+                        if i + 1 < n and sql[i + 1] == "'":
+                            i += 2  # escaped quote ('')
+                            continue
+                        break
+                    i += 1
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    @staticmethod
+    def _split_top_level(s: str) -> list[str]:
+        """Split on commas that sit outside parens and string literals."""
+        parts: list[str] = []
+        depth = 0
+        start = 0
+        i, n = 0, len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "'":
+                i += 1
+                while i < n:
+                    if s[i] == "'":
+                        if i + 1 < n and s[i + 1] == "'":
+                            i += 2  # escaped quote ('')
+                            continue
+                        break
+                    i += 1
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(s[start:i])
+                start = i + 1
+            i += 1
+        parts.append(s[start:])
+        return parts
+
+    @staticmethod
+    def _definition_table_names(definition: str, by_ident: dict[str, TableInfo]) -> list[str]:
+        """Known table identifiers (bare or qualified) a definition references.
+
+        Same cheap identifier matching as ``_referenced_tables`` — a
+        definition is operator-authored SQL over the lake's real table names.
+        """
+        return [ident for ident in by_ident if re.search(rf"\b{re.escape(ident)}\b", definition)]
+
+    def _expand_query_tables(self, seed: list[TableInfo]) -> tuple[list[TableInfo], list[TableInfo]]:
+        """Resolve a query's table set into (physical, ordered virtual).
+
+        A virtual table referenced by the SQL — or by another virtual table's
+        definition — pulls in every base table its definition names, so the
+        registration order is: physical datasets first, then virtual views
+        dependencies-first. A definition cycle is an operator error and
+        raises (the query fails with a clear message instead of hanging).
+        """
+        virtual_entries = self._virtual_entries()
+        by_ident: dict[str, TableInfo] = {}
+        for info in self.list_tables():
+            by_ident.setdefault(info.name, info)
+            by_ident.setdefault(info.qualified_name, info)
+        physical: dict[tuple[str, str], TableInfo] = {}
+        virtuals: dict[str, TableInfo] = {}
+        seen: set[tuple[str, str]] = set()
+        stack = list(seed)
+        while stack:
+            info = stack.pop()
+            key = (info.source, info.path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if info.format == "virtual":
+                virtuals[info.name] = info
+                for ref in self._definition_table_names(virtual_entries[info.name]["definition"], by_ident):
+                    dep = by_ident.get(ref)
+                    if dep is not None:
+                        stack.append(dep)
+            else:
+                physical[key] = info
+        order: list[TableInfo] = []
+        state: dict[str, int] = {}  # 0/absent = unvisited, 1 = visiting, 2 = done
+
+        def visit(name: str) -> None:
+            mark = state.get(name, 0)
+            if mark == 1:
+                raise LakehouseError(f"virtual tables form a definition cycle at '{name}'")
+            if mark == 2:
+                return
+            state[name] = 1
+            for ref in self._definition_table_names(virtual_entries[name]["definition"], by_ident):
+                if ref != name and ref in virtuals:
+                    visit(ref)
+            state[name] = 2
+            order.append(virtuals[name])
+
+        for name in virtuals:
+            visit(name)
+        return list(physical.values()), order
 
     # -------------------------------------------------------------- help
     def prewarm(self, tables: Sequence[str]) -> dict[str, str]:

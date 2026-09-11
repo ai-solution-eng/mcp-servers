@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- with .Values.securityContext }}
+      # Scratch pad by design: non-root uid, group-writable volume.
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No args: the image CMD already pins the transport/host/port, and
+          # k8s `args` REPLACES the entire CMD when the image has no
+          # ENTRYPOINT — passing bare flags here makes the runtime exec
+          # "--transport" (the v0.1.0 CrashLoopBackOff). If the port ever
+          # diverges from the image default, set container command+args
+          # TOGETHER or add an ENTRYPOINT to the Dockerfile.
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: mcp
+          env:
+            # Rendered in the TEMPLATE from the workbench.* knobs — Helm does
+            # not template inside values.yaml, so a values-file
+            # 'value: "{{ .Values.workbench.root }}"' would ship as a LITERAL
+            # string (the prometheus-mcp v0.1.0 release lesson).
+            - name: WORKBENCH_ROOT
+              value: {{ .Values.persistence.mountPath | quote }}
+            - name: WORKBENCH_EXEC_ALLOWLIST
+              value: {{ .Values.workbench.execAllowlist | quote }}
+            - name: WORKBENCH_EXEC_DENYLIST
+              value: {{ .Values.workbench.execDenylist | quote }}
+            - name: WORKBENCH_EXEC_TIMEOUT_DEFAULT
+              value: {{ .Values.workbench.execTimeoutDefault | quote }}
+            - name: WORKBENCH_EXEC_TIMEOUT_MAX
+              value: {{ .Values.workbench.execTimeoutMax | quote }}
+            - name: WORKBENCH_MAX_FILE_BYTES
+              value: {{ .Values.workbench.maxFileBytes | quote }}
+            - name: WORKBENCH_MAX_OUTPUT_BYTES
+              value: {{ .Values.workbench.maxOutputBytes | quote }}
+            - name: WORKBENCH_MAX_LIST_ENTRIES
+              value: {{ .Values.workbench.maxListEntries | quote }}
+            - name: WORKBENCH_LOG_LEVEL
+              value: {{ .Values.workbench.logLevel | quote }}
+            # Web UI + /api/* toggle (chart: webui.enabled). The /api/*
+            # endpoints reuse the MCP tools' core functions — no new powers.
+            - name: WORKBENCH_UI_ENABLED
+              value: {{ .Values.webui.enabled | toString | quote }}
+            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            # Corporate proxy: reaches fetch/pip from the server process AND
+            # every run_command child (the server passes these through).
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+            {{- if .Values.caCert.enabled }}
+            # Corporate MITM CA: pip/requests inside run_command verify TLS
+            # against these files (passed through to children by the server).
+            - name: SSL_CERT_FILE
+              value: /workbench-certs/ca.crt
+            - name: REQUESTS_CA_BUNDLE
+              value: /workbench-certs/ca.crt
+            - name: PIP_CERT
+              value: /workbench-certs/ca.crt
+            {{- end }}
+          # Stateless MCP 2.0: probes hit /healthz — a plain JSON endpoint
+          # that does not depend on the MCP session manager.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.caCert.enabled }}
+            # The ezaf-root-ca ConfigMap key normalized to a fixed path via
+            # items+subPath (the DshChart pattern) — env vars point here.
+            - name: ca-cert
+              mountPath: /workbench-certs/ca.crt
+              subPath: ca.crt
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        # PVC-backed: workspaces survive pod restarts and are shared by all
+        # replicas (RWX).
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.deployment.name }}-data
+        {{- else }}
+        # persistence disabled: an emptyDir keeps the pod functional (a
+        # scratch pad whose contents vanish with the pod — for throwaway
+        # environments only).
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.caCert.enabled }}
+        - name: ca-cert
+          configMap:
+            name: {{ .Values.caCert.configMap }}
+            items:
+              - key: {{ .Values.caCert.configMapKey }}
+                path: ca.crt
+        {{- end }}

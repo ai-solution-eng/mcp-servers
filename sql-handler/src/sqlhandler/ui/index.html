@@ -170,6 +170,7 @@
     padding: 0 5px;
     text-transform: uppercase;
   }
+  .table-item .fmt.virtual { color: var(--accent); border-color: var(--accent); }
   .table-item .tname { flex: 1; font-family: var(--mono); font-size: 13px; word-break: break-all; }
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .tabs {
@@ -616,7 +617,7 @@ function renderTables() {
     const el = document.createElement("div");
     el.className = "table-item" + (state.selected && state.selected.path === t.path ? " active" : "");
     const fmt = document.createElement("span");
-    fmt.className = "fmt";
+    fmt.className = "fmt" + (t.format === "virtual" ? " virtual" : "");
     fmt.textContent = t.format || "?";
     const name = document.createElement("span");
     name.className = "tname";

@@ -30,7 +30,7 @@ image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
   # Keep in lockstep with Chart.yaml appVersion (same image as the internal
   # chart — the locking lives in this chart, not the binary).
-  tag: v0.3.0
+  tag: v0.3.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull

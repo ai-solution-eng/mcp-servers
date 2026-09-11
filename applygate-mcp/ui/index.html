@@ -1,0 +1,846 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+  // Resolve the theme before first paint to avoid a flash of the wrong theme.
+  // Precedence: saved choice > OS preference > dark (the historical default).
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("applygate-theme"); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<title>ApplyGate MCP · Governed K8s Writes</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2301A982'/%3E%3Ctext x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='%23101820' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-2: #1c2438;
+    --border: #2a3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --yellow: #f0b429;
+    --header-grad-1: #131a2b;
+    --header-grad-2: #10162a;
+    --row-hover: #1a2338;
+    --row-border: #202a42;
+    --editor-bg: #0d1220;
+    --err-bg: #2a1620;
+    --err-border: #5a2430;
+    --err-text: #ffb3b3;
+    --banner-bg: rgba(1, 169, 130, 0.08);
+    --banner-border: rgba(1, 169, 130, 0.45);
+    --shadow: rgba(0, 0, 0, 0.4);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  /* Light theme: opt in via <html data-theme="light">, set before first paint
+     by the head script (OS preference) and toggled from the header. */
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --banner-bg: rgba(1, 169, 130, 0.07);
+    --banner-border: rgba(1, 169, 130, 0.5);
+    --shadow: rgba(15, 23, 42, 0.15);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  @font-face {
+    font-family: 'MetricHPE';
+    src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, var(--header-grad-1), var(--header-grad-2));
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .hpe-element {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    background: var(--hpe);
+    clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+  .brand-company {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--muted);
+  }
+  .brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+  .brand-product b { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  header .meta .pill {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  header .meta .pill.pill-ok { color: var(--green); border-color: var(--green); }
+  header .meta .pill.pill-err { color: var(--red); border-color: var(--red); }
+  header .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+  /* The trust-model banner: visible on every tab, impossible to miss. */
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 18px;
+    background: var(--banner-bg);
+    border-bottom: 1px solid var(--banner-border);
+    color: var(--text);
+    font-size: 13px;
+  }
+  .banner .lock { flex-shrink: 0; color: var(--accent); font-size: 14px; }
+  .banner b { color: var(--accent); }
+  main.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .tabs { display: flex; gap: 4px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tab {
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .pane { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
+  .pane.hidden { display: none; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .panel h2 .hint { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .panel h2 .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .error-panel {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .error-panel.show { display: block; }
+  .error-panel .title { color: var(--red); font-weight: 700; display: block; margin-bottom: 4px; font-family: "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid th {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  table.grid td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  table.grid tr:hover td { background: var(--row-hover); }
+  .badge {
+    display: inline-block;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-family: var(--mono);
+  }
+  .badge.ok { color: var(--green); border: 1px solid var(--green); background: rgba(62, 207, 142, 0.08); }
+  .badge.fail { color: var(--red); border: 1px solid var(--red); background: rgba(255, 107, 107, 0.08); }
+  .badge.refused { color: var(--yellow); border: 1px solid var(--yellow); background: rgba(240, 180, 41, 0.08); }
+  .badge.dryrun { color: var(--muted); border: 1px solid var(--border); background: transparent; }
+  .badge.applied { color: var(--green); border: 1px solid var(--green); background: rgba(62, 207, 142, 0.08); }
+  .badge.deleted { color: var(--red); border: 1px solid var(--red); background: rgba(255, 107, 107, 0.08); }
+  .badge.neutral { color: var(--muted); border: 1px solid var(--border); background: transparent; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .card .card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 6px; }
+  .card .card-value { font-size: 24px; font-weight: 700; line-height: 1.1; font-family: var(--mono); overflow-wrap: anywhere; }
+  .card .card-value.red { color: var(--red); }
+  .card .card-value.yellow { color: var(--yellow); }
+  .card .card-value.green { color: var(--green); }
+  .card .card-sub { color: var(--muted); font-size: 11px; margin-top: 4px; min-height: 15px; }
+  .query-box textarea {
+    width: 100%;
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 12px;
+    min-height: 200px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    tab-size: 2;
+  }
+  .query-box textarea:focus { border-color: var(--accent); }
+  .form-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 10px; }
+  .form-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .form-row .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+  input.inline, select.inline {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  input.inline:focus, select.inline:focus { border-color: var(--accent); }
+  input.inline.wide { width: 260px; }
+  button {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-2); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover { border-color: var(--accent); }
+  button.copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; font-weight: 400; }
+  button.theme-toggle {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 9px;
+    border-radius: 6px;
+  }
+  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin: 10px 0; flex-wrap: wrap; }
+  .result-meta .ok { color: var(--green); font-weight: 600; }
+  .result-meta .bad { color: var(--red); font-weight: 600; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  /* per-document plan verdicts */
+  .doc-result {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--panel-2);
+  }
+  .doc-result.ok { border-left-color: var(--green); }
+  .doc-result.bad { border-left-color: var(--red); }
+  .doc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .doc-head .doc-id { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .doc-msg { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .doc-result.bad .doc-msg { color: var(--err-text); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 2px 9px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--text);
+  }
+  .chip.deny { color: var(--red); border-color: var(--red); }
+  .chip.allow { color: var(--green); border-color: var(--green); }
+  .refusal-block {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--err-text);
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-top: 6px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .kv { display: grid; grid-template-columns: 160px 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 20px var(--shadow);
+    display: none;
+    z-index: 50;
+  }
+  .toast.show { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="hpe-element" aria-hidden="true"></span>
+    <div class="brand-text">
+      <div class="brand-company">Hewlett Packard Enterprise</div>
+      <div class="brand-product"><b>ApplyGate MCP</b> · Governed K8s Writes</div>
+    </div>
+  </div>
+  <div class="meta">
+    <span><span class="dot" id="status-dot"></span><span id="status-text">connecting…</span></span>
+    <span class="pill" id="ns-pill">namespaces: ?</span>
+    <span class="pill" id="audit-pill" title="configured APPLYGATE_AUDIT_FILE">audit: ?</span>
+    <span class="pill" style="color:var(--yellow)">read-only</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+</header>
+
+<div class="banner">
+  <span class="lock" aria-hidden="true">🛡</span>
+  <span>Read-only console — mutations happen only through the MCP tools with explicit confirm flags, behind gateway authn.</span>
+</div>
+
+<main class="wrap">
+  <div class="tabs">
+    <button class="tab active" data-tab="plan">Plan</button>
+    <button class="tab" data-tab="status">Status</button>
+    <button class="tab" data-tab="audit">Audit</button>
+    <button class="tab" data-tab="policy">Policy</button>
+  </div>
+
+  <!-- ============ PLAN (always dry-run) ============ -->
+  <div id="pane-plan" class="pane">
+    <div class="panel">
+      <h2>Plan console <span class="hint">plan_apply, ALWAYS dry_run=All — nothing here can change the cluster</span><span class="spacer"></span>
+        <button id="plan-example" class="ghost copy-btn">load example</button>
+        <button id="plan-clear" class="ghost copy-btn">clear</button>
+      </h2>
+      <div class="form-row">
+        <div class="field">
+          <label for="plan-ns">Namespace (allowlist rules apply — see Policy tab)</label>
+          <input class="inline wide" id="plan-ns" placeholder="e.g. team-a" autocomplete="off" spellcheck="false" />
+        </div>
+        <button id="plan-run">Plan (dry-run)</button>
+      </div>
+      <div class="query-box">
+        <textarea id="plan-manifest" spellcheck="false" placeholder="Paste a YAML manifest — multi-doc OK. Every doc needs apiVersion, kind, metadata.name; a doc-level metadata.namespace must equal the namespace above."></textarea>
+      </div>
+    </div>
+
+    <div id="plan-error" class="error-panel"></div>
+
+    <div class="panel" id="plan-results-panel" style="display:none">
+      <h2>Plan results <span class="hint">per-document verdicts from the same code path as the plan_apply tool</span></h2>
+      <div class="result-meta" id="plan-meta"></div>
+      <div id="plan-results"><div class="empty">no plan run yet</div></div>
+    </div>
+  </div>
+
+  <!-- ============ STATUS ============ -->
+  <div id="pane-status" class="pane hidden">
+    <div class="panel">
+      <h2>Status inspector <span class="hint">get_resource_status — same namespace policy + kind gates as the write tools</span></h2>
+      <div class="form-row">
+        <div class="field"><label for="status-ns">Namespace</label><input class="inline wide" id="status-ns" placeholder="e.g. team-a" autocomplete="off" spellcheck="false" /></div>
+        <div class="field"><label for="status-kind">Kind</label>
+          <select class="inline" id="status-kind"></select>
+        </div>
+        <div class="field"><label for="status-name">Name</label><input class="inline wide" id="status-name" placeholder="e.g. web" autocomplete="off" spellcheck="false" /></div>
+        <button id="status-run">Get status</button>
+      </div>
+      <div class="hint" id="status-kinds-hint"></div>
+    </div>
+
+    <div id="status-error" class="error-panel"></div>
+
+    <div class="panel" id="status-results-panel" style="display:none">
+      <h2>Status <span class="hint" id="status-obj"></span></h2>
+      <dl class="kv" id="status-summary"></dl>
+      <div style="margin-top:12px" id="status-conditions"></div>
+    </div>
+  </div>
+
+  <!-- ============ AUDIT ============ -->
+  <div id="pane-audit" class="pane hidden">
+    <div class="panel">
+      <h2>Audit trail <span class="hint">tail of the JSONL audit file — every plan, apply, delete and refusal</span><span class="spacer"></span>
+        <label class="hint" style="text-transform:none"><input type="checkbox" id="audit-auto" /> auto 15s</label>
+        <select class="inline" id="audit-lines">
+          <option value="50">last 50</option>
+          <option value="100">last 100</option>
+          <option value="200" selected>last 200</option>
+          <option value="500">last 500</option>
+        </select>
+        <button id="audit-refresh" class="ghost copy-btn">↻ refresh</button>
+      </h2>
+      <div class="result-meta" id="audit-meta"></div>
+      <div id="audit-table"><div class="empty">no audit lines loaded</div></div>
+    </div>
+  </div>
+
+  <!-- ============ POLICY ============ -->
+  <div id="pane-policy" class="pane hidden">
+    <div class="cards">
+      <div class="card"><div class="card-label">Namespaces enabled</div><div class="card-value" id="pol-card-ns">—</div><div class="card-sub" id="pol-card-ns-sub"></div></div>
+      <div class="card"><div class="card-label">Allowed patterns</div><div class="card-value" id="pol-card-allowed">—</div><div class="card-sub">APPLYGATE_ALLOWED_NAMESPACES</div></div>
+      <div class="card"><div class="card-label">Blocked patterns</div><div class="card-value" id="pol-card-blocked">—</div><div class="card-sub">blocklist ALWAYS wins</div></div>
+      <div class="card"><div class="card-label">Allowed kinds</div><div class="card-value" id="pol-card-kinds">—</div><div class="card-sub">Secret / cluster-scoped always refused</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Namespace policy <span class="hint">DEFAULT-DENY — an empty allowlist means nothing is writable</span></h2>
+      <div id="pol-namespaces"><div class="loading">loading…</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Kind allowlist <span class="hint">may only narrow the built-in namespaced-kind registry</span></h2>
+      <div class="chips" id="pol-kinds"><div class="loading">loading…</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Unconditional refusals <span class="hint">exact texts the tools produce — these fire even on operator misconfiguration</span></h2>
+      <div id="pol-refusals"><div class="loading">loading…</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Limits <span class="hint">manifest hygiene caps enforced on every plan/apply</span></h2>
+      <dl class="kv" id="pol-caps"></dl>
+    </div>
+  </div>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = { tab: "plan", autoTimer: null, policyLoaded: false };
+
+// ---- tiny fetch + render helpers -------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok || (data && data.error)) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+function showPanelError(id, title, msg) {
+  const el = $(id);
+  el.innerHTML = '<span class="title">' + esc(title) + "</span>" + esc(msg || "");
+  el.className = "error-panel show";
+}
+
+function hidePanelError(id) {
+  const el = $(id);
+  el.textContent = "";
+  el.className = "error-panel";
+}
+
+function outcomeBadge(outcome) {
+  const map = { "dry-run": "dryrun", applied: "applied", deleted: "deleted", failed: "fail", refused: "refused" };
+  const cls = map[outcome] || "neutral";
+  return '<span class="badge ' + cls + '">' + esc(outcome || "?") + "</span>";
+}
+
+// ---- header status -----------------------------------------------------------
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("status-dot").className = "dot ok";
+    $("status-text").textContent = "connected";
+    const pill = $("ns-pill");
+    if (s.namespaces_enabled) {
+      pill.className = "pill pill-ok";
+      pill.textContent = "namespaces enabled: " + s.policy.allowed_namespaces.join(", ");
+    } else {
+      pill.className = "pill";
+      pill.style.color = "var(--red)";
+      pill.textContent = "namespaces: DEFAULT-DENY (none enabled)";
+    }
+    const file = (s.audit_file || "?").split("/").pop();
+    $("audit-pill").textContent = "audit: " + file;
+    $("audit-pill").title = s.audit_file || "";
+    state.status = s;
+  } catch (e) {
+    $("status-dot").className = "dot err";
+    $("status-text").textContent = "offline";
+  }
+}
+
+// ---- tabs ---------------------------------------------------------------------
+function switchTab(name) {
+  state.tab = name;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("hidden", p.id !== "pane-" + name));
+  if (name === "audit") loadAudit();
+  if (name === "policy") loadPolicy();
+}
+
+// ---- PLAN console (always dry-run) ---------------------------------------------
+const EXAMPLE_MANIFEST = [
+  "apiVersion: v1",
+  "kind: ConfigMap",
+  "metadata:",
+  "  name: applygate-demo",
+  "data:",
+  '  greeting: "planned from the read-only console — nothing applied yet"',
+  "---",
+  "apiVersion: apps/v1",
+  "kind: Deployment",
+  "metadata:",
+  "  name: applygate-demo",
+  "spec:",
+  "  replicas: 1",
+  "  selector:",
+  "    matchLabels:",
+  "      app: applygate-demo",
+  "  template:",
+  "    metadata:",
+  "      labels:",
+  "        app: applygate-demo",
+  "    spec:",
+  "      containers:",
+  "        - name: demo",
+  "          image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
+].join("\n");
+
+async function runPlan() {
+  const ns = $("plan-ns").value.trim();
+  const manifestText = $("plan-manifest").value;
+  hidePanelError("plan-error");
+  $("plan-results-panel").style.display = "none";
+  if (!ns) {
+    showPanelError("plan-error", "Namespace required", "Pick the target namespace. It must be matched by APPLYGATE_ALLOWED_NAMESPACES (default-deny otherwise) and not by the blocklist — see the Policy tab.");
+    return;
+  }
+  if (!manifestText.trim()) {
+    showPanelError("plan-error", "Manifest required", "Paste a YAML manifest (multi-doc OK). Every document needs apiVersion, kind and metadata.name.");
+    return;
+  }
+  $("plan-run").disabled = true;
+  $("plan-results-panel").style.display = "";
+  $("plan-results").innerHTML = '<div class="loading">planning — server-side apply DRY-RUN (dry_run=All), nothing is changed…</div>';
+  $("plan-meta").innerHTML = "";
+  try {
+    // The body carries ONLY namespace + manifest: there is no dry-run /
+    // confirmation field to send — the plan path is a dry-run by construction.
+    const data = await api("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: ns, manifest: manifestText }),
+    });
+    renderPlan(ns, data);
+  } catch (e) {
+    $("plan-results").innerHTML = "";
+    showPanelError("plan-error", "Plan refused", e.message);
+  } finally {
+    $("plan-run").disabled = false;
+  }
+}
+
+function renderPlan(ns, data) {
+  if (data.refused) {
+    // Tool-level refusal (denied namespace, unparseable YAML, hygiene caps) —
+    // the exact self-describing message the plan_apply tool produces.
+    $("plan-results").innerHTML = "";
+    showPanelError("plan-error", "Refused by policy", data.error);
+    return;
+  }
+  const sum = data.summary || { total: 0, ok: 0, failed: 0 };
+  $("plan-meta").innerHTML =
+    '<span class="' + (data.ok ? "ok" : "bad") + '">dry-run ' + (data.ok ? "passed" : "has failures") + "</span>" +
+    "<span>namespace: " + esc(ns) + "</span>" +
+    "<span>documents: " + sum.total + "</span>" +
+    '<span class="ok">ok: ' + sum.ok + "</span>" +
+    (sum.failed ? '<span class="bad">failed: ' + sum.failed + "</span>" : "") +
+    '<span class="hint">nothing was changed — real applies happen only through the MCP tools with their confirm flags, never from this console</span>';
+  const docs = data.documents || [];
+  if (!docs.length) {
+    $("plan-results").innerHTML = '<div class="empty">no documents</div>';
+    return;
+  }
+  $("plan-results").innerHTML = docs.map((d) =>
+    '<div class="doc-result ' + (d.ok ? "ok" : "bad") + '">' +
+      '<div class="doc-head">' +
+        '<span class="badge ' + (d.ok ? "ok" : "fail") + '">' + (d.ok ? "would apply" : "refused") + "</span>" +
+        '<span class="doc-id">' + esc(d.kind || "?") + "/" + esc(d.name || "?") + "</span>" +
+      "</div>" +
+      '<div class="doc-msg">' + esc(d.message || "") + "</div>" +
+    "</div>"
+  ).join("");
+}
+
+// ---- STATUS inspector ------------------------------------------------------------
+const STATUS_KINDS = [
+  "ConfigMap", "Service", "ServiceAccount", "Deployment", "StatefulSet", "DaemonSet",
+  "ReplicaSet", "Job", "CronJob", "Ingress", "NetworkPolicy", "PodDisruptionBudget",
+  "HorizontalPodAutoscaler", "PersistentVolumeClaim", "Role", "RoleBinding", "Lease",
+];
+
+async function runStatus() {
+  const ns = $("status-ns").value.trim();
+  const kind = $("status-kind").value;
+  const name = $("status-name").value.trim();
+  hidePanelError("status-error");
+  $("status-results-panel").style.display = "none";
+  if (!ns || !kind || !name) {
+    showPanelError("status-error", "Missing input", "namespace, kind and name are all required.");
+    return;
+  }
+  $("status-run").disabled = true;
+  try {
+    const q = "namespace=" + encodeURIComponent(ns) + "&kind=" + encodeURIComponent(kind) + "&name=" + encodeURIComponent(name);
+    const data = await api("/api/resource_status?" + q);
+    if (data.refused) {
+      showPanelError("status-error", "Refused by policy", data.error);
+      return;
+    }
+    if (data.ok === false) {
+      showPanelError("status-error", "Status lookup failed", data.error || "unknown error");
+      return;
+    }
+    renderStatus(data);
+  } catch (e) {
+    showPanelError("status-error", "Status lookup failed", e.message);
+  } finally {
+    $("status-run").disabled = false;
+  }
+}
+
+function renderStatus(data) {
+  $("status-results-panel").style.display = "";
+  $("status-obj").textContent = data.kind + "/" + data.name + " · namespace " + data.namespace;
+  const st = data.status || {};
+  const rows = Object.entries(st.summary || {}).map(([k, v]) =>
+    "<dt>" + esc(k) + "</dt><dd>" + esc(v === null || v === undefined || v === "" ? "—" : String(v)) + "</dd>"
+  ).join("");
+  $("status-summary").innerHTML = rows || "<dt>status</dt><dd>—</dd>";
+  const conds = st.conditions || [];
+  $("status-conditions").innerHTML = conds.length
+    ? '<table class="grid"><thead><tr><th>Condition</th><th>Status</th><th>Reason</th></tr></thead><tbody>' +
+      conds.map((c) =>
+        "<tr><td>" + esc(c.type || "?") + "</td><td>" + esc(c.status || "?") + "</td><td>" + esc(c.reason || "") + "</td></tr>"
+      ).join("") + "</tbody></table>"
+    : "";
+}
+
+// ---- AUDIT trail --------------------------------------------------------------------
+async function loadAudit() {
+  const lines = $("audit-lines").value || "200";
+  try {
+    const data = await api("/api/audit?lines=" + encodeURIComponent(lines));
+    renderAudit(data);
+  } catch (e) {
+    $("audit-table").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    $("audit-meta").innerHTML = "";
+  }
+}
+
+function renderAudit(data) {
+  $("audit-meta").innerHTML =
+    '<span class="hint" style="overflow-wrap:anywhere">' + esc(data.file || "?") + "</span>" +
+    (data.exists ? "" : '<span class="hint">(file not created yet)</span>') +
+    "<span>" + data.n_total + " line(s)" + (data.window_truncated ? " in tail window" : "") + "</span>" +
+    "<span>showing " + data.n_shown + "</span>" +
+    (data.malformed ? '<span class="bad">malformed: ' + data.malformed + "</span>" : "");
+  const entries = data.entries || [];
+  if (!entries.length) {
+    $("audit-table").innerHTML = '<div class="empty">no audit entries yet — plans, applies, deletes and refusals will appear here</div>';
+    return;
+  }
+  $("audit-table").innerHTML =
+    '<table class="grid"><thead><tr><th>ts (UTC)</th><th>tool</th><th>namespace</th><th>kind</th><th>name</th><th>dry_run</th><th>outcome</th></tr></thead><tbody>' +
+    entries.map((e) =>
+      "<tr><td>" + esc(e.ts || "?") + "</td><td>" + esc(e.tool || "?") + "</td><td>" + esc(e.namespace || "") +
+      "</td><td>" + esc(e.kind || "") + "</td><td>" + esc(e.name || "") + "</td><td>" +
+      (e.dry_run ? "true" : "false") + "</td><td>" + outcomeBadge(e.outcome) + "</td></tr>"
+    ).join("") + "</tbody></table>";
+}
+
+// ---- POLICY panel ---------------------------------------------------------------------
+async function loadPolicy() {
+  try {
+    const p = await api("/api/policy");
+    renderPolicy(p);
+    state.policyLoaded = true;
+  } catch (e) {
+    $("pol-namespaces").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderPolicy(p) {
+  const nsCard = $("pol-card-ns");
+  nsCard.textContent = p.namespaces_enabled ? "ENABLED" : "DEFAULT-DENY";
+  nsCard.className = "card-value " + (p.namespaces_enabled ? "green" : "red");
+  $("pol-card-ns-sub").textContent = p.namespaces_enabled ? "writes possible in matched namespaces" : "every write is refused until an allowlist is set";
+  $("pol-card-allowed").textContent = String((p.allowed_namespaces || []).length);
+  $("pol-card-blocked").textContent = String((p.blocked_namespaces || []).length);
+  $("pol-card-kinds").textContent = String((p.allowed_kinds || []).length);
+
+  const list = (items, cls) => (items && items.length)
+    ? items.map((i) => '<span class="chip ' + (cls || "") + '">' + esc(i) + "</span>").join("")
+    : '<span class="hint">none configured</span>';
+
+  $("pol-namespaces").innerHTML =
+    '<div class="hint" style="margin-bottom:6px">ALLOWED (APPLYGATE_ALLOWED_NAMESPACES — globs OK, empty = default-deny)</div>' +
+    '<div class="chips" style="margin-bottom:10px">' + list(p.allowed_namespaces, "allow") + "</div>" +
+    '<div class="hint" style="margin-bottom:6px">BLOCKED (APPLYGATE_BLOCKED_NAMESPACES — ALWAYS wins over the allowlist)</div>' +
+    '<div class="chips">' + list(p.blocked_namespaces, "deny") + "</div>";
+
+  $("pol-kinds").innerHTML =
+    list(p.allowed_kinds) +
+    '<div class="hint" style="margin-top:10px">' +
+    (p.kinds_from_env ? " narrowed via APPLYGATE_ALLOWED_KINDS (the env knob can only narrow the built-in registry)." :
+      " default set (APPLYGATE_ALLOWED_KINDS unset — the built-in registry may only be narrowed, never widened).") +
+    "</div>";
+
+  const hr = p.hard_refusals || {};
+  $("pol-refusals").innerHTML =
+    '<div class="hint" style="margin-bottom:2px">Secret (every tool, even if allowlisted)</div>' +
+    '<div class="refusal-block">' + esc(hr.secret || "—") + "</div>" +
+    '<div class="hint" style="margin-top:10px;margin-bottom:2px">Cluster-scoped kinds (example refusal, kind Namespace)</div>' +
+    '<div class="refusal-block">' + esc(hr.cluster_scoped_example || "—") + "</div>";
+
+  const caps = (state.status && state.status.caps) || {};
+  $("pol-caps").innerHTML =
+    "<dt>max documents</dt><dd>" + esc(caps.max_docs !== undefined ? caps.max_docs : "—") + "</dd>" +
+    "<dt>max manifest size</dt><dd>" + esc(caps.max_manifest_kib !== undefined ? caps.max_manifest_kib + " KiB" : "—") + "</dd>" +
+    "<dt>audit file</dt><dd>" + esc(state.status ? state.status.audit_file : "—") + "</dd>" +
+    "<dt>field manager</dt><dd>" + esc(state.status ? state.status.field_manager : "—") + "</dd>";
+}
+
+// ---- theme ---------------------------------------------------------------------------
+function applyThemeToggle() {
+  $("theme-toggle").textContent = document.documentElement.dataset.theme === "dark" ? "☀" : "☾";
+}
+
+$("theme-toggle").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("applygate-theme", next); } catch (e) {}
+  applyThemeToggle();
+});
+
+// ---- wiring ---------------------------------------------------------------------------
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+$("plan-run").addEventListener("click", runPlan);
+$("plan-example").addEventListener("click", () => { $("plan-manifest").value = EXAMPLE_MANIFEST; toast("example manifest loaded — pick a namespace and plan"); });
+$("plan-clear").addEventListener("click", () => { $("plan-manifest").value = ""; hidePanelError("plan-error"); $("plan-results-panel").style.display = "none"; });
+$("plan-manifest").addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") runPlan(); });
+$("status-run").addEventListener("click", runStatus);
+$("audit-refresh").addEventListener("click", loadAudit);
+$("audit-lines").addEventListener("change", loadAudit);
+$("audit-auto").addEventListener("change", () => {
+  clearInterval(state.autoTimer);
+  state.autoTimer = null;
+  if ($("audit-auto").checked && state.tab === "audit") state.autoTimer = setInterval(loadAudit, 15000);
+});
+
+(function init() {
+  STATUS_KINDS.forEach((k) => {
+    const opt = document.createElement("option");
+    opt.value = k; opt.textContent = k;
+    $("status-kind").appendChild(opt);
+  });
+  $("status-kinds-hint").textContent = "Kinds listed here are the common namespaced ones — the authoritative allowlist (and the Secret / cluster-scoped refusals) is on the Policy tab; the server has the final say.";
+  applyThemeToggle();
+  refreshStatus();
+})();
+</script>
+</body>
+</html>

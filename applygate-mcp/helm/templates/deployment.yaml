@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: mcp
+          env:
+            # Rendered in the TEMPLATE from the namespaces.* knobs (Helm does
+            # not template inside values.yaml). Default-deny on purpose: an
+            # empty APPLYGATE_ALLOWED_NAMESPACES means the server refuses
+            # EVERY write loudly — enabling namespaces is an explicit,
+            # auditable values-file act, never an accident.
+            - name: APPLYGATE_ALLOWED_NAMESPACES
+              value: {{ .Values.namespaces.allowed | quote }}
+            - name: APPLYGATE_BLOCKED_NAMESPACES
+              value: {{ .Values.namespaces.blocked | quote }}
+            - name: APPLYGATE_ALLOWED_KINDS
+              value: {{ .Values.kinds.allowed | quote }}
+            - name: APPLYGATE_AUDIT_FILE
+              value: {{ .Values.audit.file | quote }}
+            # Read-only web console gate (chart values: webui.enabled). The
+            # console exposes NO apply/delete endpoints — mutations stay
+            # behind the MCP tools' confirm flags.
+            - name: APPLYGATE_WEBUI_ENABLED
+              value: {{ .Values.webui.enabled | quote }}
+            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            # HPE corporate proxy env — wired ONLY when hpe_proxies=true. The
+            # Kubernetes API is in-cluster and covered by the NO_PROXY
+            # cluster-local entries, so this is fleet consistency with
+            # searxng-mcp, and the default-false gate keeps proxy-less sites
+            # proxy-free.
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # Audit trail volume: PVC (or emptyDir when persistence is off).
+            - name: audit
+              mountPath: /data
+            # readOnlyRootFilesystem: temp churn (kubernetes client scratch)
+            # needs a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: audit
+          persistentVolumeClaim:
+            claimName: {{ .Values.deployment.name }}-audit
+        {{- else }}
+        - name: audit
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+{{- if .Values.persistence.enabled }}
+# The audit trail must survive restarts to be worth anything — dedicated PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.deployment.name }}-audit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

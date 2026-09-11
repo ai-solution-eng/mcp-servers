@@ -23,7 +23,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.4.0
+  tag: v0.4.1
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull

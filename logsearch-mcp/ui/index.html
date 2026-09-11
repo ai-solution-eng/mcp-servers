@@ -1,0 +1,1009 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+  // Resolve the theme before first paint to avoid a flash of the wrong theme.
+  // Precedence: saved choice > OS preference > dark (the historical default).
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("logsearch-theme"); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<title>LogSearch MCP · Pod Log Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2301A982'/%3E%3Ctext x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='%23101820' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-2: #1c2438;
+    --border: #2a3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --yellow: #f0b429;
+    --header-grad-1: #131a2b;
+    --header-grad-2: #10162a;
+    --row-hover: #1a2338;
+    --row-border: #202a42;
+    --editor-bg: #0d1220;
+    --err-bg: #2a1620;
+    --err-border: #5a2430;
+    --err-text: #ffb3b3;
+    --shadow: rgba(0, 0, 0, 0.4);
+    --grp-a: rgba(255, 255, 255, 0.04);
+    --grp-b: rgba(255, 255, 255, 0.10);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  /* Light theme: opt in via <html data-theme="light">, set before first paint
+     by the head script (OS preference) and toggled from the header. */
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+    --grp-a: rgba(1, 169, 130, 0.06);
+    --grp-b: rgba(1, 169, 130, 0.13);
+  }
+  * { box-sizing: border-box; }
+  @font-face {
+    font-family: 'MetricHPE';
+    src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, var(--header-grad-1), var(--header-grad-2));
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .hpe-element {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    background: var(--hpe);
+    clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+  .brand-company {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--muted);
+  }
+  .brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+  .brand-product b { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  header .meta .pill {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  header .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 300px;
+    min-width: 250px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  aside .search { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  aside input[type="search"] {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  aside input[type="search"]:focus { border-color: var(--accent); }
+  #preset-list { flex: 1; overflow: auto; padding: 6px; }
+  .preset-cat {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 10px 8px 4px;
+  }
+  .preset-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text);
+    border: 1px solid transparent;
+  }
+  .preset-item:hover { background: var(--panel-2); border-color: var(--border); }
+  .preset-item .fmt {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 5px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .preset-item .pname { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 4px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tab {
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .pane { flex: 1; overflow: auto; padding: 14px; padding-top: 0; min-height: 0; }
+  .pane.hidden { display: none; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .panel h2 .hint { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .panel h2 .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid th {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  table.grid td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  table.grid tr:hover td { background: var(--row-hover); }
+  .badge {
+    display: inline-block;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-family: var(--mono);
+  }
+  .badge.critical { color: var(--red); border: 1px solid var(--red); background: rgba(255, 107, 107, 0.08); }
+  .badge.warning { color: var(--yellow); border: 1px solid var(--yellow); background: rgba(240, 180, 41, 0.08); }
+  .badge.info, .badge.none { color: var(--muted); border: 1px solid var(--border); background: transparent; }
+  .badge.ok { color: var(--green); border: 1px solid var(--green); background: rgba(62, 207, 142, 0.08); }
+
+  /* ---- horizontal bar charts (per-pod match counts) ---- */
+  .hbar-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+  .hbar-label { width: 260px; flex-shrink: 0; font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .hbar-track { flex: 1; background: var(--panel-2); border-radius: 4px; height: 16px; overflow: hidden; }
+  .hbar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); border-radius: 4px; min-width: 2px; }
+  .hbar-val { font-family: var(--mono); font-size: 11px; color: var(--muted); width: 76px; text-align: right; flex-shrink: 0; }
+
+  /* ---- search form ---- */
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 12px; align-items: end; }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .field input, .field select {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font-family: var(--mono);
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field.wide { grid-column: 1 / -1; }
+  .form-row { display: flex; gap: 12px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .form-row label { display: inline-flex; gap: 5px; align-items: center; color: var(--muted); font-size: 12px; cursor: pointer; }
+  .form-row label:has(input:checked) { color: var(--text); font-weight: 600; }
+  button {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-2); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover { border-color: var(--accent); }
+  button.copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; font-weight: 400; }
+  button.theme-toggle {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 9px;
+    border-radius: 6px;
+  }
+  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  input.inline {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    width: 110px;
+    outline: none;
+  }
+  input.inline:focus { border-color: var(--accent); }
+  #error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #error.show { display: block; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin: 10px 0; flex-wrap: wrap; }
+  .result-meta .ok { color: var(--green); font-weight: 600; }
+  .result-meta .warn { color: var(--yellow); font-weight: 600; }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 20px var(--shadow);
+    display: none;
+    z-index: 50;
+  }
+  .toast.show { display: block; }
+
+  /* ---- matched log lines (provenance + text) ---- */
+  .log-box { border: 1px solid var(--border); border-radius: 8px; overflow: auto; max-height: 55vh; }
+  table.log { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.log td {
+    padding: 3px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    vertical-align: top;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  table.log td.prov { color: var(--accent); white-space: nowrap; width: 1%; }
+  table.log tr:hover td { background: var(--row-hover); }
+  .pod-chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 7px;
+    margin: 2px 4px 2px 0;
+  }
+  /* Sortable tables + restart banding (a lighter/darker swap when the pod
+     group changes, so a pod's rows read as one block) */
+  th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sortable:hover { color: var(--accent); }
+  th.sortable .arrow { font-size: 9px; color: var(--accent); margin-left: 3px; }
+  tr.grp-a td { background: var(--grp-a); }
+  tr.grp-b td { background: var(--grp-b); }
+  .grp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+
+  /* ---- tool catalog ---- */
+  .tool-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+  .tool-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .tool-card h3 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .tool-card h3 .tname { font-family: var(--mono); color: var(--accent); font-size: 13px; }
+  .tool-card p { margin: 6px 0; font-size: 13px; }
+  .tool-card .when { color: var(--muted); font-size: 12px; }
+  .tool-card .when b { color: var(--text); font-weight: 600; }
+  .tool-args { margin: 8px 0 0; padding: 8px 10px; background: var(--panel-2); border-radius: 6px; font-size: 12px; }
+  .tool-args div { padding: 1px 0; }
+  .tool-args code { font-family: var(--mono); color: var(--accent-2); font-size: 11px; }
+  .tool-args span { color: var(--muted); }
+  .step-list { margin: 0; padding-left: 18px; font-size: 13px; }
+  .step-list li { margin: 6px 0; }
+  .step-list code { font-family: var(--mono); font-size: 11px; color: var(--accent-2); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="hpe-element" aria-hidden="true"></span>
+    <div class="brand-text">
+      <div class="brand-company">Hewlett Packard Enterprise</div>
+      <div class="brand-product"><b>LogSearch MCP</b> · Pod Log Console</div>
+    </div>
+  </div>
+  <div class="meta">
+    <span><span class="dot" id="status-dot"></span><span id="status-text">connecting…</span></span>
+    <span class="pill" id="policy-pill" title="namespace policy — LOGSEARCH_ALLOWED_NAMESPACES / LOGSEARCH_BLOCKED_NAMESPACES">policy: ?</span>
+    <span class="pill" id="caps-pill" title="fan-out caps — LOGSEARCH_MAX_PODS / _MAX_LINES_PER_POD / _MAX_TOTAL_LINES">caps: ?</span>
+    <span class="pill" style="color:var(--yellow)">read-only</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="search">
+      <input type="search" id="filter" placeholder="Filter triage presets…" autocomplete="off" />
+    </div>
+    <div id="preset-list"></div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <button class="tab active" data-tab="search">Search</button>
+      <button class="tab" data-tab="counts">Counts</button>
+      <button class="tab" data-tab="sources">Sources</button>
+      <button class="tab" data-tab="tools">MCP Tools</button>
+    </div>
+
+    <!-- Shared self-describing error panel (denied namespace, bad regex,
+         unreachable cluster — the server's clean error strings). Lives ABOVE
+         the panes so it is visible from every tab. -->
+    <div style="padding: 14px 14px 0;">
+      <div id="error"></div>
+    </div>
+
+    <!-- ============ SEARCH ============ -->
+    <div id="pane-search" class="pane">
+      <div class="panel">
+        <h2>Regex search across a namespace <span class="hint">fan-out over pods, merged chronologically</span></h2>
+        <div class="form-grid">
+          <div class="field"><label for="s-namespace">namespace</label><input id="s-namespace" placeholder="team-a" spellcheck="false" /></div>
+          <div class="field"><label for="s-selector">label selector</label><input id="s-selector" placeholder="app=myapp" spellcheck="false" /></div>
+          <div class="field"><label for="s-since">since minutes</label><input id="s-since" type="number" min="0" step="1" placeholder="30" /></div>
+          <div class="field"><label for="s-tail">tail lines / pod</label><input id="s-tail" type="number" min="1" step="1" value="200" /></div>
+          <div class="field"><label for="s-max">max matches</label><input id="s-max" type="number" min="1" step="1" value="300" /></div>
+          <div class="field wide"><label for="s-pattern">pattern (Python regex)</label><input id="s-pattern" spellcheck="false" placeholder="Traceback|ERROR|panic" /></div>
+          <div class="field"><label for="s-pod-regex">pod regex (optional)</label><input id="s-pod-regex" spellcheck="false" placeholder="^myapp-.*" /></div>
+          <div class="field"><label for="s-container">container (optional)</label><input id="s-container" spellcheck="false" placeholder="first container if empty" /></div>
+        </div>
+        <div class="form-row">
+          <button id="search-run">Search (Ctrl+Enter)</button>
+          <label><input type="checkbox" id="s-case" checked /> case-insensitive</label>
+          <span class="hint">read-only · every pod's tail is fetched with timestamps on and merged oldest → newest</span>
+        </div>
+      </div>
+      <div id="search-result"></div>
+    </div>
+
+    <!-- ============ COUNTS ============ -->
+    <div id="pane-counts" class="pane hidden">
+      <div class="panel">
+        <h2>Per-pod match counts <span class="hint">“where is this error coming from?” before reading full logs</span></h2>
+        <div class="form-grid">
+          <div class="field"><label for="c-namespace">namespace</label><input id="c-namespace" placeholder="team-a" spellcheck="false" /></div>
+          <div class="field"><label for="c-selector">label selector</label><input id="c-selector" placeholder="app=myapp" spellcheck="false" /></div>
+          <div class="field"><label for="c-since">since minutes</label><input id="c-since" type="number" min="0" step="1" placeholder="30" /></div>
+          <div class="field wide"><label for="c-pattern">pattern (Python regex)</label><input id="c-pattern" spellcheck="false" placeholder="OutOfMemory" /></div>
+        </div>
+        <div class="form-row">
+          <button id="count-run">Count (Ctrl+Enter)</button>
+          <label><input type="checkbox" id="c-case" checked /> case-insensitive</label>
+          <span class="hint">counts run over the last max-lines-per-pod lines of each pod's default container</span>
+        </div>
+      </div>
+      <div id="count-result"></div>
+    </div>
+
+    <!-- ============ SOURCES ============ -->
+    <div id="pane-sources" class="pane hidden">
+      <div class="panel">
+        <h2>Log sources <span class="hint">pods · containers · restarts · age — the discovery call before searching</span></h2>
+        <div class="form-grid">
+          <div class="field"><label for="o-namespace">namespace</label><input id="o-namespace" placeholder="team-a" spellcheck="false" /></div>
+          <div class="field"><label for="o-selector">label selector</label><input id="o-selector" placeholder="app=myapp" spellcheck="false" /></div>
+        </div>
+        <div class="form-row">
+          <button id="sources-run">Load sources</button>
+          <span class="hint">restart counts are summed over the pod's containers — a crash-looping sidecar is triage-relevant</span>
+        </div>
+      </div>
+      <div id="sources-result"></div>
+    </div>
+
+    <!-- ============ MCP TOOLS ============ -->
+    <div id="pane-tools" class="pane hidden">
+      <div class="panel">
+        <h2>What the four MCP tools are good for <span class="hint">all read-only · this page calls the exact same code</span></h2>
+        <p class="hint" style="margin-top:0">
+          This console is a human front-end over the SAME seams, namespace policy, and caps that back the
+          MCP tools at <code>/mcp</code> — it has no powers the tools don't. Prometheus MCP (the fleet's other
+          observability server) sees <b>behavior over time</b>: rates, trends, alert state. LogSearch sees
+          <b>what the applications actually printed</b>: tracebacks, panics, OOM kills, crash loops.
+        </p>
+        <div class="tool-grid" id="tool-grid"></div>
+      </div>
+      <div class="panel">
+        <h2>Triage workflow</h2>
+        <ol class="step-list">
+          <li>Sources tab (or <code>list_log_sources</code>): which pods exist, which containers to name, who is restarting</li>
+          <li>Counts tab (or <code>count_matches</code>): <code>ERROR|Traceback</code> — which pod is loud?</li>
+          <li>Search tab (or <code>search_logs</code>): the same pattern with provenance, chronologically merged across pods</li>
+          <li>Agent follow-up: <code>get_pod_logs</code> with <code>previous=true</code> reads the PREVIOUS (crashed) container — the first move on CrashLoopBackOff</li>
+        </ol>
+      </div>
+      <div class="panel">
+        <h2>LLM-safe shaping <span class="hint">why tool answers stay small</span></h2>
+        <p class="hint" style="margin:0">
+          Fan-out touches at most <code>LOGSEARCH_MAX_PODS</code> pods, tails at most
+          <code>LOGSEARCH_MAX_LINES_PER_POD</code> lines each, and returns at most
+          <code>LOGSEARCH_MAX_TOTAL_LINES</code> merged matches (keeping the MOST RECENT ones, flagged
+          <code>truncated</code>). One dead pod never sinks a search — it is reported in
+          <code>errors</code> while the rest complete. This page reuses the exact same caps.
+        </p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const state = { tab: "search", sources: [] };
+
+const PALETTE = ["#01a982","#4f8ff7","#f0b429","#ff6b6b","#b678f0","#3ecf8e","#6bc7e8","#e8875b","#c9d34f","#8f7ff0"];
+
+// ---- triage preset library (the sidebar) -------------------------------------
+// Each preset fills the pattern field of its tab and runs it. The namespace
+// is always the user's — presets never guess one.
+const PRESETS = [
+  { cat: "Errors", name: "Errors & tracebacks", tab: "search", pattern: "Traceback|ERROR|panic|FATAL" },
+  { cat: "Errors", name: "Timeouts & refusals", tab: "search", pattern: "timeout|timed out|connection refused|unavailable" },
+  { cat: "Crash", name: "Crash-loop triage", tab: "search", pattern: "Back-off|CrashLoopBackOff|restarting" },
+  { cat: "Crash", name: "OOM kills", tab: "search", pattern: "OOMKilled|out of memory|Kill signal|oom-kill" },
+  { cat: "Crash", name: "GPU / CUDA faults", tab: "search", pattern: "CUDA|Xid|NVML|nvidia" },
+  { cat: "Counts", name: "Who logs ERROR? (counts)", tab: "counts", pattern: "ERROR" },
+  { cat: "Counts", name: "Restart storm check", tab: "counts", pattern: "." },
+  { cat: "Discovery", name: "Everything (tail)", tab: "search", pattern: "." },
+];
+
+// ---- tiny fetch + UI helpers ------------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok || (data && data.error)) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+function setError(msg) {
+  const el = $("error");
+  if (msg) { el.textContent = msg; el.className = "show"; }
+  else { el.textContent = ""; el.className = ""; }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+// A matched line arrives as "podname/container: 2026-…Z message" — split the
+// provenance prefix (k8s names are DNS labels: no colons, no slashes) so it
+// can be colored; anything unparsable renders verbatim.
+function splitProvenance(line) {
+  const m = String(line).match(/^([^/:]+\/[^:]+): (.*)$/s);
+  return m ? { prov: m[1], rest: m[2] } : { prov: "", rest: String(line) };
+}
+
+// ---- header status -----------------------------------------------------------
+async function refreshStatus() {
+  try {
+    const s = await api("/api/status");
+    $("status-dot").className = "dot ok";
+    $("status-text").textContent = "connected";
+    const p = s.policy || {};
+    const allowed = (p.allowed && p.allowed.length) ? p.allowed.join(", ") : "<all namespaces>";
+    const blocked = (p.blocked && p.blocked.length) ? " · blocked " + p.blocked.join(", ") : "";
+    $("policy-pill").textContent = "policy: " + trunc(allowed, 40) + blocked;
+    const c = s.caps || {};
+    $("caps-pill").textContent =
+      "caps: " + (c.max_pods ?? "?") + " pods × " + (c.max_lines_per_pod ?? "?") +
+      " lines · " + (c.max_total_lines ?? "?") + " matches";
+  } catch (e) {
+    $("status-dot").className = "dot err";
+    $("status-text").textContent = "offline";
+  }
+}
+
+// ---- sortable tables + pod banding ---------------------------------------------
+const tableSort = {}; // hostId -> {key, dir}
+
+function setTableSort(hostId, key, dir) {
+  tableSort[hostId] = { key, dir: dir === -1 ? -1 : 1 };
+}
+
+function groupColor(name) {
+  let h = 0;
+  const s = String(name);
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+
+function renderSortableTable(hostId, columns, rows, opts) {
+  opts = opts || {};
+  const st = tableSort[hostId] || { key: columns[0].key, dir: 1 };
+  const col = columns.find((c) => c.key === st.key) || columns[0];
+  const fallback = opts.fallback || (() => 0);
+  const cellVal = (c, r) => (c.sortVal ? c.sortVal(r) : r[c.key]);
+  const cmp = (a, b) => {
+    const va = cellVal(col, a), vb = cellVal(col, b);
+    const na = va === null || va === undefined || va === "";
+    const nb = vb === null || vb === undefined || vb === "";
+    if (na && nb) return 0;
+    if (na) return 1; // nulls sink, regardless of direction
+    if (nb) return -1;
+    if (typeof va === "number" || typeof vb === "number") {
+      const fa = parseFloat(va), fb = parseFloat(vb);
+      const faOk = isFinite(fa), fbOk = isFinite(fb);
+      if (!faOk && !fbOk) return String(va).localeCompare(String(vb));
+      if (!faOk) return 1;
+      if (!fbOk) return -1;
+      return fa < fb ? -1 : fa > fb ? 1 : 0;
+    }
+    return String(va).localeCompare(String(vb));
+  };
+  const sorted = [...(rows || [])].sort((a, b) => {
+    const primary = cmp(a, b);
+    return primary !== 0 ? primary * st.dir : fallback(a, b);
+  });
+  let html = '<div style="overflow:auto;max-height:52vh;border:1px solid var(--border);border-radius:8px;">' +
+    '<table class="grid sortable"><thead><tr>' +
+    columns.map((c) => {
+      const active = c.key === st.key;
+      const arrow = active ? '<span class="arrow">' + (st.dir === 1 ? "▲" : "▼") + "</span>" : "";
+      return '<th class="sortable" data-key="' + esc(c.key) + '" title="sort by ' + esc(c.label) + '">' + esc(c.label) + arrow + "</th>";
+    }).join("") + "</tr></thead><tbody>";
+  let prevGroup = null, band = 0;
+  sorted.forEach((r) => {
+    let tint = "", runStart = false, group = null;
+    if (opts.groupBy) {
+      group = opts.groupBy(r);
+      if (group !== prevGroup) {
+        if (group != null) band = 1 - band;
+        runStart = group != null;
+        prevGroup = group;
+      }
+      tint = group == null ? "" : band ? " class='grp-b'" : " class='grp-a'";
+    }
+    const ctx = { group, runStart };
+    html += "<tr" + tint + ">" + columns.map((c) => c.render(r, ctx)).join("") + "</tr>";
+  });
+  html += "</tbody></table></div>";
+  const host = $(hostId);
+  host.innerHTML = html;
+  host.querySelectorAll("th.sortable").forEach((th) => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      const cur = tableSort[hostId];
+      tableSort[hostId] = { key, dir: cur && cur.key === key ? -cur.dir : 1 };
+      renderSortableTable(hostId, columns, rows, opts);
+    };
+  });
+}
+
+// ---- search tab ----------------------------------------------------------------
+async function runSearch() {
+  const ns = $("s-namespace").value.trim();
+  const pattern = $("s-pattern").value;
+  if (!ns) { setError("Enter a namespace to search."); return; }
+  if (!pattern) { setError("Enter a regex pattern (e.g. 'ERROR|Traceback')."); return; }
+  setError("");
+  $("search-run").disabled = true;
+  $("search-result").innerHTML = '<div class="loading">searching…</div>';
+  const body = {
+    namespace: ns,
+    pattern,
+    label_selector: $("s-selector").value.trim(),
+    pod_regex: $("s-pod-regex").value.trim(),
+    container: $("s-container").value.trim(),
+    case_insensitive: $("s-case").checked,
+  };
+  const since = parseFloat($("s-since").value);
+  if (isFinite(since) && since > 0) body.since_minutes = since;
+  const tail = parseInt($("s-tail").value, 10);
+  if (isFinite(tail) && tail > 0) body.tail_lines = tail;
+  const max = parseInt($("s-max").value, 10);
+  if (isFinite(max) && max > 0) body.max_total_lines = max;
+  try {
+    const d = await api("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    renderSearch(d);
+  } catch (e) {
+    $("search-result").innerHTML = "";
+    setError(e.message);
+  } finally {
+    $("search-run").disabled = false;
+  }
+}
+
+function renderSearch(d) {
+  const host = $("search-result");
+  const matches = d.matches || [];
+  const truncatedBadge = d.truncated
+    ? ' <span class="badge warning">truncated</span>'
+    : "";
+  const meta =
+    '<div class="result-meta"><span class="ok">✓ ' + d.match_count + " match(es)</span>" +
+    truncatedBadge +
+    "<span>pods searched: " + d.pods_searched + "</span>" +
+    "<span>pods with matches: " + d.pods_with_matches + "</span>" +
+    (d.pod_cap_applied ? '<span class="warn">pod cap applied</span>' : "") +
+    "<span>pattern: <code>" + esc(d.pattern) + "</code></span></div>";
+  if (!matches.length && !(d.errors || []).length) {
+    host.innerHTML = meta + '<div class="empty">no matches in the searched pods' +
+      (d.truncated ? "" : " (empty is a normal result, not an error)") + "</div>";
+    return;
+  }
+  let rows = "";
+  matches.forEach((line) => {
+    const p = splitProvenance(line);
+    rows += "<tr><td class='prov'>" + esc(p.prov) + "</td><td>" + esc(p.rest) + "</td></tr>";
+  });
+  let html = meta +
+    '<div class="log-box"><table class="log"><tbody>' + rows + "</tbody></table></div>";
+  if ((d.errors || []).length) {
+    html += '<div class="panel"><h2><span class="badge critical">pod errors</span>' +
+      '<span class="hint">these pods failed mid-search; the rest completed</span></h2>' +
+      d.errors.map((e) => '<div class="hint" style="font-family:var(--mono);padding:3px 0">' + esc(trunc(e, 220)) + "</div>").join("") +
+      "</div>";
+  }
+  host.innerHTML = html;
+}
+
+// ---- counts tab ------------------------------------------------------------------
+async function runCount() {
+  const ns = $("c-namespace").value.trim();
+  const pattern = $("c-pattern").value;
+  if (!ns) { setError("Enter a namespace to count in."); return; }
+  if (!pattern) { setError("Enter a regex pattern (e.g. 'OutOfMemory')."); return; }
+  setError("");
+  $("count-run").disabled = true;
+  $("count-result").innerHTML = '<div class="loading">counting…</div>';
+  const body = {
+    namespace: ns,
+    pattern,
+    label_selector: $("c-selector").value.trim(),
+    case_insensitive: $("c-case").checked,
+  };
+  const since = parseFloat($("c-since").value);
+  if (isFinite(since) && since > 0) body.since_minutes = since;
+  try {
+    const d = await api("/api/count", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    renderCounts(d);
+  } catch (e) {
+    $("count-result").innerHTML = "";
+    setError(e.message);
+  } finally {
+    $("count-run").disabled = false;
+  }
+}
+
+function renderCounts(d) {
+  const host = $("count-result");
+  const entries = Object.entries(d.counts || {}); // already sorted descending by the server
+  const meta =
+    '<div class="result-meta"><span class="ok">✓ ' + (d.total_matches ?? 0) + " total match(es)</span>" +
+    "<span>pods searched: " + d.pods_searched + "</span>" +
+    "<span>pods with matches: " + d.pods_with_matches + "</span>" +
+    (d.pod_cap_applied ? '<span class="warn">pod cap applied</span>' : "") +
+    "<span>pattern: <code>" + esc(d.pattern) + "</code></span></div>";
+  if (!entries.length) {
+    host.innerHTML = meta + '<div class="empty">no pods searched (namespace empty or every pod failed — see the server answer)</div>';
+    return;
+  }
+  const max = Math.max(...entries.map(([, v]) => v), 0);
+  let bars = "";
+  entries.forEach(([pod, n], i) => {
+    const pct = max ? Math.max(0.5, (n / max) * 100) : 0;
+    bars += '<div class="hbar-row" title="' + esc(pod + ": " + n + " match(es)") + '">' +
+      '<span class="hbar-label">' + esc(trunc(pod, 34)) + "</span>" +
+      '<div class="hbar-track"><div class="hbar-fill" style="width:' + pct + "%;background:" + PALETTE[i % PALETTE.length] + '"></div></div>' +
+      '<span class="hbar-val">' + n + "</span></div>";
+  });
+  host.innerHTML = meta + "<div class='panel'>" + bars + "</div>";
+  if ((d.errors || []).length) {
+    host.innerHTML += '<div class="panel"><h2><span class="badge critical">pod errors</span></h2>' +
+      d.errors.map((e) => '<div class="hint" style="font-family:var(--mono);padding:3px 0">' + esc(trunc(e, 220)) + "</div>").join("") +
+      "</div>";
+  }
+}
+
+// ---- sources tab ------------------------------------------------------------------
+async function loadSources() {
+  const ns = $("o-namespace").value.trim();
+  if (!ns) { setError("Enter a namespace to inspect."); return; }
+  setError("");
+  $("sources-run").disabled = true;
+  $("sources-result").innerHTML = '<div class="loading">listing pods…</div>';
+  const params = new URLSearchParams({ namespace: ns });
+  const sel = $("o-selector").value.trim();
+  if (sel) params.set("label_selector", sel);
+  try {
+    const d = await api("/api/sources?" + params.toString());
+    renderSources(d);
+  } catch (e) {
+    $("sources-result").innerHTML = "";
+    setError(e.message);
+  } finally {
+    $("sources-run").disabled = false;
+  }
+}
+
+function renderSources(d) {
+  state.sources = d.pods || [];
+  const meta =
+    '<div class="result-meta"><span class="ok">✓ ' + d.pod_count + " pod(s)</span>" +
+    (d.pod_cap_applied ? '<span class="warn">pod cap applied — showing the first ' + state.sources.length + "</span>" : "") +
+    "<span>namespace: <code>" + esc(d.namespace) + "</code></span>" +
+    (d.label_selector ? "<span>selector: <code>" + esc(d.label_selector) + "</code></span>" : "") +
+    "</div>";
+  if (!state.sources.length) {
+    $("sources-result").innerHTML = meta + '<div class="empty">no pods in this namespace (or the selector matches nothing)</div>';
+    return;
+  }
+  renderSortableTable("sources-result", [
+    { key: "name", label: "pod",
+      render: (p, ctx) => "<td>" + (ctx.runStart ? "<span class='grp-dot' style='background:" + groupColor(ctx.group) + "'></span>" : "") + esc(p.name) + "</td>" },
+    { key: "containers", label: "containers",
+      sortVal: (p) => (p.containers || []).join(","),
+      render: (p) => "<td>" + (p.containers || []).map((c) => "<span class='pod-chip'>" + esc(c) + "</span>").join("") + "</td>" },
+    { key: "restarts", label: "restarts",
+      render: (p) => "<td>" + (p.restarts > 0
+        ? "<span class='badge " + (p.restarts >= 5 ? "critical" : "warning") + "'>" + p.restarts + "</span>"
+        : "<span class='badge ok'>0</span>") + "</td>" },
+    { key: "age", label: "age",
+      sortVal: (p) => p.started || "",
+      render: (p) => "<td title='" + esc(p.started || "") + "'>" + esc(p.age || "—") + "</td>" },
+  ], state.sources, {
+    groupBy: (p) => null, // one row per pod — no banding, plain sorted table
+    fallback: (a, b) => String(a.name).localeCompare(String(b.name)),
+  });
+}
+
+// ---- presets ----------------------------------------------------------------------
+function loadPreset(p) {
+  switchTab(p.tab);
+  if (p.tab === "search") {
+    $("s-pattern").value = p.pattern;
+    runSearch();
+  } else if (p.tab === "counts") {
+    $("c-pattern").value = p.pattern;
+    runCount();
+  }
+}
+
+function renderPresets() {
+  const host = $("preset-list");
+  const q = ($("filter").value || "").toLowerCase();
+  const rows = PRESETS.filter((p) =>
+    !q || (p.name + " " + p.cat + " " + p.pattern).toLowerCase().includes(q)
+  );
+  if (!rows.length) { host.innerHTML = '<div class="empty">no presets match</div>'; return; }
+  let html = "", lastCat = null;
+  rows.forEach((p) => {
+    if (p.cat !== lastCat) { html += "<div class='preset-cat'>" + esc(p.cat) + "</div>"; lastCat = p.cat; }
+    const idx = PRESETS.indexOf(p);
+    html += "<div class='preset-item' data-i='" + idx + "' title='" + esc(p.pattern) + "'>" +
+      "<span class='fmt'>" + esc(p.tab) + "</span>" +
+      "<span class='pname'>" + esc(p.name) + "</span></div>";
+  });
+  host.innerHTML = html;
+  host.querySelectorAll(".preset-item").forEach((el) => {
+    el.onclick = () => loadPreset(PRESETS[Number(el.dataset.i)]);
+  });
+}
+
+// ---- MCP tools catalog ----------------------------------------------------------------
+const TOOLS = [
+  {
+    name: "list_log_sources", title: "List Log Sources", icon: "🔎",
+    purpose: "Pods + containers in one namespace with restart counts and age — the discovery call before searching.",
+    when: "<b>Which pods exist, which containers to name, who is crash-looping.</b> Always the first call in a namespace you haven't touched.",
+    args: [["namespace", "Kubernetes namespace to inspect"], ["label_selector", "optional, e.g. 'app=myapp'"]],
+    openTab: "sources",
+  },
+  {
+    name: "get_pod_logs", title: "Get Pod Logs", icon: "📄",
+    purpose: "Raw tail-bounded log fetch for ONE pod's container (newest last, length-capped).",
+    when: "<b>Full context for one pod.</b> previous=true reads the PREVIOUS (crashed/restarted) container — the first move on CrashLoopBackOff, where the current container has nothing but 'back-off restarting'.",
+    args: [["namespace / pod", "the target"], ["container", "empty = the pod's first container"], ["tail_lines / since_seconds", "window"], ["previous", "read the crashed container"]],
+    tip: "A multi-container pod needs an explicit container name — discover it with list_log_sources.",
+  },
+  {
+    name: "search_logs", title: "Search Pod Logs", icon: "🔍",
+    purpose: "Fan-out regex search over every pod in a namespace, merged chronologically with 'pod/container: ' provenance.",
+    when: "<b>What happened, in what order, on which pod.</b> When the cap bites the MOST RECENT matches are kept and truncated=true.",
+    args: [["namespace / pattern", "Python regex"], ["label_selector / pod_regex", "narrow the fan-out"], ["since_minutes", "only recent logs"], ["case_insensitive", "default true"], ["max_total_lines", "cap on merged matches"]],
+    tip: "One dead pod never sinks the search — it is reported per-pod in errors while the rest complete.",
+    openTab: "search",
+  },
+  {
+    name: "count_matches", title: "Count Log Matches", icon: "🔢",
+    purpose: "Per-pod match counts for one pattern, sorted descending.",
+    when: "<b>The 'where is this error coming from?' call</b> before reading full logs — cheap, and the ranking tells you which pod to open.",
+    args: [["namespace / pattern", "Python regex"], ["label_selector", "optional"], ["since_minutes", "optional"], ["case_insensitive", "default true"]],
+    openTab: "counts",
+  },
+];
+
+function renderTools() {
+  const host = $("tool-grid");
+  host.innerHTML = TOOLS.map((t, i) => {
+    let html = "<div class='tool-card'><h3><span>" + t.icon + "</span><span class='tname'>" + esc(t.name) + "</span><span class='hint'>· " + esc(t.title) + "</span></h3>" +
+      "<p>" + esc(t.purpose) + "</p>" +
+      "<p class='when'>" + t.when + "</p>" +
+      "<div class='tool-args'>" + t.args.map(([a, d]) => "<div><code>" + esc(a) + "</code> <span>" + esc(d) + "</span></div>").join("") + "</div>";
+    if (t.tip) html += "<p class='hint'>💡 " + esc(t.tip) + "</p>";
+    if (t.openTab) {
+      const label = { sources: "Sources", search: "Search", counts: "Counts" }[t.openTab] || t.openTab;
+      html += "<div style='margin-top:8px'><button class='ghost copy-btn' data-open='" + esc(t.openTab) + "'>Open " + label + " tab →</button></div>";
+    }
+    return html + "</div>";
+  }).join("");
+  host.querySelectorAll("button[data-open]").forEach((btn) => {
+    btn.onclick = () => switchTab(btn.dataset.open);
+  });
+}
+
+// ---- tab switching ---------------------------------------------------------------------
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("pane-search").classList.toggle("hidden", tab !== "search");
+  $("pane-counts").classList.toggle("hidden", tab !== "counts");
+  $("pane-sources").classList.toggle("hidden", tab !== "sources");
+  $("pane-tools").classList.toggle("hidden", tab !== "tools");
+}
+
+// ---- theme toggle ----------------------------------------------------------------------
+function initThemeToggle() {
+  const btn = $("theme-toggle");
+  const sync = () => {
+    const dark = document.documentElement.dataset.theme !== "light";
+    btn.textContent = dark ? "☀️" : "🌙";
+    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
+  };
+  btn.onclick = () => {
+    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("logsearch-theme", t); } catch (e) { /* ignore */ }
+    sync();
+    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
+  };
+  sync();
+}
+
+// ---- wiring -----------------------------------------------------------------------------
+document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+$("search-run").onclick = runSearch;
+$("count-run").onclick = runCount;
+$("sources-run").onclick = loadSources;
+$("s-pattern").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runSearch(); }
+});
+$("c-pattern").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runCount(); }
+});
+$("filter").oninput = renderPresets;
+
+initThemeToggle();
+renderPresets();
+renderTools();
+refreshStatus();
+switchTab("search");
+</script>
+</body>
+</html>

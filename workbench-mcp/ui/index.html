@@ -1,0 +1,991 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+  // Resolve the theme before first paint to avoid a flash of the wrong theme.
+  // Precedence: saved choice > OS preference > dark (the historical default).
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("workbench-theme"); } catch (e) {}
+    if (t !== "light" && t !== "dark") {
+      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+        ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<title>Workbench MCP · Scratch Pad</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2301A982'/%3E%3Ctext x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='%23101820' text-anchor='middle'%3EW%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-2: #1c2438;
+    --border: #2a3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #3ecf8e;
+    --red: #ff6b6b;
+    --yellow: #f0b429;
+    --header-grad-1: #131a2b;
+    --header-grad-2: #10162a;
+    --row-hover: #1a2338;
+    --row-border: #202a42;
+    --editor-bg: #0d1220;
+    --err-bg: #2a1620;
+    --err-border: #5a2430;
+    --err-text: #ffb3b3;
+    --shadow: rgba(0, 0, 0, 0.4);
+    --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  /* Light theme: opt in via <html data-theme="light">, set before first paint
+     by the head script (OS preference) and toggled from the header. */
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+  }
+  * { box-sizing: border-box; }
+  @font-face {
+    font-family: 'MetricHPE';
+    src: local('MetricHPE'), local('Metric HPE'), local('Arial');
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "MetricHPE", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, var(--header-grad-1), var(--header-grad-2));
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .hpe-element {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    background: var(--hpe);
+    clip-path: polygon(25% 0%, 100% 0%, 75% 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+  .brand-company {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--muted);
+  }
+  .brand-product { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--text); }
+  .brand-product b { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  header .meta .pill {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  header .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+  /* Trust-model banner: always visible, directly under the header. */
+  .banner {
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--border);
+    color: var(--yellow);
+    font-size: 12px;
+    padding: 7px 18px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .banner .banner-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border: 1px solid var(--yellow);
+    border-radius: 4px;
+    padding: 0 6px;
+    flex-shrink: 0;
+  }
+  .banner .banner-text { color: var(--text); }
+  .banner .banner-text b { color: var(--yellow); }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 300px;
+    min-width: 240px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  aside .ws-head { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  aside .ws-head label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; display: block; margin-bottom: 5px; }
+  select.inline, input.wide {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  select.inline:focus, input.wide:focus { border-color: var(--accent); }
+  aside .ws-row { display: flex; gap: 6px; }
+  aside .ws-row select.inline { flex: 1; min-width: 0; }
+  aside .ws-create { display: flex; gap: 6px; margin-top: 8px; }
+  aside .ws-create input.wide { flex: 1; min-width: 0; }
+  #file-list { flex: 1; overflow: auto; padding: 6px; }
+  .file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    color: var(--text);
+    border: 1px solid transparent;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .file-item:hover { background: var(--panel-2); border-color: var(--border); }
+  .file-item.active { background: var(--panel-2); border-color: var(--accent); }
+  .file-item .fico { flex-shrink: 0; width: 14px; text-align: center; }
+  .file-item .fpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-item .fsize { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+  aside .side-foot { padding: 8px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 4px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tab {
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .pane { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
+  .pane.hidden { display: none; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .panel h2 .hint { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .panel h2 .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid th {
+    text-align: left;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  table.grid td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--row-border);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: top;
+  }
+  table.grid td.wrap { white-space: pre-wrap; max-width: 480px; overflow-wrap: anywhere; }
+  table.grid tr:hover td { background: var(--row-hover); }
+  table.grid input.cell {
+    width: 100%;
+    background: var(--editor-bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  table.grid input.cell:focus { border-color: var(--accent); }
+  .badge {
+    display: inline-block;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-family: var(--mono);
+  }
+  .badge.ok { color: var(--green); border: 1px solid var(--green); background: rgba(62, 207, 142, 0.08); }
+  .badge.fail { color: var(--red); border: 1px solid var(--red); background: rgba(255, 107, 107, 0.1); }
+  .badge.warn { color: var(--yellow); border: 1px solid var(--yellow); background: rgba(240, 180, 41, 0.1); }
+  .badge.muted { color: var(--muted); border: 1px solid var(--border); background: transparent; }
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 8px;
+    margin: 4px 4px 0 0;
+    white-space: nowrap;
+  }
+  .chip.deny { color: var(--red); border-color: var(--err-border); }
+  button {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-2); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover { border-color: var(--accent); }
+  button.danger { background: transparent; border: 1px solid var(--red); color: var(--red); font-weight: 600; }
+  button.danger:hover { background: rgba(255, 107, 107, 0.12); }
+  button.copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; font-weight: 400; }
+  button.mini-del { color: var(--muted); background: none; border: none; padding: 0 4px; font-size: 12px; font-weight: 400; }
+  button.mini-del:hover { color: var(--red); background: none; }
+  button.theme-toggle {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 9px;
+    border-radius: 6px;
+  }
+  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  input.inline {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    width: 90px;
+    outline: none;
+  }
+  input.inline:focus { border-color: var(--accent); }
+  textarea.code {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 12px;
+    width: 100%;
+    min-height: 220px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    tab-size: 2;
+    white-space: pre;
+  }
+  textarea.code:focus { border-color: var(--accent); }
+  #error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #error.show { display: block; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin: 10px 0; flex-wrap: wrap; }
+  .result-meta .ok { color: var(--green); font-weight: 600; }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 20px var(--shadow);
+    display: none;
+    z-index: 50;
+    max-width: 420px;
+  }
+  .toast.show { display: block; }
+  .out-pre {
+    background: var(--editor-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 320px;
+    overflow: auto;
+    margin: 0 0 10px;
+  }
+  .argv-chip { font-family: var(--mono); font-size: 11px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 4px; margin: 0 4px 4px 0; display: inline-block; }
+  .argv-chip.argv0 { color: var(--accent); border-color: var(--accent); font-weight: 700; }
+  .split { display: grid; grid-template-columns: minmax(260px, 1fr) 2fr; gap: 12px; align-items: start; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+  .policy-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="hpe-element" aria-hidden="true"></span>
+    <div class="brand-text">
+      <div class="brand-company">Hewlett Packard Enterprise</div>
+      <div class="brand-product"><b>Workbench MCP</b> · Scratch Pad</div>
+    </div>
+  </div>
+  <div class="meta">
+    <span><span class="dot" id="status-dot"></span><span id="status-text">connecting…</span></span>
+    <span class="pill" id="ws-root">root: ?</span>
+    <span class="pill" style="color:var(--yellow)">read/write</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+</header>
+
+<div class="banner">
+  <span class="banner-tag">trust model</span>
+  <span class="banner-text"><b>Scratch pad by design</b> — executes allow-listed commands; endpoint must sit behind gateway authn.</span>
+</div>
+
+<div class="layout">
+  <aside>
+    <div class="ws-head">
+      <label for="ws-select">Workspace</label>
+      <div class="ws-row">
+        <select id="ws-select" class="inline" style="flex:1"><option value="">loading…</option></select>
+        <button id="ws-refresh" class="ghost copy-btn" title="reload workspace list">↻</button>
+      </div>
+      <div class="ws-create">
+        <input id="ws-new" class="wide" placeholder="new-workspace-name" spellcheck="false" />
+        <button id="ws-create-btn" class="copy-btn">create</button>
+      </div>
+      <div class="ws-create">
+        <button id="ws-delete-btn" class="danger copy-btn" style="flex:1">delete workspace…</button>
+      </div>
+      <div class="hint" id="ws-info" style="margin-top:8px"></div>
+    </div>
+    <div id="file-list"><div class="empty">select a workspace</div></div>
+    <div class="side-foot" id="policy-foot">policy: ?</div>
+  </aside>
+
+  <main>
+    <div id="error"></div>
+    <div class="tabs">
+      <button class="tab active" data-tab="files">Files</button>
+      <button class="tab" data-tab="env">Env</button>
+      <button class="tab" data-tab="run">Run</button>
+      <button class="tab" data-tab="audit">Audit</button>
+    </div>
+
+    <!-- ============ FILES ============ -->
+    <div id="pane-files" class="pane">
+      <div class="panel">
+        <h2>File viewer / saver <span class="hint">path-confined to the workspace — traversal and symlink escapes are refused by the core</span></h2>
+        <div class="split">
+          <div>
+            <div class="hint" style="margin-bottom:4px">Path (workspace-relative)</div>
+            <div style="display:flex;gap:6px">
+              <input id="file-path" class="wide" style="flex:1" placeholder="notes/idea.md" spellcheck="false" />
+              <button id="file-load-btn" class="ghost copy-btn">load</button>
+            </div>
+            <div class="hint" style="margin:10px 0 4px">Create / save</div>
+            <button id="file-save-btn">💾 save file</button>
+            <button id="file-delete-btn" class="danger copy-btn">delete file…</button>
+            <div class="hint" id="file-meta" style="margin-top:10px"></div>
+          </div>
+          <div>
+            <textarea id="file-content" class="code" spellcheck="false" placeholder="File contents appear here — edit and save."></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ ENV ============ -->
+    <div id="pane-env" class="pane hidden">
+      <div class="panel">
+        <h2>Per-workspace env store <span class="hint">run_command injects these into every child process</span>
+          <span class="spacer"></span>
+          <button id="env-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="env-table"><div class="empty">select a workspace</div></div>
+      </div>
+      <div class="panel">
+        <h2>Add / update a key <span class="hint">keys are UPPERCASE env names (A-Z, 0-9, _)</span></h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="env-new-key" class="wide" style="width:220px" placeholder="MODEL_NAME" spellcheck="false" />
+          <input id="env-new-value" class="wide" style="flex:1;min-width:200px" placeholder="value" spellcheck="false" />
+          <button id="env-set-btn">set</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ RUN ============ -->
+    <div id="pane-run" class="pane hidden">
+      <div class="panel">
+        <h2>Run command <span class="hint">argv tokens — no shell interpolation; cwd = workspace root</span></h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+          <input id="run-argv" class="wide" style="flex:1;min-width:280px" placeholder='python3 -c "print(1+1)"' spellcheck="false" />
+          <label class="hint" for="run-timeout">timeout&nbsp;s</label>
+          <input id="run-timeout" class="inline" type="number" min="1" value="60" />
+          <button id="run-btn">▶ run</button>
+        </div>
+        <div class="hint" style="margin-bottom:6px">parsed argv:</div>
+        <div id="run-argv-preview" class="hint">—</div>
+        <div id="run-result"><div class="empty">no command run yet</div></div>
+      </div>
+      <div class="panel">
+        <h2>Execution policy <span class="hint">enforced by the core for MCP tools AND this UI alike</span></h2>
+        <div class="policy-cols">
+          <div>
+            <div class="hint" style="margin-bottom:2px">Allowlist (argv[0] must match)</div>
+            <div id="policy-allow"></div>
+          </div>
+          <div>
+            <div class="hint" style="margin-bottom:2px">Denylist (hard deny, wins)</div>
+            <div id="policy-deny"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ AUDIT ============ -->
+    <div id="pane-audit" class="pane hidden">
+      <div class="panel">
+        <h2>Audit tail <span class="hint">append-only JSONL at the volume root (.audit.jsonl) — read-only view</span>
+          <span class="spacer"></span>
+          <label class="hint" for="audit-n">tail&nbsp;lines</label>
+          <select id="audit-n" class="inline">
+            <option>50</option>
+            <option selected>200</option>
+            <option>500</option>
+          </select>
+          <button id="audit-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="audit-meta" class="hint" style="margin-bottom:8px"></div>
+        <div id="audit-table"><div class="loading">loading…</div></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+// ---- tiny helpers ------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function fmtBytes(n) {
+  if (n == null) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1024 / 1024).toFixed(1) + " MiB";
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+function showError(err) {
+  const el = $("error");
+  el.textContent = String(err && err.message ? err.message : err);
+  el.classList.add("show");
+}
+function clearError() { $("error").classList.remove("show"); }
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok || (data && data.error)) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+// ---- state ------------------------------------------------------------------------------
+const state = {
+  ws: "",
+  workspaces: [],
+  policy: { allowlist: [], denylist: [] },
+  caps: {},
+  fileOpen: "",   // path currently loaded in the viewer
+  envLoaded: false,
+  auditLoaded: false,
+  tab: "files",
+};
+
+function currentWs() { return state.ws || ($("ws-select").value || ""); }
+
+// ---- workspaces -------------------------------------------------------------------------
+async function loadWorkspaces(keep) {
+  const data = await api("/api/workspaces");
+  state.workspaces = data.workspaces || [];
+  const sel = $("ws-select");
+  const prev = keep ? currentWs() : "";
+  sel.innerHTML = "";
+  if (!state.workspaces.length) {
+    sel.innerHTML = "<option value=''>— none yet —</option>";
+    state.ws = "";
+    $("ws-info").textContent = "no workspaces — create one";
+    $("file-list").innerHTML = "<div class='empty'>no workspaces</div>";
+    return;
+  }
+  for (const w of state.workspaces) {
+    const opt = document.createElement("option");
+    opt.value = w.workspace;
+    opt.textContent = w.workspace + " (" + w.files + " files)";
+    sel.appendChild(opt);
+  }
+  const target = state.workspaces.some((w) => w.workspace === prev) ? prev : state.workspaces[0].workspace;
+  sel.value = target;
+  state.ws = target;
+  renderWsInfo();
+  loadFiles();
+  if (state.envLoaded) loadEnv();
+}
+
+function renderWsInfo() {
+  const w = state.workspaces.find((x) => x.workspace === state.ws);
+  $("ws-info").textContent = w ? (w.files + " files · " + fmtBytes(w.bytes)) : "";
+}
+
+$("ws-select").onchange = () => {
+  state.ws = $("ws-select").value;
+  state.fileOpen = "";
+  renderWsInfo();
+  loadFiles();
+  if (state.envLoaded) loadEnv();
+};
+$("ws-refresh").onclick = () => { loadWorkspaces(true).catch(showError); };
+$("ws-create-btn").onclick = async () => {
+  const name = $("ws-new").value.trim();
+  if (!name) { toast("workspace name required"); return; }
+  clearError();
+  try {
+    await api("/api/workspaces", { method: "POST", body: JSON.stringify({ name }) });
+    $("ws-new").value = "";
+    toast("created workspace " + name);
+    await loadWorkspaces(false);
+  } catch (e) { showError(e); }
+};
+$("ws-new").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ws-create-btn").onclick(); });
+$("ws-delete-btn").onclick = async () => {
+  const ws = currentWs();
+  if (!ws) { toast("no workspace selected"); return; }
+  // The core refuses without confirm=true — the UI asks, then passes it on.
+  if (!window.confirm("Delete workspace '" + ws + "' and EVERYTHING in it? Irreversible.")) return;
+  clearError();
+  try {
+    await api("/api/workspaces/delete", { method: "POST", body: JSON.stringify({ name: ws, confirm: true }) });
+    toast("deleted " + ws);
+    state.fileOpen = "";
+    state.envLoaded = false;
+    await loadWorkspaces(false);
+  } catch (e) { showError(e); }
+};
+
+// ---- file tree ---------------------------------------------------------------------------
+async function loadFiles() {
+  const ws = currentWs();
+  const host = $("file-list");
+  if (!ws) { host.innerHTML = "<div class='empty'>select a workspace</div>"; return; }
+  host.innerHTML = "<div class='loading'>loading…</div>";
+  clearError();
+  let data;
+  try {
+    data = await api("/api/ws/" + encodeURIComponent(ws) + "/files");
+  } catch (e) { host.innerHTML = "<div class='empty'>" + esc(e.message) + "</div>"; return; }
+  const entries = data.entries || [];
+  if (!entries.length) { host.innerHTML = "<div class='empty'>empty workspace</div>"; return; }
+  host.innerHTML = "";
+  for (const ent of entries) {
+    const depth = ent.path.split("/").length - 1;
+    const row = document.createElement("div");
+    row.className = "file-item";
+    if (ent.path === state.fileOpen) row.classList.add("active");
+    row.style.paddingLeft = 8 + depth * 12 + "px";
+    row.innerHTML = "<span class='fico'>" + (ent.type === "dir" ? "▸" : "·") + "</span>" +
+      "<span class='fpath'>" + esc(ent.path) + "</span>" +
+      "<span class='fsize'>" + (ent.type === "dir" ? "" : fmtBytes(ent.bytes)) + "</span>";
+    if (ent.type === "file") {
+      row.onclick = () => openFile(ent.path);
+    }
+    host.appendChild(row);
+  }
+}
+
+async function openFile(path) {
+  const ws = currentWs();
+  if (!ws || !path) return;
+  clearError();
+  try {
+    const data = await api("/api/ws/" + encodeURIComponent(ws) + "/file?path=" + encodeURIComponent(path));
+    $("file-path").value = data.path;
+    $("file-content").value = data.content;
+    state.fileOpen = data.path;
+    $("file-meta").textContent = data.bytes + " bytes" + (data.truncated ? " · TRUNCATED (open with a smaller max_bytes via the API to see the rest)" : "");
+    document.querySelectorAll(".file-item").forEach((el) => el.classList.remove("active"));
+    const rows = document.querySelectorAll(".file-item .fpath");
+    rows.forEach((el) => { if (el.textContent === data.path) el.parentElement.classList.add("active"); });
+  } catch (e) {
+    showError(e);
+    $("file-meta").textContent = "";
+  }
+}
+
+$("file-load-btn").onclick = () => openFile($("file-path").value.trim());
+$("file-path").addEventListener("keydown", (e) => { if (e.key === "Enter") openFile($("file-path").value.trim()); });
+$("file-save-btn").onclick = async () => {
+  const ws = currentWs();
+  const path = $("file-path").value.trim();
+  if (!ws) { toast("select a workspace"); return; }
+  if (!path) { toast("path required"); return; }
+  clearError();
+  try {
+    const out = await api("/api/ws/" + encodeURIComponent(ws) + "/file", {
+      method: "POST",
+      body: JSON.stringify({ path, content: $("file-content").value }),
+    });
+    toast("wrote " + out.path + " (" + out.bytes + " bytes)");
+    state.fileOpen = out.path;
+    $("file-meta").textContent = out.bytes + " bytes";
+    loadFiles();
+  } catch (e) { showError(e); }
+};
+$("file-delete-btn").onclick = async () => {
+  const ws = currentWs();
+  const path = $("file-path").value.trim();
+  if (!ws || !path) { toast("select workspace and path"); return; }
+  if (!window.confirm("Delete '" + path + "' in '" + ws + "'?")) return;
+  clearError();
+  try {
+    await api("/api/ws/" + encodeURIComponent(ws) + "/file/delete", {
+      method: "POST",
+      body: JSON.stringify({ path, confirm: true }),
+    });
+    toast("deleted " + path);
+    if (state.fileOpen === path) {
+      state.fileOpen = "";
+      $("file-content").value = "";
+      $("file-meta").textContent = "";
+    }
+    loadFiles();
+  } catch (e) { showError(e); }
+};
+
+// ---- env ----------------------------------------------------------------------------------
+async function loadEnv() {
+  const ws = currentWs();
+  const host = $("env-table");
+  if (!ws) { host.innerHTML = "<div class='empty'>select a workspace</div>"; return; }
+  host.innerHTML = "<div class='loading'>loading…</div>";
+  clearError();
+  let data;
+  try {
+    data = await api("/api/ws/" + encodeURIComponent(ws) + "/env");
+  } catch (e) { host.innerHTML = "<div class='empty'>" + esc(e.message) + "</div>"; return; }
+  const keys = Object.keys(data.env || {});
+  if (!keys.length) { host.innerHTML = "<div class='empty'>no env vars set for this workspace</div>"; return; }
+  let html = "<table class='grid'><thead><tr><th style='width:220px'>Key</th><th>Value</th><th style='width:90px'></th></tr></thead><tbody>";
+  for (const k of keys) {
+    html += "<tr><td>" + esc(k) + "</td>" +
+      "<td><input class='cell' data-envkey='" + esc(k) + "' value=\"" + esc(data.env[k]) + "\" spellcheck='false' /></td>" +
+      "<td><button class='ghost copy-btn' data-envsave='" + esc(k) + "'>save</button> " +
+      "<button class='mini-del' data-envdel='" + esc(k) + "' title='delete key'>✕</button></td></tr>";
+  }
+  html += "</tbody></table>";
+  host.innerHTML = html;
+  host.querySelectorAll("button[data-envsave]").forEach((btn) => {
+    btn.onclick = async () => {
+      const k = btn.dataset.envsave;
+      const input = host.querySelector("input[data-envkey='" + CSS.escape(k) + "']");
+      clearError();
+      try {
+        await api("/api/ws/" + encodeURIComponent(currentWs()) + "/env", {
+          method: "POST",
+          body: JSON.stringify({ key: k, value: input.value }),
+        });
+        toast("set " + k);
+      } catch (e) { showError(e); }
+    };
+  });
+  host.querySelectorAll("button[data-envdel]").forEach((btn) => {
+    btn.onclick = async () => {
+      const k = btn.dataset.envdel;
+      clearError();
+      try {
+        // Overwrite with empty string is the store's only removal — delete the
+        // row locally too so the table matches (the core store has no unset).
+        await api("/api/ws/" + encodeURIComponent(currentWs()) + "/env", {
+          method: "POST",
+          body: JSON.stringify({ key: k, value: "" }),
+        });
+        toast(k + " cleared (empty string)");
+        loadEnv();
+      } catch (e) { showError(e); }
+    };
+  });
+}
+
+$("env-refresh").onclick = () => loadEnv().catch(showError);
+$("env-set-btn").onclick = async () => {
+  const k = $("env-new-key").value.trim();
+  if (!k) { toast("key required"); return; }
+  clearError();
+  try {
+    await api("/api/ws/" + encodeURIComponent(currentWs()) + "/env", {
+      method: "POST",
+      body: JSON.stringify({ key: k, value: $("env-new-value").value }),
+    });
+    $("env-new-key").value = "";
+    $("env-new-value").value = "";
+    toast("set " + k);
+    loadEnv();
+  } catch (e) { showError(e); }
+};
+
+// ---- run console ---------------------------------------------------------------------------
+// Tokenize an argv line the way a shell would split words: whitespace
+// separates tokens; single/double quotes group them. NO shell execution
+// happens here or server-side — tokens become a JSON list for the core.
+function tokenizeArgv(line) {
+  const tokens = [];
+  let cur = "", has = false, q = null;
+  for (const ch of line) {
+    if (q) {
+      if (ch === q) { q = null; } else { cur += ch; }
+    } else if (ch === '"' || ch === "'") {
+      q = ch; has = true;
+    } else if (/\s/.test(ch)) {
+      if (has || cur) { tokens.push(cur); cur = ""; has = false; }
+    } else {
+      cur += ch; has = true;
+    }
+  }
+  if (has || cur) tokens.push(cur);
+  return tokens;
+}
+
+function renderArgvPreview() {
+  const toks = tokenizeArgv($("run-argv").value);
+  $("run-argv-preview").innerHTML = toks.length
+    ? toks.map((t, i) => "<span class='argv-chip" + (i === 0 ? " argv0" : "") + "'>" + esc(t) + "</span>").join("")
+    : "—";
+}
+$("run-argv").addEventListener("input", renderArgvPreview);
+$("run-argv").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); $("run-btn").onclick(); }
+});
+
+function renderRunResult(out) {
+  const badge = out.timed_out
+    ? "<span class='badge warn'>timeout</span>"
+    : (out.exit_code === 0 ? "<span class='badge ok'>exit " + out.exit_code + "</span>"
+                           : "<span class='badge fail'>exit " + out.exit_code + "</span>");
+  let html = "<div class='result-meta'>" + badge +
+    "<span class='hint'>duration " + out.duration_ms + " ms</span>" +
+    (out.truncated ? "<span class='badge warn'>output truncated</span>" : "") +
+    "<span class='hint'>" + esc(out.argv.join(" ")) + "</span></div>";
+  html += "<div class='hint' style='margin:2px 0'>stdout</div><pre class='out-pre'>" + esc(out.stdout || "(empty)") + "</pre>";
+  html += "<div class='hint' style='margin:2px 0'>stderr</div><pre class='out-pre'" + (out.stderr ? " style='color:var(--err-text)'" : "") + ">" + esc(out.stderr || "(empty)") + "</pre>";
+  $("run-result").innerHTML = html;
+}
+
+$("run-btn").onclick = async () => {
+  const ws = currentWs();
+  if (!ws) { toast("select a workspace"); return; }
+  const tokens = tokenizeArgv($("run-argv").value);
+  if (!tokens.length) { toast("nothing to run — enter argv tokens"); return; }
+  clearError();
+  $("run-btn").disabled = true;
+  try {
+    const out = await api("/api/ws/" + encodeURIComponent(ws) + "/run", {
+      method: "POST",
+      body: JSON.stringify({ command: tokens, timeout_s: parseInt($("run-timeout").value, 10) || 60 }),
+    });
+    renderRunResult(out);
+  } catch (e) {
+    showError(e);
+    $("run-result").innerHTML = "<div class='empty'>command refused — see the error above</div>";
+  } finally {
+    $("run-btn").disabled = false;
+  }
+};
+
+function renderPolicy() {
+  const allow = state.policy.allowlist || [];
+  const deny = state.policy.denylist || [];
+  $("policy-allow").innerHTML = allow.length
+    ? allow.map((b) => "<span class='chip'>" + esc(b) + "</span>").join("")
+    : "<span class='hint'>empty allowlist — nothing runs</span>";
+  $("policy-deny").innerHTML = deny.length
+    ? deny.map((b) => "<span class='chip deny'>" + esc(b) + "</span>").join("")
+    : "<span class='hint'>empty denylist</span>";
+  $("policy-foot").textContent = "allow " + allow.length + " binaries · deny " + deny.length +
+    " · run cap " + fmtBytes(state.caps.max_output_bytes || 0) + "/stream" +
+    " · write cap " + fmtBytes(state.caps.max_file_bytes || 0);
+}
+
+// ---- audit ---------------------------------------------------------------------------------
+function renderAudit(data) {
+  const events = data.events || [];
+  $("audit-meta").textContent = "showing last " + data.n_shown + " of " + data.n_total + " entries";
+  if (!events.length) { $("audit-table").innerHTML = "<div class='empty'>no audit entries yet</div>"; return; }
+  let html = "<table class='grid'><thead><tr><th style='width:170px'>ts</th><th style='width:170px'>event</th><th style='width:150px'>workspace</th><th>detail</th></tr></thead><tbody>";
+  for (const ev of events.slice().reverse()) {  // newest first
+    const detail = Object.assign({}, ev);
+    delete detail.ts; delete detail.event; delete detail.workspace;
+    html += "<tr><td>" + esc(ev.ts || "") + "</td><td>" + esc(ev.event || "") + "</td><td>" + esc(ev.workspace || "") + "</td>" +
+      "<td class='wrap'>" + esc(JSON.stringify(detail)) + "</td></tr>";
+  }
+  html += "</tbody></table>";
+  $("audit-table").innerHTML = html;
+}
+
+async function loadAudit() {
+  $("audit-table").innerHTML = "<div class='loading'>loading…</div>";
+  clearError();
+  try {
+    renderAudit(await api("/api/audit?n=" + ($("audit-n").value || "200")));
+  } catch (e) {
+    $("audit-table").innerHTML = "<div class='empty'>" + esc(e.message) + "</div>";
+  }
+}
+$("audit-refresh").onclick = loadAudit;
+$("audit-n").onchange = loadAudit;
+
+// ---- status + tabs + theme ------------------------------------------------------------------
+async function refreshStatus() {
+  try {
+    const data = await api("/api/status");
+    $("status-dot").className = "dot ok";
+    $("status-text").textContent = "connected";
+    $("ws-root").textContent = "root: " + data.workbench;
+    state.policy = data.policy || {};
+    state.caps = data.caps || {};
+    renderPolicy();
+  } catch (e) {
+    $("status-dot").className = "dot err";
+    $("status-text").textContent = "offline";
+  }
+}
+
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("pane-files").classList.toggle("hidden", tab !== "files");
+  $("pane-env").classList.toggle("hidden", tab !== "env");
+  $("pane-run").classList.toggle("hidden", tab !== "run");
+  $("pane-audit").classList.toggle("hidden", tab !== "audit");
+  // Lazy-load the heavier views on first open.
+  if (tab === "env" && !state.envLoaded) { state.envLoaded = true; loadEnv(); }
+  if (tab === "audit" && !state.auditLoaded) { state.auditLoaded = true; loadAudit(); }
+}
+document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+
+function initThemeToggle() {
+  const btn = $("theme-toggle");
+  const sync = () => {
+    const dark = document.documentElement.dataset.theme !== "light";
+    btn.textContent = dark ? "☀️" : "🌙";
+    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
+  };
+  btn.onclick = () => {
+    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("workbench-theme", t); } catch (e) { /* ignore */ }
+    sync();
+    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
+  };
+  sync();
+}
+
+initThemeToggle();
+renderArgvPreview();
+refreshStatus();
+loadWorkspaces(false).catch(showError);
+</script>
+</body>
+</html>

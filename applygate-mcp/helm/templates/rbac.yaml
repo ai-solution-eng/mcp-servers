@@ -1,0 +1,83 @@
+{{- if .Values.rbac.create }}
+{{- if .Values.serviceAccount.create }}
+# Service account the server runs as — everything the server does against
+# the API is this identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+{{- end }}
+---
+# RBAC FOR A WRITER — read this before extending:
+#
+# The Role is NAMESPACED-SCOPED BY CONSTRUCTION: a Role + RoleBinding in the
+# release namespace can never grant access outside it, no matter how broad
+# the verbs/resources below are. NEVER bind ClusterRoles (or create
+# ClusterRoleBindings) for this server — cluster-wide write RBAC is exactly
+# what applygate-mcp exists to prevent.
+#
+# PCAI DEPLOYMENT NOTE: this release's identity can only create RBAC in its
+# OWN namespace. Writes into OTHER namespaces (mm-rag, sqlhandler, …) are
+# enabled by the ONE-TIME bootstrap manifest at
+# helm/local/rbac-bootstrap.se-g2.yaml — applied interactively by an admin
+# with god rights over those namespaces (kubectl apply -f …), NOT by this
+# release. The server's namespace policy (APPLYGATE_ALLOWED_NAMESPACES) must
+# stay a subset of the namespaces that bootstrap covers; a namespace in the
+# policy without a bootstrap Role means the tool's policy passes but the API
+# answers 403.
+#
+# Resource list mirrors the server's kind allowlist (core "" group + apps +
+# batch + networking + policy + autoscaling apiGroups). Extend per site ONLY
+# after the same kinds exist in the server's registry.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.deployment.name }}-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+  # core (apiGroup "")
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts", "pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # apps
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # batch
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # networking.k8s.io
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # policy
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # autoscaling
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-writer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ .Values.deployment.name }}-writer
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

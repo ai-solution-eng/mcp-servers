@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logsearch-mcp"
+version = "0.1.4"
+description = "LogSearch MCP Server — read-only, namespace-scoped Kubernetes pod-log search (fan-out regex, time bounds, provenance, caps) over MCP"
+requires-python = ">=3.10"
+keywords = ["mcp", "kubernetes", "logs", "observability", "model-context-protocol"]
+
+dependencies = [
+    "mcp>=2.0.0",
+    "kubernetes>=29.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.27.0",
+]
+
+[project.scripts]
+logsearch-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "webui"]

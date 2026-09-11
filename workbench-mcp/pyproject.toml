@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workbench-mcp"
+version = "0.1.2"
+description = "Workbench MCP Server — persistent per-agent scratch workspaces: files, env, bounded command execution on a PVC"
+requires-python = ">=3.10"
+keywords = ["mcp", "workbench", "workspace", "persistence", "model-context-protocol"]
+
+dependencies = [
+    "mcp>=2.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.27.0",
+]
+
+[project.scripts]
+workbench-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "webui"]

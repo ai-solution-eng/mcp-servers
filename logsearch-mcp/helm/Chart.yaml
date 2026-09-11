@@ -1,0 +1,23 @@
+# logsearch-mcp — read-only, namespace-scoped Kubernetes pod-log search over
+# MCP (fan-out regex search, single-pod log fetch, match counts) for PCAI.
+apiVersion: v2
+name: logsearch-mcp
+description: >-
+  LogSearch MCP Server — read-only, namespace-scoped Kubernetes pod-log
+  search over MCP: fan-out regex search with provenance and caps, single-pod
+  log fetch (incl. previous/crashed container), per-pod match counts.
+type: application
+version: 0.1.4
+appVersion: "v0.1.4"
+keywords:
+  - mcp
+  - kubernetes
+  - logs
+  - observability
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Prefer: Slack

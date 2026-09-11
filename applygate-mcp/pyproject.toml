@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "applygate-mcp"
+version = "0.1.4"
+description = "applygate-mcp — governed Kubernetes write-path MCP: allowlisted server-side apply with plan/confirm semantics, default-deny namespaces, kind allowlist and a JSONL audit trail"
+requires-python = ">=3.10"
+keywords = ["mcp", "kubernetes", "server-side-apply", "gitops", "hpe", "pcai"]
+
+dependencies = [
+    "mcp>=2.0.0",
+    "kubernetes>=29.0.0",
+    "PyYAML>=6.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.27.0",
+]
+
+[project.scripts]
+applygate-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "webui"]

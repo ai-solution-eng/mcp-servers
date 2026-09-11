@@ -1,6 +1,6 @@
 # Prometheus MCP server — thin read-only client over the Prometheus HTTP API.
 # NOTE: pin the base image by digest for production builds; this tag moves.
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

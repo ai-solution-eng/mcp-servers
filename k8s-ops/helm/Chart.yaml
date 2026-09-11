@@ -8,8 +8,8 @@ description: >-
   namespace governance and an HPE ops console over MCP 2.0, behind the
   PCAI Istio gateway.
 type: application
-version: 0.3.0
-appVersion: "v0.3.0"
+version: 0.3.1
+appVersion: "v0.3.1"
 keywords:
   - mcp
   - kubernetes

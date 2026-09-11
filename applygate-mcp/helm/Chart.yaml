@@ -1,0 +1,21 @@
+# applygate-mcp — the governed WRITE half of the fleet's Kubernetes story:
+# allowlisted server-side apply with plan/confirm semantics, for PCAI.
+apiVersion: v2
+name: applygate-mcp
+description: >-
+  applygate-mcp — governed Kubernetes write-path MCP: server-side apply into
+  allowlisted namespaces with plan/confirm semantics, kind allowlist,
+  default-deny namespace policy and a JSONL audit trail, behind the PCAI
+  Istio gateway.
+type: application
+version: 0.1.4
+appVersion: "v0.1.4"
+keywords:
+  - mcp
+  - kubernetes
+  - server-side-apply
+  - gitops
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

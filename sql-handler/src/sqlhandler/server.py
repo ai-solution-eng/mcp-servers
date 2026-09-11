@@ -90,9 +90,7 @@ def _dispatch_tool(name: str, args: dict) -> tuple[str, bool]:
             return describe_table(str(args.get("table", ""))), False
         elif name == "profile_table":
             cols = args.get("columns")
-            col_list = (
-                [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
-            )
+            col_list = [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
             return profile_table(str(args.get("table", "")), col_list), False
         elif name == "search_tables":
             return search_tables(str(args.get("query", ""))), False
@@ -222,8 +220,7 @@ _TOOLS = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Optional max number of rows to return. Default: capped by "
-                        "SQLHANDLER_MAX_ROWS (1000)."
+                        "Optional max number of rows to return. Default: capped by SQLHANDLER_MAX_ROWS (1000)."
                     ),
                 },
                 "output_format": {
@@ -237,7 +234,7 @@ _TOOLS = [
                 "params": {
                     "description": (
                         "Optional bind parameters: an object for named $placeholders "
-                        "(e.g. {\"status\": \"open\"}) or an array for positional ?. "
+                        '(e.g. {"status": "open"}) or an array for positional ?. '
                         "Keeps reusable query templates injection-safe."
                     ),
                 },
@@ -415,12 +412,22 @@ def list_tables() -> str:
             lines = ["No tables found in the configured data source."]
         else:
             lines = ["Tables:"]
+            n_virtual = 0
             for t in tables:
                 # Catalog descriptions annotate the list when present (compact:
                 # name first, description after an em dash), so agents can pick
                 # the right table without a describe round-trip per candidate.
                 desc = handler.table_description(t)
-                lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
+                if t.format == "virtual":
+                    n_virtual += 1
+                    lines.append(f"  - {t.name} (VIRTUAL)" + (f" — {desc}" if desc else ""))
+                else:
+                    lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
+            if n_virtual:
+                lines.append(
+                    f"  ({n_virtual} VIRTUAL table{'s' if n_virtual != 1 else ''} — computed on the fly "
+                    "from their semantic-catalog definitions; query them like any other table)"
+                )
         # Attached external databases (read-only): listed with fully-qualified
         # names so agents can address them in run_sql / describe_table
         # directly. Best-effort — a database that is down must not fail the
@@ -430,8 +437,7 @@ def list_tables() -> str:
                 lines.append("")
                 if db.get("error"):
                     lines.append(
-                        f"Attached database {db['name']} ({db['type']}, {db['uri']}): "
-                        f"unavailable — {db['error']}"
+                        f"Attached database {db['name']} ({db['type']}, {db['uri']}): unavailable — {db['error']}"
                     )
                     continue
                 lines.append(
@@ -455,6 +461,8 @@ def describe_table(table: str) -> str:
         handler = _handler()
         info = handler.describe_table(table)
         lines = [f"Table: {info['table']}", f"URI: {info['uri']}"]
+        if info.get("virtual"):
+            lines.append("Kind: VIRTUAL — computed on the fly from its semantic-catalog definition")
         if info.get("description"):
             lines.append(f"Description: {info['description']}")
         if info.get("aliases"):
@@ -481,8 +489,7 @@ def profile_table(table: str, columns: list[str] | None = None) -> str:
                 f"Rows: {p['n_rows']}"
                 + (
                     f" (profiled {p['profiled_rows']}, capped by SQLHANDLER_PROFILE_MAX_ROWS)"
-                    if p.get("profile_max_rows", 0) > 0
-                    and p.get("profiled_rows") == p.get("profile_max_rows")
+                    if p.get("profile_max_rows", 0) > 0 and p.get("profiled_rows") == p.get("profile_max_rows")
                     else ""
                 )
             )

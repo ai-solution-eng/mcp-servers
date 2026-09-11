@@ -741,6 +741,10 @@ tables:
 
 Keys match the logical `schema/name` path (a bare name or the source-qualified name also work). The file is hot-reloaded on change (cached describes are invalidated so new wording appears immediately); a missing/broken file never breaks queries.
 
+#### Virtual tables — catalog entries with a SQL `definition`
+
+A catalog entry keyed by a clean bare identifier that carries a `definition` (a single `SELECT`/`WITH` query) becomes a **virtual table**: listed with a `VIRTUAL` badge in `list_tables` and the Data Explorer, describable (schema derived from the definition itself, docs merged on top), searchable by its aliases, and queryable like any other table — constructed on the fly, at query time, as a view over the base tables its definition names. Nothing is stored; user filters still push down into the physical scans, and definitions compose (a virtual table may build on another). Definitions must be a single read-only statement in the engine's DuckDB dialect (`iff(...)` is provided as a compat macro; see [`docs/semantic-catalog.md`](docs/semantic-catalog.md), including a full Snowflake→DuckDB port from Omnilife in [`docs/examples/omnilife-catalog.yaml`](docs/examples/omnilife-catalog.yaml)). Storage wins on name collisions; invalid definitions are dropped with a warning, never breaking the catalog.
+
 #### Upload through the UI / API (no file access needed)
 
 The web UI's **Semantic catalog** panel uploads a `.json`/`.yaml` file (or accepts pasted text) straight from the browser; the same operations are available as JSON API endpoints for scripts:

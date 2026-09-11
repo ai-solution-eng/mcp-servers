@@ -1,0 +1,42 @@
+{{- if .Values.ezua.enabled }}
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: {{ .Values.deployment.name }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    hpe-ezua/app: {{ .Values.deployment.appName }}
+    hpe-ezua/type: vendor-service
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required !" }}
+  http:
+    # MCP clients: streamable-http (JSON responses, stateless) at /mcp ->
+    # MCP server (9101). This is the only route agents use.
+    - match:
+        - uri:
+            prefix: /mcp
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    # Everything else: the HPE-branded log-search web console at / (+ its
+    # /api/* JSON endpoints, same seams/policy/caps as the MCP tools) when
+    # webui.enabled, plus /health and /healthz — all served by the same
+    # Starlette app. Route to the same service so the root doesn't 404 at
+    # the edge. Stateless MCP means any replica can answer any path.
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+{{- end }}
