@@ -1,0 +1,120 @@
+# workbench-mcp — values for a customer HOSTED-TRIAL environment
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document for the PCAI Helm Values editor. Adjust the
+# '# SITE:' lines, then apply.
+# Secret-free by construction: nothing here needs credentials. If your PCAI
+# build resolves ${DOMAIN_NAME} in ezua values, the placeholders below work as
+# pasted; otherwise replace them with the literal cluster domain — an
+# unresolved placeholder registers a gateway host that matches nothing.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: workbench-mcp
+  appName: workbench-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# repository/tag/pullPolicy are release-managed — leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/workbench-mcp
+  tag: v0.1.2
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Web UI -------------------------------------------------------------------------------
+# Read/write, unauthenticated at the pod — keep on only where the gateway
+# enforces authn (the ezaf-gateway VirtualService below).
+webui:
+  enabled: true
+
+# -- Workbench configuration --------------------------------------------------------
+workbench:
+  # Root directory holding all workspaces — MUST match persistence.mountPath.
+  root: /data
+  # argv[0] allowlist for run_command (comma-separated); no shells by design.
+  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  # Hard deny (WINS over the allowlist): network/escalation binaries.
+  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
+  # Per-command timeout bounds (seconds).
+  execTimeoutDefault: 60
+  execTimeoutMax: 600
+  # write_file cap (bytes, 8 MiB).
+  maxFileBytes: 8388608
+  # stdout/stderr cap per run_command (bytes, 200 KiB).
+  maxOutputBytes: 204800
+  # Max entries per list_files response.
+  maxListEntries: 500
+  logLevel: INFO
+
+# -- HPE corporate proxy --------------------------------------------------------------------------
+# SITE: off unless the trial cluster sits behind the HPE corporate proxy —
+# when true, proxy env passes through to run_command children so `pip` works.
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- Corporate MITM CA ---------------------------------------------------------------------------
+# Off unless hpe_proxies is true and pip/requests must trust the MITM proxy
+# (requires the ezaf-root-ca ConfigMap in the release namespace).
+caCert:
+  enabled: false
+  configMap: "ezaf-root-ca"
+  configMapKey: "ezaf-root-ca.crt"
+
+# -- Kyverno vendor-label policy -------------------------------------------------------------------
+# Enable only where the trial platform enforces the hpe-ezua/* vendor labels.
+kyverno:
+  enabled: false
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9103
+  targetPort: 9103
+
+# -- Resources (modest: a scratch pad, not a compute node) -------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- Security context -----------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+# -- Persistence ---------------------------------------------------------------------
+# Workspaces survive pod restarts. RWX so every replica sees the same state;
+# single-replica trials without an RWX class can use ReadWriteOnce with
+# replicaCount: 1.
+# SITE: shrink for a trial if 10Gi is more scratch than the tenant needs.
+persistence:
+  enabled: true
+  size: 10Gi
+  mountPath: /data
+  accessModes:
+    - ReadWriteMany
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# SITE: gateway exposure. The /mcp timeout is generous because run_command can
+# legitimately run to its max (600 s default).
+ezua:
+  enabled: true   # SITE: deploy the VirtualService
+  # SITE: current PCAI builds resolve ${DOMAIN_NAME} in ezua values; if yours
+  # does not, replace both placeholders with the literal cluster domain.
+  domainName: ${DOMAIN_NAME}   # informational only — no template reads it
+  virtualService:
+    endpoint: workbench-mcp.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s

@@ -1428,7 +1428,7 @@ def _provision_exec_rbac(patterns=None) -> str:
         if e.status == 404:
             return (
                 f"RBAC provisioning: template ClusterRole '{EXEC_TEMPLATE_ROLE}' "
-                "is missing — apply k8s-mcp-2-0-server.yaml (see DEPLOYMENT.md)"
+                "is missing — apply k8s-mcp-2-0-server.yaml (see documentation/DEPLOYMENT.md)"
             )
         return f"RBAC provisioning: cannot read template ClusterRole: {e.reason}"
 

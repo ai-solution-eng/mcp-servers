@@ -1,0 +1,141 @@
+# searxng-mcp — SE-G2 lab cluster values (values-examples, secret-free).
+# Cluster: pcai-se-ai-application.hst.rdlabs.hpecorp.net (HPE network —
+# corporate proxy required; browser sidecar + MITM CA enabled).
+# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
+# Paste-ready: this file alone is the full values document (helm deep-merges
+# it over identical chart defaults; PCAI's values editor replaces the chart's
+# bundled values.yaml entirely, so every key must be present here).
+
+# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
+# SearXNG sidecar, for PCAI (HPE Ezmeral Unified Analytics). The
+# VirtualService root serves the SearXNG web UI; /mcp routes to the MCP
+# server (streamable-http + SSE) through the PCAI Istio gateway.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: searxng-mcp
+  appName: searxng-mcp
+  replicaCount: 1
+
+# -- Images ------------------------------------------------------------------------
+image:
+  # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
+  # tags) — a stale default is how an "old MCP + new sidecar" pod happens.
+  repository: ghcr.io/ai-solution-eng/searxng-mcp
+  tag: v1.2.2
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE. Public packages (the
+# ddgs-mcp convention) pull anonymously. Create with:
+#   kubectl create secret docker-registry ghcr-pull -n searxng-mcp \
+#     --docker-server=ghcr.io --docker-username=<gh-user> \
+#     --docker-password=<gh-PAT-with-read:packages>
+imagePullSecrets: []
+
+# Bundled SearXNG sidecar.
+searxng:
+  image:
+    repository: docker.io/searxng/searxng
+    # Pinned to the dated tag that Docker Hub 'latest' resolved to when the
+    # chart was updated — a mutable 'latest' tag would give different images
+    # per node/restart. Refresh the pin by editing the tag and re-applying.
+    tag: "2026.9.8-3fdc6d753"
+    pullPolicy: IfNotPresent
+  # SITE: session/crypto secret — MUST be replaced for any real deployment
+  # (e.g. openssl rand -hex 32). This example file never carries a real one.
+  secretKey: "<SECRET_KEY>"
+  # SITE: public base URL of the SearXNG UI (rendered into settings.yml
+  # server.base_url); set the literal https://<endpoint>/ for correct UI links.
+  baseUrl: "https://searxng-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net/"
+  # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
+  language: "en-US"
+  # Engines to disable via settings.yml (top-level engines key). Default: []
+  # — every default SearXNG engine stays enabled. SearXNG auto-suspends
+  # engines that fail repeatedly and the search tool reports per-query which
+  # engines did not respond; only hard-disable one that is consistently dead
+  # on the site's network (e.g. startpage behind the HPE proxy).
+  disabledEngines: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9090        # MCP server (streamable-http + SSE at /mcp)
+  targetPort: 9090
+  searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
+
+# -- Resources (MCP container) ----------------------------------------------------------------
+resources:
+  requests:
+    cpu: 200m
+    memory: 200Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- Headless-browser sidecar (optional) ----------------------------------------------------------
+# SITE: enabled on SE-G2 — fetch_content can render JS-only pages and take
+# screenshots. The image is built from ./browser/Dockerfile (Playwright
+# Chromium headless shell) and must be pushed before enabling.
+browser:
+  enabled: true
+  image:
+    repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
+    tag: v1.2.2
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # Corporate MITM CA: the entrypoint installs *.crt files from this
+  # ConfigMap into the container trust store at startup (Chromium does not
+  # honor SSL_CERT_FILE / NODE_EXTRA_CA_CERTS). The ConfigMap must exist in
+  # the release namespace — copy the cluster-wide ezaf-root-ca if needed.
+  caCert:
+    # SITE: on for SE-G2 — Chromium needs the corporate MITM CA to trust
+    # https fetches through the proxy.
+    enabled: true
+    configMap: "ezaf-root-ca"
+  # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
+  extraArgs: ""
+
+# -- Environment ------------------------------------------------------------------------------------
+env:
+  - name: SEARXNG_URL
+    value: "http://localhost:8080"
+
+# -- HPE corporate proxy -------------------------------------------------------------------------------
+# SITE: ON for SE-G2 — this cluster has no direct internet egress: SearXNG
+# engine requests and fetch_content must go through the corporate proxy.
+# When true this configures BOTH: env proxies for the MCP container
+# (fetch_content) and SearXNG's outgoing.proxies (engine requests).
+hpe_proxies: true
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
+# SITE: literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
+ezua:
+  enabled: true
+  domainName: "pcai-se-ai-application.hst.rdlabs.hpecorp.net"   # informational only — no template reads it
+  virtualService:
+    # SITE: literal host for SE-G2. Root of this host serves the normal
+    # SearXNG web page; /mcp is routed to the MCP server (streamable-http + SSE).
+    endpoint: "searxng-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  authorizationPolicy:
+    enabled: true
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

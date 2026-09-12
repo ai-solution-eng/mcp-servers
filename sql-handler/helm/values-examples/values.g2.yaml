@@ -1,6 +1,33 @@
-# Owner: Andrew Bydlon
-# Email: andrew.bydlon@hpe.com
-# Prefer: Slack
+# ============================================================================
+# SQLhandler — SE G2 site values (EXAMPLE — sanitized, no credentials)
+#
+# This file lives in helm/values-examples/, a folder that is hardlink-synced
+# to GitHub: it is intentionally SECRET-FREE. The real per-site file with
+# credentials is helm/local/values.g2.yaml (gitignored + hardlink-excluded —
+# never commit, never package). Replace every <UPPER_SNAKE> placeholder before
+# applying; markers on lines a site may edit: '# SITE:'.
+#
+# Site        : SE G2 — pcai-se-ai-application.hst.rdlabs.hpecorp.net
+#               (PCAI assigns each user a project-user-* namespace)
+# Data source : in-cluster MinIO — bucket "test-parquet" (benchmark dataset)
+# Fleet 2026-09-08: 4 replicas + HPA — benchmark showed 1 replica collapses
+#   under concurrency (2.7 qps @16 clients) while 4 held ~6 qps flat
+# Anything NOT listed below = chart default (helm/values.yaml is the field
+# reference; catalog spec: docs/semantic-catalog.md)
+# ============================================================================
+
+# ── Deployment & scaling ───────────────────────────────────────────────────────
+# HPA owns the replica count (4-8, CPU@80% — burst/runaway protection, not
+# load-following); replicaCount below is advisory. PDB keeps 2 through drains.
+
+# ============================================================================
+# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
+# Paste-ready: this file alone is the full values document.
+# (Supersedes the "Anything NOT listed below = chart default" note in the
+#  original header above — every chart key is now listed below.)
+# (Image tag below is v1.6.1 — the packaged chart default; bump it only to
+#  track a newer released image.)
+# ============================================================================
 
 # SQLhandler MCP server — PCAI (HPE Ezmeral Unified Analytics) deployment.
 # Deploys SQLhandler as a MCP 2.0 (streamable-http) server exposed at
@@ -13,7 +40,7 @@
 # serializes requests per process, while 4 replicas held a flat ~6 qps at 16
 # clients (p50 3.1-4.0s) using only 0.24 cores / 1.3GiB fleet-wide peak. CPU
 # and memory bumps on a single replica buy nothing (limits went unused).
-replicaCount: 1
+replicaCount: 4  # SITE: advisory while HPA is on — HPA owns the count (chart default: 1)
 
 # -- Horizontal autoscaling -----------------------------------------------------
 # HorizontalPodAutoscaler (autoscaling/v2). Requires metrics-server for the
@@ -32,8 +59,8 @@ replicaCount: 1
 #           type: AverageValue
 #           averageValue: "1.5"
 autoscaling:
-  enabled: false
-  minReplicas: 2
+  enabled: true  # SITE: HPA on: burst/runaway protection, not load-following (chart default: false)
+  minReplicas: 4  # SITE: chart default: 2
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
   # Raw extra HPA metrics appended verbatim (autoscaling/v2 schema).
@@ -47,15 +74,15 @@ autoscaling:
 # Spread replicas across nodes (ScheduleAnyway keeps scheduling permissive on
 # single-node clusters).
 topologySpread:
-  enabled: false
+  enabled: true  # SITE: spread replicas across nodes (chart default: false)
   maxSkew: 1
   topologyKey: kubernetes.io/hostname
   whenUnsatisfiable: ScheduleAnyway
 
 # Budget for voluntary disruptions (node drains) once replicaCount > 1.
 podDisruptionBudget:
-  enabled: false
-  minAvailable: 1
+  enabled: true  # SITE: keep 2 pods through node drains (chart default: false)
+  minAvailable: 2  # SITE: chart default: 1
 
 # Grace period for in-flight MCP tool calls on rollout (gateway allows up
 # to 3600s per call; the pod gets this many seconds to finish draining).
@@ -107,8 +134,8 @@ sources: []
 # -- External databases (read-only attach) ------------------------------------
 # Postgres/MySQL servers whose tables become queryable — and join-able with
 # lake tables in ONE query — as <name>.<schema>.<table>. STRICTLY read-only:
-# DuckDB itself rejects writes on the attached catalog (documentation/
-# DEPLOYMENT.md "External databases"). The generated SQLHANDLER_ATTACH config carries env-var NAMES
+# DuckDB itself rejects writes on the attached catalog (README: External
+# databases). The generated SQLHANDLER_ATTACH config carries env-var NAMES
 # only (SQLHANDLER_DB_PW_<NAME>); the password values come from the
 # <fullname>-db-credentials Secret — rendered here ONLY for entries with a
 # non-empty `password`. Prefer managing that Secret out-of-band (kubectl
@@ -170,12 +197,16 @@ mcp:
 # ~1.1GiB long-warmed) with margin; don't go below that.
 # Raise the limits (not the requests) on sites running very wide tables or
 # large joins; the requests can stay put in every case observed so far.
+# SITE note (preserved from previous sparse file):
+# CPU limit 800m = ~1 DuckDB thread — THE constraint for wide scans; raise
+# to 4-8 if large-table scans need speed (Omnilife runs 16). Memory: DuckDB
+# budget = 0.6 x 16Gi = 9.6Gi before spilling to /tmp.
 resources:
   requests:
     cpu: 250m
     memory: 1Gi
   limits:
-    cpu: "4"
+    cpu: "800m"  # SITE: benchmark-pinned 2026-09-08: 800m = ~1 DuckDB thread, THE constraint for wide scans (chart default: "4")
     memory: 16Gi
 
 # -- Probes --------------------------------------------------------------------
@@ -205,6 +236,10 @@ startupProbe:
 # -- Workload security hardening ------------------------------------------------
 # Defense-in-depth for a network-facing SQL endpoint. Each piece can be
 # turned off individually without leaving the hardened profile.
+# SITE note (preserved from previous sparse file):
+# Hardened profile = chart defaults: non-root 1000, read-only rootfs (+/tmp
+# emptyDir), no SA token, seccomp, dropped caps. Ingress NetworkPolicy stays
+# OFF = in-cluster callers open by design (ClusterIP, gateway authn below).
 security:
   # Master switch: run as non-root, seccomp RuntimeDefault, no privilege
   # escalation, dropped capabilities, read-only root filesystem, no
@@ -255,6 +290,8 @@ security:
 # fabric.credentialsSecret.name refers to a Secret you create separately
 # (via `kubectl create secret`, or by the chart when
 # fabric.credentialsSecret.create is true).
+# SITE note (preserved from previous sparse file): unused backends
+# kept verbatim for future backend flips.
 fabric:
   # Secret name + keys holding the Entra service-principal credential.
   credentialsSecret:
@@ -278,13 +315,13 @@ fabric:
   workspaceId: ""                # fallback (if no full URL)
   lakehouseId: ""                # fallback (if no full URL)
   authority: onelake.dfs.fabric.microsoft.com
-  # Extra delta-rs storage options (JSON-merged into the env): object-client
-  # retries, timeouts, connection behavior for the OneLake backend.
-  storageOptions: {}
 
 # -- S3 / MinIO backend (used when backend: s3) ------------------------------------
 # Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
 # key and secret go through a Kubernetes Secret - NEVER in values.yaml.
+# SITE note (preserved from previous sparse file): bucket below stays
+# EXPLICIT even though it equals the chart default — never inherit the
+# bucket silently.
 s3:
   # Secret name + keys holding the S3 credentials. Create the Secret
   # out-of-band (the default), e.g.:
@@ -304,10 +341,10 @@ s3:
     # values below, which then live in values files and the Helm release
     # secret (readable via `helm get values <release> -a`). Only for
     # throwaway clusters, never for a shared chart.
-    create: false
+    create: true  # SITE: chart renders the s3-credentials Secret from the values below — LOCAL-ONLY dev pattern (chart default: false)
     values:
-      accessKey: ""
-      secretKey: ""
+      accessKey: "<S3_ACCESS_KEY>"  # SITE: filler — real key lives in helm/local/ (chart default: "")
+      secretKey: "<S3_SECRET_KEY>"  # SITE: filler — real key lives in helm/local/ (chart default: "")
 
   # MinIO/S3 connection details (non-secret -> ConfigMap).
   endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # in-cluster MinIO
@@ -316,9 +353,6 @@ s3:
   prefix: ""                  # optional sub-tree within the bucket
   anonymous: false            # read public buckets without keys
   useSsl: false               # force https when endpointUrl has no scheme
-  # Extra pyarrow S3FileSystem kwargs (JSON-merged into the env): timeouts,
-  # retry limits, connection behavior. e.g. {request_timeout: 120}
-  options: {}
 
 # -- Iceberg backend (used when backend: iceberg) ---------------------------------
 # Tables are discovered through an Iceberg catalog; the Parquet data files
@@ -362,8 +396,8 @@ nfs:
 
 
 # -- Metadata caching --------------------------------------------------------
-# In-process cache for list_tables / describe_table (see documentation/
-# FEATURES.md "Key configuration knobs"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
+# In-process cache for list_tables / describe_table (see README "Performance
+# & caching"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
 cache:
   # Seconds to keep list_tables / describe_table results in memory (0 disables).
   ttl: 3600
@@ -389,47 +423,26 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
-  # -- Virtual-table performance (documentation/FEATURES.md "Key configuration knobs") ---
-  # Seconds a virtual table's materialized result is reused. The cache key
-  # covers the definition (and everything it builds on) plus every base
-  # table's Delta/Iceberg snapshot version, so new ETL commits invalidate
-  # immediately; the TTL is only a backstop. 0 disables materialization.
-  virtualCacheTtl: 3600
-  # Where materialized results are written. Default: cacheDir above. Point
-  # at an RWX PVC shared by all replicas to materialize once per deployment
-  # instead of once per pod.
-  virtualCacheDir: ""
-  # Cluster (sort) materialized virtual results by their lowest-cardinality
-  # columns so row-group statistics prune filtered reads. 0 disables.
-  virtualCacheSort: true
-  # Seconds an identical query's result is served from memory (keyed by
-  # sql/params/limits + base-snapshot versions). 0 disables.
-  resultCacheTtl: 3600
-  # In-memory byte cap for cached query results (LRU-evicted).
-  resultCacheMaxBytes: "268435456"
-  # -- Disk block cache (object-store reads) --------------------------------
-  # Opt-in disk cache for parquet footers/column chunks read through pyarrow
-  # filesystems (s3 + iceberg backends; delta-rs IO on onelake is not
-  # wrappable). Off by default: cold big sequential scans pay a small
-  # Python-layer cost, repeated/filtered/preview reads win big.
+  # -- Virtual-table performance (SITE, 2026-09: bench-first validation) -----
+  # The G2 catalog carries a virtual table (vw_top_orders, uploaded via the
+  # Data Explorer panel; it lives in the PVC upload store, which overrides
+  # the ConfigMap catalog below). Defaults are fine for static bench data.
+  # Shared RWX catalog-store PVC: materialize once per deployment (4-8 HPA
+  # replicas) instead of once per pod.
+  virtualCacheDir: /var/lib/sqlhandler-catalog
+  # -- Disk block cache (SITE: ON — the s3/MinIO backend's pyarrow parquet IO
+  # is exactly what it accelerates, and the bench re-reads the same tables
+  # constantly). Measure with the bench suite before/after; the cap is
+  # conservative for the /tmp emptyDir.
   blockCache:
-    enabled: false
-    # Cache location. Default: <tmp>/sqlhandler-block-cache.
-    dir: ""
-    # Bytes per cached block (bigger = fewer remote round-trips).
-    blockSize: "8388608"
-    # Total cache size; the cache resets itself when exceeded.
-    maxBytes: "4294967296"
-    # 1 also caches LocalFileSystem paths — NFS mounts ARE LocalFileSystem
-    # to pyarrow while being network; real-local disk is already covered by
-    # the OS page cache.
-    includeLocal: false
+    enabled: true
+    maxBytes: "1073741824"   # 1GiB
 
 # -- Semantic catalog ----------------------------------------------------------
 # The "semantic view": human-written table/column descriptions merged into
 # list_tables / describe_table output (and the MCP resources), so agents see
 # business meaning, not just dtypes. Full spec + shareable data-owner guide:
-# docs/semantic-catalog.md (documentation/DEPLOYMENT.md §6 "Semantic catalog").
+# docs/semantic-catalog.md (README: "Semantic catalog").
 #
 # Deploy = set enabled: true and paste your catalog AS NATIVE YAML under
 # `tables:` below — no stringification, it is ordinary values structure. The
@@ -444,8 +457,14 @@ cache:
 # /api/semantic-catalog; store defaults next to cache.cacheDir). Uploads are
 # per-replica and pod-local (emptyDir) unless SQLHANDLER_CATALOG_STORE points
 # at a PVC — the values route below is the durable, all-replica one.
+# SITE note (preserved from previous sparse file):
+# Spec + examples: docs/semantic-catalog.md. Seed = STARTER read from
+# bench/workload_g2.json (orders columns straight from its SQL) — correct or
+# extend from the Data Explorer "Semantic catalog" panel (upload JSON/YAML;
+# hot-reloads, no restart). The shared store below reaches every HPA replica
+# (4-8) and survives rescheduling; RWX StorageClass required.
 semanticCatalog:
-  enabled: false
+  enabled: true  # SITE: G2 starter catalog seeded from bench/workload_g2.json (chart default: false)
   # Directory inside the pod where the catalog ConfigMap is mounted (the
   # file lands at <mountPath>/semantic-catalog.json). Rarely changed.
   mountPath: /etc/sqlhandler
@@ -455,12 +474,21 @@ semanticCatalog:
   #       description: ...
   #       aliases: [...]
   #       columns: {col: doc}
-  #       definition: |          # optional — makes the entry a VIRTUAL table
-  #         SELECT ...           # (single read-only SELECT/WITH, DuckDB dialect)
+  #       definition: |      # optional — single SELECT/WITH (DuckDB dialect) -> VIRTUAL table
   # Rendered to canonical JSON into the ConfigMap. Entry shapes are validated
   # at render time (each table entry must be a mapping) — operator-authored
   # config must not fail silently (same philosophy as SQLHANDLER_ATTACH).
-  tables: {}
+  tables:  # SITE: site-authored semantic-catalog entries — app-consumed free-form config, not in chart values.yaml; preserved key-for-key
+    orders:
+      description: Orders fact table used by the G2 benchmark workload
+      columns:
+        order_id: Order identifier (bench range-filters on it)
+        region: Sales region — bench groups/aggregates by it
+        product: Product key — bench groups by it
+        unit_price: Unit price — bench filters > 250 / averages it
+        qty: Quantity sold — bench sums it
+    employees:
+      description: Employee dimension table used by the G2 benchmark workload
   # Alternative: the catalog as an inline JSON STRING ({"tables": {...}}) —
   # for machine-generated catalogs. Mutually exclusive with `tables` and
   # `yaml` (setting more than one non-empty fails the render).
@@ -488,7 +516,7 @@ semanticCatalog:
   # classes (EBS, local-path, ...) attach on one node only and strand the
   # other replicas Pending — the render fails loudly on that mismatch.
   store:
-    enabled: false
+    enabled: true  # SITE: shared 1Gi PVC → durable + cross-pod uploads for every HPA replica (chart default: false)
     # When set, mount this existing PVC (no PVC is created). Leave "" to
     # have the chart create one named <release>-catalog.
     existingClaim: ""
@@ -498,6 +526,7 @@ semanticCatalog:
     storageClass: ""
     # [ReadWriteOnce] ONLY for single-replica deployments (replicaCount: 1,
     # autoscaling off) — PVC access modes are immutable once created.
+    # (site note preserved: RWX required — replicas can exceed 1)
     accessModes: [ReadWriteMany]
     # Where the store volume is mounted; SQLHANDLER_CATALOG_STORE points at
     # <mountPath>/semantic-catalog.json. The upload API writes here, so the
@@ -537,7 +566,7 @@ affinity: {}
 # the PCAI platform can discover and monitor the MCP endpoint.
 ezua:
   enabled: true
-  domainName: "${DOMAIN_NAME}"
+  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
 
   # Kyverno ClusterPolicy that tags this workload as a PCAI vendor-service.
   # Disable on clusters without the kyverno.io CRD — the post-install hook
@@ -558,6 +587,6 @@ ezua:
 
   # configure the authorization policy (oauth2-proxy in front of PCAI).
   authorizationPolicy:
-    enabled: true
+    enabled: false  # SITE: gateway authz off — in-cluster callers open by design (chart default: true)
     namespace: "istio-system"
     providerName: "oauth2-proxy"

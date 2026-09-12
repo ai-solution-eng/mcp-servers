@@ -1,224 +1,131 @@
 # applygate-mcp
 
-**The GOVERNED Kubernetes WRITE-path MCP server.** The fleet's existing K8s
-MCP server is read-only by design — it can look, never touch. This server is
-the deliberate, guarded write half of that story: server-side apply
-(`application/apply-patch+yaml`) of manifests into **allowlisted namespaces**
-with **plan/confirm semantics**, a **kind allowlist**, **default-deny
-namespace policy**, and a **JSONL audit trail**.
+applygate-mcp is a governed Kubernetes **write-path** MCP (Model Context
+Protocol) server: it takes a YAML manifest and applies it to the cluster with
+**server-side apply** — but only after a dry-run plan, only into
+**allowlisted namespaces**, only for **allowlisted namespaced kinds**, and
+only on an explicit per-call confirmation, with every operation appended to a
+JSONL audit trail on a persistent volume. It is the deliberate write half of
+the fleet's read-only Kubernetes MCP story, exposed over MCP 2.0
+(stateless streamable-HTTP at `/mcp`) through the PCAI Istio gateway.
 
-> The guardrails ARE the product. When in doubt the server refuses loudly
-> with a self-describing message that names the knob which would have allowed
-> the operation — and why it is probably still a bad idea.
+**What problem(s) it solves**
 
-MCP 2.0 (stateless, JSON responses) on both stdio and streamable-http.
-
----
+- LLM agents cannot safely touch clusters: the fleet's K8s MCP server is
+  read-only by design, so agents can look but never fix. applygate-mcp is the
+  guarded write path — guardrails are the product, and every refusal is a
+  self-describing message naming the knob that would have allowed the
+  operation (and why it is probably still a bad idea).
+- Uncontrolled `kubectl apply` from an agent is a blast-radius problem:
+  default-deny namespace policy (`namespaces.allowed` empty = nothing
+  writable), a kind allowlist that can only narrow the built-in namespaced
+  registry, hard refusal of `Secret` and all cluster-scoped kinds regardless
+  of configuration, and a hard `confirm_apply` / `confirm_delete` gate.
+- Blind writes are a trust problem: `plan_apply` is ALWAYS a server-side
+  dry-run (`dry_run=All`), so the agent sees the per-document verdict — and
+  the exact refusal text — before anything mutates.
+- Untraceable mutations are an audit problem: one JSONL line per document per
+  operation (`dry-run | applied | deleted | failed | refused`) on a PVC,
+  plus a strictly read-only web console at `/` (plan previews, status,
+  audit tail, effective policy — there are NO apply/delete endpoints, not
+  even gated ones).
+- One bad document silently blocking a multi-doc apply: documents are
+  planned/applied **per document**; each reports its own outcome.
 
 ## Tools
 
-| Tool | Mutates | Guardrails enforced | Contract |
-|---|---|---|---|
-| `plan_apply(namespace, manifest, force=False)` | **never** (always `dry_run=All`) | namespace policy, kind allowlist, manifest hygiene | Per-doc `{kind, name, ok, message}` + `summary`; `readOnlyHint=True`. `force` is accepted for call-site symmetry but can never turn a plan into a mutation. |
-| `apply_manifest(namespace, manifest, confirm_apply=False)` | yes, per doc | confirm gate → namespace policy → manifest hygiene → kind allowlist | Real server-side apply per document (`field_manager=applygate-mcp`); refuses loudly unless `confirm_apply=True`. `readOnlyHint=False, destructiveHint=True`. |
-| `delete_resource(namespace, kind, name, confirm_delete=False)` | yes | confirm gate → namespace policy → kind allowlist | Deletes one allowlisted resource; audit-logged. `destructiveHint=True`. |
-| `get_resource_status(namespace, kind, name)` | never | namespace policy, kind allowlist (same fence as writes) | Status excerpt: Deployment/StatefulSet ready-vs-total replicas, Job succeeded/failed, else raw phase/conditions. `readOnlyHint=True`. |
+All tools return a JSON string; refusals are structured
+`{"ok": false, "refused": true, "error": "<self-describing>"}`.
 
-All tool results are `json.dumps` strings. Refusals are structured JSON:
-`{"ok": false, "refused": true, "error": "<self-describing message>"}`.
-
-### The intended flow
-
-```
-plan_apply(ns, manifest)        # dry-run: what WOULD happen, per doc
-  └─ read the per-doc verdicts
-apply_manifest(ns, manifest, confirm_apply=True)   # only after a clean plan
-get_resource_status(ns, kind, name)                # verify what you applied
-```
-
-Multi-doc manifests are applied **per document**: a bad document never
-silently blocks the good ones — every doc reports its own outcome, and every
-doc (plan, applied, failed, refused) gets its own audit line.
-
-## Guardrail stack (checked on every write, in order)
-
-1. **Namespace policy — DEFAULT-DENY.** `APPLYGATE_ALLOWED_NAMESPACES`
-   unset or empty means **nothing is writable** — the server starts, serves
-   health, and refuses every write loudly. Comma-separated; `fnmatch` globs
-   supported (`team-*`). `APPLYGATE_BLOCKED_NAMESPACES` **always wins** over
-   the allowlist (`kube-system,kube-public,*-system`).
-2. **Kind allowlist — namespaced kinds only.**
-   `APPLYGATE_ALLOWED_KINDS` defaults to `ConfigMap, Service, Deployment,
-   StatefulSet, Job, CronJob, Ingress, ServiceAccount, PodDisruptionBudget,
-   HorizontalPodAutoscaler`. Cluster-scoped kinds (Namespace, ClusterRole,
-   ClusterRoleBinding, PersistentVolume, StorageClass, …) are refused even if
-   someone allowlists them. The env knob can only **narrow** the built-in
-   namespaced-kind registry, never widen it — an allowlisted-but-unknown kind
-   is refused because its scope cannot be proven.
-3. **Secrets never flow through this server.** Kind `Secret` is hard-refused
-   on every tool (plan/apply/delete/status), with a message pointing at
-   out-of-band secret management (`kubectl create secret`, sealed-secrets,
-   external-secrets) — manifest secret values would otherwise end up in
-   audit/log surfaces.
-4. **Manifest hygiene.** Multi-doc YAML (`yaml.safe_load_all`); empty
-   documents rejected (a *trailing* `---` is tolerated as an end-of-docs
-   marker, an empty doc *between* documents is rejected); every doc must
-   carry `apiVersion`, `kind`, `metadata.name`; a doc-level
-   `metadata.namespace` must equal the tool's namespace parameter; caps: **8
-   documents**, **256 KiB**.
-5. **Confirm gates.** Real mutation requires `confirm_apply=True` /
-   `confirm_delete=True` — anything else refuses with instructions.
-6. **Audit trail.** Best-effort JSONL append to `APPLYGATE_AUDIT_FILE`
-   (default `/data/audit.jsonl`), one line per document per operation:
-   `{"ts","tool","namespace","kind","name","dry_run","outcome"}` with
-   `outcome` ∈ `dry-run | applied | deleted | failed | refused`. A broken
-   audit sink never blocks an operation but always screams on stderr.
-
-## Configuration
-
-| Env var | Default | Meaning |
+| Tool | Mutates | Purpose |
 |---|---|---|
-| `APPLYGATE_ALLOWED_NAMESPACES` | *(empty)* | Namespace allowlist, comma-separated, globs OK. **Empty = every write refused (default-deny).** A loud warning prints at startup when empty. |
-| `APPLYGATE_BLOCKED_NAMESPACES` | *(empty)* | Namespace blocklist — always wins over the allowlist. |
-| `APPLYGATE_ALLOWED_KINDS` | `ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler` | Kind allowlist (narrow-only; Secret/cluster-scoped always refused). |
-| `APPLYGATE_AUDIT_FILE` | `/data/audit.jsonl` | JSONL audit sink (mounted volume in the Helm chart). |
+| `plan_apply` | never (always `dry_run=All`) | Validate a manifest and predict the server-side apply — per-doc verdicts; also answers "would this be refused, and why". `force` is accepted for symmetry but can never turn a plan into a mutation. |
+| `apply_manifest` | yes, per doc | The real write: server-side apply each document (`field_manager=applygate-mcp`). Refuses unless `confirm_apply=true`; run `plan_apply` first. |
+| `delete_resource` | yes | Delete one allowlisted, namespaced resource. Refuses unless `confirm_delete=true`. |
+| `get_resource_status` | never | Read-only status excerpt for one resource (Deployment/StatefulSet replica readiness, Job succeeded/failed, else phase + conditions) — verify what you applied. Same namespace/kind fence as the writes. |
 
-## RBAC requirements
+Intended flow: `plan_apply` → read verdicts → `apply_manifest(confirm_apply=true)`
+→ `get_resource_status` to verify.
 
-The Helm chart ships a **Role + RoleBinding in the release namespace** —
-namespaced-scoped by construction (never ClusterRoles), covering the same
-resource surface as the kind allowlist across the `""` (core), `apps`,
-`batch`, `networking.k8s.io`, `policy` and `autoscaling` apiGroups with
-`get/list/watch/create/patch/update/delete`. In-cluster auth uses the pod's
-ServiceAccount (or kubeconfig outside the cluster). To write into more
-namespaces, deploy the chart (or copy the Role) there — do **not** widen the
-identity to cluster scope.
+## Architecture
 
-## Trust model
+A single Python service (FastMCP/Starlette, MCP 2.0 stateless, JSON
+responses) that talks to exactly one backend: the **Kubernetes API server**,
+reached in-cluster with the pod's ServiceAccount via a dynamic client.
+Server-side apply uses `application/apply-patch+yaml` with field manager
+`applygate-mcp`. The chart ships a **namespaced Role + RoleBinding in the
+release namespace only** (never a ClusterRole/ClusterRoleBinding), so the
+release's write identity is namespace-scoped by construction; writes into
+other namespaces need a one-time operator-applied bootstrap Role per target
+namespace (see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)).
+The JSONL audit trail lands on a dedicated PVC. HTTP surface: `/mcp`
+(MCP streamable-HTTP), `/health` + `/healthz`, and — when `webui.enabled` —
+the read-only console at `/` and `/ui` with its `/api/*` JSON endpoints
+(plan, status, audit, policy).
 
-- **Default-deny namespaces**: a fresh deployment without an explicit
-  allowlist is a no-op writer, on purpose — enabling writes is an explicit,
-  auditable values-file act.
-- **Kind allowlist + registry**: the write surface is explicit and
-  narrow-by-default; admission is defense-in-depth (Secret and
-  cluster-scoped refusals fire even on operator misconfiguration).
-- **Plan → apply flow**: the mutating tool demands an explicit
-  `confirm_apply=True`; the plan tool can never mutate regardless of flags.
-- **No Secrets ever**: no secret values are read, written, or deleted.
-- **Audit trail**: every operation (including refusals) leaves a JSONL line
-  on a persistent volume.
-- **HTTP posture**: MCP 2.0 stateless (any replica serves any request, no
-  session state), DNS-rebinding protection disabled per fleet convention —
-  put real gateway auth in front if you expose `/mcp` through the Istio
-  gateway (`ezua.enabled=true`).
+## Deploy on PCAI (HPE Private Cloud AI)
 
-## Run
+Import the packaged chart once into PCAI, then edit the chart's values in the
+PCAI **Helm Values** editor and apply — you never run `helm install` or
+`kubectl apply` for the deployment itself. Every `helm --set a.b=c`
+corresponds 1:1 to a values key. PCAI resolves `${DOMAIN_NAME}` in the
+editor on current builds; if your build does not, substitute the literal
+cluster domain (the chart refuses an un-substituted placeholder only in
+prometheus-mcp, but a wrong host here means the gateway route matches
+nothing).
 
-```bash
-# stdio (default; for local MCP harnesses)
-applygate-mcp
+**Required values** (the chart default is a no-op writer on purpose —
+enabling namespaces is an explicit, auditable act):
 
-# streamable-http (in-cluster)
-applygate-mcp --transport streamable-http --host 0.0.0.0 --port 9102
-#   GET /healthz  -> {"status":"ok","namespaces_enabled":false,...}
-#   POST /mcp     -> MCP 2.0 JSON-RPC (stateless)
+```yaml
+namespaces:
+  allowed: "team-alpha,mcp-demo"     # SITE: writable namespaces (globs OK) — empty = EVERY write refused
+  blocked: "kube-system,kube-public,kube-node-lease"   # SITE: always wins over allowed
+ezua:
+  enabled: true                      # SITE: expose through the PCAI Istio gateway
+  domainName: <your-domain>          # SITE: literal cluster domain
+  virtualService:
+    endpoint: applygate-mcp.<your-domain>   # SITE: /mcp -> MCP server; / -> read-only console
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 120s
 ```
 
-Health endpoints report `namespaces_enabled: false` loudly when the
-allowlist is empty — probes pass, writes don't.
+**Optional values** (chart defaults are sane): `kinds.allowed` (narrow the
+write surface), `webui.enabled` (read-only console), `persistence.*` (audit
+PVC, default 1Gi), `image.*` (repository/tag — kept in lockstep with the
+chart by release tooling), `resources`, `securityContext` /
+`podSecurityContext` / `containerSecurityContext`, `serviceAccount` /
+`rbac.create`, `hpe_proxies` + `proxy.*` (inert here — the k8s API is
+in-cluster), `kyverno.enabled` (vendor-label ClusterPolicy). Complete
+paste-ready documents: [helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml)
+and [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
 
-## Web UI (strictly read-only console)
+## Connect an MCP client
 
-The streamable-http server also serves a self-contained, no-build HPE-branded
-console at `/` (and `/ui`) — the same visual language as the fleet's other
-MCP consoles (green element mark, MetricHPE wordmark, dark default + light
-theme with no-flash init and `localStorage` persistence). A visible banner
-states the trust model: *Read-only console — mutations happen only through
-the MCP tools with explicit confirm flags, behind gateway authn.*
+Any MCP client that speaks streamable-HTTP connects to `/mcp` (stateless —
+no session header needed); humans use the read-only console at `/`:
 
-**THE UI CAN NEVER MUTATE THE CLUSTER.** There are NO `/api` endpoints for
-apply or delete — not even gated ones — and the plan console rides the exact
-`plan_apply` code path, which is always a server-side-apply dry-run
-(`dry_run="All"`). Even a hand-crafted request posting `dry_run: false` /
-`confirm_apply: true` to `/api/plan` cannot flip it: those fields are ignored
-by construction, and the k8s seam only ever receives `dry_run=True`.
-
-| Tab | What it shows |
-| --- | --- |
-| **Plan** | The plan console: paste a manifest, pick a namespace, get the per-document `{kind, name, ok, message}` verdicts the `plan_apply` tool would give (dry-run passed / refused, with the exact refusal text). |
-| **Status** | `get_resource_status` for one kind/name/namespace — same namespace policy + kind gates as the write tools; Deployment/StatefulSet replica summaries, Job counters, conditions. |
-| **Audit** | Tail of the JSONL audit file (last N lines, parsed): every plan, apply, delete, failure and refusal, with the configured file path. The endpoint reads ONLY the configured `APPLYGATE_AUDIT_FILE` — client-selected paths are refused with 400. |
-| **Policy** | The effective namespace allowlist/blocklist + kind allowlist (from the same config functions the tools read), the default-deny state, and the unconditional Secret / cluster-scoped refusal texts — so a human can see exactly why a plan was refused. |
-
-### JSON API (all read-only)
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/status` | Server status, `namespaces_enabled`, field manager, audit path, policy + caps |
-| `GET /api/policy` | Effective allowlist/blocklist/kinds + hard-refusal texts |
-| `POST /api/plan` | Plan console `{"namespace", "manifest"}` — ALWAYS a dry-run; returns the tool's per-doc verdicts |
-| `GET /api/resource_status?namespace=&kind=&name=` | Status excerpt (tool-equivalent, guardrails included) |
-| `GET /api/audit?lines=N` | Last N parsed audit entries — configured path only, traversal refused |
-
-The console is gated by `webui.enabled` (values) → `APPLYGATE_WEBUI_ENABLED`
-(env; unset = on, `false|0|no|off` strips `/`, `/ui` and `/api/*` while `/mcp`
-and the health endpoints keep working). The UI asset is `ui/index.html`,
-copied into `/app/ui` by the Dockerfile; `webui.py` also honors an
-`APPLYGATE_WEBUI_HTML` override.
-
-## Test
-
-```bash
-cd /home/andrew/Code/HPE/mcp_servers/applygate_mcp
-/home/andrew/Code/HPE/SQLhandler/.venv312/bin/python -m pytest tests/ -v
+```json
+{
+  "mcpServers": {
+    "applygate-mcp": {
+      "url": "https://applygate-mcp.<your-domain>/mcp"
+    }
+  }
+}
 ```
 
-The suite (30 guardrail tests + 23 web-console tests) drives the async tools
-via `asyncio.run` and the UI routes via Starlette's `TestClient`, with
-monkeypatched seam fakes — the test venv needs **no `kubernetes` package**;
-only the guardrail logic is under test. Covers: default-deny matrix (empty
-allowlist, globs, blocked-wins), kind allowlist + cluster-scoped + Secret
-hard-refusal, doc/parameter namespace mismatch, multi-doc parsing incl.
-empty-doc rejection, plan-never-mutates, apply confirm gate, delete gates,
-audit JSONL contents, byte/doc caps — plus the console: `/` renders, the plan
-endpoint keeps the seam at `dry_run=True` even against crafted bodies,
-refusals reuse the exact tool strings, the audit endpoint refuses
-path-traversal, the status endpoint honors namespace/kind gates, and
-`webui.enabled=false` removes the UI routes while `/mcp` keeps serving.
+Clients that want the transport spelled out accept `"type": "http"`
+(Claude Code / Claude Desktop) or `"transport": "streamable-http"` (DSH
+profile, opencode). In-cluster consumers can use the service DNS instead:
+`http://applygate-mcp-service.<namespace>.svc.cluster.local:9102/mcp`.
+Put real gateway auth in front of a write-path MCP — this chart ships no
+auth template by design; rely on the ezaf-gateway's SSO/bearer enforcement.
 
-`tests/smoke_check.py` additionally drives the real HTTP app (uvicorn in a
-thread): `/healthz`, the stateless `/mcp` JSON-RPC round-trip, `/` HTML,
-`/api/status`, `/api/plan`, `/api/audit` and the 400 on a path-traversal
-attempt.
+## Documentation
 
-## Helm
-
-```bash
-helm lint helm/
-helm template test helm/
-helm template site helm/ -f helm/local/values.example.yaml   # after filling it in
-```
-
-`values.yaml` ships **default-deny** (`namespaces.allowed: ""`). Site
-overrides go in `helm/local/values.<site>.yaml` (never committed, never
-packaged). The audit PVC (`persistence.enabled=true`, 1Gi) keeps the trail
-across restarts; with persistence disabled an `emptyDir` is mounted instead
-so `readOnlyRootFilesystem` still works (trail lost on restart — labs only).
-
-Fleet-convention blocks: the Owner header, `imagePullSecrets`, the gated
-`hpe_proxies`/`proxy` block (default false — the k8s API is in-cluster and
-covered by the standard NO_PROXY cluster-local entries; `*_PROXY` env is
-wired only when `hpe_proxies=true`), an explanatory comment where `caCert`
-would be (deliberately not wired — in-cluster SA CA, no MITM egress), and an
-optional Kyverno vendor-label ClusterPolicy ported from searxng-mcp
-(`kyverno.enabled`, default false — cluster-scoped, so it never changes the
-default render). The `webui.enabled` flag (default true) ships the read-only
-console and, when `ezua.enabled=true`, routes `/` alongside `/mcp` through
-the gateway.
-
-## Release
-
-```bash
-./automation.sh 0.1.1   # bump → docker buildx --push → helm package → prune
-python3 hardlinker.py --config hardlink_config.json --run   # mirror to pcai-solutions
-```
+| Document | Contents |
+|---|---|
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), ezua/Istio gateway exposure, cross-namespace RBAC bootstrap, upgrading |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | MCP handshake + first tool test, optional operator kubectl checks, troubleshooting |
+| [helm/values-examples/README.md](helm/values-examples/README.md) | What the example values files are, how to use them (PCAI editor or `helm -f`) |

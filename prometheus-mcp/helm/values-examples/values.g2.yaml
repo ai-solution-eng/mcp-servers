@@ -1,0 +1,103 @@
+# prometheus-mcp — values for the SE-G2 lab cluster
+# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document (PCAI's Helm Values editor replaces the
+# chart's bundled values.yaml). Site edits are marked '# SITE:'.
+# Sanitized for publication: no credentials, no personal endpoints — real
+# site values live in helm/local/ (never committed, never packaged).
+#
+# Workflow notes:
+#   * What belongs in '# SITE:' edits: site policy and behavior (URLs,
+#     domains, feature toggles). NEVER versions: the image tag flows from
+#     helm/values.yaml, which release tooling keeps in lockstep — pinning it
+#     here is how tags drift.
+#   * PCAI envsubst-ed ${DOMAIN_NAME} in submitted values before helm runs —
+#     this file uses the literal G2 domain anyway (paste-ready). domainName
+#     itself is informational: no template reads it.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: prometheus-mcp
+  appName: prometheus-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# pullPolicy stays Always on purpose: an early mutable tag was overwritten in
+# the registry, and IfNotPresent would serve a stale cached digest.
+image:
+  repository: ghcr.io/ai-solution-eng/prometheus-mcp
+  tag: v0.4.1
+  pullPolicy: Always
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Prometheus target ------------------------------------------------------------------
+# SITE: kept explicit — the one value that defines what this deployment IS
+# (the in-cluster kube-prometheus-stack service).
+prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+
+# -- GPU tab: NVLink domain grouping ----------------------------------------------
+# Precedence: this override > auto-detection (nvlinkAutodetect) > built-in
+# default (two 4-GPU islands per 8-GPU node). Accepts a JSON string or a
+# native YAML list. Empty/omitted -> fall through to detection/default.
+# SITE: pinned to operator-confirmed hardware truth (two 4-GPU islands per
+# node) while the detector's contrary reading is investigated.
+gpuNvlinkDomains: "[[0,1,2,3],[4,5,6,7]]"
+
+# -- GPU tab: NVLink topology auto-detection ----------------------------------------
+# Two-container DaemonSet on GPU nodes: initContainer runs the host-installed
+# driver's nvidia-smi topo -m; the sidecar pushes
+# nvidia_gpu_nvlink_domain{gpu,domain,peers,hostname} to the pushgateway.
+# One ~0-CPU Running pod per GPU node is the expected steady state; a node
+# whose pod logs failures needs its driver access looked at — the UI keeps
+# working with the default/override grouping regardless.
+nvlinkAutodetect:
+  # SITE: disabled on this cluster (the grouping pin above is authoritative
+  # and no resident detector pods are wanted); chart default is true.
+  enabled: false
+  image: python:3.12-slim
+  privileged: true
+  driverInstallDir: /run/nvidia/driver
+  # Must stay well under the pushgateway's --metric.timetolive=30s.
+  pushInterval: 20
+  pushgatewayUrl: http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+# -- Service exposure ---------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9095
+  targetPort: 9095
+
+# -- Resources --------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# SITE: literal G2 domain (paste-ready). The long MCP timeout is deliberate:
+# wide range queries can run for minutes. domainName is informational only —
+# the gateway host comes from endpoint alone.
+ezua:
+  enabled: true
+  # SITE: literal cluster domain
+  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  virtualService:
+    # SITE: literal host — /mcp -> MCP server (9095); / -> web console
+    endpoint: prometheus-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
+  # rotating-token pain for machine MCP callers is an accepted lab trade;
+  # flipping it on enforces PCAI tokens for this host.
+  authorizationPolicy:
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

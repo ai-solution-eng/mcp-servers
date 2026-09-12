@@ -1,0 +1,88 @@
+# prometheus-mcp — values for a customer HOSTED-TRIAL environment
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document for the PCAI Helm Values editor. Adjust the
+# '# SITE:' lines, then apply.
+# Secret-free by construction (nothing here needs credentials).
+#
+# IMPORTANT: PCAI resolves the ${DOMAIN_NAME} placeholder in submitted values
+# before rendering (every ezua chart relies on this) — keep the placeholders
+# below as-is for PCAI; substitute the literal cluster domain only when
+# render-checking outside PCAI (`helm template`).
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: prometheus-mcp
+  appName: prometheus-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# pullPolicy stays Always on purpose (see helm/values.yaml).
+image:
+  repository: ghcr.io/ai-solution-eng/prometheus-mcp
+  tag: v0.4.1
+  pullPolicy: Always
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Prometheus target ------------------------------------------------------------------
+# Included, not a placeholder: kube-prometheus-stack's service DNS is the same
+# across PCAI deployments (verified on G2). Adjust only if your cluster's
+# Prometheus release name/namespace differs (kubectl get svc -A | grep prom).
+prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+
+# -- GPU tab: NVLink domain grouping ----------------------------------------------
+# Precedence: this override > auto-detection > built-in default (two 4-GPU
+# islands per 8-GPU node). Leave "" to defer to detection/default.
+gpuNvlinkDomains: ""
+
+# -- GPU tab: NVLink topology auto-detection ----------------------------------------
+# DaemonSet on GPU nodes (nvidia.com/gpu.present) that detects the real
+# NVLink islands at node boot. Disable on CPU-only trials or when you pin
+# gpuNvlinkDomains and want no resident pods.
+nvlinkAutodetect:
+  # SITE: false on CPU-only trial clusters; true where GPU nodes exist
+  enabled: false
+  image: python:3.12-slim
+  privileged: true
+  driverInstallDir: /run/nvidia/driver
+  # Must stay well under the pushgateway's --metric.timetolive=30s.
+  pushInterval: 20
+  # SITE: adjust to your cluster's pushgateway service
+  pushgatewayUrl: http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+# -- Service exposure ---------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9095
+  targetPort: 9095
+
+# -- Resources --------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# SITE: none needed — PCAI substitutes ${DOMAIN_NAME} in both values below.
+# (domainName is informational; the gateway host comes from endpoint alone.)
+ezua:
+  enabled: true   # SITE: deploy the VirtualService
+  domainName: ${DOMAIN_NAME}   # informational only — no template reads it
+  virtualService:
+    endpoint: prometheus-mcp.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer). Default off — the
+  # rotating 30-min SSO token is a known pain for machine MCP callers. Flip on
+  # if the trial's trust posture requires token-enforced access.
+  authorizationPolicy:
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

@@ -1,0 +1,112 @@
+# logsearch-mcp — values for the SE-G2 lab cluster
+# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document (PCAI's Helm Values editor replaces the
+# chart's bundled values.yaml). Site edits are marked '# SITE:'.
+# Sanitized for publication: no credentials, no personal namespaces — real
+# site values live in helm/local/ (never committed, never packaged).
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: logsearch-mcp
+  appName: logsearch-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# repository/tag/pullPolicy are release-managed (kept in lockstep with
+# Chart.yaml by the release tooling) — leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/logsearch-mcp
+  tag: v0.1.4
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Namespace policy (LOUD — this is the server's ONLY access control) --------
+# READ-ONLY by design, but pod logs routinely contain sensitive strings
+# (tokens in stack traces, PII, internal hostnames). The namespace policy is
+# the control that bounds what an agent harness can reach.
+#   allowedNamespaces: comma-separated fnmatch globs. EMPTY STRING = ALL
+#   namespaces allowed. Set it EXPLICITLY for anything beyond a lab cluster.
+#   blockedNamespaces: ALWAYS wins over the allowed list.
+logsearch:
+  # SITE: policy kept at the chart default on this lab cluster — empty
+  # allowlist = ALL namespaces readable (read-only server). Tighten for prod:
+  #   allowedNamespaces: "team-a,team-b-*"
+  allowedNamespaces: ""
+  # SITE: punch holes back out of a broad allow-list here
+  blockedNamespaces: ""
+
+# -- Caps (blast-radius limits for agent harnesses) -----------------------------
+# A fan-out search touches up to maxPods pods, tailing maxLinesPerPod lines
+# each, and returns at most maxTotalLines merged matches. These bound both
+# API-server load and the MCP response size (an agent's context window).
+  maxPods: 50
+  maxLinesPerPod: 1000
+  maxTotalLines: 300
+
+# -- Service exposure ---------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9101
+  targetPort: 9101
+
+# -- Web console (fleet pattern: prometheus-mcp's webui) --------------------------------------------
+# The HPE-branded log-search console at / and the /api/* JSON endpoints are a
+# HUMAN front-end over the SAME seams, namespace policy, and caps that back
+# the MCP tools — the UI has no powers the tools don't. false = MCP-only
+# surface (only /health, /healthz, /mcp are served).
+webui:
+  enabled: true
+
+# -- Resources --------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# -- Security ---------------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+# -- RBAC --------------------------------------------------------------------------------------
+# READ-ONLY, deliberately minimal: pods get/list + pods/log get, in the
+# release namespace ONLY (cross-namespace reads need a one-time admin-applied
+# bootstrap — see documentation/DEPLOYMENT.md). No secrets, no exec, no write
+# verbs, no cluster scope.
+rbac:
+  create: true
+
+# -- HPE corporate proxy (fleet convention: searxng-mcp) -----------------------------------------
+# The only network peer is the IN-CLUSTER Kubernetes API, covered by the
+# NO_PROXY cluster-local entries — the proxy env is effectively inert here;
+# it exists for fleet consistency and any future egress need.
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# Deploys the Istio VirtualService through the ezaf-gateway. /mcp is the agent
+# path; the web console rides the root route when webui.enabled. Enabling ezua
+# also renders the fleet's vendor-label Kyverno policy (gated on ezua in this
+# chart).
+# SITE: gateway exposure on — with the literal host (this file must not rely
+# on ${DOMAIN_NAME} resolution).
+ezua:
+  enabled: true   # SITE: deploy the VirtualService on this cluster
+  # SITE: literal domain
+  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  virtualService:
+    # SITE: literal host — /mcp -> MCP server (9101); / -> web console
+    endpoint: logsearch-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 300s

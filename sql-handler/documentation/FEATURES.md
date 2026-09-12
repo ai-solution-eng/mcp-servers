@@ -1,7 +1,24 @@
 # SQLhandler — Features
 
-Fast, direct SQL access to columnar lake data — OneLake/Delta Lake, S3/MinIO Parquet, Delta-on-S3, Iceberg catalogs, and NFS/local directories — exposed as an **MCP server** with a bundled read-only web UI. This document describes the features of the **current stack** (`main` working tree, version **1.0.0**; the last tagged release was 0.8.0 — everything below is the feature wave built as "0.9.0"
-and shipped as 1.0.0, a deliberate version jump for the feature lift, unless marked otherwise).
+Fast, direct SQL access to columnar lake data — OneLake/Delta Lake, S3/MinIO Parquet, Delta-on-S3, Iceberg catalogs, and NFS/local directories — exposed as an **MCP server** (MCP 2.0, stateless streamable-http at `/mcp`) with a bundled read-only web UI and JSON API. This document describes the features of the **current stack** (chart/image **1.6.1**; the 0.9.0→1.0.0 feature wave plus the subsequent 1.1–1.6 additions unless marked otherwise).
+
+---
+
+## Backends & data sources
+
+One engine, four backends (selected by `SQLHANDLER_BACKEND` / the chart's `backend:` value) — they share the same SQL engine, caches, MCP tools, and backend-aware readiness probe; only the `DataProvider` differs:
+
+| Backend | Reads |
+|---|---|
+| `onelake` | Microsoft Fabric OneLake — Delta Lake over ABFS, Entra service principal |
+| `s3` / `minio` | S3-compatible object storage (MinIO/AWS) — Parquet, plus Delta tables via `S3_FORMAT=auto` (`_delta_log` detection, time travel) |
+| `iceberg` | Apache Iceberg tables through a REST or SQL catalog, Parquet data files |
+| `nfs` / `file` | Mounted directory (NFS/PVC/hostPath) — Delta **and** Parquet |
+
+Plus two composition mechanisms:
+
+- **Federated multi-source** — `SQLHANDLER_SOURCES` / the chart's `sources:` list federates several buckets/sources (any mix of backends) behind one endpoint: source-qualified tables, one shared cache, cross-source `JOIN`s in a single `run_sql`.
+- **External databases (read-only attach)** — `SQLHANDLER_ATTACH` / the chart's `databases:` list attaches Postgres/MySQL servers read-only (`ATTACH ... READ_ONLY` — writes are rejected by DuckDB itself); their tables join with lake tables in the same query as `<db-alias>.<schema>.<table>`.
 
 ---
 
@@ -15,7 +32,7 @@ and shipped as 1.0.0, a deliberate version jump for the feature lift, unless mar
 | Data access | pyarrow ≥ 17 (S3/Azure filesystems + dataset engine), `deltalake` ≥ 1.0 (native Delta reader incl. OneLake ABFS), optional `pyiceberg[pyarrow]` (+ SQLAlchemy for SQL catalogs) |
 | HTTP | uvicorn + Starlette ASGI app hosting `/mcp`, the JSON API, `/ui`, `/health`, `/ready`, `/metrics` |
 | Web UI | one self-contained `index.html` — no build step, no CDN, no framework |
-| Deploy | Helm chart for Kubernetes / PCAI (oauth2-proxy gateway, non-root hardened image, health/startup probes) |
+| Deploy | Helm chart for Kubernetes / PCAI (oauth2-proxy gateway, non-root hardened image, health/startup probes, HPA + PDB + topology spread for scale-out, optional shared catalog PVC) |
 | Ops | zero extra dependencies — Prometheus text exposition and JSONL audit log are hand-rolled |
 
 The `DataProvider` interface is the only extension point for a new source: each backend (onelake, s3, iceberg, nfs/file) is a subclass plus one `make_provider` branch.
@@ -43,6 +60,12 @@ Features that make LLM agents effective against the lake on the first try.
 ### Semantic catalog
 `SQLHANDLER_CATALOG=<file.json|file.yaml>` merges human-written table/column documentation into `list_tables` / `describe_table` / resources. Hot-reloaded on change (cached describes invalidated); a missing/broken file never breaks queries.
 
+- **Virtual tables** — a catalog entry keyed by a clean bare identifier with a
+  `definition` (a single read-only `SELECT`/`WITH`) becomes a queryable virtual
+  table: listed with a `VIRTUAL` badge, schema derived from the definition,
+  user filters still push down into the physical scans, definitions compose.
+  Materialized results are clustered and reused across queries and replicas
+  (see Performance). Spec: [`../docs/semantic-catalog.md`](../docs/semantic-catalog.md).
 - **Browser editing (1.4.0)** — a global **Edit YAML…** editor in the lower-left *Semantic catalog* panel (whole live catalog as YAML, JSON toggle) plus a per-dataset **Semantic** tab on every table (that table's breakout; skeletons prefilled from the real column list; per-entry upsert/remove). Both write through the same validated upload store — YAML default, JSON swap, `pygmentize -g`-style server-side highlighting (graceful plain-text fallback without pygments), `SQLHANDLER_CATALOG_UPLOAD=0` disables applying.
 
 ### Self-correction loops
@@ -115,7 +138,8 @@ Measured with the repo's own harness (`bench/ezpresto_vs_sqlhandler.py`,
 stdlib-only, persistent-connection transport with per-thread pooling) against
 the G2 deployment — v1.6.0, 4 replicas × 8 vCPU/16Gi, MinIO-backed workload of
 10 queries from 50K to 3M rows. Full methodology, tables, and the in-cluster
-variant: [`bench/BENCHMARK.md`](bench/BENCHMARK.md).
+variant: [`../bench/BENCHMARK.md`](../bench/BENCHMARK.md), with the scale-out
+(HPA) campaign summarized in [BENCHMARKS.md](BENCHMARKS.md).
 
 - **Query result cache** (new) — identical queries served from memory, keyed
   by sql/params/limits + base-snapshot versions (ETL commits invalidate
@@ -171,7 +195,7 @@ traffic is unaffected on all counts.
 
 All 62 tests in the five new test files (`test_ops`, `test_mcp_resources`, `test_async_query`, `test_s3_delta`, `test_tools_output`) pass on the current tree.
 
-## New configuration knobs (this wave)
+## Key configuration knobs
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -186,3 +210,17 @@ All 62 tests in the five new test files (`test_ops`, `test_mcp_resources`, `test
 | `SQLHANDLER_AUDIT_LOG` | — | JSONL audit file path |
 | `SQLHANDLER_API_TOKEN` | — | Bearer/X-API-Token gate for `/api/*` |
 | `S3_FORMAT` | auto | `auto` \| `parquet` \| `delta` for the s3 backend |
+| `SQLHANDLER_ATTACH` / `SQLHANDLER_ATTACH_FILE` | — | Read-only Postgres/MySQL attach config (JSON; `password_env` names only) |
+| `SQLHANDLER_BLOCK_CACHE` / `_DIR` / `_BLOCK_SIZE` / `_MAX_BYTES` / `_INCLUDE_LOCAL` | off | Disk block cache for object-store parquet reads (s3/iceberg backends) |
+| `SQLHANDLER_RESULT_CACHE_TTL` / `_MAX_BYTES` | 3600 / 256MiB | In-memory result cache for identical queries (snapshot-version-keyed) |
+| `SQLHANDLER_VIRTUAL_CACHE_TTL` / `_DIR` / `_MAX_BYTES` / `_SORT` | 3600 / cacheDir / 2GiB / on | Virtual-table materialization cache (point `_DIR` at an RWX PVC to share across replicas) |
+
+### Scale-out deployment (chart keys)
+
+`autoscaling` (HPA, autoscaling/v2, needs metrics-server), `podDisruptionBudget`,
+`topologySpread`, `terminationGracePeriodSeconds`, and
+`semanticCatalog.store` (shared RWX PVC for uploads + virtual-table
+materializations) — the G2 benchmark showed a single replica collapses under
+concurrency while 4 replicas hold flat throughput; the HPA's CPU target is
+burst/runaway protection, not load-following. Numbers:
+[BENCHMARKS.md](BENCHMARKS.md).

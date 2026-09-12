@@ -1,16 +1,8 @@
 {{- if .Values.ezua.enabled }}
-{{- /* PCAI does NOT envsubst values files: a domainName/endpoint left with
-     the literal ${DOMAIN_NAME} placeholder would register a gateway host
-     that matches nothing — the UI and MCP endpoint silently vanish from
-     the gateway. Fail the deploy loudly instead (the searxng-mcp lesson;
-     copy-paste deployments from the base values.yaml are exactly how this
-     happens). */ -}}
-{{- if contains "${" (.Values.ezua.domainName | toString) -}}
-{{- fail (printf "\nezua.domainName still contains the literal placeholder %q — PCAI does not envsubst values files. Set the real cluster domain (see helm/local/values.se-g2.yaml for the working example)." .Values.ezua.domainName) -}}
-{{- end -}}
-{{- if contains "${" (.Values.ezua.virtualService.endpoint | toString) -}}
-{{- fail (printf "\nezua.virtualService.endpoint still contains the literal placeholder %q — set the real endpoint host (see helm/local/values.se-g2.yaml)." .Values.ezua.virtualService.endpoint) -}}
-{{- end -}}
+{{- /* PCAI envsubst-ed ${DOMAIN_NAME} in the submitted values before helm
+     runs, so the endpoint arrives fully resolved. The gateway host is built
+     ONLY from ezua.virtualService.endpoint — ezua.domainName is informational
+     and no template reads it. */ -}}
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
 metadata:

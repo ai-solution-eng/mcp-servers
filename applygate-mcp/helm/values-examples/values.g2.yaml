@@ -1,0 +1,132 @@
+# applygate-mcp — values for the SE-G2 lab cluster
+# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document (PCAI's Helm Values editor replaces the
+# chart's bundled values.yaml). Site edits are marked '# SITE:'.
+# Sanitized for publication: no credentials, no personal namespaces — real
+# site values live in helm/local/ (never committed, never packaged).
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: applygate-mcp
+  appName: applygate-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# repository/tag/pullPolicy are release-managed (kept in lockstep with
+# Chart.yaml by the release tooling) — leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/applygate-mcp
+  tag: v0.1.4
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Web console ---------------------------------------------------------------------------
+# The strictly READ-ONLY HPE-branded UI at / (plan previews are ALWAYS
+# dry-run; there are NO apply/delete endpoints). false strips / and /api/*
+# while /mcp and the health endpoints keep working.
+webui:
+  enabled: true
+
+# -- Namespace policy ------------------------------------------------------------------------
+# THE guardrail. Chart default is '' = default-deny: every write refused.
+namespaces:
+  # SITE: namespaces this server may write in (globs like team-* are OK)
+  allowed: team-alpha,team-beta,mcp-demo
+  # SITE: ALWAYS wins over allowed
+  blocked: kube-system,kube-public,kube-node-lease
+
+# -- Write surface ----------------------------------------------------------------------------
+kinds:
+  # SITE: kept at the chart default (explicitly pinned so the editor shows it);
+  # narrow per site if desired — Secret and cluster-scoped kinds are refused
+  # regardless of this list.
+  allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
+
+# -- Audit ------------------------------------------------------------------------------------
+audit:
+  file: /data/audit.jsonl
+
+# -- Persistence ------------------------------------------------------------------------------
+# Audit-trail PVC — the trail must survive restarts to be worth anything.
+persistence:
+  enabled: true
+  size: 1Gi
+  accessModes:
+  - ReadWriteOnce
+
+# -- Service exposure -------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9102
+  targetPort: 9102
+
+# -- Resources --------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: '1'
+    memory: 512Mi
+
+# -- Security contexts -------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+
+# -- Service account / RBAC ---------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: applygate-mcp
+
+rbac:
+  # SITE: kept at the chart default (explicitly pinned by this file)
+  create: true
+
+# -- HPE corporate proxy --------------------------------------------------------------------------
+# The k8s API is in-cluster and covered by the standard NO_PROXY cluster-local
+# entries, so the proxy block is fleet consistency only — *_PROXY env is wired
+# only when hpe_proxies=true.
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost
+
+# -- Kyverno vendor-label policy ------------------------------------------------------------------
+# Optional cluster-scoped ClusterPolicy — off by default so the default render
+# stays unchanged; enable where EZUA vendor labeling is enforced.
+kyverno:
+  enabled: false
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ---------------------------------------------
+# SITE: gateway exposure on with the literal host — a WRITE-path MCP behind
+# the gateway relies on ezaf-gateway authn in front.
+ezua:
+  enabled: true   # SITE: deploy the VirtualService on this cluster
+  # SITE: literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
+  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  virtualService:
+    # SITE: literal host — /mcp -> MCP server (9102); / -> read-only console
+    endpoint: applygate-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 120s

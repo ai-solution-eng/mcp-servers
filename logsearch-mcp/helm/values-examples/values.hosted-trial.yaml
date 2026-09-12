@@ -1,0 +1,98 @@
+# logsearch-mcp — values for a customer HOSTED-TRIAL environment
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document for the PCAI Helm Values editor. Adjust the
+# '# SITE:' lines, then apply.
+# Secret-free by construction: nothing here needs credentials. If your PCAI
+# build resolves ${DOMAIN_NAME} in ezua values, the placeholders below work as
+# pasted; otherwise replace them with the literal cluster domain — an
+# unresolved placeholder registers a gateway host that matches nothing.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: logsearch-mcp
+  appName: logsearch-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# repository/tag/pullPolicy are release-managed — leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/logsearch-mcp
+  tag: v0.1.4
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Namespace policy (LOUD — this is the server's ONLY access control) --------
+# READ-ONLY by design, but pod logs routinely contain sensitive strings
+# (tokens in stack traces, PII, internal hostnames). EMPTY STRING = ALL
+# namespaces allowed — a trial should set an explicit allowlist.
+logsearch:
+  # SITE: namespaces the trial agent may search (fnmatch globs OK) — REQUIRED
+  # for anything beyond a lab cluster
+  allowedNamespaces: <ALLOWED_NAMESPACES>
+  # SITE: ALWAYS wins over the allowed list — keep the platform namespaces out
+  blockedNamespaces: kube-system,kube-public,kube-node-lease
+
+# -- Caps (blast-radius limits for agent harnesses) -----------------------------
+# Bound both API-server load and the MCP response size (an agent's context
+# window). Defaults are sane for a trial.
+  maxPods: 50
+  maxLinesPerPod: 1000
+  maxTotalLines: 300
+
+# -- Service exposure ---------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9101
+  targetPort: 9101
+
+# -- Web console ---------------------------------------------------------------------------
+# HPE-branded log-search console at / — a human front-end over the SAME
+# seams, namespace policy, and caps as the MCP tools. Keep on for the trial.
+webui:
+  enabled: true
+
+# -- Resources --------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# -- Security ---------------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+# -- RBAC --------------------------------------------------------------------------------------
+# READ-ONLY, release namespace only (pods get/list + pods/log get). Searching
+# OTHER trial namespaces needs a one-time admin-applied read-only bootstrap
+# per namespace (see documentation/DEPLOYMENT.md).
+rbac:
+  create: true
+
+# -- HPE corporate proxy -------------------------------------------------------------------------
+# Off unless the trial cluster sits behind the HPE proxy (the k8s API is
+# in-cluster and covered by the NO_PROXY entries either way).
+hpe_proxies: false
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# SITE: gateway exposure — /mcp for agents, / for the web console.
+ezua:
+  enabled: true   # SITE: deploy the VirtualService
+  # SITE: current PCAI builds resolve ${DOMAIN_NAME} in ezua values; if yours
+  # does not, replace both placeholders with the literal cluster domain.
+  domainName: ${DOMAIN_NAME}   # informational only — no template reads it
+  virtualService:
+    endpoint: logsearch-mcp.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 300s

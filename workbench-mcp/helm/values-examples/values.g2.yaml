@@ -1,0 +1,125 @@
+# workbench-mcp — values for the SE-G2 lab cluster
+# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+#
+# FULL VALUES — every key from helm/values.yaml is present, so this file alone
+# is the complete values document (PCAI's Helm Values editor replaces the
+# chart's bundled values.yaml). Site edits are marked '# SITE:'.
+# Sanitized for publication: no credentials — real site values live in
+# helm/local/ (never committed, never packaged).
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: workbench-mcp
+  appName: workbench-mcp
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+# repository/tag/pullPolicy are release-managed (kept in lockstep with
+# Chart.yaml by the release tooling) — leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/workbench-mcp
+  tag: v0.1.2
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# -- Web UI -------------------------------------------------------------------------------
+# HPE-branded browser console at / — read/write, calls the SAME core functions
+# the MCP tools use (path confinement, caps, argv allowlist, audit all still
+# apply). Unauthenticated at the pod: the endpoint must sit behind gateway
+# authn (the ezaf-gateway VirtualService below).
+webui:
+  enabled: true
+
+# -- Workbench configuration --------------------------------------------------------
+workbench:
+  # Root directory holding all workspaces — MUST match persistence.mountPath.
+  root: /data
+  # argv[0] allowlist for run_command (comma-separated); no shells by design.
+  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  # Hard deny (WINS over the allowlist): network/escalation binaries.
+  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
+  # Per-command timeout bounds (seconds).
+  execTimeoutDefault: 60
+  execTimeoutMax: 600
+  # write_file cap (bytes, 8 MiB).
+  maxFileBytes: 8388608
+  # stdout/stderr cap per run_command (bytes, 200 KiB).
+  maxOutputBytes: 204800
+  # Max entries per list_files response.
+  maxListEntries: 500
+  logLevel: INFO
+
+# -- HPE corporate proxy --------------------------------------------------------------------------
+# SITE: this cluster sits behind the HPE corporate proxy — wiring it is what
+# makes `pip install ...` inside run_command reach PyPI through the MITM
+# proxy. NO_PROXY keeps cluster-local traffic direct.
+hpe_proxies: true
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- Corporate MITM CA ---------------------------------------------------------------------------
+# SITE: on — the proxy re-terminates TLS, so pip/requests inside run_command
+# need the PCAI root CA (mounted from the ezaf-root-ca ConfigMap; copy it into
+# the release namespace if absent).
+caCert:
+  enabled: true
+  configMap: "ezaf-root-ca"
+  configMapKey: "ezaf-root-ca.crt"
+
+# -- Kyverno vendor-label policy -------------------------------------------------------------------
+# Cluster-scoped — off by default so the default render stays unchanged (and
+# clusters without the kyverno CRD still install).
+kyverno:
+  enabled: false
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9103
+  targetPort: 9103
+
+# -- Resources (modest: a scratch pad, not a compute node) -------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- Security context -----------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+# -- Persistence ---------------------------------------------------------------------
+# THE point of the workbench: workspaces survive pod restarts. RWX so every
+# replica sees the same workspaces (MCP is stateless — any replica serves any
+# request). Single-replica clusters without an RWX class can drop to
+# ReadWriteOnce with replicaCount: 1.
+persistence:
+  enabled: true
+  size: 10Gi
+  mountPath: /data
+  accessModes:
+    - ReadWriteMany
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
+# SITE: gateway exposure on with the literal host. The /mcp timeout is
+# generous because run_command can legitimately run to its max (600 s).
+ezua:
+  enabled: true   # SITE: deploy the VirtualService on this cluster
+  # SITE: literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
+  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  virtualService:
+    # SITE: literal host — /mcp -> MCP server (9103); / -> web UI
+    endpoint: workbench-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s
