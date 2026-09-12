@@ -80,10 +80,12 @@ tables:
 
 Rules of the road:
 
-- **Dialect**: definitions run on the engine's DuckDB. `GROUP BY ALL`, `GREATEST`, `::INT` casts, CTE column
-  lists and integer `||` string concatenation work as in Snowflake; the engine also provides an `iff(c, t, e)`
-  compat macro. `ARRAY_CONSTRUCT_COMPACT` has no equivalent — use `list_filter([...], x -> x IS NOT NULL)`
-  (see [`examples/omnilife-catalog.yaml`](examples/omnilife-catalog.yaml) for a full worked port).
+- **Dialect**: definitions run on the engine's DuckDB. `GROUP BY ALL`, `GREATEST`, `::INT` casts and CTE column
+  lists work as in Snowflake, and the engine bridges the two constructs DuckDB lacks: an `iff(c, t, e)` compat
+  macro, and `ARRAY_CONSTRUCT_COMPACT(...)` rewritten to `list_filter([...], x -> x IS NOT NULL)` at
+  registration time (string-literal-safe, any arity). Snowflake-style definitions using those two run verbatim;
+  anything more exotic needs porting (see [`examples/omnilife-catalog.yaml`](examples/omnilife-catalog.yaml)
+  for a worked example).
 - **Validation**: a definition must be exactly one read-only statement and must parse; anything else is dropped
   with a warning (a broken entry must never break the catalog). Definitions execute on the same locked-down,
   read-only connections as every other query — they add no new capability, only curated, reusable query shapes.
@@ -91,9 +93,13 @@ Rules of the road:
   never shadow real data.
 - **Base-table scope**: definitions resolve base tables among the lake's tables and other virtual tables;
   attached-database tables (SQLHANDLER_ATTACH) are not pulled in automatically.
-- **Costs are query-time costs**: profiling a virtual table and its row count actually run the definition
-  (bounded by `SQLHANDLER_PROFILE_MAX_ROWS` for the sample); `scan_table` works via the SQL path but its
-  pyarrow `filters` argument is refused (use `run_sql`).
+- **Costs are query-time costs — paid once**: the first query touching a virtual table materializes its full
+  result to parquet; every later query (UI previews, filtered reads, aggregates) reads that file — milliseconds
+  instead of re-running the pipeline — until the definition, any base table's snapshot version, or
+  `SQLHANDLER_VIRTUAL_CACHE_TTL` (default 3600; `0` disables) changes. Unfiltered previews cannot short-circuit
+  a definition with blocking aggregates, which is exactly why the materialization exists. Profiling and its row
+  count run the definition (bounded by `SQLHANDLER_PROFILE_MAX_ROWS` for the sample); `scan_table` works via the
+  SQL path but its pyarrow `filters` argument is refused (use `run_sql`). Time-travel queries bypass the cache.
 - `virtual: true` **without** a `definition` is just a documentation marker — no table appears.
 
 ### Authoring tips

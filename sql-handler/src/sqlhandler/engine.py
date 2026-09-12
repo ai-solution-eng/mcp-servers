@@ -22,6 +22,7 @@ Design notes (kept from the original OneLake handler):
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -611,6 +612,61 @@ class SqlEngine:
         self._definition_verdicts: dict[str, str | None] = {}
         # and the rewritten (Snowflake -> DuckDB) SQL, memoized the same way.
         self._definition_rewrites: dict[str, str] = {}
+        # Virtual-table materialization cache: an unfiltered query against a
+        # virtual table must run its whole definition (blocking aggregates
+        # defeat LIMIT), which for big base tables is a multi-second payment
+        # on EVERY query. So the definition's full result is written to a
+        # parquet file once and reused (registered like any physical table —
+        # same pushdown path) until the definition, any base table's snapshot
+        # version, or the TTL changes. SQLHANDLER_VIRTUAL_CACHE_TTL=0
+        # disables it; SQLHANDLER_VIRTUAL_CACHE_DIR overrides the location
+        # (default: the disk-warm cache dir, resolved below). Point it at an
+        # RWX PVC shared by all replicas to pay the materialization once per
+        # deployment instead of once per pod.
+        raw = os.environ.get("SQLHANDLER_VIRTUAL_CACHE_TTL", "")
+        try:
+            self._virtual_cache_ttl = max(int(raw), 0) if raw else 3600
+        except ValueError:
+            self._virtual_cache_ttl = 3600
+        raw = os.environ.get("SQLHANDLER_VIRTUAL_CACHE_MAX_BYTES", "")
+        try:
+            # Skip caching results larger than this (serve them live) — a
+            # runaway definition must not fill the disk. 0 = unlimited.
+            self._virtual_cache_max_bytes = max(int(raw), 0) if raw else 2 * 1024**3
+        except ValueError:
+            self._virtual_cache_max_bytes = 2 * 1024**3
+        self._virtual_cache_hits = 0
+        self._virtual_cache_writes = 0
+        # Cluster (sort) materialized virtual results by their lowest-
+        # cardinality columns so row-group stats prune filtered reads.
+        self._virtual_cache_sort = os.environ.get("SQLHANDLER_VIRTUAL_CACHE_SORT", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        # Query result cache (Snowflake's result-cache analog): repeated
+        # IDENTICAL queries — agent retries, loops, multi-agent sessions —
+        # are served from memory instead of re-running. Keyed by the full
+        # query identity (sql, params, limits, time travel) plus every
+        # referenced table's snapshot-version token, so a new ETL commit
+        # invalidates immediately. Virtual-table queries are excluded (their
+        # materialization cache already covers them); attached-database
+        # queries are excluded (their catalogs version differently).
+        raw = os.environ.get("SQLHANDLER_RESULT_CACHE_TTL", "")
+        try:
+            self._result_cache_ttl = max(int(raw), 0) if raw else 3600
+        except ValueError:
+            self._result_cache_ttl = 3600
+        raw = os.environ.get("SQLHANDLER_RESULT_CACHE_MAX_BYTES", "")
+        try:
+            self._result_cache_max_bytes = max(int(raw), 0) if raw else 256 * 1024**2
+        except ValueError:
+            self._result_cache_max_bytes = 256 * 1024**2
+        self._result_cache: OrderedDict[str, tuple[float, pa.Table]] = OrderedDict()
+        self._result_cache_bytes = 0
+        self._result_cache_hits = 0
+        self._result_cache_writes = 0
         # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
         # config parses loudly at startup (operator-authored, security
         # relevant — a typo should kill the pod, not silently skip a source).
@@ -639,6 +695,12 @@ class SqlEngine:
         # cache_ttl the memory layer uses.
         env_cache_dir = os.environ.get("SQLHANDLER_CACHE_DIR", "").strip()
         self._cache_dir = cache_dir or (env_cache_dir or None)
+        # Resolved here because it defaults to the disk-warm cache dir above.
+        self._virtual_cache_dir = (
+            os.environ.get("SQLHANDLER_VIRTUAL_CACHE_DIR", "").strip()
+            or self._cache_dir
+            or str(Path(tempfile.gettempdir()) / "sqlhandler-virtual-cache")
+        )
         if self._cache_dir and self.cache_ttl > 0:
             self._load_cache_from_disk()
         # Uploadable catalog store (POST /api/semantic-catalog): a WRITABLE
@@ -1572,7 +1634,10 @@ class SqlEngine:
             _apply_memory_budget(con)
             # The registration SQL is only matched for table references, never
             # executed — it exists to pull in this virtual table's closure.
-            self._register_schema(con, f"SELECT * FROM {_safe_ident(info.name)}")
+            # materialize=False: describing must stay a cheap schema bind —
+            # a describe must never trigger the (potentially expensive) first
+            # materialization.
+            self._register_schema(con, f"SELECT * FROM {_safe_ident(info.name)}", materialize=False)
             rows = con.sql(f"DESCRIBE {_safe_ident(info.name)}").fetchall()
         except Exception as exc:
             raise LakehouseError(f"Describing virtual table '{info.name}' failed: {exc}") from exc
@@ -2173,6 +2238,17 @@ class SqlEngine:
         """
         if version_as_of is not None:
             _validate_snapshot_version(version_as_of, "Time travel")
+        t0 = time.monotonic()
+        fast = self._metadata_count_fastpath(sql, version_as_of)
+        if fast is not None:
+            self._record_outcome(sql, (time.monotonic() - t0) * 1000, 1, state="ok")
+            return fast
+        cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of)
+        if cache_key is not None:
+            cached = self._result_cache_lookup(cache_key)
+            if cached is not None:
+                self._record_outcome(sql, 0.0, cached.num_rows, state="ok")
+                return cached
         timeout = _query_timeout()
         job = QueryJob(
             self,
@@ -2192,7 +2268,104 @@ class SqlEngine:
                 raise LakehouseError(f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
         else:
             job.wait()
+        if job.state == "done" and cache_key is not None and job.result is not None:
+            self._result_cache_store(cache_key, job.result)
         return job.result
+
+    # ------------------------------------------------- fast path + results
+    # Bare ``SELECT COUNT(*) FROM <table>`` — row counts live in the parquet
+    # footers / Delta log / Iceberg manifest; no data scan needed. DuckDB
+    # still enumerates row groups through an ARROW_SCAN (~125 ms on a 20M-row
+    # table); the metadata read is ~0.1 ms, and the gap grows with size.
+    _COUNT_STAR_RE = re.compile(
+        r"^\s*SELECT\s+COUNT\(\*\)\s*(?:AS\s+([A-Za-z_][A-Za-z0-9_]*)\s*)?"
+        r"FROM\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*;?\s*$",
+        re.IGNORECASE,
+    )
+
+    def _metadata_count_fastpath(self, sql: str, version: int | None) -> pa.Table | None:
+        """Serve a bare ``SELECT COUNT(*) FROM <table>`` from metadata.
+
+        Returns the one-row result, or None whenever the query is anything
+        other than an exact, unfiltered, single-provider-table count —
+        WHERE/JOIN/GROUP/aliases aside, external attaches and virtual tables
+        (whose count is the definition's business) all fall through to the
+        normal query path, and any failure down here does too.
+        """
+        m = self._COUNT_STAR_RE.match(sql)
+        if not m or self._sql_needs_external(sql):
+            return None
+        alias = m.group(1) or "count_star()"
+        try:
+            info = self._resolve(m.group(2))
+        except Exception:
+            return None
+        if info.format == "virtual":
+            return None
+        try:
+            dset = self._open_dataset(info, version)
+            n = int(dset.count_rows())
+        except Exception:
+            logger.debug("count(*) fast-path failed for %s; using the query path", info.path, exc_info=True)
+            return None
+        return pa.table({alias: pa.array([n], type=pa.int64())})
+
+    def _result_cache_key(
+        self,
+        sql: str,
+        params: object | None,
+        limit: int | None,
+        row_cap: int | None,
+        version_as_of: int | None,
+    ) -> str | None:
+        """Cache key for a query: full identity + base-snapshot version tokens.
+
+        None when the result must not be cached: caching disabled, no
+        recognizable tables, any virtual table involved (its materialization
+        cache already accelerates it), or an attached-database query.
+        """
+        if self._result_cache_ttl <= 0:
+            return None
+        try:
+            refs = self._referenced_tables(sql)
+            if not refs or any(i.format == "virtual" for i in refs):
+                return None
+            if self._sql_needs_external(sql):
+                return None
+            parts = [sql, repr(params), repr(limit), repr(row_cap), repr(version_as_of)]
+            for info in sorted(refs, key=lambda t: (t.source, t.path)):
+                parts.append(f"{info.source}/{info.path}={self._safe_version(info)}")
+            return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
+        except Exception:
+            return None
+
+    def _result_cache_lookup(self, key: str) -> pa.Table | None:
+        """The cached result for ``key`` when fresh, else None (LRU-ordered)."""
+        with self._lock:
+            hit = self._result_cache.get(key)
+            if hit is None:
+                return None
+            ts, table = hit
+            if time.time() - ts >= self._result_cache_ttl:
+                del self._result_cache[key]
+                self._result_cache_bytes -= table.nbytes
+                return None
+            self._result_cache.move_to_end(key)
+            self._result_cache_hits += 1
+            return table
+
+    def _result_cache_store(self, key: str, table: pa.Table) -> None:
+        """Cache one query result (in-memory, byte-capped, LRU-evicted)."""
+        nbytes = table.nbytes
+        if self._result_cache_max_bytes > 0 and nbytes > self._result_cache_max_bytes:
+            return
+        with self._lock:
+            while self._result_cache and self._result_cache_bytes + nbytes > self._result_cache_max_bytes:
+                _, evicted = self._result_cache.popitem(last=False)
+                self._result_cache_bytes -= evicted[1].nbytes
+            self._result_cache[key] = (time.time(), table)
+            self._result_cache_bytes += nbytes
+            self._result_cache_writes += 1
 
     def _referenced_tables(self, sql: str) -> list[TableInfo]:
         """Return the tables referenced by a SQL query.
@@ -2209,7 +2382,7 @@ class SqlEngine:
                     break
         return list(wanted.values())
 
-    def _register_schema(self, con, sql: str, version: int | None = None) -> None:
+    def _register_schema(self, con, sql: str, version: int | None = None, materialize: bool = True) -> None:
         """Register each referenced table as a DuckDB view over its Dataset.
 
         Each table gets its qualified view (``[source_]schema_name``) always,
@@ -2258,23 +2431,214 @@ class SqlEngine:
             return
         self._apply_compat_macros(con)
         for info in virtuals:
-            definition = self._definition_sql(info.name)
-            views = [_safe_ident(info.qualified_name)]
-            if name_counts.get(info.name, 0) <= 1:
-                views.append(_safe_ident(info.name))
-            for view in views:
-                try:
-                    # OR REPLACE: for schema-less tables the bare and qualified
-                    # names coincide — same SQL body, one view either way.
-                    con.execute(f"CREATE OR REPLACE VIEW {view} AS ({definition})")
-                except Exception as exc:
-                    # The definition parsed at catalog load, so a failure here
-                    # is a binding problem (missing base table, type clash):
-                    # fail the query with the real reason instead of letting a
-                    # bare "table not found" mislead the caller.
-                    raise LakehouseError(
-                        f"virtual table '{info.name}' could not be built from its catalog definition: {exc}"
-                    ) from exc
+            self._register_virtual(con, info, version, materialize, name_counts)
+
+    def _register_virtual(
+        self, con, info: TableInfo, version: int | None, materialize: bool, name_counts: dict[str, int]
+    ) -> None:
+        """Put virtual table ``info`` on the connection: from the
+        materialization cache when valid, otherwise as a view built from the
+        definition — populating the cache for the next query when allowed.
+
+        On a cache miss with materialization allowed, the definition runs
+        once here and its full result is published to parquet; the paying
+        query then runs against the materialized copy, so it pays the
+        definition cost exactly once and every later query (any filter, any
+        LIMIT) reads a small parquet. Failures degrade to the live view —
+        the cache is only an accelerator, never a dependency. Time-travel
+        queries bypass the cache entirely (their base snapshots differ).
+        """
+        views = [_safe_ident(info.qualified_name)]
+        if name_counts.get(info.name, 0) <= 1:
+            views.append(_safe_ident(info.name))
+        definition = self._definition_sql(info.name)
+        dset = None
+        if self._virtual_cache_ttl > 0 and version is None:
+            dset = self._virtual_cache_lookup(info, definition)
+            if dset is None and materialize:
+                dset = self._virtual_cache_materialize(con, info, definition)
+        if dset is not None:
+            try:
+                for view in views:
+                    con.register(view, dset)
+                with self._lock:
+                    self._virtual_cache_hits += 1
+                return
+            except Exception:
+                logger.warning(
+                    "virtual table %s: cached dataset unusable; building the live definition",
+                    info.name,
+                    exc_info=True,
+                )
+        for view in views:
+            try:
+                # OR REPLACE: for schema-less tables the bare and qualified
+                # names coincide — same SQL body, one view either way.
+                con.execute(f"CREATE OR REPLACE VIEW {view} AS ({definition})")
+            except Exception as exc:
+                # The definition parsed at catalog load, so a failure here
+                # is a binding problem (missing base table, type clash):
+                # fail the query with the real reason instead of letting a
+                # bare "table not found" mislead the caller.
+                raise LakehouseError(
+                    f"virtual table '{info.name}' could not be built from its catalog definition: {exc}"
+                ) from exc
+
+    def _virtual_cache_base(self, info: TableInfo, definition: str) -> dict:
+        """Identity of a virtual table's cache entry.
+
+        The key covers the definition text (rewritten) of the table AND of
+        every virtual table it transitively builds on (a nested definition
+        change must invalidate its dependents), plus the resolved base
+        tables' snapshot-version tokens, so a new ETL commit on any base
+        invalidates automatically. Returns the parquet path, the meta sidecar
+        path, the key hash, and the current expected version tokens.
+        """
+        physical, virtuals = self._expand_query_tables([info])
+        h = hashlib.sha256()
+        for v in virtuals:  # topologically ordered -> deterministic
+            h.update(v.name.encode())
+            h.update(b"\0")
+            h.update(self._definition_sql(v.name).encode())
+            h.update(b"\0")
+        versions = {
+            f"{i.source}/{i.path}": str(self._safe_version(i))
+            for i in sorted(physical, key=lambda t: (t.source, t.path))
+        }
+        digest = h.hexdigest()
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", info.name)
+        path = Path(self._virtual_cache_dir) / f"{safe}-{digest[:16]}.parquet"
+        return {
+            "path": str(path),
+            "meta": str(path) + ".json",
+            "sha256": digest,
+            "versions": versions,
+        }
+
+    def _virtual_cache_lookup(self, info: TableInfo, definition: str):
+        """A pyarrow Dataset over the cached materialization when it is valid
+        for this definition + base snapshots + TTL, else None (never raises)."""
+        import pyarrow.dataset as pad
+
+        base = self._virtual_cache_base(info, definition)
+        try:
+            meta = json.loads(Path(base["meta"]).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if meta.get("sha256") != base["sha256"] or meta.get("versions") != base["versions"]:
+            return None
+        if time.time() - float(meta.get("created", 0)) >= self._virtual_cache_ttl:
+            return None
+        try:
+            return pad.dataset(base["path"], format="parquet")
+        except Exception:
+            logger.warning("virtual table %s: cache file unreadable; ignoring it", info.name, exc_info=True)
+            return None
+
+    def _virtual_cache_materialize(self, con, info: TableInfo, definition: str):
+        """Run the definition once and publish its full result to the cache.
+
+        The result is CLUSTERED before writing (see ``_cluster_result``):
+        sorted by its most discriminative columns so the parquet row-group
+        min/max statistics become selective and filters on those columns
+        skip whole row groups on every later read. Returns the pyarrow
+        Dataset over the published parquet (registered like any physical
+        table for the rest of this query), or None on any failure — the
+        query then falls back to building the live view. Writes go to a
+        unique temp file + atomic rename, so concurrent queries may
+        materialize simultaneously without corrupting anything (last writer
+        wins; both results are valid).
+        """
+        import pyarrow.dataset as pad
+        import pyarrow.parquet as pq
+
+        base = self._virtual_cache_base(info, definition)
+        path = Path(base["path"])
+        tmp_path: str | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            table = con.sql(definition).arrow()
+            if isinstance(table, pa.RecordBatchReader):
+                table = table.read_all()
+            if self._virtual_cache_max_bytes > 0 and table.nbytes > self._virtual_cache_max_bytes:
+                logger.info(
+                    "virtual table %s: result too large to cache (%d bytes > %d); serving live",
+                    info.name,
+                    table.nbytes,
+                    self._virtual_cache_max_bytes,
+                )
+                return None
+            table = self._cluster_result(con, info, table)
+            fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+            os.close(fd)
+            pq.write_table(table, tmp_path, compression="zstd")
+            os.replace(tmp_path, path)
+            tmp_path = None
+            meta = {
+                "table": info.name,
+                "sha256": base["sha256"],
+                "versions": base["versions"],
+                "created": time.time(),
+                "rows": table.num_rows,
+                "bytes": table.nbytes,
+            }
+            fd, tmp_meta = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".meta.tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(meta))
+            os.replace(tmp_meta, base["meta"])
+            with self._lock:
+                self._virtual_cache_writes += 1
+            logger.info("virtual table %s materialized: %d rows -> %s", info.name, table.num_rows, path)
+            return pad.dataset(str(path), format="parquet")
+        except Exception:
+            logger.warning(
+                "virtual table %s: materialization failed; serving the live definition",
+                info.name,
+                exc_info=True,
+            )
+            return None
+        finally:
+            if tmp_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+
+    def _cluster_result(self, con, info: TableInfo, table: pa.Table) -> pa.Table:
+        """Sort a materialized virtual result by its most discriminative columns.
+
+        Parquet row groups carry per-column min/max statistics; on randomly
+        ordered data every row group spans the full value range, so filters
+        must read everything. Sorting by the lowest-cardinality columns
+        (dimension-like first — the ones most likely used as equality
+        filters) makes those statistics selective: whole row groups drop out
+        of every later filtered read. This is Snowflake-style clustering
+        applied at materialization time. Best-effort: any failure returns
+        the table unsorted. Disabled with SQLHANDLER_VIRTUAL_CACHE_SORT=0.
+        """
+        if not self._virtual_cache_sort or table.num_rows < 1024 or table.num_columns < 2:
+            return table
+        try:
+            probe = "_sqlhandler_sort_probe"
+            con.register(probe, table)
+            cols = table.column_names[:16]
+            stats = con.sql(
+                "SELECT "
+                + ", ".join(f"approx_count_distinct({_safe_ident(c)}) AS k{i}" for i, c in enumerate(cols))
+                + f" FROM {probe}"
+            ).fetchone()
+            ranked = sorted(zip(cols, stats), key=lambda kv: kv[1])
+            keys = [c for c, distinct in ranked if distinct > 1][:3]
+            if not keys:
+                return table  # every column is constant — nothing to cluster on
+            clustered = table.sort_by([(k, "ascending") for k in keys])
+            logger.info(
+                "virtual table %s clustered by %s (row-group pruning)",
+                info.name,
+                ", ".join(keys),
+            )
+            return clustered
+        except Exception:
+            logger.debug("clustering skipped for %s", info.name, exc_info=True)
+            return table
 
     @staticmethod
     def _apply_compat_macros(con) -> None:
@@ -2523,6 +2887,19 @@ class SqlEngine:
                 "dataset_cached_tables": len(self._dataset_cache),
                 "dataset_hits": self._dataset_hits,
                 "dataset_misses": self._dataset_misses,
+                "virtual_cache": {
+                    "ttl": self._virtual_cache_ttl,
+                    "dir": self._virtual_cache_dir,
+                    "hits": self._virtual_cache_hits,
+                    "materializations": self._virtual_cache_writes,
+                },
+                "result_cache": {
+                    "ttl": self._result_cache_ttl,
+                    "entries": len(self._result_cache),
+                    "bytes": self._result_cache_bytes,
+                    "hits": self._result_cache_hits,
+                    "writes": self._result_cache_writes,
+                },
                 "tables_cached": self._tables is not None,
                 "tables_cached_age_s": round((time.monotonic() - self._tables_ts), 1)
                 if self._tables is not None

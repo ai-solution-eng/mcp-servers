@@ -109,6 +109,52 @@ shared PVC store (`semanticCatalog.store.enabled`) making uploads durable and cr
 
 ---
 
+## 5. Performance (measured on G2, 2026-09-12)
+
+Measured with the repo's own harness (`bench/ezpresto_vs_sqlhandler.py`,
+stdlib-only, persistent-connection transport with per-thread pooling) against
+the G2 deployment — v1.6.0, 4 replicas × 8 vCPU/16Gi, MinIO-backed workload of
+10 queries from 50K to 3M rows. Full methodology, tables, and the in-cluster
+variant: [`bench/BENCHMARK.md`](bench/BENCHMARK.md).
+
+- **Query result cache** (new) — identical queries served from memory, keyed
+  by sql/params/limits + base-snapshot versions (ETL commits invalidate
+  instantly; TTL backstop). Measured speedup **1.8×–21× over cold execution**,
+  scaling with query cost: counts/filters 1.8–2.5×, aggregations
+  **6.9–19.2×**. The Snowflake result-cache analog, and the honest
+  agent-facing experience — agents retry, loop, and re-ask.
+- **Virtual-table materialization cache** (new) — a virtual table's full
+  result is written to parquet once and reused across queries and replicas
+  (`cache.virtualCacheDir` on a shared PVC = one materialization per
+  deployment per data change). Closes the multi-second cost of unfiltered
+  previews on definitions with blocking aggregations (LIMIT cannot
+  short-circuit a DISTINCT/GROUP BY pipeline).
+- **count(\*) metadata fast-path** (new) — bare `SELECT COUNT(*) FROM t`
+  reads parquet/Delta metadata instead of scanning: ~125 ms → ~0.1 ms on a
+  20M-row table; visible in-cluster as 3M-row counts in ~23 ms.
+- **Cold engine numbers** (result cache busted — pure DuckDB): 3M-row scans
+  1.0–2.0 s p50 (4.3–5.1M rows/s counts/projections), 200–350K queries
+  0.19–2.0 s. Warm floor ~104–120 ms through the gateway for every query size
+  (cache hit + round-trip), ~18–25 ms in-cluster.
+- **Concurrency**: warm queries scale to ~75–81 qps at L8 with flat p50;
+  all-cold bursts saturate per-pod CPU (flat ~11–12 qps, p95 to 4.2 s) — the
+  capacity-planning number for cold agent storms.
+- **Clustered virtual materializations** (new) — materialized results are
+  auto-sorted by their lowest-cardinality columns so parquet row-group
+  statistics prune filtered reads.
+
+### Environment findings during the benchmark (upstream/ops, not sqlhandler)
+
+Recorded with repro evidence in `bench/BENCHMARK.md` §"Environment findings":
+the EzPresto locator routes `nextUri` GETs to its web app (404 "Query not
+found", 10/10 repro), the EzPresto MCP pod flaps between MCP and health-echo
+states (4 restarts, dev image), EzPresto's OPA policy denies table access for
+non-platform principals (`AccessDeniedException`), and the ezaf-gateway tier
+alternates MCP routes on a minutes cadence for external clients. In-cluster
+traffic is unaffected on all counts.
+
+---
+
 ## Feature → code → tests map
 
 | Feature | Module(s) | Tests |

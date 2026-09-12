@@ -1,0 +1,186 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-incluster-script
+  namespace: sqlhandler
+  labels:
+    app.kubernetes.io/name: sqlhandler-bench
+data:
+  bench.py: |
+    import json, time, urllib.request, statistics, threading, os
+
+    SQLH = "http://sqlhandler.sqlhandler.svc.cluster.local:9097/mcp"
+    EZP  = "http://mcp-ezpresto-server.mcp-ezpresto-server.svc.cluster.local:9097/mcp"
+
+    WL = [
+     ("count_small","SELECT COUNT(*) AS c FROM employees","SELECT COUNT(*) AS c FROM minio.default.employees"),
+     ("range_filter","SELECT COUNT(*) AS c FROM orders WHERE order_id BETWEEN 100000 AND 100099","SELECT COUNT(*) AS c FROM minio.default.orders WHERE order_id BETWEEN 100000 AND 100099"),
+     ("filtered_agg","SELECT region, COUNT(*) AS c, SUM(qty) AS s FROM orders WHERE unit_price > 250 GROUP BY region","SELECT region, COUNT(*) AS c, SUM(qty) AS s FROM minio.default.orders WHERE unit_price > 250 GROUP BY region"),
+     ("groupby_agg","SELECT region, product, COUNT(*) AS c, AVG(unit_price) AS a FROM orders GROUP BY region, product","SELECT region, product, COUNT(*) AS c, AVG(unit_price) AS a FROM minio.default.orders GROUP BY region, product"),
+     ("join_count","SELECT COUNT(*) AS c FROM orders o JOIN customers c ON o.customer_id = c.customer_id","SELECT COUNT(*) AS c FROM minio.default.orders o JOIN minio.default.customers c ON o.customer_id = c.customer_id"),
+     ("join_agg","SELECT c.segment, COUNT(*) AS n, SUM(o.qty * o.unit_price) AS rev FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.segment","SELECT c.segment, COUNT(*) AS n, SUM(o.qty * o.unit_price) AS rev FROM minio.default.orders o JOIN minio.default.customers c ON o.customer_id = c.customer_id GROUP BY c.segment"),
+     ("count_big_3m","SELECT COUNT(*) AS c FROM testdata_50col","SELECT COUNT(*) AS c FROM minio.default.testdata_50col"),
+     ("col_proj_agg_2cols","SELECT SUM(quantity) AS s, AVG(returns_qty) AS a FROM testdata_50col","SELECT SUM(quantity) AS s, AVG(returns_qty) AS a FROM minio.default.testdata_50col"),
+     ("filtered_group_3m","SELECT tenant_id, SUM(quantity) AS s FROM testdata_50col WHERE region_id = 11 GROUP BY tenant_id","SELECT tenant_id, SUM(quantity) AS s FROM minio.default.testdata_50col WHERE region_id = 11 GROUP BY tenant_id"),
+     ("wide_agg_4cols","SELECT COUNT(*) AS c, SUM(quantity) AS s, MAX(supplier_id) AS mx, MIN(brand_id) AS mn FROM testdata_50col","SELECT COUNT(*) AS c, SUM(quantity) AS s, MAX(supplier_id) AS mx, MIN(brand_id) AS mn FROM minio.default.testdata_50col"),
+    ]
+
+    def _parse(body):
+        body = body.strip()
+        if body.startswith("{"): return json.loads(body)
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                p = line[5:].strip()
+                if p and p != "{}":
+                    try: return json.loads(p)
+                    except ValueError: continue
+        raise ValueError("unparseable MCP body")
+
+    class Mcp:
+        def __init__(self, url, bearer=""):
+            self.url, self.bearer, self.sid = url, bearer, None
+            self._post({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+                "protocolVersion":"2025-03-26","capabilities":{},
+                "clientInfo":{"name":"incluster-bench","version":"1.0"}}})
+            self._post({"jsonrpc":"2.0","method":"notifications/initialized"})
+        def _post(self, payload):
+            headers = {"Content-Type":"application/json","Accept":"application/json, text/event-stream"}
+            if self.bearer: headers["Authorization"] = "Bearer " + self.bearer
+            if self.sid: headers["mcp-session-id"] = self.sid
+            req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=headers)
+            with urllib.request.urlopen(req, timeout=300) as r:
+                sid = r.headers.get("mcp-session-id")
+                if sid: self.sid = sid
+                body = r.read().decode()
+            return _parse(body) if body.strip() else {}
+        def query(self, sql, tool, arg):
+            t0 = time.monotonic()
+            resp = self._post({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                               "params":{"name":tool,"arguments":{arg:sql}}})
+            if resp.get("error"): raise RuntimeError("mcp error")
+            content = (resp.get("result") or {}).get("content") or []
+            text = content[0].get("text","") if content else ""
+            if (resp.get("result") or {}).get("isError"): raise RuntimeError("sql error: %s" % text[:120])
+            if text.strip().startswith('{"status"'): raise RuntimeError("echo state")
+            rows = 0
+            try:
+                data = json.loads(text)
+                rows = len(data if isinstance(data, list) else data.get("rows") or [])
+            except (ValueError, TypeError):
+                lines = [l for l in text.splitlines() if l.strip().startswith("|")]
+                rows = max(0, len(lines) - 2)
+            return time.monotonic() - t0, rows
+
+    def bench_leg(url, bearer, tool, arg, label):
+        out = {"leg": label}
+        try: eng = Mcp(url, bearer)
+        except Exception as e: out["error"] = "init: %s" % str(e)[:120]; return out
+        try: eng.query("SELECT 1", tool, arg)
+        except Exception as e: out["error"] = "smoke: %s" % str(e)[:120]; return out
+        lat_w, lat_c = [], []
+        for name, sq, eq in WL:
+            sql = sq if label == "sqlhandler-mcp" else eq
+            rep_w, rep_c = [], []
+            first_err = None
+            for rep in range(5):
+                try: w, _ = eng.query(sql, tool, arg); rep_w.append(round(w*1000,1))
+                except Exception as e:
+                    rep_w.append(None)
+                    if first_err is None: first_err = str(e)[:160]
+                try: w, _ = eng.query(sql + " /* bust-%d */" % rep, tool, arg); rep_c.append(round(w*1000,1))
+                except Exception: rep_c.append(None)
+            if first_err: out.setdefault("errors", {})[name] = first_err
+            okw = [x for x in rep_w if x]; okc = [x for x in rep_c if x]
+            lat_w.append({"q": name, "p50": round(statistics.median(okw),1) if okw else None, "ok": "%d/5" % len(okw)})
+            lat_c.append({"q": name, "p50": round(statistics.median(okc),1) if okc else None, "ok": "%d/5" % len(okc)})
+        out["latency_warm"], out["latency_cold"] = lat_w, lat_c
+        jobs = [(sq if label == "sqlhandler-mcp" else eq) for _, sq, eq in WL][:8]
+        res, lock = [], threading.Lock()
+        def run(s):
+            try:
+                w, _ = eng.query(s, tool, arg)
+                with lock: res.append(w*1000)
+            except Exception: pass
+        t0 = time.monotonic()
+        ths = [threading.Thread(target=run, args=(s,)) for s in jobs]
+        [t.start() for t in ths]; [t.join() for t in ths]
+        wall = time.monotonic() - t0
+        out["conc_L4"] = {"qps": round(len(res)/wall,2) if wall else 0,
+                          "p50": round(statistics.median(res),1) if res else None, "ok": len(res)}
+        return out
+
+    sa = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+    results = {"started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    ezp_bearer = sa
+    results["ezpresto_auth"] = "service-account-jwt"
+    try:
+        p = Mcp(EZP, sa)
+        p.query("SELECT COUNT(*) AS c FROM minio.default.employees", "execute_query", "query")
+    except Exception as e:
+        # SA authenticates but OPA denies catalog access for it — the UA token
+        # (admin group) is the principal with data-plane grants
+        results["ezpresto_auth"] = "sa-insufficient for tables (%s) -> ua-bearer" % str(e)[:60]
+        ezp_bearer = os.environ.get("EZPRESTO_BEARER", "")
+
+    results["sqlhandler-mcp"] = bench_leg(SQLH, "", "run_sql", "sql", "sqlhandler-mcp")
+    results["ezpresto-mcp"] = bench_leg(EZP, ezp_bearer, "execute_query", "query", "ezpresto-mcp")
+    print("BENCH_JSON_BEGIN")
+    print(json.dumps(results, indent=1))
+    print("BENCH_JSON_END")
+    print("COMPACT_BEGIN")
+    for leg_name, leg in (("sqlhandler", results.get("sqlhandler-mcp", {})),
+                          ("ezpresto", results.get("ezpresto-mcp", {}))):
+        if "error" in leg:
+            print("%s|ERROR|%s" % (leg_name, leg["error"]))
+            continue
+        for w, c in zip(leg.get("latency_warm", []), leg.get("latency_cold", [])):
+            print("%s|%s|warm=%s|cold=%s|%s" % (leg_name, w["q"], w["p50"], c["p50"], w["ok"]))
+        for q, err in leg.get("errors", {}).items():
+            print("%s|ERR|%s|%s" % (leg_name, q, err))
+        cl = leg.get("conc_L4", {})
+        print("%s|conc_L4|qps=%s|p50=%s|ok=%s" % (leg_name, cl.get("qps"), cl.get("p50"), cl.get("ok")))
+    print("auth|%s" % results.get("ezpresto_auth"))
+    print("COMPACT_END")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-incluster
+  namespace: sqlhandler
+  labels:
+    app.kubernetes.io/name: sqlhandler-bench
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1500
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sqlhandler-bench
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      containers:
+      - name: bench
+        image: ghcr.io/ai-solution-eng/sqlhandler:v1.6.0
+        command:
+        - python3
+        - /bench/bench.py
+        volumeMounts:
+        - name: script
+          mountPath: /bench
+        resources:
+          requests:
+            cpu: '1'
+            memory: 1Gi
+          limits:
+            cpu: '2'
+            memory: 2Gi
+        env:
+        - name: EZPRESTO_BEARER
+          value: eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJWMV9IZjlqZFVRZGdTal9lbU8yeDNZcjdWN1Q2MG1KaDFMMUJjMTRuS3pBIn0.eyJleHAiOjE3OTA0NzMwNDMsImlhdCI6MTc4OTE3NzA0MywiYXV0aF90aW1lIjoxNzg5MTc3MDM3LCJqdGkiOiJhOGU1NmJmOS05Zjc0LTQ2MTItYWE0NC00NjE5ODg0MmM2MGMiLCJpc3MiOiJodHRwczovL2tleWNsb2FrLnBjYWktc2UtYWktYXBwbGljYXRpb24uaHN0LnJkbGFicy5ocGVjb3JwLm5ldC9yZWFsbXMvVUEiLCJzdWIiOiIxZDJmZWUyNi0xMmQ3LTQxNjctYmZjMi1lNzgxZmY1MmZiNTQiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiJ1YSIsIm5vbmNlIjoiSmtNYzNKd29kdnhwR0xld3ZiLW5ZZ3R6LUdUZWhNRnJnVGxKNTlWaHpkVSIsInNlc3Npb25fc3RhdGUiOiI3OWIxMzY2NS1kM2I3LTRhZTItODc5ZS1jNjQxN2QyYTQ2YWIiLCJhY3IiOiIxIiwic2NvcGUiOiJvcGVuaWQgZW1haWwgcHJvZmlsZSBvZmZsaW5lX2FjY2VzcyBwY2Fpc29sdXRpOnVhIiwic2lkIjoiNzliMTM2NjUtZDNiNy00YWUyLTg3OWUtYzY0MTdkMmE0NmFiIiwidWlkIjoiMTAwMDAwMjgiLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsImdpZCI6IjEwMDEiLCJuYW1lIjoiQW5kcmV3IEJ5ZGxvbiIsIm5hbWVzcGFjZSI6InByb2plY3QtdXNlci1hbmRyZXctYnlkbG9uIiwiZ3JvdXBzIjpbInVhLWVuYWJsZWQiLCJvZmZsaW5lX2FjY2VzcyIsImFkbWluIiwidW1hX2F1dGhvcml6YXRpb24iLCJkZWZhdWx0LXJvbGVzLXVhIl0sInByZWZlcnJlZF91c2VybmFtZSI6ImFuZHJldy1ieWRsb24iLCJnaXZlbl9uYW1lIjoiQW5kcmV3IiwicG9zaXhfdXNlcm5hbWUiOiJhbmRyZXctYnlkbG9uIiwiZmFtaWx5X25hbWUiOiJCeWRsb24iLCJlbWFpbCI6ImFuZHJldy5ieWRsb25AaHBlLmNvbSJ9.i5CAuMiq2_ibruc8s7DWgegVWVNXDhQHP2eG7tBWlOzCOVWMC3GYbYu-9mgG7ttw3GkJX0GAydY8dCfR7JF8pfI3F22tLXlzIRNc5VbT-taExuAtkR3d0o2t-BUbCI9opbECM0PsIlpY4G7OrHUZlLmMu1chbea_8EBAjVNW9dgBuXTl8wzUQRUjPBrp-IwlTR7OJIa2QaBd-gREZu430pTV9Hxh8XpPZtdObbIAgKVd7qZud1OXI1m-99jEWvT6BodwZMXyZvg260gy1HJP74Ecbph8KagSTRcyg3JoyLi2uXlJwgQwA7DBzsFgM-RJ5nShEViv4kUm7-ivNhid6g
+      volumes:
+      - name: script
+        configMap:
+          name: bench-incluster-script

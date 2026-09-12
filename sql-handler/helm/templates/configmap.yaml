@@ -106,3 +106,39 @@ data:
   SQLHANDLER_DUCKDB_MEMORY_FRACTION: {{ .Values.cache.duckdbMemoryFraction | quote }}
   SQLHANDLER_DUCKDB_TEMP_DIR: {{ .Values.cache.spillDir | quote }}
   SQLHANDLER_CACHE_DIR: {{ .Values.cache.cacheDir | quote }}
+  {{- /* Virtual-table materialization + query result caches (README:
+         "Virtual tables" + performance). TTL 0 disables each layer; cache
+         keys carry base-snapshot versions so ETL commits invalidate
+         instantly. */}}
+  SQLHANDLER_VIRTUAL_CACHE_TTL: {{ .Values.cache.virtualCacheTtl | quote }}
+  SQLHANDLER_VIRTUAL_CACHE_SORT: {{ .Values.cache.virtualCacheSort | quote }}
+  SQLHANDLER_RESULT_CACHE_TTL: {{ .Values.cache.resultCacheTtl | quote }}
+  SQLHANDLER_RESULT_CACHE_MAX_BYTES: {{ .Values.cache.resultCacheMaxBytes | quote }}
+  {{- with .Values.cache.virtualCacheDir }}
+  SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
+  {{- end }}
+  {{- /* Disk block cache: opt-in (s3/iceberg parquet IO; delta-rs IO on
+         onelake is not wrappable). Empty strings mean "engine default". */}}
+  SQLHANDLER_BLOCK_CACHE: {{ .Values.cache.blockCache.enabled | quote }}
+  {{- if .Values.cache.blockCache.enabled }}
+  {{- with .Values.cache.blockCache.dir }}
+  SQLHANDLER_BLOCK_CACHE_DIR: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cache.blockCache.blockSize }}
+  SQLHANDLER_BLOCK_CACHE_BLOCK_SIZE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cache.blockCache.maxBytes }}
+  SQLHANDLER_BLOCK_CACHE_MAX_BYTES: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.cache.blockCache.includeLocal }}
+  SQLHANDLER_BLOCK_CACHE_INCLUDE_LOCAL: "1"
+  {{- end }}
+  {{- end }}
+  {{- /* Backend-specific object-client tuning (operator JSON, merged into
+         the engine's filesystem/storage constructors). */}}
+  {{- with .Values.s3.options }}
+  SQLHANDLER_S3_OPTIONS: {{ . | toJson | quote }}
+  {{- end }}
+  {{- with .Values.fabric.storageOptions }}
+  SQLHANDLER_ONELAKE_STORAGE_OPTIONS: {{ . | toJson | quote }}
+  {{- end }}

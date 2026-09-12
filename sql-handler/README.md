@@ -401,6 +401,16 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON/YAML file (table/column descriptions merged into list/describe; hot-reloaded) |
 | `SQLHANDLER_CATALOG_STORE` | Writable path for UI/API catalog uploads (default: `<cache-dir>/semantic-catalog.json`); overrides `SQLHANDLER_CATALOG` while present |
 | `SQLHANDLER_CATALOG_UPLOAD` | `0` disables the catalog mutation endpoints (upload/clear **and** the browser editor's apply/remove — reading/editing text still works, applying is refused) (default on) |
+| `SQLHANDLER_VIRTUAL_CACHE_TTL` | Seconds a virtual table's materialized result is reused (keyed by definition + base-snapshot versions, so new ETL commits invalidate immediately). `0` disables (default 3600) |
+| `SQLHANDLER_VIRTUAL_CACHE_DIR` | Where virtual-table results are materialized (default: the disk-warm cache dir); point at an RWX PVC shared by the replicas to materialize once per deployment |
+| `SQLHANDLER_VIRTUAL_CACHE_MAX_BYTES` | Skip caching virtual results larger than this — they are served live instead (default 2GiB; `0` = unlimited) |
+| `SQLHANDLER_RESULT_CACHE_TTL` | Seconds an identical query's result is served from memory (keyed by sql/params/limits + base-snapshot versions; repeated agent queries become ~0 ms). `0` disables (default 3600) |
+| `SQLHANDLER_RESULT_CACHE_MAX_BYTES` | In-memory cap for cached query results, LRU-evicted (default 256MiB) |
+| `SQLHANDLER_VIRTUAL_CACHE_SORT` | `0` disables clustering (auto-sorting) of materialized virtual results by their lowest-cardinality columns (default on) |
+| `SQLHANDLER_BLOCK_CACHE` | `1` enables the disk block cache for object-store reads (parquet footers/column chunks cached pod-local; opt-in — cold big sequential scans pay a small Python-layer cost, repeated/filtered reads win big) (default off) |
+| `SQLHANDLER_BLOCK_CACHE_DIR` / `_BLOCK_SIZE` / `_MAX_BYTES` / `_INCLUDE_LOCAL` | Cache location (default `<tmp>/sqlhandler-block-cache`), block size (default 8MiB), total-size cap (reset on overflow, default 4GiB), and `1` to also cache `LocalFileSystem` paths (NFS mounts — real-local disk is already covered by the page cache) |
+| `SQLHANDLER_S3_OPTIONS` | JSON object merged into pyarrow's `S3FileSystem` kwargs — timeouts, retry limits, connection tuning (S3 + Iceberg backends) |
+| `SQLHANDLER_ONELAKE_STORAGE_OPTIONS` | JSON object merged into delta-rs storage options (OneLake backend) |
 | `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
 | `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
 | `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (default 0 = no timeout) |

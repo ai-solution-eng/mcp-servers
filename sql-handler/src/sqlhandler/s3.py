@@ -22,11 +22,14 @@ and bucket; path-style access is on by default (what MinIO uses).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 
 import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
+from .blockcache import maybe_block_cache
 from .config import S3Config
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 
@@ -61,6 +64,11 @@ def _endpoint_override(endpoint_url: str, use_ssl: bool) -> str | None:
 def build_s3fs(config: S3Config) -> pafs.S3FileSystem:
     """Create a pyarrow S3 filesystem from an S3Config (shared by the S3 and
     Iceberg backends for reading data files from object storage).
+
+    ``SQLHANDLER_S3_OPTIONS`` (a JSON object) is merged into the constructor
+    kwargs, so operators can tune pyarrow's S3 layer — timeouts, retry
+    limits, connection behavior — without code changes. Malformed JSON is an
+    operator config error and fails loudly (same philosophy as ATTACH).
     """
     kwargs: dict = {
         "access_key": config.access_key or None,
@@ -70,6 +78,15 @@ def build_s3fs(config: S3Config) -> pafs.S3FileSystem:
         "endpoint_override": _endpoint_override(config.endpoint_url, config.use_ssl),
         "anonymous": config.anonymous,
     }
+    raw = os.environ.get("SQLHANDLER_S3_OPTIONS", "").strip()
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if not isinstance(extra, dict):
+                raise ValueError("must be a JSON object")  # noqa: TRY004
+            kwargs.update(extra)
+        except Exception as exc:
+            raise LakehouseError(f"SQLHANDLER_S3_OPTIONS is not valid JSON options: {exc}") from exc
     try:
         return pafs.S3FileSystem(**{k: v for k, v in kwargs.items() if v is not None})
     except Exception as exc:
@@ -183,9 +200,7 @@ class S3Provider(DataProvider):
             parts = rel.split("/")
             name = parts[-1]
             schema = parts[-2] if len(parts) >= 2 else "default"
-            seen[f"{schema}/{name}"] = TableInfo(
-                name=name, schema=schema, format="delta", location=rel
-            )
+            seen[f"{schema}/{name}"] = TableInfo(name=name, schema=schema, format="delta", location=rel)
         for fi in infos:
             if fi.type != pafs.FileType.File:
                 continue
@@ -236,9 +251,7 @@ class S3Provider(DataProvider):
         try:
             if version is None:
                 return DeltaTableCls(uri, storage_options=self._delta_storage_options())
-            return DeltaTableCls(
-                uri, version=version, storage_options=self._delta_storage_options()
-            )
+            return DeltaTableCls(uri, version=version, storage_options=self._delta_storage_options())
         except Exception as exc:
             raise LakehouseError(f"Could not open S3 Delta table {info.path!r}: {exc}") from exc
 
@@ -300,7 +313,7 @@ class S3Provider(DataProvider):
         # instead of a confusing NoSuchKey from a literal "../" prefix.
         if any(part == ".." for part in location.split("/")):
             raise LakehouseError(f"Invalid S3 table location: {location!r}")
-        fs = self._s3fs()
+        fs = maybe_block_cache(self._s3fs(), purpose=f"s3:{info.path}")
         root = f"{self._base()}/{location}"
         try:
             return pad.dataset(root, filesystem=fs, format="parquet")

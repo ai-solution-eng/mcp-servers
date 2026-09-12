@@ -1,0 +1,225 @@
+{
+ "workload": "workload_g2.json",
+ "suites": {
+  "latency": [
+   {
+    "query": "count_small",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 50000,
+    "p50_ms": 185.4,
+    "p95_ms": 291.5,
+    "min_ms": 179.4,
+    "max_ms": 291.5,
+    "ok": "5/5"
+   },
+   {
+    "query": "range_filter",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "p50_ms": 216.9,
+    "p95_ms": 261.0,
+    "min_ms": 179.9,
+    "max_ms": 261.0,
+    "ok": "5/5"
+   },
+   {
+    "query": "filtered_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "p50_ms": 759.0,
+    "p95_ms": 1195.4,
+    "min_ms": 233.4,
+    "max_ms": 1195.4,
+    "ok": "5/5"
+   },
+   {
+    "query": "groupby_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "p50_ms": 999.0,
+    "p95_ms": 1017.5,
+    "min_ms": 983.4,
+    "max_ms": 1017.5,
+    "ok": "5/5"
+   },
+   {
+    "query": "join_count",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 350000,
+    "p50_ms": 266.1,
+    "p95_ms": 340.6,
+    "min_ms": 243.4,
+    "max_ms": 340.6,
+    "ok": "5/5"
+   },
+   {
+    "query": "join_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 350000,
+    "p50_ms": 1997.0,
+    "p95_ms": 2986.0,
+    "min_ms": 1597.2,
+    "max_ms": 2986.0,
+    "ok": "5/5"
+   },
+   {
+    "query": "count_big_3m",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "p50_ms": 1015.5,
+    "p95_ms": 1094.2,
+    "min_ms": 918.3,
+    "max_ms": 1094.2,
+    "ok": "5/5"
+   },
+   {
+    "query": "col_proj_agg_2cols",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "p50_ms": 998.4,
+    "p95_ms": 1108.7,
+    "min_ms": 951.9,
+    "max_ms": 1108.7,
+    "ok": "5/5"
+   },
+   {
+    "query": "filtered_group_3m",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "p50_ms": 1907.3,
+    "p95_ms": 2463.8,
+    "min_ms": 1139.0,
+    "max_ms": 2463.8,
+    "ok": "5/5"
+   },
+   {
+    "query": "wide_agg_4cols",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "p50_ms": 2048.0,
+    "p95_ms": 2716.6,
+    "min_ms": 1997.5,
+    "max_ms": 2716.6,
+    "ok": "5/5"
+   }
+  ],
+  "concurrency": [
+   {
+    "engine": "sqlhandler-rest",
+    "level": 1,
+    "calls": 5,
+    "ok": 5,
+    "wall_ms": 445,
+    "qps": 11.23,
+    "p50_ms": 405.0,
+    "p95_ms": 611.7,
+    "max_ms": 611.7
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 4,
+    "calls": 20,
+    "ok": 20,
+    "wall_ms": 1715,
+    "qps": 11.66,
+    "p50_ms": 986.6,
+    "p95_ms": 2333.7,
+    "max_ms": 2333.7
+   },
+   {
+    "engine": "sqlhandler-rest",
+    "level": 8,
+    "calls": 40,
+    "ok": 40,
+    "wall_ms": 3463,
+    "qps": 11.55,
+    "p50_ms": 1224.3,
+    "p95_ms": 4154.8,
+    "max_ms": 5000.9
+   }
+  ],
+  "throughput": [
+   {
+    "query": "count_small",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 50000,
+    "wall_ms": 123.2,
+    "rows_per_s": 405697,
+    "ok": "5/5"
+   },
+   {
+    "query": "range_filter",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "wall_ms": 127.1,
+    "rows_per_s": 1573019,
+    "ok": "5/5"
+   },
+   {
+    "query": "filtered_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "wall_ms": 401.4,
+    "rows_per_s": 498195,
+    "ok": "5/5"
+   },
+   {
+    "query": "groupby_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 200000,
+    "wall_ms": 309.1,
+    "rows_per_s": 647013,
+    "ok": "5/5"
+   },
+   {
+    "query": "join_count",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 350000,
+    "wall_ms": 376.0,
+    "rows_per_s": 930838,
+    "ok": "5/5"
+   },
+   {
+    "query": "join_agg",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 350000,
+    "wall_ms": 1758.3,
+    "rows_per_s": 199054,
+    "ok": "5/5"
+   },
+   {
+    "query": "count_big_3m",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "wall_ms": 701.8,
+    "rows_per_s": 4274852,
+    "ok": "5/5"
+   },
+   {
+    "query": "col_proj_agg_2cols",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "wall_ms": 592.5,
+    "rows_per_s": 5063699,
+    "ok": "5/5"
+   },
+   {
+    "query": "filtered_group_3m",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "wall_ms": 614.3,
+    "rows_per_s": 4883493,
+    "ok": "5/5"
+   },
+   {
+    "query": "wide_agg_4cols",
+    "engine": "sqlhandler-rest",
+    "rows_scanned": 3000000,
+    "wall_ms": 1984.1,
+    "rows_per_s": 1512057,
+    "ok": "5/5"
+   }
+  ]
+ },
+ "cache_bust": true
+}

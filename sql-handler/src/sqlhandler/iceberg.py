@@ -23,6 +23,7 @@ import os
 import pyarrow as pa
 import pyarrow.dataset as pad
 
+from .blockcache import maybe_block_cache
 from .config import IcebergConfig
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .s3 import build_s3fs
@@ -159,7 +160,7 @@ class IcebergProvider(DataProvider):
             empty = pa.table([pa.array([], type=f.type) for f in schema], schema=schema)
             return pad.dataset(empty)
         if any(p.startswith("s3://") for p in files):
-            fs = build_s3fs(self.config.storage)
+            fs = maybe_block_cache(build_s3fs(self.config.storage), purpose=f"iceberg:{info.path}")
             paths = [p[len("s3://") :] for p in files]
             try:
                 return pad.dataset(paths, filesystem=fs, format="parquet")

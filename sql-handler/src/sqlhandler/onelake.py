@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -291,8 +292,15 @@ class OneLakeProvider(DataProvider):
             raise LakehouseError(f"Could not open Delta table {info.path!r}: {exc}") from exc
 
     def _storage_options(self) -> dict:
-        """Storage options for deltalake (OneLake account + SP creds)."""
-        return {
+        """Storage options for deltalake (OneLake account + SP creds).
+
+        ``SQLHANDLER_ONELAKE_STORAGE_OPTIONS`` (a JSON object) is merged on
+        top, so operators can tune the delta-rs object-client (retries,
+        timeouts, connection behavior) without code changes. Malformed JSON
+        is an operator config error and fails loudly (same philosophy as
+        ATTACH).
+        """
+        options = {
             "account_name": "onelake",
             "azure_tenant_id": self.config.tenant_id,
             "azure_client_id": self.config.client_id,
@@ -300,6 +308,16 @@ class OneLakeProvider(DataProvider):
             "dfs_endpoint": self.config.fabric_authority,
             "blob_endpoint": self.config.fabric_authority.replace("dfs", "blob"),
         }
+        raw = os.environ.get("SQLHANDLER_ONELAKE_STORAGE_OPTIONS", "").strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+                if not isinstance(extra, dict):
+                    raise ValueError("must be a JSON object")  # noqa: TRY004
+                options.update(extra)
+            except Exception as exc:
+                raise LakehouseError(f"SQLHANDLER_ONELAKE_STORAGE_OPTIONS is not valid JSON options: {exc}") from exc
+        return options
 
     def open_dataset(self, info: TableInfo, version: int | None = None):
         """Open the Delta table as a pyarrow Dataset (cached by the engine).

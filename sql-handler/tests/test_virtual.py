@@ -35,6 +35,7 @@ class FakeProvider:
 
     def __init__(self, root):
         self.root = root
+        self.versions: dict[str, int] = {}  # path -> snapshot token (mutable in tests)
 
     def list_tables(self):
         return TABLES
@@ -44,6 +45,9 @@ class FakeProvider:
 
     def open_dataset(self, info, version=None):
         return pad.dataset(str(self.root / info.path), format="parquet")
+
+    def check_version(self, info):
+        return self.versions.get(info.path)
 
 
 def _write(root: Path, rel: str, table: pa.Table) -> None:
@@ -73,7 +77,9 @@ def _make_engine(tmp_path: Path, monkeypatch, doc=None) -> tuple[SqlEngine, Path
     cat = tmp_path / "catalog.yaml"
     cat.write_text(yaml.safe_dump(doc if doc is not None else _catalog_doc()), encoding="utf-8")
     monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))
-    return SqlEngine(FakeProvider(tmp_path), cache_ttl=0), cat
+    # cache_dir isolates the virtual materialization cache per test (the
+    # metadata disk-warm layer stays off: cache_ttl=0)
+    return SqlEngine(FakeProvider(tmp_path), cache_ttl=0, cache_dir=str(tmp_path)), cat
 
 
 @pytest.fixture()
@@ -306,3 +312,143 @@ def test_compact_rewrite_is_string_literal_safe(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path, monkeypatch, doc=doc)
     out = eng.query_duckdb("SELECT id FROM vw_literal")
     assert out.column("id").to_pylist() == [1]  # literal untouched, query valid
+
+
+# ---------------------------------------------------------------------------
+# materialization cache
+# ---------------------------------------------------------------------------
+
+
+def _cache_files(engine) -> list[Path]:
+    return list(Path(engine._virtual_cache_dir).glob("*.parquet"))
+
+
+def test_virtual_cache_materializes_then_hits(engine):
+    out1 = engine.query_duckdb("SELECT * FROM vw_big_sales ORDER BY id")
+    files = _cache_files(engine)
+    assert len(files) == 1
+    assert engine._virtual_cache_writes == 1
+    out2 = engine.query_duckdb("SELECT * FROM vw_big_sales ORDER BY id")
+    assert engine._virtual_cache_writes == 1  # served from cache, no rewrite
+    assert engine._virtual_cache_hits >= 1
+    assert (
+        out1.to_pylist()
+        == out2.to_pylist()
+        == [
+            {"id": 2, "amount": 20.0},
+            {"id": 3, "amount": 30.5},
+        ]
+    )
+
+
+def test_virtual_cache_invalidated_by_base_version_change(engine):
+    engine.provider.versions["shop/sales"] = 1
+    engine.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    engine.provider.versions["shop/sales"] = 2  # ETL commit -> new snapshot
+    engine.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    assert engine._virtual_cache_writes == 2  # re-materialized on the new snapshot
+
+
+def test_virtual_cache_invalidated_by_definition_change(tmp_path, monkeypatch):
+    eng, cat = _make_engine(tmp_path, monkeypatch)
+    eng.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    cat.write_text(
+        yaml.safe_dump(_catalog_doc(definition="SELECT id FROM sales WHERE amount > 25")),
+        encoding="utf-8",
+    )
+    out = eng.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    assert out.column("count_star()").to_pylist() == [1]  # the NEW definition's rows
+    assert eng._virtual_cache_writes == 2
+    assert len(_cache_files(eng)) == 2  # both entries coexist; the old one is just stale
+
+
+def test_virtual_cache_disabled_by_ttl_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_VIRTUAL_CACHE_TTL", "0")
+    eng, _ = _make_engine(tmp_path, monkeypatch)
+    eng.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    assert _cache_files(eng) == []
+    assert eng._virtual_cache_writes == 0
+
+
+def test_virtual_cache_bypassed_for_time_travel(engine):
+    engine.query_duckdb("SELECT count(*) FROM vw_big_sales", version_as_of=1)
+    assert _cache_files(engine) == []  # historical snapshots never materialize
+
+
+def test_describe_does_not_materialize(engine):
+    engine.describe_table("vw_big_sales")
+    assert _cache_files(engine) == []  # describe binds the view, never executes it
+    engine.query_duckdb("SELECT count(*) FROM vw_big_sales")
+    assert len(_cache_files(engine)) == 1
+
+
+def test_materialization_failure_falls_back_to_live_view(tmp_path, monkeypatch):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("occupies the path", encoding="utf-8")
+    monkeypatch.setenv("SQLHANDLER_VIRTUAL_CACHE_DIR", str(blocker))
+    eng, _ = _make_engine(tmp_path, monkeypatch)
+    out = eng.query_duckdb("SELECT count(*) FROM vw_big_sales")  # must not raise
+    assert out.column("count_star()").to_pylist() == [2]
+    assert eng._virtual_cache_writes == 0
+
+
+# ---------------------------------------------------------------------------
+# count(*) metadata fast-path + query result cache
+# (engine-level speed features; tested here against the same fixtures)
+# ---------------------------------------------------------------------------
+
+
+def test_count_star_fastpath_matches_duckdb_shape(engine):
+    plain = engine.query_duckdb("SELECT COUNT(*) FROM vw_big_sales")  # virtual: normal path
+    phys = engine.query_duckdb("SELECT COUNT(*) FROM sales")  # physical: fast-path
+    assert phys.column("count_star()").to_pylist() == [3]
+    assert plain.column("count_star()").to_pylist() == [2]
+    aliased = engine.query_duckdb("SELECT COUNT(*) AS n FROM sales")
+    assert aliased.column("n").to_pylist() == [3]
+    # a filtered count must NOT take the fast-path and must stay correct
+    filtered = engine.query_duckdb("SELECT COUNT(*) FROM sales WHERE id = 1")
+    assert filtered.column("count_star()").to_pylist() == [1]
+
+
+def test_count_star_fastpath_respects_time_travel(engine):
+    engine.provider.versions["shop/sales"] = 5
+    out = engine.query_duckdb("SELECT COUNT(*) FROM sales", version_as_of=5)
+    assert out.column("count_star()").to_pylist() == [3]  # snapshot opened, metadata counted
+
+
+def test_result_cache_serves_identical_queries(engine):
+    q = "SELECT id, amount FROM sales WHERE amount > 15 ORDER BY id"
+    first = engine.query_duckdb(q)
+    assert engine._result_cache_writes == 1
+    second = engine.query_duckdb(q)
+    assert engine._result_cache_hits == 1
+    assert second.to_pylist() == first.to_pylist()
+    # different params/limits are different identities
+    engine.query_duckdb(q, limit=1)
+    assert engine._result_cache_writes == 2
+
+
+def test_result_cache_invalidated_by_base_version(engine):
+    q = "SELECT count(*) AS c FROM sales WHERE amount > 15"
+    engine.query_duckdb(q)
+    engine.provider.versions["shop/sales"] = 7  # new ETL snapshot
+    engine.query_duckdb(q)
+    assert engine._result_cache_writes == 2  # re-ran, not served stale
+
+
+def test_result_cache_disabled_and_capped(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_RESULT_CACHE_TTL", "0")
+    eng, _ = _make_engine(tmp_path, monkeypatch)
+    eng.query_duckdb("SELECT id FROM sales")
+    assert eng._result_cache_writes == 0
+
+    monkeypatch.setenv("SQLHANDLER_RESULT_CACHE_TTL", "3600")
+    monkeypatch.setenv("SQLHANDLER_RESULT_CACHE_MAX_BYTES", "1")  # nothing fits
+    eng2, _ = _make_engine(tmp_path, monkeypatch)
+    eng2.query_duckdb("SELECT id FROM sales")
+    assert eng2._result_cache_writes == 0  # too big for the cap -> served uncached
+
+
+def test_result_cache_skips_virtual_tables(engine):
+    engine.query_duckdb("SELECT count(*) AS c FROM vw_big_sales")
+    assert engine._result_cache_writes == 0  # virtual: materialization layer owns speed

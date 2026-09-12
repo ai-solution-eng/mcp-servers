@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v1.5.0
+  tag: v1.6.1
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -278,6 +278,9 @@ fabric:
   workspaceId: ""                # fallback (if no full URL)
   lakehouseId: ""                # fallback (if no full URL)
   authority: onelake.dfs.fabric.microsoft.com
+  # Extra delta-rs storage options (JSON-merged into the env): object-client
+  # retries, timeouts, connection behavior for the OneLake backend.
+  storageOptions: {}
 
 # -- S3 / MinIO backend (used when backend: s3) ------------------------------------
 # Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
@@ -313,6 +316,9 @@ s3:
   prefix: ""                  # optional sub-tree within the bucket
   anonymous: false            # read public buckets without keys
   useSsl: false               # force https when endpointUrl has no scheme
+  # Extra pyarrow S3FileSystem kwargs (JSON-merged into the env): timeouts,
+  # retry limits, connection behavior. e.g. {request_timeout: 120}
+  options: {}
 
 # -- Iceberg backend (used when backend: iceberg) ---------------------------------
 # Tables are discovered through an Iceberg catalog; the Parquet data files
@@ -383,6 +389,41 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
+  # -- Virtual-table performance (README: "Virtual tables") -----------------
+  # Seconds a virtual table's materialized result is reused. The cache key
+  # covers the definition (and everything it builds on) plus every base
+  # table's Delta/Iceberg snapshot version, so new ETL commits invalidate
+  # immediately; the TTL is only a backstop. 0 disables materialization.
+  virtualCacheTtl: 3600
+  # Where materialized results are written. Default: cacheDir above. Point
+  # at an RWX PVC shared by all replicas to materialize once per deployment
+  # instead of once per pod.
+  virtualCacheDir: ""
+  # Cluster (sort) materialized virtual results by their lowest-cardinality
+  # columns so row-group statistics prune filtered reads. 0 disables.
+  virtualCacheSort: true
+  # Seconds an identical query's result is served from memory (keyed by
+  # sql/params/limits + base-snapshot versions). 0 disables.
+  resultCacheTtl: 3600
+  # In-memory byte cap for cached query results (LRU-evicted).
+  resultCacheMaxBytes: "268435456"
+  # -- Disk block cache (object-store reads) --------------------------------
+  # Opt-in disk cache for parquet footers/column chunks read through pyarrow
+  # filesystems (s3 + iceberg backends; delta-rs IO on onelake is not
+  # wrappable). Off by default: cold big sequential scans pay a small
+  # Python-layer cost, repeated/filtered/preview reads win big.
+  blockCache:
+    enabled: false
+    # Cache location. Default: <tmp>/sqlhandler-block-cache.
+    dir: ""
+    # Bytes per cached block (bigger = fewer remote round-trips).
+    blockSize: "8388608"
+    # Total cache size; the cache resets itself when exceeded.
+    maxBytes: "4294967296"
+    # 1 also caches LocalFileSystem paths — NFS mounts ARE LocalFileSystem
+    # to pyarrow while being network; real-local disk is already covered by
+    # the OS page cache.
+    includeLocal: false
 
 # -- Semantic catalog ----------------------------------------------------------
 # The "semantic view": human-written table/column descriptions merged into
