@@ -1,0 +1,175 @@
+# Owner: HPE AI Solution Engineering
+
+# ezapp-deploy — PCAI application-deployment MCP server: receives a packaged
+# Helm chart (.tgz) from an agent skill, pushes it to the in-cluster
+# ChartMuseum via curl, and applies the cluster-scoped EzAppConfig CR that
+# triggers the EZUA app operator. Exposed at /mcp through the PCAI Istio
+# gateway.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: ezapp-deploy
+  appName: ezapp-deploy
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+image:
+  repository: ghcr.io/ai-solution-eng/ezapp-deploy-mcp
+  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
+  # this default is what a deploy WITHOUT a profile file uses, and a stale
+  # default is how an "old MCP + new chart" pod happens.
+  tag: 0.1.4
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously). Per-namespace secret:
+#   kubectl create secret docker-registry ghcr-pull -n <ns> \
+#     --docker-server=ghcr.io --docker-username=<gh-user> \
+#     --docker-password=<gh-PAT-with-read:packages>
+imagePullSecrets: []
+
+# -- Service exposure -------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9090        # MCP (streamable-http at /mcp)
+  targetPort: 9090
+
+# -- Resources -------------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -- Service account ------------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""                   # empty = deployment.name (it is the RBAC subject)
+
+# -- MCP server app config ---------------------------------------------------------------------------
+# SECURITY INVARIANTS (do not weaken):
+#  * The API key is NEVER created by this chart and NEVER inlined in values —
+#    reference an out-of-band Secret instead; the Deployment fails loud until
+#    it exists.
+#  * Wildcard apiGroups are refused at render time (see templates/rbac.yaml) —
+#    this server's whole power is `create ezappconfigs`; keep it that narrow.
+apiKey:
+  existingSecret: ""         # empty = "<deployment.name>-apikey"
+  existingSecretKey: api-key
+
+# -- ChartMuseum (in-cluster ClusterIP service; the upload transport is curl) -----------
+chartmuseum:
+  # PCAI's official ChartMuseum (byoa-tutorials reference flow). Override if
+  # your cluster runs it elsewhere.
+  url: "http://chartmuseum.ez-chartmuseum-ns.svc.cluster.local:8080"
+  # Optional basic auth: reference an OUT-OF-BAND Secret holding the
+  # username/password keys (the chart never creates it and values never
+  # carry credentials). Empty = no auth header on uploads (matches the
+  # stock PCAI ChartMuseum).
+  authSecretName: ""
+  usernameKey: username
+  passwordKey: password
+  # PCAI platform CAs are often NOT in the container trust store. If
+  # ChartMuseum is reached over https, either skip verification...
+  tlsInsecure: false
+  # ...or (better) mount the platform CA into the pod and point the env at
+  # the file — e.g. volumeMount the ezaf-root-ca ConfigMap/Secret and set
+  # caBundle to the file path inside the container. Exactly ONE of the two
+  # may be active; the server refuses to start a call with both set.
+  caBundle: ""
+
+# -- EzAppConfig CR wiring -----------------------------------------------------------------
+# The manifest comes from an agent skill; these values pin what the server
+# validates against and what RBAC grants. The apiGroup below is the
+# platform's EzAppConfig CRD group (byoa-tutorials reference).
+ezappconfig:
+  kind: EzAppConfig
+  apiVersion: "ezconfig.hpe.ezaf.com/v1alpha1"
+  plural: ezappconfigs
+  maxChartMB: 30
+
+# -- Deploy-target namespace governance (spec.options.namespace; app layer) ------------
+# Optional fnmatch-glob allow/deny lists. Blocked always wins; kube-system,
+# kube-public and kube-node-lease are ALWAYS denied on top of these.
+targets:
+  allowed: ""                # EZAPP_MCP_ALLOWED_TARGET_NAMESPACES ("" = all)
+  blocked: ""                # EZAPP_MCP_BLOCKED_TARGET_NAMESPACES
+
+# -- Ownership ledger -----------------------------------------------------------------
+# A ConfigMap (created empty by this chart, kept across upgrades/uninstalls
+# via helm.sh/resource-policy: keep) records every chart upload and every
+# EzAppConfig apply. The server's destructive tools (delete_chart,
+# delete_ezappconfig, force-overwrite uploads, re-applying an existing CR)
+# are gated on it: they work ONLY for objects this server deployed itself.
+# A missing or wiped ledger LOCKS those tools out (fail-safe) — it never
+# unlocks them.
+ledger:
+  configmap: ""              # empty = "<deployment.name>-ledger"
+  namespace: ""              # empty = the pod's service-account namespace
+                             # (always correct in-cluster; override only for
+                             # exotic setups where the ledger lives elsewhere)
+
+# -- Web UI (read-only view of managed apps) ------------------------------------------------
+# Static shell at /ui/ (no data in it); its /api/managed data endpoint is
+# gated by the same API key as /mcp.
+ui:
+  enabled: true
+
+# -- Chunked upload tools (optional MCP statefulness) ---------------------------------------
+# upload_chart_begin/chunk/commit stream charts too big for one MCP tool
+# call (24 KB binary chunks, sha256-verified at commit). Sessions are
+# in-memory (15 min TTL, 5 max) — the server's ONLY stateful feature — so
+# keep replicaCount 1 while enabled. Disable to drop the three tools from
+# the server entirely.
+chunkedUpload:
+  enabled: true
+
+# -- Delete tools (decommissioning) ----------------------------------------------------------
+# delete_chart / delete_ezappconfig remove only ledger-recorded objects and
+# are audit-logged. Disable for automation-facing deployments where
+# decommissioning should be a purely human action.
+delete:
+  enabled: true
+
+# -- RBAC (what the server may do to the cluster) ------------------------------------------------
+rbac:
+  create: true
+  # The EzAppConfig CRD's apiGroup. NEVER "*" — with resources: [ezappconfigs]
+  # a wildcard would still be narrower than apiGroups: ["*"] elsewhere, but
+  # it invites copy-pasting the pattern into broader roles.
+  apiGroup: "ezconfig.hpe.ezaf.com"
+
+# -- Pod annotations / node placement -------------------------------------------------------------------------------------
+# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
+# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
+# — it is the audited baseline.
+podAnnotations:
+  sidecar.istio.io/inject: "false"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------------------------------------------------------
+# Deploys the Istio VirtualService so MCP clients OUTSIDE the cluster (agent
+# skills usually run on an operator's laptop or DSH) reach the server through
+# the ezaf-gateway. The MCP path (/mcp) uses a long timeout. The endpoint
+# doubles as MCP_HOSTNAME (DNS-rebinding pin) — MUST be unique per release on
+# the shared gateway: two VirtualServices claiming one host split traffic
+# between their backends (observed live on PCAI).
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "ezapp-deploy-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
+  # rotating-token pain for machine MCP callers is an accepted lab trade; the
+  # template is real, so flipping it on enforces tokens for this host.
+  authorizationPolicy:
+    enabled: false
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

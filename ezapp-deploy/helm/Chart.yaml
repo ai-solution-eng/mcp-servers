@@ -1,0 +1,23 @@
+# ezapp-deploy — application deployment MCP server for PCAI (HPE Ezmeral
+# Unified Analytics): uploads packaged Helm charts to the in-cluster
+# ChartMuseum and applies the cluster-scoped EzAppConfig CR that makes the
+# EZUA app operator install the application.
+apiVersion: v2
+name: ezapp-deploy
+description: >-
+  PCAI application-deployment MCP server — ChartMuseum chart upload (curl)
+  and cluster-scoped EzAppConfig apply over MCP 2.0, behind the PCAI Istio
+  gateway.
+type: application
+version: 0.1.4
+appVersion: "0.1.4"
+keywords:
+  - mcp
+  - kubernetes
+  - deploy
+  - ezappconfig
+  - chartmuseum
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

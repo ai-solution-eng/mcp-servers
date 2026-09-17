@@ -1,0 +1,23 @@
+{{- /* Ownership ledger — records every chart upload and EzAppConfig apply
+      so deletes and force-overwrites are limited to objects this server
+      created itself. helm.sh/resource-policy: keep stops `helm upgrade`
+      from resetting the accumulated data (and uninstall leaves the ledger
+      behind on purpose — delete it manually to wipe history). */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.deployment.name }}-ledger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    app.kubernetes.io/managed-by: ezapp-deploy
+  annotations:
+    helm.sh/resource-policy: keep
+    ezapp-deploy.hpe.com/purpose: >-
+      ownership ledger: charts uploaded and EzAppConfigs applied by the
+      ezapp-deploy MCP server; gates its delete/overwrite tools; do not
+      edit by hand
+data:
+  version: "1"
+  charts.json: "{}"
+  ezappconfigs.json: "{}"
