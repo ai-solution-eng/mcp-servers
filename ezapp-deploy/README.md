@@ -1,5 +1,8 @@
 # ezapp-deploy
 
+> [!WARNING]
+> This mcp server is experimental - use with caution
+
 An **application-deployment MCP server** for **HPE Private Cloud AI (PCAI / Ezmeral Unified Analytics)** — the write-side companion to [k8s-ops](../k8s-ops) (read-only inspection). It runs **inside the target PCAI cluster** and exposes a deliberately tiny deploy surface over **MCP 2.0** (protocol `2026-07-28`, official MCP Python SDK v2):
 
 1. **`upload_chart`** (or **`POST /upload`** for big charts) — receives a packaged Helm chart and pushes it to the in-cluster **ChartMuseum** via `curl` (raw `POST /api/charts`, the exact flow of HPE's official [byoa-tutorials](https://github.com/HPEEzmeral/byoa-tutorials); ChartMuseum is a ClusterIP service inside the cluster).
