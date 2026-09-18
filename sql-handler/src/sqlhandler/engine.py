@@ -34,8 +34,12 @@ from collections import OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    import duckdb
 
 from . import observability, resources
 from .external import (
@@ -46,6 +50,7 @@ from .external import (
     validate_qualified_name,
 )
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
+from .sqlguard import assert_attached_readonly
 
 logger = logging.getLogger("sqlhandler.engine")
 
@@ -73,14 +78,17 @@ def _query_timeout() -> float:
     """Per-query wall-clock timeout in seconds (SQLHANDLER_QUERY_TIMEOUT).
 
     Applies to the DuckDB SQL path (MCP run_sql and the web API alike);
-    0 (the default) keeps the old no-timeout behavior. On expiry the query
-    is interrupted inside DuckDB (not leaked) and a LakehouseError surfaces.
+    default 600s (decision D5): a runaway query used to hold one of the
+    concurrency-gate slots forever. On expiry the query is interrupted
+    inside DuckDB (not leaked) and a LakehouseError surfaces. 0 restores
+    the old no-timeout behavior; queries longer than 10 minutes must opt
+    in via this env.
     """
     raw = os.environ.get("SQLHANDLER_QUERY_TIMEOUT", "")
     try:
-        return max(float(raw), 0.0) if raw else 0.0
+        return max(float(raw), 0.0) if raw else 600.0
     except ValueError:
-        return 0.0
+        return 600.0
 
 
 # After a timeout-triggered interrupt, how long to wait for the query thread
@@ -195,7 +203,7 @@ class QueryJob:
         # by the (much lower) default LLM-payload cap.
         self._row_cap = row_cap
         self._lock = threading.Lock()
-        self._con = None  # live only while the query runs (cancel handle)
+        self._con: duckdb.DuckDBPyConnection | None = None  # live only while the query runs (cancel handle)
         self._state = "running"
         self._error: str | None = None
         self._result: pa.Table | None = None
@@ -221,6 +229,17 @@ class QueryJob:
             self._con = con
         try:
             if self._engine._sql_needs_external(self.sql):
+                # The attached-catalog connection is SELECT-only, UNCONDITIONALLY
+                # (see sqlhandler/external.py: "the database is a source, never
+                # a sink"). Enforced BEFORE any scanner extension is loaded, so
+                # even a caller who opted out of the MCP read-only mode
+                # (SQLHANDLER_MCP_READONLY=0) cannot use the attach connection
+                # as an exfiltration sink: ATTACH/INSERT/COPY/multi-statement
+                # scripts are refused here, and the plain (lake) connection this
+                # job would otherwise use never has the attached catalogs — nor
+                # the scanner extensions to create one. Decision D2's escape
+                # hatch restores DDL for LAKE data only.
+                assert_attached_readonly(self.sql)
                 # Extension LOAD + ATTACH must precede the fs lockdown: both
                 # use DuckDB's filesystem layer internally (the scanner .so
                 # and the attach bind), while query-time data fetch does not
@@ -324,11 +343,30 @@ class QueryJob:
         """The arrow result; raises LakehouseError unless the job is done."""
         state = self.state
         if state == "done":
-            assert self._result is not None
-            return self._result
+            with self._lock:
+                if self._result is None:
+                    # Fetch-once flows (async query jobs) release the spooled
+                    # table after handing it over; a second fetch is refused
+                    # instead of tripping the assert below.
+                    raise LakehouseError(
+                        "Query result was already fetched and released (results are handed over once)."
+                    )
+                return self._result
         if state == "cancelled":
             raise LakehouseError("Query was cancelled.")
         raise LakehouseError(self._error or f"Query did not complete (state: {state}).")
+
+    def release_result(self) -> None:
+        """Drop the spooled result table (fetch-once async-job flows).
+
+        The async job registry hands each result over exactly once and frees
+        it immediately afterwards, so a registry of finished jobs cannot
+        accumulate unbounded Arrow tables in memory. Status stays queryable
+        (state/elapsed/error) — only the row data is dropped. Synchronous
+        callers never call this; their behavior is unchanged.
+        """
+        with self._lock:
+            self._result = None
 
     def info(self) -> dict:
         """Status snapshot for the async-query API (no row data)."""
@@ -417,7 +455,7 @@ def _apply_memory_budget(con) -> None:
         if mem:
             con.execute(f"SET memory_limit='{mem}'")
         threads = budget.get("threads")
-        if threads:
+        if isinstance(threads, int) and threads:
             con.execute(f"SET threads={int(threads)}")
         temp_dir = budget.get("temp_directory")
         if temp_dir:
@@ -461,6 +499,70 @@ def _safe_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+
+
+def _normalize_cache_sql(sql: str) -> str:
+    """Whitespace-normalize SQL for result-cache keys (quote-aware, fail-open).
+
+    Collapses whitespace runs OUTSIDE quoted regions to single spaces and
+    trims both ends, so formatting-only variants of a query share one cache
+    entry. Quoted content — string literals AND double-quoted identifiers —
+    is preserved byte-for-byte, because ``'a  b'`` and ``'a b'`` can return
+    different results and ``"my col"`` is a different identifier from
+    ``"mycol"``. Trailing statement terminators (``;``) are stripped.
+
+    The tiny scanner BAILS OUT (returns the raw text) on anything it cannot
+    reason about safely: ``--``/``/*`` comments (an apostrophe inside a
+    comment would corrupt the quote state) and ``$`` (dollar-quoted strings).
+    Bailing reproduces today's exact key, so normalization can only ever ADD
+    cache hits — never serve a result a distinct query would not have gotten.
+    """
+    try:
+        out: list[str] = []
+        i, n = 0, len(sql)
+        in_quote: str | None = None
+        pending_ws = False
+        while i < n:
+            ch = sql[i]
+            if in_quote is not None:
+                out.append(ch)
+                if ch == in_quote:
+                    if i + 1 < n and sql[i + 1] == in_quote:
+                        out.append(sql[i + 1])  # doubled quote stays inside
+                        i += 1
+                    else:
+                        in_quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_quote = ch
+                pending_ws = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "$":
+                return sql  # dollar-quoted strings — beyond this scanner
+            if (ch == "-" and sql[i : i + 2] == "--") or (ch == "/" and sql[i : i + 2] == "/*"):
+                return sql  # comments — beyond this scanner
+            if ch.isspace():
+                if not pending_ws:
+                    out.append(" ")
+                    pending_ws = True
+                i += 1
+                continue
+            pending_ws = False
+            out.append(ch)
+            i += 1
+        if in_quote is not None:
+            return sql  # unterminated quote — sqlguard refuses these anyway
+        norm = "".join(out).strip()
+        while norm.endswith(";"):
+            norm = norm[:-1].rstrip()
+        return norm or sql
+    except Exception:
+        return sql
+
+
 def _validate_params(params: object) -> object | None:
     """Validate user-supplied query parameters (named dict or positional list).
 
@@ -494,6 +596,96 @@ def _validate_params(params: object) -> object | None:
                 f"Query params must be scalars (str/int/float/bool/datetime/Decimal/None); got {type(v).__name__}."
             )
     return params
+
+
+# ---------------------------------------------------------------------------
+# column_stats (additive, Wave 5): per-column statistics over a bounded sample
+# ---------------------------------------------------------------------------
+
+# Types quantile_cont accepts (everything else → quantiles reported as null).
+_QUANTILE_TYPE_RE = re.compile(
+    r"\b(tinyint|smallint|integer|bigint|hugeint|utinyint|usmallint|uinteger|ubigint|"
+    r"u?int\d*|float\d*|double|real|decimal|numeric|timestamp|timestamptz|date|time|interval)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_column(info: dict, column: str, table: str) -> tuple[str, str]:
+    """Resolve ONE column against a describe result (case-insensitive).
+
+    Returns the table's actual (case-correct) column name and its type; a
+    missing column raises a LakehouseError that names the available columns
+    so an agent self-corrects in one round-trip.
+    """
+    wanted = str(column).strip()
+    if not wanted:
+        raise LakehouseError("Provide the column to profile (column_stats(table, column)).")
+    for c in info.get("columns", []):
+        if str(c.get("name", "")).lower() == wanted.lower():
+            return str(c["name"]), str(c.get("type", ""))
+    available = ", ".join(str(c.get("name", "")) for c in info.get("columns", [])[:15])
+    raise LakehouseError(f"Column {column!r} does not exist on table {table!r}. Available columns: {available}")
+
+
+def _column_stats_queries(con, target: str, col: str, cap: int, top_n: int, col_type: str) -> dict:
+    """Run the bounded-sample stats queries for one column on one connection.
+
+    ``target`` is a DuckDB-quoted relation name (registered view, virtual
+    target, or an attached qualified name); ``col`` is a quoted identifier
+    resolved against the real schema. Every query reads at most ``cap`` rows
+    (``_profile_max_rows``) — the same sampling posture as ``profile_table``,
+    never a full-table scan beyond the existing profile cap. When ``cap`` is
+    0 (the profile cap disabled) the sample is the whole column, exactly like
+    profile_table's SUMMARIZE.
+    """
+    col_ident = _safe_ident(col)
+    inner = f"SELECT {col_ident} FROM {target}"
+    if cap > 0:
+        inner = f"SELECT * FROM ({inner}) LIMIT {int(cap)}"
+
+    row = con.sql(
+        f"SELECT count(*) AS sampled_rows, count({col_ident}) AS non_null, "
+        f"min({col_ident}) AS min, max({col_ident}) AS max, "
+        f"approx_count_distinct({col_ident}) AS approx_unique, "
+        f"count(DISTINCT {col_ident}) AS distinct_count "
+        f"FROM ({inner})"
+    ).fetchone()
+    sampled_rows = int(row[0]) if row and row[0] is not None else 0
+    non_null = int(row[1]) if row and row[1] is not None else 0
+    null_count = max(sampled_rows - non_null, 0)
+    null_pct = round(null_count * 100.0 / sampled_rows, 1) if sampled_rows else 0.0
+
+    top_values: list[dict] = []
+    if non_null:
+        top_rows = con.sql(
+            f"SELECT {col_ident} AS value, count(*) AS n FROM ({inner}) "
+            f"WHERE {col_ident} IS NOT NULL GROUP BY 1 ORDER BY n DESC, value ASC LIMIT {int(max(min(top_n, 20), 1))}"
+        ).fetchall()
+        top_values = [{"value": r[0], "count": int(r[1])} for r in top_rows]
+
+    quantiles: dict[str, float | None] = {"q25": None, "q50": None, "q75": None}
+    if non_null and _QUANTILE_TYPE_RE.search(col_type or ""):
+        try:
+            qrow = con.sql(
+                f"SELECT quantile_cont({col_ident}, 0.25), quantile_cont({col_ident}, 0.5), "
+                f"quantile_cont({col_ident}, 0.75) FROM ({inner}) WHERE {col_ident} IS NOT NULL"
+            ).fetchone()
+            if qrow:
+                quantiles = {"q25": qrow[0], "q50": qrow[1], "q75": qrow[2]}
+        except Exception:
+            pass  # exotic orderable type DuckDB's quantile_cont rejects — report nulls
+
+    return {
+        "sampled_rows": sampled_rows,
+        "distinct_count": int(row[5]) if row and row[5] is not None else None,
+        "approx_unique": row[4],
+        "null_count": null_count,
+        "null_pct": null_pct,
+        "min": row[2],
+        "max": row[3],
+        **quantiles,
+        "top_values": top_values,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +771,7 @@ class SqlEngine:
         # (caching off) or when list_async_refresh is False.
         self._async_list = bool(list_async_refresh) and cache_ttl > 0
         self._list_refreshing = False
-        self._describe_cache: dict[str, tuple[float, dict]] = {}
+        self._describe_cache: dict[tuple[str, str], tuple[float, dict]] = {}
         self._describe_hits = 0
         self._describe_misses = 0
         # Profile results (column statistics) — same TTL discipline as
@@ -590,12 +782,14 @@ class SqlEngine:
         self._profile_misses = 0
         # Reused open Datasets (metadata handles, NOT row data):
         # path -> (ts, dset, version), LRU-bounded.
-        self._dataset_cache: OrderedDict[str, tuple[float, object, object | None]] = OrderedDict()
+        self._dataset_cache: OrderedDict[tuple[str, str, int | None], tuple[float, object, object | None]] = (
+            OrderedDict()
+        )
         self._dataset_hits = 0
         self._dataset_misses = 0
         # Delta snapshot-version checks are throttled to this many seconds
         # per table (0 = check on every reuse).
-        self._version_checked_at: dict[str, float] = {}
+        self._version_checked_at: dict[tuple[str, str, int | None], float] = {}
         self._lock = threading.RLock()
         # Semantic catalog (SQLHANDLER_CATALOG): an optional JSON **or YAML**
         # file of human-written table/column descriptions merged into
@@ -757,12 +951,12 @@ class SqlEngine:
         """
         now = time.monotonic()
         with self._lock:
-            have = self._tables is not None
-            fresh = have and (now - self._tables_ts < self.cache_ttl)
-        if have and (fresh or self._async_list):
+            cached = self._tables
+            fresh = cached is not None and (now - self._tables_ts < self.cache_ttl)
+        if cached is not None and (fresh or self._async_list):
             if not fresh:  # async_list must be enabled here
                 self._maybe_refresh_async()  # serve stale, refresh in background
-            return self._tables
+            return cached
         # No cache yet, or caching disabled: fill synchronously so callers
         # always get a current result.
         tables = self.provider.list_tables()
@@ -816,6 +1010,7 @@ class SqlEngine:
 
     # ------------------------------------------------------- disk warm layer
     def _cache_file(self) -> Path:
+        assert self._cache_dir is not None  # both callers run only when a cache dir is configured
         return Path(self._cache_dir) / "metadata-cache.json"
 
     def _load_cache_from_disk(self) -> None:
@@ -1715,7 +1910,7 @@ class SqlEngine:
                 ts, listing = self._attached_listing
                 if now - ts < self.cache_ttl:
                     return listing
-        listing: list[dict] = []
+        listing = []
         for spec in self.attaches:
             entry: dict = {
                 "name": spec.name,
@@ -1863,7 +2058,15 @@ class SqlEngine:
 
         Returns a list of matches, best first:
           ``{"table", "name", "qualified_name", "format", "source",
-             "description", "matched_columns", "score"}``
+             "description", "matched_columns", "score", "matched_on"}``
+
+        Ranking layers EXACT/substring matching — table-name equality,
+        substring hits on name/aliases, term hits on names, catalog docs and
+        column names — with a FUZZY layer (additive): difflib similarity so
+        typos and near-miss names ("work oder" -> ``work_order``) still match.
+        Substring bonuses are strictly larger than fuzzy bonuses, so exact
+        hits always outrank near-misses, and a query that is neither a
+        substring nor close to any name still returns an empty list.
         """
         q = query.strip().lower()
         if not q:
@@ -1876,7 +2079,8 @@ class SqlEngine:
             entry = self._catalog_for(info)
             desc = str(entry.get("description") or "")
             aliases = [str(a) for a in entry.get("aliases") or []]
-            col_docs = entry.get("columns") if isinstance(entry.get("columns"), dict) else {}
+            raw_cols = entry.get("columns")
+            col_docs = raw_cols if isinstance(raw_cols, dict) else {}
             # Column names from an already-cached describe (never a fetch).
             cached = cached_describes.get((info.source, info.path))
             col_names = [c["name"] for c in cached[1].get("columns", [])] if cached else []
@@ -1889,26 +2093,71 @@ class SqlEngine:
             col_index = {**{c: "" for c in col_names}, **col_docs}
             score = 0
             matched_cols: list[str] = []
+            matched_on: list[str] = []
             if info.name.lower() == q or info.path.lower() == q or info.qualified_name.lower() == q:
                 score += 100
+                matched_on.append("exact-name")
             elif q in hay_name:
                 score += 80
+                matched_on.append("substring-name")
             if any(q in a.lower() for a in aliases):
                 score += 60
+                matched_on.append("alias")
             if terms:
                 if any(t in hay_name for t in terms):
                     score += 40
+                    matched_on.append("terms-name")
                 if any(t in hay_docs for t in terms):
                     score += 30
+                    matched_on.append("terms-docs")
                 matched_cols = [
                     c for c, doc in col_index.items() if any(t in c.lower() or t in str(doc).lower() for t in terms)
                 ]
                 if matched_cols:
                     score += 30
+                    matched_on.append("columns")
             elif q:
                 matched_cols = [c for c, doc in col_index.items() if q in c.lower() or q in str(doc).lower()]
                 if matched_cols:
                     score += 30
+                    matched_on.append("columns")
+
+            # Fuzzy layer (additive): near-miss names via difflib similarity.
+            # Whole-query ratio against the name forms, then per-term ratios
+            # against name/alias tokens and column names/docs. Deliberately
+            # lower bonuses than any substring layer (<=30 vs 30-100) so exact
+            # matches keep ranking first, with thresholds high enough that an
+            # unrelated query still matches nothing at all.
+            import difflib
+
+            best_name = max(
+                difflib.SequenceMatcher(None, q, form).ratio()
+                for form in (info.name, info.path, info.qualified_name, hay_name)
+            )
+            if best_name >= 0.6:
+                score += round(30 * best_name)
+                matched_on.append("fuzzy-name")
+            if terms:
+                name_tokens = {t for t in re.split(r"[^a-z0-9_]+", hay_name) if t} | {a.lower() for a in aliases}
+                token_bonus = 0
+                for t in terms:
+                    if any(difflib.SequenceMatcher(None, t, tok).ratio() >= 0.8 for tok in name_tokens if tok):
+                        token_bonus += 12
+                        matched_on.append("fuzzy-name-token")
+                score += min(token_bonus, 24)
+                for c, doc in col_index.items():
+                    if c in matched_cols:
+                        continue
+                    cl = c.lower()
+                    if any(
+                        difflib.SequenceMatcher(None, t, cl).ratio() >= 0.8
+                        or (doc and difflib.SequenceMatcher(None, t, str(doc).lower()).ratio() >= 0.8)
+                        for t in terms
+                    ):
+                        matched_cols.append(c)
+                        score += 10
+                        matched_on.append("fuzzy-column")
+
             if score <= 0:
                 continue
             results.append(
@@ -1921,6 +2170,7 @@ class SqlEngine:
                     "description": desc,
                     "matched_columns": matched_cols[:10],
                     "score": score,
+                    "matched_on": list(dict.fromkeys(matched_on))[:5],
                 }
             )
         results.sort(key=lambda r: (-r["score"], r["table"]))
@@ -1982,8 +2232,16 @@ class SqlEngine:
             inner = f"SELECT {col_sel} FROM {view}"
             if cap > 0:
                 inner = f"SELECT * FROM ({inner}) LIMIT {cap}"
-            profiled = con.sql(f"SELECT count(*) FROM ({inner})").fetchone()
-            profiled_rows = int(profiled[0]) if profiled else 0
+            # Single data scan: the row count of the bounded sample follows
+            # from the metadata count (the LIMITed subquery yields exactly
+            # min(n_rows, cap) rows), so SUMMARIZE is the only query that
+            # touches the data — the separate count(*) ran the same scan
+            # twice (audit performance finding). The count query only comes
+            # back for the rare metadata-unreadable case.
+            if n_rows is not None:
+                profiled_rows = min(n_rows, cap) if cap > 0 else n_rows
+            else:
+                profiled_rows = self._profile_count_fallback(con, inner)
             summary = con.sql(f"SUMMARIZE {inner}").arrow()
             if isinstance(summary, pa.RecordBatchReader):
                 summary = summary.read_all()
@@ -2006,6 +2264,17 @@ class SqlEngine:
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
         return result
+
+    @staticmethod
+    def _profile_count_fallback(con, inner: str) -> int:
+        """Row count of the bounded profile sample, by query.
+
+        Only used when the metadata count is unavailable (the source's
+        row-group/log stats could not be read) — the one profile path that
+        still scans the data twice.
+        """
+        row = con.sql(f"SELECT count(*) FROM ({inner})").fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def _summarize_columns(summary: pa.Table) -> list[dict]:
@@ -2087,6 +2356,119 @@ class SqlEngine:
                 self._profile_cache[key] = (time.monotonic(), result)
         return result
 
+    # -------------------------------------------------------- column stats
+    def column_stats(self, table: str, column: str, top_n: int = 5) -> dict:
+        """Statistics for ONE column over a bounded sample (additive, Wave 5).
+
+        A focused complement to :meth:`profile_table` (which stays untouched):
+        distinct count, null count/pct, min/max, q25/q50/q75 quantiles and the
+        top-N values with counts — the shape an agent needs before writing a
+        filter, for exactly one column instead of the whole table.
+
+        Sampling mirrors profile_table: every query reads at most
+        ``SQLHANDLER_PROFILE_MAX_ROWS`` rows (default 1M; 0 = full column) —
+        never a full-table scan beyond the existing profile cap. The full
+        row count still comes from Parquet/Delta metadata where it is free
+        (physical tables); virtual/attached tables report ``n_rows: None``
+        and the sample sizes instead. Cached like describe/profile.
+        """
+        ext = self._match_external_table(table)
+        if ext is not None:
+            return self._column_stats_external(*ext, column, top_n)
+        info = self._resolve(table)
+        cap = _profile_max_rows()
+        col_key = (str(column).strip().lower(),)
+        key = ("colstats", info.source, info.path, col_key)
+        now = time.monotonic()
+        with self._lock:
+            hit = self._profile_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._profile_hits += 1
+                return hit[1]
+
+        described = self.describe_table(table)
+        col, col_type = _validate_column(described, column, table)
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+            if info.format == "virtual":
+                target = _safe_ident(info.name)
+                self._register_schema(con, f"SELECT * FROM {target}")
+                n_rows: int | None = None  # the definition's full count is not paid for a column sample
+                virtual = True
+            else:
+                dset = self._open_dataset(info)
+                try:
+                    n_rows = int(dset.count_rows())
+                except Exception:
+                    n_rows = None
+                target = "_sqlhandler_colstats_target"
+                con.register(target, dset)
+                virtual = False
+            stats = _column_stats_queries(con, target, col, cap, top_n, col_type)
+        except LakehouseError:
+            raise
+        except Exception as exc:
+            raise LakehouseError(f"Column stats failed for '{table}.{column}': {exc}") from exc
+        finally:
+            con.close()
+        result = {
+            "table": table,
+            "column": col,
+            "type": col_type,
+            "uri": f"virtual://{info.name}" if virtual else self.provider.table_uri(info),
+            "n_rows": n_rows,
+            "sample_cap": cap,
+            **stats,
+        }
+        if virtual:
+            result["virtual"] = True
+        with self._lock:
+            self._profile_misses += 1
+            if self.cache_ttl > 0:
+                self._profile_cache[key] = (time.monotonic(), result)
+        return result
+
+    def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:
+        """column_stats for an attached-database table (LIMIT runs server-side)."""
+        cap = _profile_max_rows()
+        key = ("colstats-ext", qualified, (str(column).strip().lower(),))
+        now = time.monotonic()
+        with self._lock:
+            hit = self._profile_cache.get(key)
+            if hit is not None and now - hit[0] < self.cache_ttl:
+                self._profile_hits += 1
+                return hit[1]
+        con = self._external_connection()
+        try:
+            col, col_type = _validate_column(self._describe_external(spec, qualified), column, qualified)
+            stats = _column_stats_queries(con, qualified, col, cap, top_n, col_type)
+        except LakehouseError:
+            raise
+        except Exception as exc:
+            raise LakehouseError(f"Column stats failed for attached table '{qualified}.{column}': {exc}") from exc
+        finally:
+            con.close()
+        result = {
+            "table": qualified,
+            "column": col,
+            "type": col_type,
+            "uri": spec.display_uri,
+            "source": "external",
+            "read_only": True,
+            "n_rows": None,
+            "sample_cap": cap,
+            **stats,
+        }
+        with self._lock:
+            self._profile_misses += 1
+            if self.cache_ttl > 0:
+                self._profile_cache[key] = (time.monotonic(), result)
+        return result
+
     def usage_top_tables(self, n: int = 5) -> tuple[str, ...]:
         """The n most-accessed tables this/past run (for usage-driven prewarm).
 
@@ -2153,9 +2535,18 @@ class SqlEngine:
         filters may be a single pyarrow.compute expression or a list of
         expressions (AND-ed). Column projection and predicates push down.
 
+        A missing/negative limit (the historical "whole table") is clamped
+        to ``SQLHANDLER_MAX_ROWS`` (decision D4) so ``scan_table(limit=-1)``
+        can no longer materialize an entire table; pass an explicit positive
+        limit for more rows. ``SQLHANDLER_MAX_ROWS=0`` keeps the old
+        unlimited behavior.
+
         ``version_as_of`` reads a historical snapshot (Delta version or
         Iceberg snapshot id) instead of the current one.
         """
+        if limit is None or limit < 0:
+            cap = _max_rows()
+            limit = cap if cap > 0 else None
         info = self._resolve(table)
         if info.format == "virtual":
             return self._scan_virtual(info, columns, filters, limit, version_as_of)
@@ -2320,6 +2711,12 @@ class SqlEngine:
     ) -> str | None:
         """Cache key for a query: full identity + base-snapshot version tokens.
 
+        The SQL enters the key whitespace-normalized (outside quoted
+        literals — see :func:`_normalize_cache_sql`), so formatting-only
+        re-runs hit the same entry; quoted content and comment-bearing
+        queries keep byte-exact keys.
+        
+
         None when the result must not be cached: caching disabled, no
         recognizable tables, any virtual table involved (its materialization
         cache already accelerates it), or an attached-database query.
@@ -2332,7 +2729,7 @@ class SqlEngine:
                 return None
             if self._sql_needs_external(sql):
                 return None
-            parts = [sql, repr(params), repr(limit), repr(row_cap), repr(version_as_of)]
+            parts = [_normalize_cache_sql(sql), repr(params), repr(limit), repr(row_cap), repr(version_as_of)]
             for info in sorted(refs, key=lambda t: (t.source, t.path)):
                 parts.append(f"{info.source}/{info.path}={self._safe_version(info)}")
             return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()

@@ -21,7 +21,7 @@ image:
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how an "old MCP server" pod happens.
-  tag: v0.1.2
+  tag: v0.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -50,7 +50,7 @@ workbench:
   root: /data
   # argv[0] allowlist for run_command (comma-separated). Anything not on
   # the list is refused — no shells by design.
-  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
   # Hard deny (WINS over the allowlist): network/escalation binaries.
   execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
   # Per-command timeout bounds (seconds).
@@ -63,6 +63,29 @@ workbench:
   # Max entries per list_files response.
   maxListEntries: 500
   logLevel: INFO
+  # -- Workspace templates (Wave-5 F3, ADDITIVE, DEFAULT OFF) ----------------------
+  # Named operator templates for workspace_create(name, template=<name>).
+  # Rendered into the WORKBENCH_TEMPLATES env as JSON — ONLY when the object
+  # is non-empty; the default render below is byte-identical to the
+  # pre-templates baseline (nothing renders, the tool parameter is refused).
+  #
+  # A template may only (a) WIDEN the exec allowlist of the workspaces
+  # created with it — extra_allowed entries are operator-supplied BARE binary
+  # names, and WORKBENCH_EXEC_DENYLIST still wins — and (b) pre-run canned
+  # setup argv commands INSIDE the new workspace through the exact run_command
+  # machinery (D7 confinement, server-PATH allowlist resolution, timeouts,
+  # output caps, audit; each setup run is audited with the template name).
+  # Only the template NAME persists in the workspace; the widened allowlist
+  # is re-derived from this config on every call. Example:
+  #
+  #   templates:
+  #     pytools:
+  #       description: "git scratch with a prepared src/ tree"
+  #       extra_allowed: ["pytest"]
+  #       canned_setup:
+  #         - ["mkdir", "src"]
+  #         - ["git", "init", "-q"]
+  templates: {}
 
 # -- HPE corporate proxy --------------------------------------------------------------------------
 # Route outbound HTTP(S) traffic through the HPE corporate proxy. Default
@@ -107,6 +130,45 @@ service:
   port: 9103
   targetPort: 9103
 
+# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+# Prometheus self-metrics on the MCP container: ONE counter family,
+# workbench_mcp_tool_requests_total{tool,outcome} — per-tool request counts
+# with outcome ok|error (which tools agents call, how often, how often they
+# fail). No arguments, file names, workspace names, env values, or error text
+# are ever exported. DEFAULT false: the chart renders NOTHING extra (no env,
+# no ServiceMonitor) and the server serves no /metrics route — the default
+# render is byte-identical to the pre-metrics baseline. Flip to true per site
+# values to enable; /metrics is then served key-free (like the probes) on the
+# same port so the ServiceMonitor can scrape it — the counters carry nothing
+# sensitive, and the route does not exist unless you opted in.
+metrics:
+  enabled: false
+  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
+  serviceMonitor: true
+  # Scrape interval rendered into the ServiceMonitor.
+  interval: 30s
+
+# -- Fleet audit-JSONL searchability convention (Wave-3 C3, documentation only) -----
+# This server writes a best-effort JSONL audit trail at <root>/.audit.jsonl
+# (root = persistence.mountPath → /data/.audit.jsonl on the PVC by default):
+# one JSON object per audited event — workspace_create / workspace_delete /
+# file_delete / run_command / run_command_refused — with ts, event, workspace,
+# argv, exit_code, timed_out and duration_ms fields. That file is the fleet's
+# workbench "who ran what" trail, and the fleet convention (fleet-audit item 11,
+# plan §7 C3) is that audit JSONLs must be SEARCHABLE, not just written:
+# operators mount/expose the file for logsearch to search — e.g. a log-tailing
+# sidecar (or node agent) that ships .audit.jsonl lines to a pod's stdout in a
+# namespace the logsearch policy allows, whereupon search_logs / count_matches
+# over that namespace make the workbench trail queryable. Deliberately
+# documentation-only (NO behavior change): the path is derived by the server
+# from workbench.root (= persistence.mountPath), and nothing in this chart
+# renders from an audit.* key — an unconsumed values key would be dead config,
+# the exact anti-pattern the fleet audit flags. applygate's side of this
+# convention is owned by the applygate chart/agent.
+#
+#   audit:
+#     path: /data/.audit.jsonl   # informational: <persistence.mountPath>/.audit.jsonl
+
 # -- Resources (modest: a scratch pad, not a compute node) -------------------------
 resources:
   requests:
@@ -123,6 +185,41 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level hardening (fleet-audit P0): the pod mounts NO service-account
+# token (the server makes zero k8s calls — an automounted token behind the
+# python3 allowlist entry was a live credential-exfiltration path), the root
+# filesystem is read-only (run_command can then only write the PVC + /tmp), and
+# privilege escalation is impossible. /tmp is a per-pod emptyDir and HOME points
+# there so tempfile usage inside run_command keeps working under the read-only
+# rootfs. NOTE (fleet decision D18, 2026-09-13): pip/python3 are NOT in the
+# default execAllowlist anymore — re-add via this value if your deployment
+# genuinely needs them (an allow-listed interpreter can sidestep the
+# argv-level workspace confinement; see README "Honest limits").
+# rootfs (their writes reset with the pod — the workspaces themselves persist
+# on the PVC).
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+
+# -- API keys -----------------------------------------------------------------------
+# Every route except /health+/healthz requires a key (fleet pattern: K8S-MCP).
+# The chart NEVER creates a key and NEVER inlines one in values — an envsubst
+# apply once emptied a live key Secret (the K8S-MCP lesson). The deployment
+# references an operator-created Secret and fails loud
+# (CreateContainerConfigError) until it exists:
+#   kubectl -n <ns> create secret generic workbench-mcp-apikey \
+#     --from-literal=api-keys='key-old,key-new'
+# Comma-SEPARATED keys all authenticate: that is the rotation mechanism —
+# append the new key, move clients over, drop the old one, no downtime.
+apiKey:
+  existingSecret: workbench-mcp-apikey
+  existingSecretKey: api-keys
 
 # -- Persistence ---------------------------------------------------------------------
 # THE point of the workbench: workspaces must survive pod restarts. RWX so

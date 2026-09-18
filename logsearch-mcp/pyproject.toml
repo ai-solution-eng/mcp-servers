@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logsearch-mcp"
-version = "0.1.4"
+version = "0.2.1"
 description = "LogSearch MCP Server — read-only, namespace-scoped Kubernetes pod-log search (fan-out regex, time bounds, provenance, caps) over MCP"
 requires-python = ">=3.10"
 keywords = ["mcp", "kubernetes", "logs", "observability", "model-context-protocol"]
@@ -20,4 +20,9 @@ dependencies = [
 logsearch-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "webui"]
+# DEPLOY-BLOCKER (Wave-6 packaging fix): the Dockerfile does a NON-editable
+# `uv pip install --system .` and runs the installed `logsearch-mcp` console
+# script from site-packages. server.py imports mcp_auth (auth wave) AND
+# mcp_metrics (Wave-3 C3) — both MUST ship in the wheel or the image
+# crash-loops at startup with ModuleNotFoundError.
+py-modules = ["server", "webui", "mcp_auth", "mcp_metrics"]

@@ -1,0 +1,71 @@
+# ddgs-lite — PCAI hosted-trial values (values-examples, secret-free).
+# Target: an HPE-hosted PCAI trial cluster where ${DOMAIN_NAME} is resolved
+# by PCAI before rendering — keep the placeholders verbatim.
+# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
+# Paste-ready: this file alone is the full values document (helm deep-merges
+# it over identical chart defaults; PCAI's values editor replaces the chart's
+# bundled values.yaml entirely, so every key must be present here).
+
+# ddgs-lite — DuckDuckGo MCP server: metasearch via ddgs (9 engines) plus
+# a content fetcher, over MCP for PCAI (HPE Ezmeral Unified Analytics),
+# exposed at /mcp through the PCAI Istio gateway.
+
+# -- Deployment ----------------------------------------------------------------
+deployment:
+  name: ddgs-lite
+  appName: ddgs-lite
+  replicaCount: 1
+
+# -- Image ------------------------------------------------------------------------
+image:
+  # SITE: chart default repo; pin the tag to match the chart's appVersion.
+  repository: ghcr.io/ai-solution-eng/ddgs-mcp
+  tag: v1.0.1
+  pullPolicy: IfNotPresent
+
+# -- Service exposure ------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9090
+  targetPort: 9090
+
+# -- Resources -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 200m
+    memory: 200Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# -- Environment ------------------------------------------------------------------------------
+env:
+  # SITE: default region/locale for searches (e.g. us-en, de-de, wt-wt);
+  # clients can still pass region per call.
+  - name: DDG_REGION
+    value: "us-en"
+
+# -- HPE corporate proxy -----------------------------------------------------------------------
+# SITE: ON for an HPE-hosted trial (no direct internet egress). Flip to
+# false ONLY if the trial cluster has direct internet egress — a wrong
+# proxy breaks DNS/egress (chart default false).
+hpe_proxies: true
+
+proxy:
+  http: http://hpeproxy.its.hpecorp.net:8080
+  https: http://hpeproxy.its.hpecorp.net:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------
+# SITE: ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the
+# placeholders verbatim on a hosted trial.
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+  virtualService:
+    endpoint: "ddgs-lite.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

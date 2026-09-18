@@ -8,6 +8,29 @@ metadata:
 data:
   # Streamable HTTP (MCP 2.0) is the default transport.
   SQLHANDLER_TRANSPORT: {{ .Values.mcp.transport | quote }}
+  {{- /* MCP + endpoint posture (fleet decisions D2/D3/D5 + the audit's
+         rebinding/metrics quick wins). Defaults mirror the server code so
+         rendering them here only makes the posture explicit — flipping a
+         value is a one-line helm upgrade, no code change. */}}
+  # D2: MCP run_sql is SELECT-only by default; mcp.readonly: false renders
+  # "0" and restores multi-statement DDL for trusted callers (attached
+  # external catalogs stay read-only regardless — server-enforced).
+  SQLHANDLER_MCP_READONLY: {{ ternary "1" "0" .Values.mcp.readonly | quote }}
+  {{- with .Values.mcp.allowedHosts }}
+  # Strict /mcp Host-header pinning (DNS-rebinding defense, 421 on mismatch).
+  # Comma-separated; "host:*" allows any port. Leave empty when the
+  # deployment's externally-visible hostnames are not fixed (default).
+  SQLHANDLER_ALLOWED_HOSTS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mcp.allowedOrigins }}
+  # D3: extra browser origins for CORS + /mcp Origin validation. Empty
+  # (default) = same-origin only — browsers are refused, MCP clients are not.
+  SQLHANDLER_ALLOWED_ORIGINS: {{ . | quote }}
+  {{- end }}
+  # Optional auth gate on /metrics + /ready (default off = unauthenticated).
+  # When true, scrapers must present SQLHANDLER_API_TOKEN or an /mcp API key
+  # (X-API-Key / X-API-Token / Bearer); /health stays open for probes.
+  SQLHANDLER_METRICS_AUTH: {{ ternary "1" "0" .Values.security.metricsAuth | quote }}
   # Backend: onelake (default), s3/minio, or iceberg.
   SQLHANDLER_BACKEND: {{ .Values.backend | default "onelake" | quote }}
   {{- if not .Values.sources }}
@@ -77,10 +100,30 @@ data:
          wired via secretKeyRef from the db-credentials Secret (see
          secret.yaml / deployment.yaml) and never enter the ConfigMap. */}}
   {{- $attach := list }}
+  {{- /* External read-only databases: the JSON carries env-var NAMES only
+         (password_env = SQLHANDLER_DB_PW_<NAME>); the password VALUES are
+         wired via secretKeyRef from the db-credentials Secret (see
+         secret.yaml / deployment.yaml) and never enter the ConfigMap.
+         sqlite entries carry a file path (no host/port/user/password_env),
+         and every entry forwards an optional `params` object (TLS / driver
+         options — README: External databases). Impossible entries fail the
+         render. */}}
+  {{- $attach := list }}
   {{- range .Values.databases }}
-  {{- $entry := dict "name" .name "type" (.type | default "postgres") "host" .host "database" .database "password_env" (printf "SQLHANDLER_DB_PW_%s" (upper .name)) }}
+  {{- $t := .type | default "postgres" }}
+  {{- if not .name }}{{- fail "databases: every entry needs a name" }}{{- end }}
+  {{- if not .database }}{{- fail (printf "databases: entry %s is missing database" .name) }}{{- end }}
+  {{- if and (eq $t "sqlite") (or .host .port .user) }}
+  {{- fail (printf "databases: sqlite entry %s must not set host/port/user (database is the file path)" .name) }}
+  {{- end }}
+  {{- $entry := dict "name" .name "type" $t "database" .database }}
+  {{- if ne $t "sqlite" }}
+  {{- with .host }}{{- $_ := set $entry "host" . }}{{- end }}
+  {{- $_ := set $entry "password_env" (printf "SQLHANDLER_DB_PW_%s" (upper .name)) }}
   {{- with .port }}{{- $_ := set $entry "port" (. | int) }}{{- end }}
   {{- with .user }}{{- $_ := set $entry "user" . }}{{- end }}
+  {{- end }}
+  {{- with .params }}{{- $_ := set $entry "params" . }}{{- end }}
   {{- $attach = append $attach $entry }}
   {{- end }}
   # Attached external databases (read-only; see README: External databases).
@@ -117,6 +160,10 @@ data:
   {{- with .Values.cache.virtualCacheDir }}
   SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
   {{- end }}
+  # D5: per-query wall-clock timeout (seconds; 0 = no timeout). A runaway
+  # query used to hold one of the concurrency-gate slots forever; >10-minute
+  # queries must opt in by raising this.
+  SQLHANDLER_QUERY_TIMEOUT: {{ .Values.query.timeoutSeconds | quote }}
   {{- /* Disk block cache: opt-in (s3/iceberg parquet IO; delta-rs IO on
          onelake is not wrappable). Empty strings mean "engine default". */}}
   SQLHANDLER_BLOCK_CACHE: {{ .Values.cache.blockCache.enabled | quote }}

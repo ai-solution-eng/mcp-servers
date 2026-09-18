@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v1.6.1
+  tag: v2.1.2
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -105,10 +105,11 @@ backend: s3
 sources: []
 
 # -- External databases (read-only attach) ------------------------------------
-# Postgres/MySQL servers whose tables become queryable — and join-able with
-# lake tables in ONE query — as <name>.<schema>.<table>. STRICTLY read-only:
-# DuckDB itself rejects writes on the attached catalog (documentation/
-# DEPLOYMENT.md "External databases"). The generated SQLHANDLER_ATTACH config carries env-var NAMES
+# External database servers (postgres | mariadb | mysql | sqlite | sqlserver)
+# whose tables become queryable — and join-able with lake tables in ONE
+# query — as <name>.<schema>.<table>. STRICTLY read-only:
+# DuckDB itself rejects writes on the attached catalog (README: External
+# databases). The generated SQLHANDLER_ATTACH config carries env-var NAMES
 # only (SQLHANDLER_DB_PW_<NAME>); the password values come from the
 # <fullname>-db-credentials Secret — rendered here ONLY for entries with a
 # non-empty `password`. Prefer managing that Secret out-of-band (kubectl
@@ -116,13 +117,36 @@ sources: []
 # socket) need no password at all.
 #   databases:
 #     - name: ops
-#       type: postgres        # postgres | mysql
+#       type: postgres        # postgres | mariadb | mysql | sqlite | sqlserver
+#                             # (omit `type` for the postgres default)
 #       host: postgresql.postgresql.svc.cluster.local
 #       port: 5432            # default per type when omitted
 #       database: opsdb
 #       user: ro_user
 #       password: ""          # -> db-credentials Secret; "" = trust-auth
+#       params:               # optional TLS / driver options (README: External databases)
+#         sslmode: verify-full
+# sqlite entries: name, type: sqlite, database = FILE PATH - no host/port/
+# user/password, and `params` are not accepted for sqlite.
 databases: []
+
+# -- Prometheus scraping -------------------------------------------------------
+# PodMonitor so the prometheus-operator scrapes /metrics (engine gauges:
+# query rates, cache stats, RSS). The MCP prometheus tools read the same
+# Prometheus, so a target here is immediately visible there.
+#   security.metricsAuth true: the scrape 401s unless Prometheus presents a
+#   credential — set metrics.podMonitor.bearerTokenSecret to a Secret carrying
+#   SQLHANDLER_API_TOKEN or one of the /mcp API keys.
+metrics:
+  podMonitor:
+    enabled: true
+    # Extra labels on the PodMonitor itself — if the prometheus-operator's
+    # podMonitorSelector requires a label (commonly release: prometheus),
+    # set it here or the target silently never appears.
+    additionalLabels: {}
+    # Bearer token for the scrape when security.metricsAuth is true.
+    # Shape: {name: <secret>, key: <key>} — omit for open scraping.
+    bearerTokenSecret: {}
 
 # -- Naming overrides (rarely needed) ----------------------------------------
 nameOverride: ""
@@ -150,6 +174,39 @@ mcp:
   transport: streamable-http   # MCP 2.0 transport
   path: /mcp                   # FastMCP default; VirtualService routes on it
   port: 9097                   # container + service port
+  # Fleet decision D2: MCP run_sql is SELECT-only by default (the same
+  # DuckDB-parser guard the web API uses — multi-statement DDL, INSERT/
+  # UPDATE/DELETE, ATTACH, COPY, PRAGMA are refused with an error that names
+  # SQLHANDLER_MCP_READONLY). Set false ONLY for trusted-caller deployments
+  # that need DDL/script execution; attached external databases stay
+  # read-only either way (enforced in the engine, not the flag).
+  readonly: true
+  # Strict /mcp Host-header allowlist (DNS-rebinding protection, 421 on
+  # mismatch). Comma-separated exact hostnames; "host:*" allows any port,
+  # e.g. "sqlhandler.pcai.svc.cluster.local:*,sqlhandler.example.com".
+  # Origin validation is ALWAYS on for /mcp (browser-originated requests
+  # are refused unless listed under allowedOrigins), so this stays optional:
+  # a pod cannot know which externally-visible hostname callers use, and a
+  # wrong pin 421s every request. Set it when your hostnames are fixed.
+  allowedHosts: ""
+  # Fleet decision D3: extra browser origins allowed on /api/*, /ui and
+  # /mcp (comma-separated, e.g. "https://sql-ui.example.com"). Empty
+  # (default) = same-origin only: cross-origin browser reads are refused,
+  # MCP clients (which send no Origin header) are unaffected. The legacy
+  # SQLHANDLER_CORS_ORIGINS env is still honored when set explicitly, but
+  # its old "*" default is gone.
+  allowedOrigins: ""
+
+# -- Query execution ------------------------------------------------------------
+# Applies to the DuckDB SQL path — MCP run_sql and the web API alike.
+query:
+  # Fleet decision D5: per-query wall-clock timeout in seconds (0 = no
+  # timeout, the pre-D5 behavior). On expiry the query is interrupted inside
+  # DuckDB (no leaked threads/connections) and the caller gets a clean error.
+  # The default 600s stops a runaway query from holding one of the
+  # concurrency-gate slots forever; genuine >10-minute queries must raise
+  # this deliberately (the gateway itself caps calls at 3600s).
+  timeoutSeconds: "600"
 
 # -- Resources ----------------------------------------------------------------
 # Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
@@ -211,6 +268,29 @@ security:
   # auto-mounted ServiceAccount token, plus an optional ingress
   # NetworkPolicy (security.networkPolicy.enabled below, default false).
   hardened: true
+  # OPTIONAL API-key auth on /mcp (fleet decision 2026-09 — SQL is optional
+  # until per-user keys/roles land). When apiKey.existingSecret is set, the
+  # chart wires SQLHANDLER_API_KEYS from that Secret's key and every /mcp
+  # request needs a valid key (X-API-Key or Bearer). Leave empty for
+  # gateway-fronted deployments — the server then runs open (with a loud
+  # startup warning). Comma-separated keys all authenticate: that is the
+  # rotation mechanism — append the new key, move clients over, drop the old
+  # one, no downtime. The fleet-universal MCP_API_KEYS env is honored too
+  # (either var authenticates).
+  apiKey:
+    existingSecret: ""
+    existingSecretKey: api-keys
+  # Optional auth gate on /metrics ONLY (audit: /metrics leaks table counts,
+  # RSS and error strings unauthenticated). Default false = today's
+  # behavior (open). When true, a scrape/read must present SQLHANDLER_API_TOKEN
+  # or an /mcp API key (MCP_API_KEYS / SQLHANDLER_API_KEYS) as
+  # X-API-Key / X-API-Token / Bearer — wire the matching header into the
+  # Prometheus scrape config; liveness (/health) AND readiness (/ready)
+  # probes stay open: kubelet probes cannot carry a secret, and a gated
+  # /ready strands every pod NotReady (live-seen 2026-09-18). With the gate
+  # on but NO credential source configured, /metrics 401s for everyone
+  # (fail closed, loud startup warning).
+  metricsAuth: false
   # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
   # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
   # Egress is NOT restricted (the server must reach AAD/OneLake/S3).
@@ -362,8 +442,8 @@ nfs:
 
 
 # -- Metadata caching --------------------------------------------------------
-# In-process cache for list_tables / describe_table (see documentation/
-# FEATURES.md "Key configuration knobs"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
+# In-process cache for list_tables / describe_table (see README "Performance
+# & caching"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
 cache:
   # Seconds to keep list_tables / describe_table results in memory (0 disables).
   ttl: 3600
@@ -389,7 +469,7 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
-  # -- Virtual-table performance (documentation/FEATURES.md "Key configuration knobs") ---
+  # -- Virtual-table performance (README: "Virtual tables") -----------------
   # Seconds a virtual table's materialized result is reused. The cache key
   # covers the definition (and everything it builds on) plus every base
   # table's Delta/Iceberg snapshot version, so new ETL commits invalidate
@@ -429,7 +509,7 @@ cache:
 # The "semantic view": human-written table/column descriptions merged into
 # list_tables / describe_table output (and the MCP resources), so agents see
 # business meaning, not just dtypes. Full spec + shareable data-owner guide:
-# docs/semantic-catalog.md (documentation/DEPLOYMENT.md §6 "Semantic catalog").
+# docs/semantic-catalog.md (README: "Semantic catalog").
 #
 # Deploy = set enabled: true and paste your catalog AS NATIVE YAML under
 # `tables:` below — no stringification, it is ordinary values structure. The

@@ -140,7 +140,7 @@ def _memory_budget_string(num_bytes: int) -> str:
     return f"{num_bytes / mib:.0f}MiB"
 
 
-def _memory_fraction() -> float | None:
+def _memory_fraction() -> float:
     """The configured DuckDB memory fraction (0 disables the cap)."""
     raw = os.environ.get("SQLHANDLER_DUCKDB_MEMORY_FRACTION", "").strip()
     if not raw:
@@ -185,7 +185,5 @@ def duckdb_budget() -> dict[str, object]:
         budget["memory_limit"] = _memory_budget_string(int(memory * fraction))
     if cpu is not None:
         budget["threads"] = max(1, int(cpu))
-    budget["temp_directory"] = os.environ.get(
-        "SQLHANDLER_DUCKDB_TEMP_DIR", "/tmp/sqlhandler-duckdb-spill"
-    )
+    budget["temp_directory"] = os.environ.get("SQLHANDLER_DUCKDB_TEMP_DIR", "/tmp/sqlhandler-duckdb-spill")
     return budget

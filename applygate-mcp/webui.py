@@ -48,6 +48,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
@@ -163,7 +164,7 @@ async def _json_body(request) -> dict:
     except Exception as exc:
         raise ValueError(f"invalid JSON body: {exc}") from exc
     if not isinstance(body, dict):
-        raise ValueError("JSON body must be an object")
+        raise TypeError("JSON body must be an object")
     return body
 
 
@@ -174,7 +175,7 @@ def _read_audit_tail(path: str, lines: int) -> dict:
     never from the request). A missing file is a normal fresh-deployment
     state, not an error. A window cap bounds the read for very long trails.
     """
-    out = {
+    out: dict[str, Any] = {
         "file": path,
         "exists": True,
         "n_total": 0,
@@ -282,7 +283,7 @@ def build_ui_routes(plan_fn=None, status_fn=None) -> list:
         so no client input can flip the seam's dry_run=True."""
         try:
             body = await _json_body(request)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         namespace = str(body.get("namespace") or "").strip()
         manifest = body.get("manifest")

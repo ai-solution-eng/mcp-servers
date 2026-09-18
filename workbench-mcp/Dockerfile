@@ -14,7 +14,12 @@ RUN apt-get update \
     && useradd --uid 10001 --create-home workbench \
     && mkdir -p /data && chown workbench:workbench /data
 
-COPY pyproject.toml server.py webui.py ./
+COPY pyproject.toml server.py webui.py mcp_auth.py ./
+# The vendored mcp_fleet_common package (Wave-6 G1, D16): server.py imports
+# `from mcp_fleet_common import …` — without this COPY the non-editable
+# `uv pip install --system .` builds a wheel without the package and the
+# installed console script crash-loops at import (same class as mcp_auth).
+COPY mcp_fleet_common/ ./mcp_fleet_common/
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `workbench-mcp`
 # script runs from there, not from /app).

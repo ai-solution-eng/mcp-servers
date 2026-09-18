@@ -17,19 +17,45 @@ Tools (all read-only, all return a JSON string):
   search_logs       regex search across every pod in a namespace, merged
                     chronologically with "pod/container: " provenance
   count_matches     per-pod match counts for one pattern, sorted descending
+  export_matches    the EXACT search_logs pipeline, with the matched lines
+                    written to <LOGSEARCH_EXPORT_ROOT>/<dest_name> — the one
+                    non-read-only tool (it writes only into that operator-
+                    configured directory; OPT-IN: unset env → the tool
+                    refuses with setup instructions, nothing is written)
 
 Configuration (environment variables, read lazily per call — flip policy or
 caps in tests without reimporting):
-  LOGSEARCH_ALLOWED_NAMESPACES  comma-separated fnmatch globs; EMPTY = ALL
-                                namespaces allowed
+  LOGSEARCH_ALLOWED_NAMESPACES  comma-separated fnmatch globs; EMPTY = DENY
+                                ALL namespaces (default-deny, fleet decision
+                                D8) unless LOGSEARCH_EMPTY_ALLOWS_ALL=1
+  LOGSEARCH_EMPTY_ALLOWS_ALL    =1 restores the pre-D8 open default: an empty
+                                allowlist means ALL namespaces are searchable
   LOGSEARCH_BLOCKED_NAMESPACES  comma-separated fnmatch globs; ALWAYS wins
                                 over the allowed list
   LOGSEARCH_MAX_PODS            max pods per fan-out search (default 50)
   LOGSEARCH_MAX_LINES_PER_POD   max tail lines fetched per pod (default 1000)
   LOGSEARCH_MAX_TOTAL_LINES     default cap on merged search matches
                                 (default 300)
+  LOGSEARCH_MAX_LINE_CHARS      per-line char cap on search output lines
+                                (default 2000; overlong lines are cut with
+                                an explicit "...[truncated N chars]" marker)
+  LOGSEARCH_FETCH_CONCURRENCY   bounded-semaphore width for the parallel pod
+                                fan-out (default 8)
+  LOGSEARCH_MAX_REGEX_CHARS     max length of a user regex before the ReDoS
+                                screen refuses it (default 512)
   LOGSEARCH_WEBUI_ENABLED       serve the web UI + /api/* routes on the
                                 streamable-http transport (default true)
+  LOGSEARCH_EXPORT_ROOT         directory export_matches may write to; UNSET
+                                (default) = export_matches refuses (opt-in).
+                                Fleet convention: a path on the workbench/
+                                shared PVC so agents read exports back.
+
+User regexes are SCREENED at compile time: patterns whose backtracking can
+explode ((a+)+, (a|aa)+, '(.*)*' shapes) are refused in microseconds with an
+error explaining the rewrite, instead of freezing every worker under the GIL.
+If the optional re2 package happens to be installed it is preferred for
+matching (linear-time engine); nothing installs it and the screen runs either
+way.
 """
 
 import argparse
@@ -41,11 +67,15 @@ import os
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+
+import mcp_auth
+import mcp_metrics
 
 # ---------------------------------------------------------------------------
 # Configuration — lazy env reads (a test flips env vars, not module globals)
@@ -53,11 +83,18 @@ from mcp.types import ToolAnnotations
 
 ENV_ALLOWED = "LOGSEARCH_ALLOWED_NAMESPACES"
 ENV_BLOCKED = "LOGSEARCH_BLOCKED_NAMESPACES"
+ENV_EMPTY_ALLOWS_ALL = "LOGSEARCH_EMPTY_ALLOWS_ALL"
 ENV_WEBUI_ENABLED = "LOGSEARCH_WEBUI_ENABLED"
+ENV_MAX_LINE_CHARS = "LOGSEARCH_MAX_LINE_CHARS"
+ENV_FETCH_CONCURRENCY = "LOGSEARCH_FETCH_CONCURRENCY"
+ENV_MAX_REGEX_CHARS = "LOGSEARCH_MAX_REGEX_CHARS"
 
 DEFAULT_MAX_PODS = 50
 DEFAULT_MAX_LINES_PER_POD = 1000
 DEFAULT_MAX_TOTAL_LINES = 300
+DEFAULT_MAX_LINE_CHARS = 2000
+DEFAULT_FETCH_CONCURRENCY = 8
+DEFAULT_MAX_REGEX_CHARS = 512
 
 # Hard ceiling on any single log body handed to a caller, regardless of
 # tail_lines: one pod can emit megabyte lines, and the MCP response is the
@@ -68,9 +105,7 @@ _MAX_OUTPUT_CHARS = 100_000
 # (2026-09-08T00:00:00.123456789Z); match the timestamp prefix wherever it
 # sits in the line. Naive (offset-less) timestamps are tolerated by the
 # parser and sorted as UTC.
-_RFC3339_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
-)
+_RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
 
 
 def _env_csv(name: str) -> list[str]:
@@ -98,6 +133,21 @@ def _default_max_total_lines() -> int:
     return _env_int("LOGSEARCH_MAX_TOTAL_LINES", DEFAULT_MAX_TOTAL_LINES)
 
 
+def _max_line_chars() -> int:
+    """Per-line char cap on search output (0 or negative = disabled)."""
+    return _env_int(ENV_MAX_LINE_CHARS, DEFAULT_MAX_LINE_CHARS)
+
+
+def _fetch_concurrency() -> int:
+    """Width of the bounded-semaphore pod fan-out (>= 1)."""
+    return max(1, _env_int(ENV_FETCH_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY))
+
+
+def _max_regex_chars() -> int:
+    """Max user-regex length before the ReDoS screen refuses it (0 = off)."""
+    return _env_int(ENV_MAX_REGEX_CHARS, DEFAULT_MAX_REGEX_CHARS)
+
+
 def _webui_enabled() -> bool:
     """Whether the HTTP transport should also serve the web UI + /api/* JSON
     routes (webui.py). Read lazily like every other knob so a test can flip
@@ -107,9 +157,22 @@ def _webui_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _empty_allows_all() -> bool:
+    """The D8 escape hatch: LOGSEARCH_EMPTY_ALLOWS_ALL=1 (or true/yes/on)
+    restores the pre-D8 open default where an empty allowlist means every
+    namespace is searchable. Default (unset/false-ish) = default-deny."""
+    return os.getenv(ENV_EMPTY_ALLOWS_ALL, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _namespace_allowed(ns: str) -> bool:
-    """Pure namespace-policy predicate: blocked ALWAYS wins, an empty
-    allowed-list means everything is allowed, otherwise fnmatch glob match.
+    """Pure namespace-policy predicate: blocked ALWAYS wins, then fnmatch glob
+    match against the allowlist.
+
+    Default-deny (fleet decision D8, 2026-09): an EMPTY allowlist denies every
+    namespace — pod logs carry sensitive strings, so an unconfigured server
+    must answer nothing rather than everything. Operators either set
+    LOGSEARCH_ALLOWED_NAMESPACES explicitly or opt back into the pre-D8 open
+    default with LOGSEARCH_EMPTY_ALLOWS_ALL=1.
 
     fnmatchcase (not fnmatch) so matching is identical on every platform —
     namespace names are DNS labels and always lowercase.
@@ -119,21 +182,19 @@ def _namespace_allowed(ns: str) -> bool:
             return False
     allowed = _env_csv(ENV_ALLOWED)
     if not allowed:
-        return True
+        return _empty_allows_all()
     return any(fnmatch.fnmatchcase(ns, pattern) for pattern in allowed)
 
 
 def _ns_denied_error(ns: str) -> str:
     """Self-describing denial: names the env vars an operator must change."""
-    return (
-        f"Error: namespace {ns!r} is denied by this server's namespace policy "
-        f"({_ENV_POLICY_HINT})."
-    )
+    return f"Error: namespace {ns!r} is denied by this server's namespace policy ({_ENV_POLICY_HINT})."
 
 
 _ENV_POLICY_HINT = (
-    f"allowed={ENV_ALLOWED}, blocked={ENV_BLOCKED}; blocked always wins, "
-    "empty allowed-list means all namespaces"
+    f"allowed={ENV_ALLOWED}, blocked={ENV_BLOCKED}; blocked always wins, an "
+    f"EMPTY allowed-list DENIES all namespaces (default-deny, D8) — set the "
+    f"allowlist or {ENV_EMPTY_ALLOWS_ALL}=1 to open it up"
 )
 
 
@@ -177,9 +238,7 @@ def _list_pods(namespace: str, label_selector: str = "") -> list[dict]:
 
     api = _get_core_v1_api()
     try:
-        resp = api.list_namespaced_pod(
-            namespace=namespace, label_selector=label_selector or ""
-        )
+        resp = api.list_namespaced_pod(namespace=namespace, label_selector=label_selector or "")
     except ApiException as e:
         status = getattr(e, "status", None)
         if status == 404:
@@ -193,8 +252,7 @@ def _list_pods(namespace: str, label_selector: str = "") -> list[dict]:
         ) from e
     except Exception as e:  # config load failure, connection refused, ...
         raise LogSearchError(
-            f"Kubernetes cluster unreachable while listing pods in namespace "
-            f"{namespace!r}: {type(e).__name__}: {e}"
+            f"Kubernetes cluster unreachable while listing pods in namespace {namespace!r}: {type(e).__name__}: {e}"
         ) from e
 
     pods = []
@@ -208,9 +266,7 @@ def _list_pods(namespace: str, label_selector: str = "") -> list[dict]:
         started = ""
         if status and status.start_time:
             started = status.start_time.isoformat().replace("+00:00", "Z")
-        pods.append(
-            {"name": pod.metadata.name, "containers": containers, "restarts": restarts, "started": started}
-        )
+        pods.append({"name": pod.metadata.name, "containers": containers, "restarts": restarts, "started": started})
     return pods
 
 
@@ -263,9 +319,7 @@ def _read_log(
         # literal backslash-n and zero real newlines (verified 2026-09-11
         # against a controlled API: the whole log collapsed to one line).
         # Raw bytes via .data are honest; decode them ourselves.
-        resp = api.read_namespaced_pod_log(
-            name=pod, namespace=namespace, _preload_content=False, **kwargs
-        )
+        resp = api.read_namespaced_pod_log(name=pod, namespace=namespace, _preload_content=False, **kwargs)
         return _decode_log_payload(resp.data)
     except ApiException as e:
         status = getattr(e, "status", None)
@@ -299,17 +353,24 @@ mcp = MCPServer("logsearch-mcp")
 
 print("LogSearch MCP Server initialized:", file=sys.stderr)
 print(
-    f"  namespace policy: allowed={os.getenv(ENV_ALLOWED, '') or '<all>'} "
-    f"blocked={os.getenv(ENV_BLOCKED, '') or '<none>'} (re-read per call)",
+    f"  namespace policy: allowed={os.getenv(ENV_ALLOWED, '') or '<empty: deny-all (D8)>'} "
+    f"blocked={os.getenv(ENV_BLOCKED, '') or '<none>'} "
+    f"empty-allowlist-open={_empty_allows_all()} (re-read per call)",
     file=sys.stderr,
 )
 print(
     f"  caps: max_pods={_max_pods()} max_lines_per_pod={_max_lines_per_pod()} "
-    f"max_total_lines={_default_max_total_lines()}",
+    f"max_total_lines={_default_max_total_lines()} max_line_chars={_max_line_chars()} "
+    f"fetch_concurrency={_fetch_concurrency()} max_regex_chars={_max_regex_chars()}",
     file=sys.stderr,
 )
 
 _mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+# API-key auth (fleet pattern, shared module pcai_utils/mcp_auth.py) —
+# MANDATORY per fleet decision 2026-09 (chart fails loud without the Secret).
+LOGSEARCH_API_KEYS_ENV = "LOGSEARCH_API_KEYS"
+AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, LOGSEARCH_API_KEYS_ENV)
 
 
 def _err(context: str, exc: Exception) -> str:
@@ -321,7 +382,430 @@ def _err(context: str, exc: Exception) -> str:
     return f"Error: {context} failed: {type(exc).__name__}: {exc}"
 
 
+# ---------------------------------------------------------------------------
+# ReDoS guard — compile-time screening of user-supplied regexes
+# ---------------------------------------------------------------------------
+# A user pattern with catastrophic backtracking (the classic nested-quantifier
+# bombs: '(a+)+', '(a|aa)+', '(.*)*', '(\w+\s)*') freezes the whole event loop
+# under the CPython GIL while `re` backtracks — every worker, every request,
+# until the process is killed. The screen below runs BEFORE compilation and
+# rejects the dangerous shapes in microseconds with an error that explains the
+# rewrite. When the optional `re2` package is importable it is preferred for
+# matching (linear-time engine, belt-and-braces); nothing installs it and the
+# screen stays in front either way. Screening parses with CPython's own sre
+# parser (re._parser; sre_parse before 3.11), so "invalid regex" keeps its
+# existing message shape and screen rejections are precise, not guessed.
+#
+# What is rejected (all in microseconds):
+#   1. patterns longer than LOGSEARCH_MAX_REGEX_CHARS (bounded length);
+#   2. NESTED variable quantifiers: a quantifier whose body contains another
+#      variable quantifier (min != max), unless the body is anchored — pinned
+#      to start with one definite character that no inner variable quantifier
+#      can consume, e.g. '(?:\.\d+)*' ('.' pins every iteration, \d can never
+#      eat the pin). Possessive/atomic inner groups shield their bodies;
+#   3. alternation ambiguity under an unbounded quantifier: a branch that can
+#      match empty ('(a?)+') or branches whose first characters overlap
+#      ('(ERROR|Error)+' under case-insensitivity).
+# A rejected pattern raises LogSearchError("unsafe regex ... rejected: ...")
+# — never a traceback, never a hang.
+
+try:  # Python >= 3.11 exposes the sre parser as re._parser / re._constants
+    # CPython-private sre submodules — intentionally not in typeshed.
+    from re import _constants as _sre_c  # type: ignore[attr-defined]
+    from re import _parser as _sre_p  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - Python < 3.11 fallback names
+    try:
+        import sre_constants as _sre_c  # type: ignore[no-redef]
+        import sre_parse as _sre_p  # type: ignore[no-redef]
+    except ImportError:  # pragma: no cover - screen degrades to the length cap
+        _sre_c = None  # type: ignore[assignment]
+        _sre_p = None  # type: ignore[assignment]
+
+try:  # OPTIONAL: linear-time regex engine — used for matching when present
+    import re2 as _re2
+except ImportError:
+    _re2 = None
+
+if _sre_c is not None:  # opcodes + the unbounded-repeat sentinel
+    _SRE_MAXREPEAT = _sre_c.MAXREPEAT
+    _SRE_MAX_REPEAT = _sre_c.MAX_REPEAT
+    _SRE_MIN_REPEAT = _sre_c.MIN_REPEAT
+    _SRE_POSSESSIVE_REPEAT = getattr(_sre_c, "POSSESSIVE_REPEAT", None)
+    _SRE_ATOMIC_GROUP = getattr(_sre_c, "ATOMIC_GROUP", None)
+    _SRE_SUBPATTERN = _sre_c.SUBPATTERN
+    _SRE_BRANCH = _sre_c.BRANCH
+    _SRE_LITERAL = _sre_c.LITERAL
+    _SRE_NOT_LITERAL = _sre_c.NOT_LITERAL
+    _SRE_ANY = _sre_c.ANY
+    _SRE_IN = _sre_c.IN
+    _SRE_CATEGORY = _sre_c.CATEGORY
+    _SRE_RANGE = _sre_c.RANGE
+    _SRE_NEGATE = _sre_c.NEGATE
+    _SRE_ASSERT = _sre_c.ASSERT
+    _SRE_ASSERT_NOT = _sre_c.ASSERT_NOT
+    _SRE_AT = _sre_c.AT
+    _SRE_GROUPREF = _sre_c.GROUPREF
+    _CATEGORY_PREDICATES = {
+        _sre_c.CATEGORY_DIGIT: str.isdigit,
+        _sre_c.CATEGORY_SPACE: str.isspace,
+        _sre_c.CATEGORY_WORD: lambda ch: ch.isalnum() or ch == "_",
+    }
+    _CATEGORY_NOT_PREDICATES = {
+        _sre_c.CATEGORY_NOT_DIGIT: str.isdigit,
+        _sre_c.CATEGORY_NOT_SPACE: str.isspace,
+        _sre_c.CATEGORY_NOT_WORD: lambda ch: ch.isalnum() or ch == "_",
+    }
+else:  # pragma: no cover - only on a Python without the sre parser
+    _SRE_MAXREPEAT = None
+
+# A bounded repeat this wide over a VARIABLE inner quantifier already admits
+# combinatorial backtracking ('(a+){20}' partitions a long line C(n,20) ways),
+# so it is screened like an unbounded one. Small fixed bounds ({2}, {3} — the
+# common compressions like '(?:\d{1,3}\.){3}') stay allowed.
+_LARGE_REPEAT_BOUND = 10
+
+# Representative alphabet for the pairwise branch-overlap test: two
+# non-negated character classes that share no probe are treated as disjoint.
+_CLASS_PROBES = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ \t-_.:,/=@"
+
+
+def _screen_unsafe_error(what: str, pattern: str, reason: str) -> LogSearchError:
+    return LogSearchError(
+        f"unsafe regex {what} {pattern!r} rejected: {reason} The pattern is "
+        "valid but its backtracking can explode on a non-matching line and "
+        "freeze this server (ReDoS). Rewrite without quantifying a group "
+        "that already contains a quantifier."
+    )
+
+
+def _same_char(a: str, b: str, ignorecase: bool) -> bool:
+    return a == b or (ignorecase and a.lower() == b.lower())
+
+
+def _in_item_covers(item, ch: str, ignorecase: bool) -> bool:
+    """Can one element of a character class ([...]) match character ch?"""
+    op, av = item
+    if op == _SRE_LITERAL:
+        return _same_char(chr(av), ch, ignorecase)
+    if op == _SRE_RANGE:
+        lo, hi = av
+        codes = {ord(ch), ord(ch.lower()), ord(ch.upper())} if ignorecase else {ord(ch)}
+        return any(lo <= code <= hi for code in codes)
+    if op == _SRE_CATEGORY:
+        pred = _CATEGORY_PREDICATES.get(av)
+        return bool(pred(ch)) if pred else True  # unknown category: conservative
+    return True  # unknown item shape: conservative
+
+
+def _atom_covers(node, ch: str, ignorecase: bool) -> bool:
+    """Can this single-character atom match character ch? Unknown/exotic
+    atoms answer True (conservative — they fail the anchoring exemption)."""
+    op, av = node
+    if op == _SRE_LITERAL:
+        return _same_char(chr(av), ch, ignorecase)
+    if op == _SRE_NOT_LITERAL:
+        return not _same_char(chr(av), ch, ignorecase)
+    if op == _SRE_ANY:
+        return True
+    if op == _SRE_IN:
+        items = list(av)
+        negated = any(i[0] == _SRE_NEGATE for i in items)
+        covered = any(_in_item_covers(i, ch, ignorecase) for i in items if i[0] != _SRE_NEGATE)
+        return covered != negated if negated else covered
+    if op == _SRE_CATEGORY:
+        if av in _CATEGORY_PREDICATES:
+            return bool(_CATEGORY_PREDICATES[av](ch))
+        not_pred = _CATEGORY_NOT_PREDICATES.get(av)
+        return (not not_pred(ch)) if not_pred else True
+    return True  # GROUPREF, nested groups, lookarounds: conservative
+
+
+def _subpattern_items(av) -> list:
+    """Unwrap SUBPATTERN/ATOMIC_GROUP nodes to their item lists."""
+    if isinstance(av, tuple):
+        av = av[3] if len(av) == 4 else (av[1] if len(av) == 2 else av)
+    return list(av)
+
+
+def _count_variable_quantifiers(items) -> int:
+    """Variable (min != max) quantifiers in a subtree. Possessive and atomic
+    bodies are shields — a variable quantifier inside them cannot multiply
+    the parse paths of an enclosing quantifier — so they are not descended."""
+    count = 0
+    for op, av in items:
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT):
+            mn, mx, body = av
+            if mn != mx:
+                count += 1
+            count += _count_variable_quantifiers(list(body))
+        elif op == _SRE_SUBPATTERN:
+            count += _count_variable_quantifiers(_subpattern_items(av))
+        elif op == _SRE_BRANCH:
+            count += sum(_count_variable_quantifiers(list(b)) for b in av[1])
+        elif op in (_SRE_ASSERT, _SRE_ASSERT_NOT):
+            count += _count_variable_quantifiers(_subpattern_items(av))
+    return count
+
+
+def _find_single_variable(items):
+    """The one variable quantifier of a subtree known to contain exactly one,
+    or None. Returns (min, max, body_items) of that quantifier."""
+    for op, av in items:
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT):
+            mn, mx, body = av
+            body_items = list(body)
+            if mn != mx:
+                return (mn, mx, body_items)
+            found = _find_single_variable(body_items)
+            if found is not None:
+                return found
+        elif op == _SRE_SUBPATTERN:
+            found = _find_single_variable(_subpattern_items(av))
+            if found is not None:
+                return found
+        elif op == _SRE_BRANCH:
+            for b in av[1]:
+                found = _find_single_variable(list(b))
+                if found is not None:
+                    return found
+        elif op in (_SRE_ASSERT, _SRE_ASSERT_NOT):
+            found = _find_single_variable(_subpattern_items(av))
+            if found is not None:
+                return found
+    return None
+
+
+def _has_exotic_node(items) -> bool:
+    """GROUPREF / lookaround / atomic groups make the anchoring analysis
+    unreliable — the anchoring exemption refuses to apply around them."""
+    for op, av in items:
+        if op in (_SRE_GROUPREF, _SRE_ASSERT, _SRE_ASSERT_NOT, _SRE_ATOMIC_GROUP):
+            return True
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT, _SRE_POSSESSIVE_REPEAT):
+            if _has_exotic_node(list(av[2])):
+                return True
+        elif op == _SRE_SUBPATTERN:
+            if _has_exotic_node(_subpattern_items(av)):
+                return True
+        elif op == _SRE_BRANCH and any(_has_exotic_node(list(b)) for b in av[1]):
+            return True
+    return False
+
+
+def _anchored_body_ok(body_items: list, ignorecase: bool) -> bool:
+    """Anchoring exemption for the nested-quantifier rule: the quantified body
+    is pinned to start with ONE definite literal character and its single
+    variable quantifier consumes only characters that can never be that pin —
+    every iteration then starts at the pin, iteration boundaries are forced by
+    the input, and backtracking stays linear. '(?:\\.\\d+)*' qualifies ('.' is
+    the pin, \\d never matches '.'); '(a+)+' does not ('a+' eats the pin)."""
+    if not body_items or _has_exotic_node(body_items):
+        return False
+    first_op, first_av = body_items[0]
+    if first_op != _SRE_LITERAL:
+        return False
+    pin = chr(first_av)
+    rest = body_items[1:]
+    if _count_variable_quantifiers(rest) != 1:
+        return False
+    found = _find_single_variable(rest)
+    if found is None:
+        return False
+    _mn, _mx, var_body = found
+    if len(var_body) != 1:
+        return False  # multi-char inner: can straddle the pin boundary
+    return not _atom_covers(var_body[0], pin, ignorecase)
+
+
+def _can_be_empty(items) -> bool:
+    """Can this subtree match the empty string? A SEQUENCE can only be empty
+    when EVERY element can ('a?' alone yes; 'a?b' no — b consumes)."""
+    for op, av in items:
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT, _SRE_POSSESSIVE_REPEAT):
+            if av[0] != 0 and not _can_be_empty(list(av[2])):
+                return False  # must iterate AND the body consumes
+        elif op == _SRE_SUBPATTERN:
+            if not _can_be_empty(_subpattern_items(av)):
+                return False
+        elif op == _SRE_BRANCH:
+            if not any(_can_be_empty(list(b)) for b in av[1]):
+                return False
+        elif op not in (_SRE_ASSERT, _SRE_ASSERT_NOT, _SRE_AT):
+            return False  # a consuming atom (literal, class, any, dot...)
+        # lookarounds and anchors are zero-width → keep scanning
+    return True
+
+
+def _first_descriptor(items, ignorecase: bool):
+    """What can this subtree START with? Returns ('empty', None) when it can
+    match empty outright, ('unknown', None) when unanalyzable, or
+    ('class', predicate) where predicate(ch) says whether ch can be first."""
+    for op, av in items:
+        if op == _SRE_LITERAL:
+            ch = chr(av)
+            return ("class", lambda c, _ch=ch: _same_char(c, _ch, ignorecase))
+        if op == _SRE_NOT_LITERAL:
+            ch = chr(av)
+            return ("class", lambda c, _ch=ch: not _same_char(c, _ch, ignorecase))
+        if op == _SRE_ANY:
+            return ("unknown", None)
+        if op == _SRE_IN:
+            in_items = [i for i in av if i[0] != _SRE_NEGATE]
+            negated = len(in_items) != len(av)
+            if negated:
+                return (
+                    "class",
+                    lambda c, _it=in_items: not any(_in_item_covers(i, c, ignorecase) for i in _it),
+                )
+            return (
+                "class",
+                lambda c, _it=in_items: any(_in_item_covers(i, c, ignorecase) for i in _it),
+            )
+        if op == _SRE_CATEGORY:
+            if av in _CATEGORY_PREDICATES:
+                pred = _CATEGORY_PREDICATES[av]
+                return ("class", lambda c: bool(pred(c)))
+            return ("unknown", None)  # negated categories: conservative
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT, _SRE_POSSESSIVE_REPEAT):
+            mn, _mx, body = av
+            if mn == 0:
+                continue  # optional atom: the next element decides
+            kind, payload = _first_descriptor(list(body), ignorecase)
+            if kind != "empty":
+                return (kind, payload)
+            continue
+        if op == _SRE_SUBPATTERN:
+            kind, payload = _first_descriptor(_subpattern_items(av), ignorecase)
+            if kind == "empty":
+                continue
+            return (kind, payload)
+        if op == _SRE_BRANCH:
+            descs = [_first_descriptor(list(b), ignorecase) for b in av[1]]
+            if any(d[0] == "unknown" for d in descs):
+                return ("unknown", None)
+            preds = [d[1] for d in descs if d[0] == "class"]
+            if len(preds) == len(descs):
+                return ("class", lambda c, _ps=preds: any(p(c) for p in _ps))
+            continue  # some branches empty: the next element decides
+        if op in (_SRE_ASSERT, _SRE_ASSERT_NOT, _SRE_AT):
+            continue  # zero-width
+        return ("unknown", None)  # GROUPREF and friends
+    return ("empty", None)
+
+
+def _branches_overlap(d1, d2) -> bool:
+    """Pairwise branch-overlap test. Predicates already bake in the
+    case-insensitivity flag at descriptor-build time; class-vs-class compares
+    over a representative probe alphabet, unknown-vs-anything overlaps."""
+    k1, p1 = d1
+    k2, p2 = d2
+    if k1 == "empty" or k2 == "empty":
+        return False  # empty branches are rejected by their own rule
+    if k1 == "unknown" or k2 == "unknown":
+        return True  # conservative
+    return any(p1(c) and p2(c) for c in _CLASS_PROBES)
+
+
+def _check_branch_ambiguity(items, pattern: str, what: str, ignorecase: bool) -> None:
+    """Under an unbounded (or wide) quantifier, an alternation must be
+    unambiguous: no branch may match empty and no two branches may start with
+    overlapping characters ('(a|aa)+', '(ERROR|Error)+' shapes)."""
+    for op, av in items:
+        if op != _SRE_BRANCH:
+            continue
+        branches = [list(b) for b in av[1]]
+        for branch in branches:
+            if _can_be_empty(branch):
+                raise _screen_unsafe_error(
+                    what,
+                    pattern,
+                    "an alternation branch inside the quantifier can match the empty string ('(x|)+' / '(a?)+' shape).",
+                )
+        descs = [_first_descriptor(b, ignorecase) for b in branches]
+        for i in range(len(descs)):
+            for j in range(i + 1, len(descs)):
+                if _branches_overlap(descs[i], descs[j]):
+                    raise _screen_unsafe_error(
+                        what,
+                        pattern,
+                        "alternation branches inside the quantifier start with "
+                        "overlapping characters ('(a|aa)+' shape).",
+                    )
+
+
+def _scan_regex_items(items, under_ambiguous: bool, ignorecase: bool, pattern: str, what: str) -> None:
+    """Depth-first walk of the sre tree, enforcing the nested-quantifier and
+    branch-ambiguity rules. under_ambiguous=True means 'somewhere inside an
+    unbounded/wide quantifier'."""
+    for op, av in items:
+        if op in (_SRE_MAX_REPEAT, _SRE_MIN_REPEAT):
+            _mn, mx, body = av
+            body_items = list(body)
+            unbounded = mx == _SRE_MAXREPEAT
+            wide = unbounded or mx >= _LARGE_REPEAT_BOUND
+            if wide and _count_variable_quantifiers(body_items) > 0 and not _anchored_body_ok(body_items, ignorecase):
+                raise _screen_unsafe_error(
+                    what,
+                    pattern,
+                    "a quantifier is applied to a group containing another "
+                    "variable quantifier ('(a+)+', '(.*)*', '(\\\\w+\\\\s)*' "
+                    "shape) — note the inner quantifier can also be made "
+                    "atomic/possessive: '(?>a+)+'.",
+                )
+            _scan_regex_items(body_items, under_ambiguous or wide, ignorecase, pattern, what)
+        elif op == _SRE_POSSESSIVE_REPEAT:
+            # possessive = atomic: the body commits without backtracking, so
+            # it shields the outer quantifier; still scan it for its own bombs.
+            _scan_regex_items(list(av[2]), under_ambiguous, ignorecase, pattern, what)
+        elif op == _SRE_ATOMIC_GROUP:
+            # atomic groups shield their contents from the enclosing quantifier
+            _scan_regex_items(_subpattern_items(av), False, ignorecase, pattern, what)
+        elif op == _SRE_SUBPATTERN:
+            _scan_regex_items(_subpattern_items(av), under_ambiguous, ignorecase, pattern, what)
+        elif op == _SRE_BRANCH:
+            if under_ambiguous:
+                _check_branch_ambiguity([(op, av)], pattern, what, ignorecase)
+            for b in av[1]:
+                _scan_regex_items(list(b), under_ambiguous, ignorecase, pattern, what)
+        elif op in (_SRE_ASSERT, _SRE_ASSERT_NOT):
+            # a bomb inside a lookaround explodes on its own when evaluated
+            _scan_regex_items(_subpattern_items(av), under_ambiguous, ignorecase, pattern, what)
+
+
+def _screen_regex(pattern: str, what: str, flags: int) -> None:
+    """Compile-time ReDoS screen — see the section comment above. Raises
+    LogSearchError for refused patterns AND for genuinely invalid ones (same
+    'invalid regex' message the compiler used to raise)."""
+    limit = _max_regex_chars()
+    if limit > 0 and len(pattern) > limit:
+        raise LogSearchError(
+            f"unsafe regex {what} {pattern!r} rejected: {len(pattern)} characters "
+            f"exceeds LOGSEARCH_MAX_REGEX_CHARS={limit} — narrow the pattern or "
+            "raise the cap."
+        )
+    if _sre_p is None or not isinstance(pattern, str):  # pragma: no cover
+        return  # parser unavailable: the length cap is the only screen
+    ignorecase = bool(flags & re.IGNORECASE)
+    try:
+        tree = _sre_p.parse(pattern, flags)
+    except re.error as e:
+        raise LogSearchError(f"invalid regex {what} {pattern!r} ({e})") from e
+    except Exception:  # pragma: no cover - exotic parser failure: fail open
+        return
+    _scan_regex_items(list(tree), False, ignorecase, pattern, what)
+
+
 def _compile_regex(pattern: str, what: str = "pattern", flags: int = 0) -> re.Pattern:
+    """Screen for ReDoS, then compile. Prefers the OPTIONAL re2 engine when
+    it is importable (linear-time matching); falls back to `re` when re2 is
+    absent or refuses syntax that `re` accepts (backreferences) — the screen
+    above is the real guard either way."""
+    _screen_regex(pattern, what, flags)
+    if _re2 is not None:
+        try:
+            return _re2.compile(pattern, flags)
+        except Exception:
+            pass  # re2 rejects some valid-for-re syntax (e.g. backreferences)
     try:
         return re.compile(pattern, flags)
     except re.error as e:
@@ -335,7 +819,7 @@ def _since_seconds_from_minutes(since_minutes: float | None) -> int | None:
         return None
     if since_minutes <= 0:
         raise LogSearchError("since_minutes must be > 0 (e.g. 30 = last half hour).")
-    return max(1, int(round(since_minutes * 60)))
+    return max(1, round(since_minutes * 60))
 
 
 def _pick_container(pod: dict, container: str) -> str | None:
@@ -346,6 +830,26 @@ def _pick_container(pod: dict, container: str) -> str | None:
     if container:
         return container if container in containers else None
     return containers[0] if containers else None
+
+
+# Sentinel for the parallel fan-out: this pod had no readable container, so
+# no fetch was attempted and the result contributes nothing.
+_SKIP = object()
+
+# Appended to a search-output line cut by the per-line char cap. The marker
+# names the exact number of dropped characters so the caller can tell how
+# much of the line was withheld.
+_LINE_TRUNCATION_MARKER = " ...[truncated {} chars]"
+
+
+def _cap_line(line: str, cap: int) -> str:
+    """Per-line char cap on search output: keep the first `cap` characters and
+    append an explicit truncation marker. cap <= 0 disables the cap. The
+    marker is additive (a capped line may run `cap + len(marker)` wide) so
+    `cap` stays the honest visible-payload budget."""
+    if cap <= 0 or len(line) <= cap:
+        return line
+    return line[:cap] + _LINE_TRUNCATION_MARKER.format(len(line) - cap)
 
 
 def _rfc3339_sort_key(line: str) -> tuple:
@@ -368,17 +872,17 @@ def _rfc3339_to_epoch(ts: str) -> float:
     normalized = re.sub(r"(\.\d{6})\d+", r"\1", ts.replace("Z", "+00:00"))
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.timestamp()
 
 
 def _human_age(started: str) -> str:
     """Pod age as a compact human string, from the RFC3339 start time."""
     try:
-        start = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        start = datetime.fromisoformat(started)
         if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        secs = max(0, int((datetime.now(timezone.utc) - start).total_seconds()))
+            start = start.replace(tzinfo=UTC)
+        secs = max(0, int((datetime.now(UTC) - start).total_seconds()))
     except ValueError:
         return "unknown"
     days, rem = divmod(secs, 86400)
@@ -399,7 +903,7 @@ def _human_age(started: str) -> str:
 
 @mcp.tool(
     title="List Log Sources",
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def list_log_sources(namespace: str, label_selector: str = "") -> str:
     """List pods+containers in one namespace with restart counts and age —
@@ -434,7 +938,7 @@ async def list_log_sources(namespace: str, label_selector: str = "") -> str:
 
 @mcp.tool(
     title="Get Pod Logs",
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def get_pod_logs(
     namespace: str,
@@ -467,7 +971,7 @@ async def get_pod_logs(
         return "Error: since_seconds must be > 0 when given."
     effective_tail = min(tail_lines, _max_lines_per_pod())
     try:
-        target_container = container
+        target_container: str | None = container
         if not target_container:
             # Resolve the pod's default container up front so multi-container
             # pods fail into a helpful message instead of an API 400.
@@ -475,8 +979,7 @@ async def get_pod_logs(
             match = next((p for p in pods if p["name"] == pod), None)
             if match is None:
                 return (
-                    f"Error: pod {pod!r} not found in namespace {namespace!r} — "
-                    "use list_log_sources to discover pods."
+                    f"Error: pod {pod!r} not found in namespace {namespace!r} — use list_log_sources to discover pods."
                 )
             target_container = _pick_container(match, "")
             if target_container is None:
@@ -515,11 +1018,7 @@ async def get_pod_logs(
     )
 
 
-@mcp.tool(
-    title="Search Pod Logs",
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
-)
-async def search_logs(
+async def _search_logs_impl(
     namespace: str,
     pattern: str,
     label_selector: str = "",
@@ -530,27 +1029,10 @@ async def search_logs(
     container: str = "",
     max_total_lines: int = 300,
 ) -> str:
-    """Fan-out regex search over the pods of one namespace: fetch the tail of
-    each pod (timestamps on), keep matching lines, prefix each with
-    'podname/container: ' provenance, merge, and sort chronologically by the
-    embedded RFC3339 timestamp (untimestamped lines last). Capped at
-    max_total_lines — when the cap bites, the MOST RECENT matches are kept
-    and 'truncated' is true. Empty matches are a normal empty result, not an
-    error.
-
-    Args:
-        namespace: Kubernetes namespace to search.
-        pattern: Python regex to match against log lines, e.g. 'Traceback|ERROR'.
-        label_selector: Optional pod label selector, e.g. 'app=myapp'.
-        pod_regex: Optional regex narrowing WHICH pods to search by name.
-        since_minutes: Optional: only fetch logs newer than this many minutes.
-        tail_lines: Lines fetched per pod (server-capped by
-            LOGSEARCH_MAX_LINES_PER_POD).
-        case_insensitive: Match pattern case-insensitively (default true).
-        container: Restrict to one container name; empty = each pod's first
-            (default) container.
-        max_total_lines: Cap on merged matches returned (default 300).
-    """
+    """THE search pipeline (Wave-5 F3): every caller — the search_logs MCP
+    tool AND export_matches — goes through this exact function, so caps, the
+    ReDoS screen, and the namespace policy can never diverge between the two.
+    Returns the search_logs JSON payload, or an 'Error: ...' string."""
     if not _namespace_allowed(namespace):
         return _ns_denied_error(namespace)
     try:
@@ -575,43 +1057,83 @@ async def search_logs(
     pods = pods[:cap]
     if pod_rx is not None:
         pods = [p for p in pods if pod_rx.search(p["name"])]
+    # Deterministic fan-out order: the budget stops the search mid-flight, so
+    # WHICH pods get read decides what is kept — sort by name so results do
+    # not depend on API return order or on arrival timing under parallelism.
+    pods.sort(key=lambda p: p["name"])
 
-    matches: list[str] = []
-    errors: list[str] = []
-    pods_searched = 0
-    pods_with_matches = 0
-    for pod in pods:
-        target_container = _pick_container(pod, container)
+    line_cap = _max_line_chars()
+    concurrency = _fetch_concurrency()
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _fetch(pod_name: str, target_container: str | None):
+        """One pod's log fetch behind the bounded semaphore; a pod with no
+        readable container returns the _SKIP sentinel (nothing to read)."""
         if target_container is None:
-            continue
-        try:
-            log_text = await asyncio.to_thread(
+            return _SKIP
+        async with semaphore:
+            return await asyncio.to_thread(
                 _read_log,
                 namespace,
-                pod["name"],
+                pod_name,
                 target_container,
                 effective_tail,
                 since_seconds,
                 True,  # timestamps: what chronological merge sort runs on
                 False,
             )
-        except LogSearchError as e:
-            # One dead pod must not sink the search: record, keep going.
-            errors.append(f"{pod['name']}: {e}")
-            continue
-        pods_searched += 1
-        prefix = f"{pod['name']}/{target_container}: "
-        pod_matches = [prefix + line for line in log_text.splitlines() if rx.search(line)]
-        if pod_matches:
-            pods_with_matches += 1
-            matches.extend(pod_matches)
+
+    matches: list[str] = []
+    errors: list[str] = []
+    pods_searched = 0
+    pods_with_matches = 0
+    pods_skipped_budget = 0
+    truncated = False
+    for start in range(0, len(pods), concurrency):
+        if len(matches) >= max_total_lines:
+            # Budget already full from an earlier wave: never schedule these
+            # pods — the pull stops before the fetch, not after it.
+            truncated = True
+            pods_skipped_budget += len(pods) - start
+            break
+        wave = [(p, _pick_container(p, container)) for p in pods[start : start + concurrency]]
+        results = await asyncio.gather(*(_fetch(p["name"], t) for p, t in wave), return_exceptions=True)
+        # Merge strictly in pod order (wave results come back ordered), so the
+        # merged stream — and the budget stop point — is identical whether the
+        # fan-out ran with concurrency 1 or 50.
+        for (pod, target_container), result in zip(wave, results):
+            if truncated:
+                # Budget full: discard in-flight results; count the pod as
+                # skipped (never scheduled, or fetched but unmerged).
+                pods_skipped_budget += 1
+                continue
+            if target_container is None:
+                continue
+            if isinstance(result, BaseException):
+                if isinstance(result, LogSearchError):
+                    # One dead pod must not sink the search: record, keep going.
+                    errors.append(f"{pod['name']}: {result}")
+                    continue
+                raise result
+            pods_searched += 1
+            prefix = f"{pod['name']}/{target_container}: "
+            pod_has_match = False
+            for line in result.splitlines():
+                if not rx.search(line):
+                    continue
+                if len(matches) >= max_total_lines:
+                    # Global line budget reached mid-fan-out: stop pulling.
+                    truncated = True
+                    pods_skipped_budget += 1
+                    break
+                matches.append(_cap_line(prefix + line, line_cap))
+                if not pod_has_match:
+                    pod_has_match = True
+                    pods_with_matches += 1
+        if truncated:
+            break
 
     matches.sort(key=_rfc3339_sort_key)
-    truncated = len(matches) > max_total_lines
-    if truncated:
-        # Chronological sort + cap: keep the TAIL (most recent) — triage
-        # cares about what happened last, not what happened first.
-        matches = matches[-max_total_lines:]
     return json.dumps(
         {
             "namespace": namespace,
@@ -622,14 +1144,292 @@ async def search_logs(
             "pods_with_matches": pods_with_matches,
             "pod_cap_applied": pod_cap_applied,
             "truncated": truncated,
+            "pods_skipped_budget": pods_skipped_budget,
             "errors": errors,
         }
     )
 
 
 @mcp.tool(
+    title="Search Pod Logs",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+async def search_logs(
+    namespace: str,
+    pattern: str,
+    label_selector: str = "",
+    pod_regex: str = "",
+    since_minutes: float | None = None,
+    tail_lines: int = 200,
+    case_insensitive: bool = True,
+    container: str = "",
+    max_total_lines: int = 300,
+) -> str:
+    """Fan-out regex search over the pods of one namespace: fetch the tail of
+    each pod (timestamps on), keep matching lines, prefix each with
+    'podname/container: ' provenance, merge, and sort chronologically by the
+    embedded RFC3339 timestamp (untimestamped lines last). Pods are fetched in
+    parallel (bounded semaphore, LOGSEARCH_FETCH_CONCURRENCY) and the global
+    line budget is enforced DURING the fan-out: once max_total_lines matches
+    are in hand the search stops pulling further pods (reported in
+    'pods_skipped_budget', with 'truncated' true) instead of fetching
+    everything and slicing afterwards. A pod straddling the stop point counts
+    in BOTH 'pods_searched' (it was read) and 'pods_skipped_budget' (its
+    remaining matches were dropped). Lines longer than
+    LOGSEARCH_MAX_LINE_CHARS are cut with an explicit ' ...[truncated N
+    chars]' marker. Empty matches are a normal empty result, not an error.
+
+    Args:
+        namespace: Kubernetes namespace to search.
+        pattern: Python regex to match against log lines, e.g. 'Traceback|ERROR'.
+        label_selector: Optional pod label selector, e.g. 'app=myapp'.
+        pod_regex: Optional regex narrowing WHICH pods to search by name.
+        since_minutes: Optional: only fetch logs newer than this many minutes.
+        tail_lines: Lines fetched per pod (server-capped by
+            LOGSEARCH_MAX_LINES_PER_POD).
+        case_insensitive: Match pattern case-insensitively (default true).
+        container: Restrict to one container name; empty = each pod's first
+            (default) container.
+        max_total_lines: Cap on merged matches returned (default 300).
+    """
+    return await _search_logs_impl(
+        namespace,
+        pattern,
+        label_selector=label_selector,
+        pod_regex=pod_regex,
+        since_minutes=since_minutes,
+        tail_lines=tail_lines,
+        case_insensitive=case_insensitive,
+        container=container,
+        max_total_lines=max_total_lines,
+    )
+
+
+# ---------------------------------------------------------------------------
+# export_matches (Wave-5 F3 — ADDITIVE, OPT-IN via LOGSEARCH_EXPORT_ROOT)
+# ---------------------------------------------------------------------------
+#
+# Result sets that would blow a context window go to a FILE instead: the
+# search runs through the EXACT _search_logs_impl pipeline above (same
+# namespace policy, ReDoS screen, pod/line caps — no bypass), and the matched
+# lines land under LOGSEARCH_EXPORT_ROOT.  Unset (the default) → the tool
+# refuses with setup instructions and writes NOTHING.  Suggested value (see
+# README): a directory on the workbench/shared PVC so an agent reads the
+# export back through its workbench tools.
+#
+# Path safety: dest_name is a bare FILE NAME — validated BEFORE it is joined
+# under the export root (no '/' or '\' separators, no '..' anywhere, no
+# leading dot, no whitespace/control characters), so the write cannot escape
+# the export area.  Writes are bounded by the search's own caps
+# (max_total_lines matches × per-line char cap) and land atomically
+# (temp file + os.replace): a reader never sees a half-written export, and a
+# re-export to the same name replaces the previous file rather than
+# appending.  A failed search (denied namespace, refused regex, bad args)
+# writes nothing and returns the very same error string search_logs would.
+
+ENV_EXPORT_ROOT = "LOGSEARCH_EXPORT_ROOT"
+
+# Bare file name for an export destination: starts with a letter/digit, then
+# letters/digits/dots/underscores/dashes, ≤128 chars.  Combined with the
+# explicit separator/'..' rejection below this cannot traverse, cannot name a
+# hidden file, and cannot carry whitespace or control characters.
+_DEST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _export_root() -> Path | None:
+    """LOGSEARCH_EXPORT_ROOT — the only directory export_matches may write.
+    UNSET/empty (the default) → None: the tool refuses (opt-in, Wave-5 F3).
+    Read per call (the fleet env-re-read pattern)."""
+    raw = (os.getenv(ENV_EXPORT_ROOT) or "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _export_unconfigured_error() -> str:
+    return (
+        "Error: export_matches is not configured on this server — the "
+        f"{ENV_EXPORT_ROOT} environment variable is unset, and the tool "
+        "refuses to write anywhere until an operator opts in. Setup: set "
+        f"{ENV_EXPORT_ROOT} to an absolute directory on a writable volume that "
+        "agents can read back (fleet convention: a path on the workbench/shared "
+        "PVC — e.g. /data/exports, which workbench workspaces can reach via "
+        "WORKBENCH_SHARED_PATHS), then retry; the directory is created on "
+        "first export if it does not exist."
+    )
+
+
+def _dest_name_error(dest_name: str) -> str | None:
+    """Path-safety screen for an export destination name; None when OK."""
+    if not isinstance(dest_name, str) or not dest_name.strip() or dest_name.strip() != dest_name:
+        return (
+            "Error: dest_name must be a non-empty bare file name (letters, "
+            "digits, '.', '_' or '-'; no path separators, no surrounding "
+            "whitespace)."
+        )
+    if "/" in dest_name or "\\" in dest_name or ".." in dest_name:
+        return (
+            f"Error: dest_name {dest_name!r} must be a bare file name — path "
+            "separators and '..' sequences are refused; an export always lands "
+            f"directly under {ENV_EXPORT_ROOT}."
+        )
+    if not _DEST_NAME_RE.match(dest_name):
+        return (
+            f"Error: dest_name {dest_name!r} must match {_DEST_NAME_RE.pattern} "
+            "(a bare file name starting with a letter or digit — no spaces, "
+            "control characters, or leading dot)."
+        )
+    return None
+
+
+def _export_file_text(namespace: str, pattern: str, result: dict) -> str:
+    """The export file body: a small #-prefixed header (query, namespace,
+    timestamp, counts) followed by the matched lines VERBATIM — they are
+    already provenance-prefixed and char-capped by the search pipeline.  The
+    namespace/pattern fields are flattened to one line each so a hostile
+    pattern cannot forge header lines."""
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def one_line(s: str) -> str:
+        return str(s).replace("\r", "\\r").replace("\n", "\\n")
+
+    errors = result.get("errors") or []
+    header = [
+        "# logsearch export_matches",
+        f"# timestamp: {ts}",
+        f"# namespace: {one_line(namespace)}",
+        f"# pattern: {one_line(pattern)}",
+        f"# matches: {result.get('match_count', 0)} (truncated: {result.get('truncated', False)})",
+        (
+            f"# pods_searched: {result.get('pods_searched', 0)}"
+            f"  pods_with_matches: {result.get('pods_with_matches', 0)}"
+            f"  pods_skipped_budget: {result.get('pods_skipped_budget', 0)}"
+            f"  pod_cap_applied: {result.get('pod_cap_applied', False)}"
+        ),
+        "# errors: " + (json.dumps(errors) if errors else "none"),
+    ]
+    matches = result.get("matches") or []
+    if matches:
+        # a REAL blank line separates header from payload (readers split the
+        # file on it; matches never start with '# ' — they carry the
+        # 'pod/container: ' provenance prefix)
+        return "\n".join(header) + "\n\n" + "\n".join(matches) + "\n"
+    return "\n".join(header) + "\n"
+
+
+@mcp.tool(
+    title="Export Log Matches",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True),
+)
+async def export_matches(
+    namespace: str,
+    pattern: str,
+    dest_name: str,
+    label_selector: str = "",
+    pod_regex: str = "",
+    since_minutes: float | None = None,
+    tail_lines: int = 200,
+    case_insensitive: bool = True,
+    container: str = "",
+    max_total_lines: int = 300,
+) -> str:
+    """Run the search_logs pipeline and write the matched lines to
+    `<LOGSEARCH_EXPORT_ROOT>/<dest_name>` — for result sets too big for a
+    context window: the agent reads the FILE back (e.g. a workbench workspace
+    that shares the export root via WORKBENCH_SHARED_PATHS) instead of the
+    MCP response.  OPT-IN: with LOGSEARCH_EXPORT_ROOT unset the tool refuses
+    with a self-describing setup message and writes nothing.  dest_name must
+    be a bare file name (no separators, no '..'; a clear error otherwise) and
+    an existing file of the same name is REPLACED (never appended).  The
+    search reuses the EXACT search_logs pipeline — same namespace policy (D8),
+    ReDoS screen, and caps, so the written lines are identical to what
+    search_logs would return and the write is bounded by the same limits.
+    The file gets a small #-prefixed header (query, namespace, timestamp,
+    counts).  A failed search (bad regex, denied namespace) writes NOTHING
+    and returns the same error string search_logs would.  The response
+    carries counts and the file path — never the matches themselves (the
+    file is the artifact).
+
+    Args:
+        namespace: Kubernetes namespace to search.
+        pattern: Python regex to match against log lines, e.g. 'Traceback|ERROR'.
+        dest_name: Bare file name for the export (no separators/'..'; lands
+            directly under LOGSEARCH_EXPORT_ROOT).
+        label_selector: Optional pod label selector, e.g. 'app=myapp'.
+        pod_regex: Optional regex narrowing WHICH pods to search by name.
+        since_minutes: Optional: only fetch logs newer than this many minutes.
+        tail_lines: Lines fetched per pod (server-capped by
+            LOGSEARCH_MAX_LINES_PER_POD).
+        case_insensitive: Match pattern case-insensitively (default true).
+        container: Restrict to one container name; empty = each pod's first
+            (default) container.
+        max_total_lines: Cap on merged matches written (default 300 — the
+            same budget search_logs enforces during the fan-out).
+    """
+    root = _export_root()
+    if root is None:
+        return _export_unconfigured_error()
+    dest_err = _dest_name_error(dest_name)
+    if dest_err:
+        return dest_err
+    # The search — policy, ReDoS screen, caps — is the EXACT pipeline; an
+    # 'Error: ...' result is returned verbatim and writes nothing.
+    raw = await _search_logs_impl(
+        namespace,
+        pattern,
+        label_selector=label_selector,
+        pod_regex=pod_regex,
+        since_minutes=since_minutes,
+        tail_lines=tail_lines,
+        case_insensitive=case_insensitive,
+        container=container,
+        max_total_lines=max_total_lines,
+    )
+    if raw.startswith("Error"):
+        return raw
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:  # pragma: no cover - impl always emits JSON
+        return _err("export", ValueError("search pipeline returned a non-JSON payload"))
+    dest = root / dest_name
+    tmp = root / f".{dest_name}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}.tmp"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(_export_file_text(namespace, pattern, result), encoding="utf-8")
+        os.replace(tmp, dest)
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return (
+            f"Error: could not write the export to {str(dest)!r} ({exc}) — "
+            f"check that {ENV_EXPORT_ROOT} points at a WRITABLE directory "
+            "(a mounted volume, not the read-only rootfs)."
+        )
+    body_bytes = dest.stat().st_size
+    return json.dumps(
+        {
+            "exported": True,
+            "path": str(dest),
+            "dest_name": dest_name,
+            "namespace": namespace,
+            "pattern": pattern,
+            "match_count": result["match_count"],
+            "truncated": result["truncated"],
+            "pods_searched": result["pods_searched"],
+            "pods_with_matches": result["pods_with_matches"],
+            "pod_cap_applied": result["pod_cap_applied"],
+            "pods_skipped_budget": result["pods_skipped_budget"],
+            "errors": result["errors"],
+            "bytes": body_bytes,
+        }
+    )
+
+
+@mcp.tool(
     title="Count Log Matches",
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def count_matches(
     namespace: str,
@@ -641,7 +1441,8 @@ async def count_matches(
     """Per-pod match counts for one pattern across a namespace, sorted
     descending — the 'where is this error coming from?' call before reading
     full logs. Counts run over the last LOGSEARCH_MAX_LINES_PER_POD lines of
-    each pod's default container.
+    each pod's default container, fetched in parallel (bounded semaphore,
+    LOGSEARCH_FETCH_CONCURRENCY).
 
     Args:
         namespace: Kubernetes namespace to count in.
@@ -666,30 +1467,42 @@ async def count_matches(
     cap = _max_pods()
     pod_cap_applied = len(pods) > cap
     pods = pods[:cap]
+    pods.sort(key=lambda p: p["name"])  # deterministic fan-out + ranking input
 
-    counts: dict[str, int] = {}
-    errors: list[str] = []
-    pods_searched = 0
-    for pod in pods:
-        target_container = _pick_container(pod, "")
+    concurrency = _fetch_concurrency()
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _fetch(pod_name: str, target_container: str | None):
         if target_container is None:
-            continue
-        try:
-            log_text = await asyncio.to_thread(
+            return _SKIP
+        async with semaphore:
+            return await asyncio.to_thread(
                 _read_log,
                 namespace,
-                pod["name"],
+                pod_name,
                 target_container,
                 _max_lines_per_pod(),
                 since_seconds,
                 True,
                 False,
             )
-        except LogSearchError as e:
-            errors.append(f"{pod['name']}: {e}")
-            continue
-        pods_searched += 1
-        counts[pod["name"]] = sum(1 for line in log_text.splitlines() if rx.search(line))
+
+    counts: dict[str, int] = {}
+    errors: list[str] = []
+    pods_searched = 0
+    for start in range(0, len(pods), concurrency):
+        wave = [(p, _pick_container(p, "")) for p in pods[start : start + concurrency]]
+        results = await asyncio.gather(*(_fetch(p["name"], t) for p, t in wave), return_exceptions=True)
+        for (pod, target_container), result in zip(wave, results):
+            if target_container is None:
+                continue
+            if isinstance(result, BaseException):
+                if isinstance(result, LogSearchError):
+                    errors.append(f"{pod['name']}: {result}")
+                    continue
+                raise result
+            pods_searched += 1
+            counts[pod["name"]] = sum(1 for line in result.splitlines() if rx.search(line))
 
     # Sorted descending by count (pod name breaks ties deterministically);
     # JSON preserves insertion order, so clients see the ranking directly.
@@ -706,6 +1519,34 @@ async def count_matches(
             "errors": errors,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# self-metrics (Wave-3 C3 — additive, chart-gated DEFAULT-OFF)
+# ---------------------------------------------------------------------------
+
+# Count every MCP-protocol tool call (per-tool {ok,error} counters — see
+# mcp_metrics.py). Unconditional and inert: the counters exist from import
+# time, but nothing exposes them unless the /metrics route below is mounted,
+# which requires the chart to set LOGSEARCH_METRICS_ENABLED (metrics.enabled,
+# default false). No behavior change when metrics are off. Outcome labeling:
+# this server's tools report failures as "Error: ..." strings (never raise),
+# so a returned error string counts as outcome="error" too.
+mcp_metrics.instrument(mcp, error_result=lambda result: isinstance(result, str) and result.startswith("Error"))
+
+
+def _metrics_enabled() -> bool:
+    """Serve the /metrics endpoint? (LOGSEARCH_METRICS_ENABLED, default off).
+
+    The chart renders this env — and the ServiceMonitor — ONLY when
+    ``metrics.enabled: true`` (values), so a default deployment has no
+    /metrics route at all. Read per call (env re-read, the fleet pattern)
+    so tests can flip it without reimporting.
+    """
+    raw = os.environ.get("LOGSEARCH_METRICS_ENABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _build_http_app():
@@ -737,6 +1578,14 @@ def _build_http_app():
         Route("/health", health),
         Route("/healthz", health),
     ]
+    if _metrics_enabled():
+        # Prometheus self-metrics (Wave-3 C3, ADDITIVE, default OFF): per-tool
+        # request counters ONLY — no namespace names, pod names, patterns, or
+        # log content are exported (see mcp_metrics.py). Served key-free like
+        # the probes so the ServiceMonitor can scrape it; the data is
+        # non-sensitive, and the route exists only when the chart opted in
+        # (metrics.enabled=true → LOGSEARCH_METRICS_ENABLED).
+        routes.append(Route("/metrics", mcp_metrics.endpoint))
     if _webui_enabled():
         # HPE-branded web UI + read-only JSON API at / and /api/* — a human
         # front-end over the SAME seams/policy/caps that back the MCP tools
@@ -746,15 +1595,27 @@ def _build_http_app():
 
         routes.extend(build_ui_routes())
     routes.extend(http_app.routes)
-    return Starlette(
-        routes=routes,
-        lifespan=http_app.router.lifespan_context,
+    # API-key auth (fleet pattern, shared module: pcai_utils/mcp_auth.py).
+    # Scope matches applygate: ONLY /mcp is enforced — the console's /api/*
+    # is a read-only search front-end (it calls the same tool coroutines and
+    # has no extra powers), and the probes must stay public for k8s. The
+    # fleet decision (2026-09) makes logsearch MANDATORY-auth: the chart
+    # wires the key env from an operator-created Secret and the pod fails
+    # loud until it exists. One-address wiring: the UNIVERSAL MCP_API_KEYS
+    # is honored alongside LOGSEARCH_API_KEYS (key sets unioned,
+    # constant-time compares); comma-separated keys = the rotation story.
+    return mcp_auth.ApiKeyAuthMiddleware(
+        Starlette(
+            routes=routes,
+            lifespan=http_app.router.lifespan_context,
+        ),
+        env_names=AUTH_ENV_NAMES,
+        protected=lambda p: p.startswith("/mcp"),
     )
 
 
 def main():
     import uvicorn
-    from starlette.middleware.cors import CORSMiddleware
 
     parser = argparse.ArgumentParser(description="LogSearch MCP Server")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
@@ -766,14 +1627,12 @@ def main():
         mcp.run(transport="stdio")
         return
 
+    mcp_auth.warn_if_open("logsearch-mcp", AUTH_ENV_NAMES)
+
     app = _build_http_app()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["Mcp-Session-Id"],
-    )
+    # No CORSMiddleware: the old allow_origins=["*"] let any website the
+    # operator visits read pod-log search results cross-origin (fleet audit
+    # S-6). The console is same-origin; MCP clients are not browsers.
     print(f"LogSearch MCP streamable-http endpoint: http://{args.host}:{args.port}/mcp")
     uvicorn.run(app, host=args.host, port=args.port)
 

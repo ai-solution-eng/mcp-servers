@@ -1,4 +1,4 @@
-# FEATURES — Hardening & Capability changelog (v0.0.1 → v0.2.12)
+# FEATURES — Hardening & Capability changelog (v0.0.1 → v0.2.13)
 
 This file summarizes everything that changed across the hardening session that took `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl, `cluster-admin`, unauthenticated endpoint) to v0.2.12 — deployed, verified live, and in daily use from DSH. The chart line has since moved on (current: `helm/` 0.3.1 + `helm-customer/` 0.3.1-customer, see `helm/Chart.yaml`); the invariants below still hold.
 
@@ -111,7 +111,7 @@ Two charts in the PCAI house style (values-driven naming, `ezua:` integration bl
 
 - `test_namespace_policy.py` — **168 self-contained checks**: namespace policy and globs, precedence (blacklist wins), exec command guard (allowlist, hard-denies, token denials), argv building, per-client parsing/auth/narrowing, provisioning (create/keep/patch/skip/refuse/degrade), API-key middleware (401 paths, both headers, dev mode), MCP 2.0 envelope behavior, `check_rbac` answer surfacing, the VirtualServices tool (summary/detail rendering, policy filtering, kubectl fallback argv), and the built-in console (routing, CSP, traversal guards, disable knob). Runs without a cluster (the `kubernetes` package is stubbed when absent).
 - `smoke_console.py` — boots the REAL ASGI wiring (uvicorn, kubernetes stubbed) and verifies over HTTP: static shell + CSP, traversal 404s, console toggle, modern `tools/list`/`tools/call` with the 2026-07-28 envelope, legacy SSE fallback, and the 401 gate with the console-shell exemption.
-- `audit_forms.py` — schema↔form contract audit: **19 tools / 38 parameters**, every widget output type round-trips to its server schema type (run after ANY change to tool signatures or `ui/app.js` widgets; exec enabled via env before import).
+- `audit_forms.py` — schema↔form contract audit: **20 tools / 40 parameters** (Wave-5: + `triage`), every widget output type round-trips to its server schema type (run after ANY change to tool signatures or `ui/app.js` widgets; exec enabled via env before import).
 - **Live protocol conformance**: stateless tools/list+call, `server/discover`, cache hints, legacy-era fallback, strict envelope rejection — verified over real HTTP.
 - **Live deployment verification** (production cluster): 236 exec RoleBindings provisioned and repointed across a namespace migration; `can-i create pods/exec` yes in kept namespaces / no elsewhere; real `ps` executed inside a running predictor through the full gateway→auth→policy→allowlist→RBAC chain; 401 gate and audit trail confirmed.
 
@@ -138,12 +138,13 @@ For the post-deployment verification checklist against a running instance, see [
 | v0.2.10 | 2.2.0 | Console polish: primary button rests in the deep brand green with white text (was the bright tint, which read as light green and flipped dark only after pressing); hover deepens, pressed darkens further, keyboard focus is a bright-green ring |
 | v0.2.11 | 2.2.0 | Container-picker fix: the pod-spec fetch used full `output=json`, which truncates at ~50k — a KServe predictor's spec is ~56KB, JSON.parse threw, and the picker silently never appeared; now fetches `jsonpath={.spec.containers[*].name}` (tiny, truncation-proof). Logs/Exec auto-run also awaits the pickers, so the first click already carries the kserve-container default |
 | v0.2.12 | 2.2.0 | Logs readability: some kubernetes-client versions return the log subresource as raw BYTES — returned as-is, the MCP layer rendered a Python bytes repr (`b'…\n…'`): every newline escaped, one flat line. `get_pod_logs` now decodes bytes (and defensively un-decodes bytes-reprs via ast.literal_eval). Plus a ⛶ Full screen toggle for the output panel (fixed overlay, Esc/exit button) |
+| v0.2.13 | 2.2.0 | Wave-5 additive: `triage(namespace, app)` — a one-call namespace health summary composed ONLY from the server's own governed read paths (namespace policy up front — refusal byte-identical to `list_pods`'; namespaced Python-API reads only, never kubectl / cluster-wide lists; `get_events`' Warning filter, sort and 100-item cap reused). Attention-first output: container waiting reasons (CrashLoopBackOff / OOMKilled / ImagePullBackOff / …), Pending/Failed/Unknown phase, Running-but-`Ready=False`, any restarts, and `Unhealthy` Warning events as failing probes; Succeeded pods stay unflagged. Then pods (name/phase/restarts/age/node), workloads ready-vs-desired, Warning events, PVCs. `app` narrows pods+workloads+attention (label-first `app`/`app.kubernetes.io/name`, then name substring — the `list_pods` label-selector convention); events/PVCs stay namespace-wide. Whole render capped by `K8S_MCP_TRIAGE_MAX_LINES` (default 150, >=1, malformed→default) with a naming marker. One failed non-core read degrades only its section to an honest `Error - …` line; a failed pod read fails the triage exactly like `list_pods`. +40 tests (`test_triage.py`), suite 277. The k8s-mcp↔applygate write-path identity pass-through is deliberately NOT built this wave — README carries the design note, deferred to the Wave-6 shared middleware |
 
 ## 14. Files
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | The server — 19 tools, auth, policy, exec, provisioning, console serving |
+| `server.py` | The server — 19 tools (20 with exec enabled), auth, policy, triage, exec, provisioning, console serving |
 | `ui/` | Built-in HPE ops console (static: `index.html`, `style.css`, `app.js`) |
 | `helm/` | Trusted-operator chart (k8s-mcp): every security knob values-configurable, `ezua:` exposure, Kyverno vendor labels; packaged `.tgz` at the repo root |
 | `helm/values-examples/` | Secret-free paste-ready full-values examples (G2 lab, hosted trial) |
@@ -158,4 +159,4 @@ For the post-deployment verification checklist against a running instance, see [
 | `documentation/VERIFICATION.md` | Post-deployment verification checklist (MCP handshake, tool test, operator checks) |
 | `test_namespace_policy.py` | 168-check verification suite (no cluster required) |
 | `smoke_console.py` | HTTP-level console + protocol smoke test (real ASGI wiring, kubernetes stubbed) |
-| `audit_forms.py` | Schema↔form audit — boots the server (exec enabled), simulates the console's inferWidget/read matrix for every parameter of all 19 tools, exits non-zero on any widget↔schema type mismatch |
+| `audit_forms.py` | Schema↔form audit — boots the server (exec enabled), simulates the console's inferWidget/read matrix for every parameter of all 20 tools, exits non-zero on any widget↔schema type mismatch |

@@ -9,8 +9,8 @@ description: >-
   S3-compatible store (MinIO/AWS, Parquet). Exposes list_tables /
   describe_table / run_sql / scan_table as MCP tools.
 type: application
-version: 1.6.1
-appVersion: "v1.6.1"
+version: 2.1.2
+appVersion: "v2.1.2"
 keywords:
   - mcp
   - onelake
@@ -24,3 +24,15 @@ keywords:
   - hpe
 maintainers:
   - name: HPE AI Solution Engineering
+dependencies:
+  # Shared fleet helm library (type: library — renders no resources of its
+  # own; audit §3.5 "extract a minimal shared helm library chart"). Adopted
+  # concerns, one at a time with a byte-identical render-diff proof each:
+  #   - probes (Wave-3 C5 pilot)
+  # file:// path is relative to this chart directory; vendored as the
+  # UNPACKED charts/pcai-fleet-lib/ dir + Chart.lock — the charts' .helmignore
+  # excludes vendored *.tgz, so a tgz dependency is invisible to the loader
+  # and to helm package (see pcai-helm-port/README.md).
+  - name: pcai-fleet-lib
+    version: 0.1.0
+    repository: file://../../pcai-helm-lib/chart/pcai-fleet-lib

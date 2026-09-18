@@ -21,8 +21,7 @@ class StubClient:
         return {
             "resultType": "vector",
             "result": [
-                {"metric": {"__name__": "up", "pod": f"p{i}"}, "value": [1757337600, str(i)]}
-                for i in range(30)
+                {"metric": {"__name__": "up", "pod": f"p{i}"}, "value": [1757337600, str(i)]} for i in range(30)
             ],
         }
 
@@ -157,7 +156,7 @@ def test_query_caps_series_and_formats():
     data = c.post("/api/query", json={"query": "up"}).json()
     assert data["resultType"] == "vector"
     assert data["n_total"] == 30 and data["n_shown"] == 5  # capped by config
-    assert data["result"][0]["series"] == 'up{pod=p0}'
+    assert data["result"][0]["series"] == "up{pod=p0}"
     assert data["result"][0]["value"] == "0"
     assert "duration_ms" in data
 
@@ -172,7 +171,9 @@ def test_query_requires_query_param():
 
 def test_query_range_downsamples_points():
     c = make_client()
-    data = c.post("/api/query_range", json={"query": "m", "start": "1757337600", "end": "1757341200", "step": "1s"}).json()
+    data = c.post(
+        "/api/query_range", json={"query": "m", "start": "1757337600", "end": "1757341200", "step": "1s"}
+    ).json()
     assert data["resultType"] == "matrix"
     assert data["n_shown"] == 1
     values = data["result"][0]["values"]
@@ -521,11 +522,14 @@ def test_gpu_duplicate_domain_claim_skips_host():
     class Dupes(DetectedClient):
         async def instant_query(self, query, ts=None):
             if query == webui._NVLINK_DOMAIN_QUERY:
-                return {"resultType": "vector", "result": [
-                    _domain_sample(GPU_HOST, 0, 0),
-                    _domain_sample(GPU_HOST, 0, 1),  # same GPU claimed twice — bad data
-                    _domain_sample(GPU_HOST, 1, 0),
-                ]}
+                return {
+                    "resultType": "vector",
+                    "result": [
+                        _domain_sample(GPU_HOST, 0, 0),
+                        _domain_sample(GPU_HOST, 0, 1),  # same GPU claimed twice — bad data
+                        _domain_sample(GPU_HOST, 1, 0),
+                    ],
+                }
             return await DetectedClient.instant_query(self, query, ts)
 
     cfg = PromConfig(base_url="http://prom.test:9090")

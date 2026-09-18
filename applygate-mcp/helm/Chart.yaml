@@ -8,8 +8,8 @@ description: >-
   default-deny namespace policy and a JSONL audit trail, behind the PCAI
   Istio gateway.
 type: application
-version: 0.1.4
-appVersion: "v0.1.4"
+version: 0.2.2
+appVersion: "v0.2.2"
 keywords:
   - mcp
   - kubernetes

@@ -38,7 +38,7 @@ workbench:
   # Root directory holding all workspaces — MUST match persistence.mountPath.
   root: /data
   # argv[0] allowlist for run_command (comma-separated); no shells by design.
-  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
   # Hard deny (WINS over the allowlist): network/escalation binaries.
   execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
   # Per-command timeout bounds (seconds).
@@ -76,7 +76,7 @@ caCert:
 # Cluster-scoped — off by default so the default render stays unchanged (and
 # clusters without the kyverno CRD still install).
 kyverno:
-  enabled: false
+  enabled: true
 
 # -- Service exposure -------------------------------------------------------------------
 service:
@@ -123,3 +123,12 @@ ezua:
     endpoint: workbench-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
     istioGateway: istio-system/ezaf-gateway
     timeout: 660s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true

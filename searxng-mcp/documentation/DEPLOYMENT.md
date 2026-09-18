@@ -10,13 +10,16 @@ Deployment on PCAI (HPE Private Cloud AI / Ezmeral Unified Analytics) is values-
 |---|---|
 | `ezua.domainName` | Cluster domain; use `${DOMAIN_NAME}` — PCAI substitutes it. |
 | `ezua.virtualService.endpoint` | Full public hostname, e.g. `searxng-mcp.${DOMAIN_NAME}`; must be unique per release on the shared gateway. The VirtualService fails to render without it. |
-| `searxng.secretKey` | SearXNG session/crypto secret (`SEARXNG_SECRET`). The chart default is a placeholder — **change it for any real deployment** (a random hex string). The VirtualService template hard-requires it. |
+| `searxng.secretKey` | SearXNG session/crypto secret (`SEARXNG_SECRET`) — only used when `searxng.existingSecret` is empty. The chart default is a placeholder. **Preferred:** pre-create a Secret and set `searxng.existingSecret` (rotation = update the Secret + restart); never put a real secret in a values file (see `helm/local/values.example.yaml`). |
 
 Minimal required-values document:
 
 ```yaml
 searxng:
-  secretKey: "<SECRET_KEY>"   # openssl rand -hex 32
+  # Preferred — the secret never passes through values files or git:
+  existingSecret: "searxng-secret"       # kubectl create secret generic searxng-secret --from-literal=secret=$(openssl rand -hex 32)
+  existingSecretKey: secret
+  # … or a literal (lab only): secretKey: "<SECRET_KEY>"   # openssl rand -hex 32
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
@@ -49,6 +52,7 @@ ezua:
 | `browser.caCert.enabled` / `.configMap` | `false` / `ezaf-root-ca` | Installs a corporate MITM CA into the Chromium trust store at startup (Chromium ignores `SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS`). The ConfigMap must exist in the release namespace — copy the cluster-wide one if needed. |
 | `browser.extraArgs` | `""` | Extra Chromium command-line flags. |
 | `env` | `SEARXNG_URL=http://localhost:8080` | MCP container env. `SEARXNG_URL` points at the sidecar — leave it. Other server knobs (`SEARXNG_TIMEOUT`, `FETCH_REQUESTS_PER_MINUTE`, …) can be added here. |
+| `fetch.*` | `""` (built-in defaults) | `fetch_content` SSRF-guard escapes/caps (fleet decision D6 — the guard is default-ON in the server): `allowHosts` (internal hosts/CIDRs to permit), `denyExtra`, `cacheTtl`, `maxBodyBytes`, `maxScreenshotKb`, `maxRedirects`. Wired to the `SEARXNG_FETCH_*` envs; loopback/pod-local/metadata targets are never fetchable regardless. See README "fetch_content SSRF guard". |
 | `hpe_proxies` + `proxy.{http,https,noProxy}` | `false` + HPE defaults | **On HPE-network clusters set `true`** — wires the corporate proxy into BOTH SearXNG's engine requests (`settings.yml` `outgoing.proxies`) AND the MCP container's `fetch_content` egress (env). On open-internet systems leave `false`. |
 | `ezua.enabled` | `true` | `false` skips the VirtualService (in-cluster-only exposure). |
 

@@ -46,6 +46,13 @@ All tools are read-only and talk to one Prometheus instance.
 | `prom_label_values` | Values of one label (e.g. list pods/namespaces reporting a metric), optionally restricted by a selector. |
 | `prom_alerts` | Currently firing/pending alerts with severity, labels, annotations, age. |
 | `prom_rules` | Alerting/recording rules with expressions, filterable by state and name. |
+| `query_save` | Save a query (+ optional run params) under a name (Wave-5). |
+| `query_list` | List saved queries — name, params, expression; no Prometheus traffic. |
+| `query_delete` | Remove one saved query by name. |
+| `query_saved` | RUN a saved query through the same instant/range paths as `prom_query`/`prom_query_range` (clamps, caps, validation all apply). |
+
+Both query tools take an optional `include_hints` flag (default `true`) —
+see "Query hints" below.
 
 ## Architecture
 
@@ -119,6 +126,138 @@ profile, opencode). In-cluster consumers can use the service DNS instead:
 `http://prometheus-mcp-service.<namespace>.svc.cluster.local:9095/mcp`. If
 `ezua.authorizationPolicy.enabled=true`, external callers must present a
 valid PCAI token on every call.
+
+## Self-metrics (GET /metrics — default OFF)
+
+The MCP server exports ITS OWN request counters (not the upstream
+Prometheus's series) at `GET /metrics`: one counter family,
+`prometheus_mcp_tool_requests_total{tool,outcome}` — per-tool call counts
+with outcome ok|error (a tool's "Error: ..." string or exception both count
+as error). No PromQL text, label names, or error strings are exported.
+Chart-gated default-OFF: `metrics.enabled: false` (the default) renders no
+env and no ServiceMonitor and the server serves no `/metrics` route — the
+default pod is unchanged. Set `metrics.enabled: true` (values) to enable;
+`/metrics` rides the same port as `/mcp`, and the ServiceMonitor template
+(templates/servicemonitor.yaml) scrapes it via the Prometheus Operator.
+
+## Performance defaults (Wave-4, decision D14)
+
+Two ratified default changes protect the upstream Prometheus (and the
+model's context) from pathological queries — each with an env escape hatch
+that restores today's behavior exactly:
+
+**Range-query step clamp** — `PROMETHEUS_MIN_STEP_SECONDS` (default **15**).
+A caller-supplied `step` below the floor is clamped UP to it before the
+request reaches the upstream server (`step=1s` over a 24h range would
+otherwise pull ~86k points per series). The clamp never lowers a step, and
+it is honest: the `prom_query_range` tool result carries a notice line —
+`step clamped to 15s (requested 1s) — PROMETHEUS_MIN_STEP_SECONDS` — and the
+JSON API (`POST /api/query_range`) returns the same text in a `step_notice`
+field (the effective resolution stays in `step`). Steps at or above the
+floor pass through byte-unchanged. `PROMETHEUS_MIN_STEP_SECONDS=0` disables
+clamping entirely; unset/non-numeric values fall back to the default. The
+clamp applies to every range path: the MCP tool, the query editor, and the
+dashboard trends.
+
+**`/api/overview` payload cache** — `PROMETHEUS_OVERVIEW_CACHE_TTL`
+(default **20** seconds; `0` disables). The dashboard aggregate runs ~14
+upstream queries per refresh (30-60s payload on a busy cluster); a refresh
+within the TTL is served instantly from the previous computation and is
+marked honestly — `cached: true` + `cache_age_seconds` (fresh responses say
+`cached: false`, age `0`). The cache key is the request's actual parameter
+set, failures are never memoized (an overview whose every block errored is
+recomputed next refresh), and concurrent identical overviews share a single
+computation (single-flight) instead of stampeding Prometheus. The cache is
+per-process (each replica computes its own); `0` restores the pre-D14
+recompute-every-refresh behavior exactly.
+
+**Label-name validation** — no env. The client validates the label NAME
+against the same rule the web console always applied
+(`[a-zA-Z_][a-zA-Z0-9_]*`) before interpolating it into the
+`/api/v1/label/<name>/values` URL path; invalid names are rejected
+client-side with a clear error (`Error: invalid label name 'a/b': …`)
+instead of reaching the server. Valid label names are unaffected.
+
+`PROMETHEUS_METRICS_ENABLED` (Wave 3) remains chart-gated default-off — see
+the self-metrics section above.
+
+## Saved queries, query hints, dashboard deep links (Wave-5, additive)
+
+Three additive features; the default experience is unchanged when they are
+unused.
+
+### Saved queries (`query_save` / `query_list` / `query_delete` / `query_saved`)
+
+A small name→{query, params} store:
+
+- **Where it lives** — `PROMETHEUS_SAVED_QUERIES_PATH` (server env). Unset
+  (default) → the store is **in-memory only for the session** and every
+  tool result says so ("in-memory only for this session — set
+  PROMETHEUS_SAVED_QUERIES_PATH to persist"). Set → a **durable JSON file**
+  at that path. The store is per-process (each replica keeps its own; the
+  file is per-replica state, not a shared multi-writer database).
+- **Writes are atomic** — every mutation writes a temp file in the same
+  directory, fsyncs, then `os.replace`s it over the target. A failed write
+  (disk full, …) rolls the store back and leaves the previous file
+  byte-intact; no partial file can ever appear at the path.
+- **Names are sanitized** — whitespace collapses, anything outside
+  letters/digits/space/`.`/`_`/`-` becomes `_`, length caps at 64. The
+  stored (sanitized) name is reported back, and the original spelling is
+  kept as an alias so `query_saved`/`query_delete` accept either.
+- **Saving over an existing name overwrites** it (an update, not a
+  duplicate); the store caps at 100 entries with a clear error instead of
+  silent eviction.
+- **`params`** — optional run defaults recorded with the query, using the
+  exact arguments the query tools already take: `mode`
+  (`instant`|`range`), `time` (instant) or `start`/`end`/`step` (range).
+  `query_saved(name, params?)` merges per-call overrides over the saved
+  defaults and runs the query through the **same code path** as
+  `prom_query`/`prom_query_range` — the D14 step clamp, the series/point
+  caps and all validation apply unchanged. Queries are validated when they
+  RUN, not when saved.
+
+### Query hints (advisory, capped, suppressible)
+
+`prom_query` and `prom_query_range` append a short `Hints (advisory)` block
+when the query text matches an obvious pattern — static analysis of the
+expression only, no extra HTTP, no result inspection:
+
+- `[cardinality]` — a label matcher whose regex matches every value
+  (`{pod=~".*"}`): narrow the selector to bound the series count.
+- `[counter]` — a `_total`/`_count` metric used without `rate()`/`increase()`
+  or any over-time function: raw counters only ever rise.
+- `[regex]` — a matcher starting with an unbounded wildcard
+  (`{pod=~".*myapp.*"}`): anchoring keeps matching cheap on
+  high-cardinality labels.
+- `[range-vector]` — a bare `metric[5m]` selector with no over-time
+  function: an instant query wants `rate(metric[5m])` (or the selector
+  without the bracket).
+
+At most **3 hints** are returned per result, quoted label values can never
+trip them (`errors{kind="user_total"}` is not a counter), and queries that
+match nothing are byte-identical with hints on or off. Pass
+`include_hints=false` to suppress the block entirely.
+
+### Dashboard deep links (web console)
+
+The query editor's state is shareable: the expression + time range ride in
+the URL **fragment** (`#q=…&range=…`) — never the query string — so a
+shared link re-sends nothing to the server and never lands in access logs:
+
+- `#q=up&range=now` — instant at `now`
+- `#q=<urlencoded PromQL>&range=now-6h..now/2m` — range from `now-6h` to
+  `now` with step `2m` (omit the `/step` for auto resolution)
+
+The fragment is decoded on page load (switching to the Query tab and
+running the query), refreshed after every successful run
+(`history.replaceState` — no reload), and copied by the **🔗 Link** button
+next to 💾 Save. Decoded values only ever land in input `.value`
+assignments (never `innerHTML`) — the console's escape-clean rendering
+rule applies to the fragment too.
+
+These browser features are independent of the MCP-side saved queries (the
+console's "Saved queries" panel remains per-browser localStorage; the MCP
+store above is per-server).
 
 ## Documentation
 

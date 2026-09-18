@@ -218,9 +218,7 @@ async def handle_read_resource(ctx, params) -> ReadResourceResult:
 
         code = INVALID_PARAMS if isinstance(exc, LookupError) else INTERNAL_ERROR
         raise MCPError(code=code, message=str(exc)) from exc
-    return ReadResourceResult(
-        contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)]
-    )
+    return ReadResourceResult(contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)])
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +241,9 @@ _PROMPTS = [
         name="analyze-table",
         description="Deep-dive one table: schema, profile statistics, then targeted queries.",
         arguments=[
-            PromptArgument(name="table", description="Table name (schema/name when the source uses schemas)", required=True)
+            PromptArgument(
+                name="table", description="Table name (schema/name when the source uses schemas)", required=True
+            )
         ],
     ),
 ]

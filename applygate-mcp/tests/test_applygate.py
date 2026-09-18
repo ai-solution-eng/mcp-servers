@@ -37,15 +37,26 @@ ENV_VARS = (
     "APPLYGATE_BLOCKED_NAMESPACES",
     "APPLYGATE_ALLOWED_KINDS",
     "APPLYGATE_AUDIT_FILE",
+    "APPLYGATE_UNPLANNED_APPLY",
+    "APPLYGATE_METRICS_ENABLED",
 )
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
-    """No ambient policy, and every test gets its own audit sink."""
+    """No ambient policy, and every test gets its own audit sink.
+
+    D11 note: the D11 plan-binding DEFAULT (deny, env unset) is pinned in
+    tests/test_plan_binding.py. THESE tests predate D11 and exercise the
+    OTHER gates in isolation, so the fixture opts them into
+    APPLYGATE_UNPLANNED_APPLY=allow — without it, every confirm-gated apply
+    would first trip the plan-binding refusal and the gate-under-test would
+    never be reached.
+    """
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("APPLYGATE_AUDIT_FILE", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("APPLYGATE_UNPLANNED_APPLY", "allow")
 
 
 def allow(monkeypatch, *patterns):
@@ -199,7 +210,9 @@ def test_blocked_namespaces_always_win(monkeypatch, tmp_path):
     refused = parse(run(server.apply_manifest(namespace="team-secrets", manifest=SIMPLE_MANIFEST, confirm_apply=True)))
     assert refused["refused"] is True and "blocklist always wins" in refused["error"]
 
-    refused2 = parse(run(server.delete_resource(namespace="platform-prod", kind="ConfigMap", name="x", confirm_delete=True)))
+    refused2 = parse(
+        run(server.delete_resource(namespace="platform-prod", kind="ConfigMap", name="x", confirm_delete=True))
+    )
     assert refused2["refused"] is True
 
     # Only the legitimate team-a plan reached the seam — nothing else did.
@@ -214,7 +227,9 @@ def test_blocked_namespaces_always_win(monkeypatch, tmp_path):
 def test_kind_not_on_allowlist_refused_with_allowlist_echoed(monkeypatch, tmp_path):
     allow(monkeypatch, "team-a")
     spy = install_apply_spy(monkeypatch)
-    out = parse(run(server.apply_manifest(namespace="team-a", manifest=manifest(doc(kind="Pod", name="p")), confirm_apply=True)))
+    out = parse(
+        run(server.apply_manifest(namespace="team-a", manifest=manifest(doc(kind="Pod", name="p")), confirm_apply=True))
+    )
     assert out["documents"][0]["ok"] is False
     assert "not on the kind allowlist" in out["documents"][0]["message"]
     assert "APPLYGATE_ALLOWED_KINDS" in out["documents"][0]["message"]
@@ -238,7 +253,11 @@ def test_cluster_scoped_kind_refused_even_if_allowlisted(monkeypatch, tmp_path):
     assert out["documents"][0]["ok"] is False
     assert "cluster-scoped" in out["documents"][0]["message"]
     # Namespace too (plan path).
-    out2 = parse(run(server.plan_apply(namespace="team-a", manifest=manifest(doc(kind="Namespace", name="ns", api_version="v1")))))
+    out2 = parse(
+        run(
+            server.plan_apply(namespace="team-a", manifest=manifest(doc(kind="Namespace", name="ns", api_version="v1")))
+        )
+    )
     assert out2["documents"][0]["ok"] is False and "cluster-scoped" in out2["documents"][0]["message"]
     assert spy.calls == []
 
@@ -293,7 +312,13 @@ def test_allowlisted_but_unknown_kind_refused(monkeypatch, tmp_path):
     allow(monkeypatch, "team-a")
     kinds(monkeypatch, "ConfigMap,MyCustomThing")
     spy = install_apply_spy(monkeypatch)
-    out = parse(run(server.plan_apply(namespace="team-a", manifest=manifest(doc(kind="MyCustomThing", name="x", api_version="example.com/v1")))))
+    out = parse(
+        run(
+            server.plan_apply(
+                namespace="team-a", manifest=manifest(doc(kind="MyCustomThing", name="x", api_version="example.com/v1"))
+            )
+        )
+    )
     assert out["documents"][0]["ok"] is False
     assert "unknown to the built-in namespaced-kind registry" in out["documents"][0]["message"]
     assert spy.calls == []
@@ -307,7 +332,11 @@ def test_allowlisted_but_unknown_kind_refused(monkeypatch, tmp_path):
 def test_multi_doc_manifest_plans_and_applies_per_doc(monkeypatch, tmp_path):
     allow(monkeypatch, "team-a")
     spy = install_apply_spy(monkeypatch)
-    m = manifest(doc(name="cm-1"), doc(kind="Service", name="svc-1", api_version="v1"), doc(kind="Job", name="j-1", api_version="batch/v1"))
+    m = manifest(
+        doc(name="cm-1"),
+        doc(kind="Service", name="svc-1", api_version="v1"),
+        doc(kind="Job", name="j-1", api_version="batch/v1"),
+    )
     out = parse(run(server.apply_manifest(namespace="team-a", manifest=m, confirm_apply=True)))
     assert out["summary"] == {"total": 3, "ok": 3, "failed": 0}
     assert [d["name"] for d in out["documents"]] == ["cm-1", "svc-1", "j-1"]
@@ -327,7 +356,7 @@ def test_empty_doc_between_documents_rejected(monkeypatch, tmp_path):
 def test_trailing_separator_tolerated_not_an_empty_doc(monkeypatch, tmp_path):
     """A trailing '---' is an end-of-docs marker, not a phantom empty doc."""
     allow(monkeypatch, "team-a")
-    spy = install_apply_spy(monkeypatch)
+    install_apply_spy(monkeypatch)
     m = yaml.safe_dump(doc(name="cm-1")) + "\n---\n"
     out = parse(run(server.plan_apply(namespace="team-a", manifest=m)))
     assert out["ok"] is True and out["summary"]["ok"] == 1
@@ -412,7 +441,7 @@ def test_plan_always_dry_run_and_never_mutates(monkeypatch, tmp_path):
 
 def test_plan_reports_per_doc_failures_without_refusing_the_rest(monkeypatch, tmp_path):
     allow(monkeypatch, "team-a")
-    spy = install_apply_spy(monkeypatch, exc=Exception("api server exploded"))
+    install_apply_spy(monkeypatch, exc=Exception("api server exploded"))
     m = manifest(doc(name="cm-1"), doc(name="cm-2"))
     out = parse(run(server.plan_apply(namespace="team-a", manifest=m)))
     assert out["ok"] is False
@@ -480,7 +509,9 @@ def test_delete_kind_and_namespace_gates(monkeypatch, tmp_path):
     out = parse(run(server.delete_resource(namespace="team-a", kind="Pod", name="p", confirm_delete=True)))
     assert out["refused"] is True and "allowlist" in out["error"]
 
-    out = parse(run(server.delete_resource(namespace="team-a", kind="PersistentVolume", name="pv", confirm_delete=True)))
+    out = parse(
+        run(server.delete_resource(namespace="team-a", kind="PersistentVolume", name="pv", confirm_delete=True))
+    )
     assert out["refused"] is True and "cluster-scoped" in out["error"]
     assert spy.calls == []
 
@@ -554,9 +585,14 @@ def test_audit_jsonl_written_for_plan_apply_delete(monkeypatch, tmp_path):
     assert apply_e["dry_run"] is False and apply_e["outcome"] == "applied"
     del_e = by[("delete_resource", "deleted")]
     assert del_e["kind"] == "ConfigMap" and del_e["name"] == "app-config"
-    # Every entry carries the full schema {ts, tool, namespace, kind, name, dry_run, outcome}.
+    # Every entry carries the full base schema {ts, tool, namespace, kind,
+    # name, dry_run, outcome} PLUS the additive hardening fields
+    # (prev_sha256 hash chain, caller identity) — readers of the old
+    # format stay compatible (new fields only; the chain itself is tested
+    # in tests/test_audit_chain.py).
     for e in lines:
-        assert set(e) == {"ts", "tool", "namespace", "kind", "name", "dry_run", "outcome"}
+        assert {"ts", "tool", "namespace", "kind", "name", "dry_run", "outcome"} <= set(e)
+        assert "prev_sha256" in e and "caller" in e
         assert e["ts"].endswith("Z")
 
 

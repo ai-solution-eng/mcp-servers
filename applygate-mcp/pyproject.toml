@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "applygate-mcp"
-version = "0.1.4"
+version = "0.2.2"
 description = "applygate-mcp — governed Kubernetes write-path MCP: allowlisted server-side apply with plan/confirm semantics, default-deny namespaces, kind allowlist and a JSONL audit trail"
 requires-python = ">=3.10"
 keywords = ["mcp", "kubernetes", "server-side-apply", "gitops", "hpe", "pcai"]
@@ -21,4 +21,10 @@ dependencies = [
 applygate-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "webui"]
+# DEPLOY-BLOCKER (Wave-6 packaging fix): the Dockerfile does a NON-editable
+# `uv pip install --system .` and runs the installed `applygate-mcp` console
+# script from site-packages. server.py does `import mcp_auth` (auth wave) —
+# it MUST ship in the wheel or the image crash-loops at startup with
+# ModuleNotFoundError. (applygate has no mcp_metrics module — its /metrics
+# surface is inline in server.py.)
+py-modules = ["server", "webui", "mcp_auth"]

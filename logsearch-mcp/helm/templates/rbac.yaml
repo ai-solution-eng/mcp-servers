@@ -5,8 +5,16 @@
 #   - secrets / configmaps / events of any kind
 #   - pods/exec, pods/attach (no command execution into any container)
 #   - any create/patch/delete/update verb, on any resource
-# Namespaced Role in the release namespace only — never a ClusterRole — so
-# the release's blast radius is exactly one namespace.
+#
+# Scope — rbac.clusterWide chooses WHERE those two read-only rules apply:
+#   false (default) — namespaced Role + RoleBinding in the release namespace
+#     only: the release's blast radius is exactly one namespace.
+#   true — the SAME two read-only rules as a ClusterRole + ClusterRoleBinding:
+#     the SA reads pods/logs everywhere. RBAC bounds what the SA CAN read;
+#     the namespace policy (logsearch.allowedNamespaces / blockedNamespaces)
+#     still bounds what AGENTS may ask for — keep both layers deliberate.
+#     Cluster-wide inherently includes kube-system; punch it back out of the
+#     agents' reach with blockedNamespaces ("kube-*") if that is unwanted.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -15,6 +23,40 @@ metadata:
   labels:
     app: {{ .Values.deployment.appName }}
 ---
+{{- if .Values.rbac.clusterWide }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.deployment.name }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+  # Pod discovery (list_log_sources): names, containers, restarts, age.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Log reads (get_pod_logs / search_logs / count_matches). pods/log has no
+  # list/watch semantics — "get" is the only verb it supports, and it is
+  # inherently read-only.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.deployment.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.deployment.name }}
+    namespace: {{ .Release.Namespace }}
+{{- else }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -49,4 +91,5 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Values.deployment.name }}
     namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

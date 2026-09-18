@@ -1,128 +1,217 @@
-# workbench-mcp
+# Workbench MCP Server
 
-workbench-mcp is a persistent, per-agent **scratch workspace** MCP (Model
-Context Protocol) server: it gives an agent named directories on a persistent
-volume (they survive pod restarts), path-confined file read/write/list/delete
-inside each workspace, a per-workspace environment-variable store, and a
-governed argv-list command runner with a binary allowlist/denylist, timeouts,
-output caps, and a JSONL audit trail. It is the durable layer a stateless
-harness shell does not give the model, exposed over MCP 2.0 (stateless
-streamable-HTTP at `/mcp`) through the PCAI Istio gateway.
+Persistent, per-agent **scratch workspaces** for baseline agent harnesses
+(opencode, DSH): the durable layer a stateless shell does not give the model.
 
-**What problem(s) it solves**
+## Why
 
-- Baseline agent harnesses (opencode, DSH) give the model a stateless shell:
-  each call is a fresh process, platform temp areas may not survive between
-  calls, env vars vanish, background processes die. A workbench is the
-  missing durable layer — files, env, and command state persist across calls
-  and across pod restarts.
-- Scratch work needs a home per task/agent: `workspace_create` mints an
-  isolated directory on the PVC; `run_command` executes with the workspace as
-  cwd, so tools like `git`, `pip`, and `tar` operate on exactly that state.
-- Command execution from a model is dangerous by default: `run_command` is
-  argv-only (no shell interpolation), argv[0] must be on an operator
-  allowlist, a hard denylist (`curl`, `wget`, `sudo`, `su`, `nc`, `ssh`, ...)
-  always wins, commands are time-bounded and output-capped, and every
-  mutating call is audit-logged.
-- Path escapes: file tools refuse absolute paths, `..` traversal, and symlink
-  escapes by design — a workspace cannot read or write outside itself.
-- Persistent storage with the right shape: an RWX PVC so every replica sees
-  the same workspaces (MCP is stateless — any replica serves any request);
-  the pod mounts no secrets, runs non-root, and touches only that volume.
+Harness shells are stateless between calls — platform temp areas may not
+survive, env vars vanish, background processes die.  A workbench is a named
+directory on a persistent volume plus a governed command runner:
 
-## Tools
+- `workspace_create` / `workspace_list` / `workspace_delete` — PVC-backed
+  dirs that survive pod restarts and work across replicas (RWX volume).
+  `workspace_create` takes an optional `template` (opt-in, see "Workspace
+  templates" below).
+- `write_file` / `read_file` / `list_files` / `delete_file` — path-confined
+  file access (traversal and symlink escapes refused by design).
+- `set_env` / `get_env` — per-workspace env vars that `run_command` injects.
+- `run_command` — argv-list execution (no shell) with a binary allowlist /
+  denylist, timeouts, output caps, and a JSONL audit log.
+- **Workspaces are isolated from each other** (D7): tools and commands
+  resolve against the addressed workspace only; `WORKBENCH_SHARED_PATHS`
+  is the operator escape hatch.  See "Workspace isolation" below.
 
-All tool results are JSON strings; errors are self-describing and surfaced
-verbatim to the model.
+## Trust model
 
-| Tool | Mutates | Purpose |
-|---|---|---|
-| `workspace_create` | yes | Create a persistent named workspace (directory under the PVC root); the container for everything else. |
-| `workspace_list` | no | List workspaces with file counts and total bytes. |
-| `workspace_delete` | yes | Delete a workspace and everything in it — requires `confirm=true`. |
-| `write_file` | yes | Write a UTF-8 text file (parents auto-created); workspace-relative paths only, 8 MiB cap. |
-| `read_file` | no | Read a UTF-8 text file, capped at `max_bytes` (default 64 KiB). |
-| `list_files` | no | List files/dirs under a workspace path (recursive, bounded at 500 entries). |
-| `delete_file` | yes | Delete a file or directory inside the workspace — requires `confirm=true`. |
-| `set_env` | yes | Persist an env var for the workspace (`run_command` injects it; its entries win over pod passthrough). |
-| `get_env` | no | Read one persisted env var. |
-| `run_command` | yes | Run an argv command in the workspace (cwd = workspace root): allowlisted argv[0], denylist wins, timeout bounds, capped output, JSONL-audited. |
+The workbench pod is a **scratch pad by design**: it mounts no secrets, runs
+non-root (uid 10001), and can only touch one volume.  `run_command` is
+intentional RCE on that scratch pad — governed by
+`WORKBENCH_EXEC_ALLOWLIST` / `WORKBENCH_EXEC_DENYLIST`
+(`curl`, `wget`, `sudo`, `ssh`, ... denied by default), timeouts
+(`WORKBENCH_EXEC_TIMEOUT_MAX`, default 600s), output caps, and audit.
 
-## Architecture
+## Workspace isolation (decision D7 — default change)
 
-A single Python service (Starlette, MCP 2.0 stateless, JSON responses) whose
-backend is the **filesystem**: one PVC mounted at `/data` (the
-`WORKBENCH_ROOT`) holding every workspace, plus bounded subprocesses spawned
-inside it. It talks to **no Kubernetes API and no other service** — no RBAC,
-no ServiceAccount grants. Operator-configured proxy/TLS-trust env
-(`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
-`PIP_CERT`) is passed through to `run_command` children so `pip` works behind
-a corporate proxy — those names come from the deployment, not the caller, so
-passing them through leaks nothing. HTTP surface: `/mcp` (MCP
-streamable-HTTP), `/health` + `/healthz`, and — when `webui.enabled` — the
-HPE-branded console at `/` (workspace switcher, file tree, env editor,
-run-command console, audit tail) whose `/api/*` endpoints call the same core
-functions the MCP tools use.
+Every operation resolves against the **addressed workspace only**.  Before
+D7, `run_command` confined only its cwd: any workspace's commands could read
+every other workspace's files and env values (`cat ../other/.workbench-env.json`)
+and the fleet-audit JSONL (`cat /data/.audit.jsonl`) — same-uid chmod is
+theater when the pod runs uid 10001 everywhere.  Since D7:
 
-## Deploy on PCAI (HPE Private Cloud AI)
+- **File and env tools** (`read_file`, `write_file`, `list_files`,
+  `delete_file`, `get_env`, `set_env`) touch the addressed workspace only.
+  Traversal/symlink escapes were already refused; the error now also names
+  the escape hatch below.
+- **`run_command` screens its argv**: any path-shaped token that resolves
+  into the workbench root but outside the addressed workspace is refused
+  with a clear error (and audited as a `run_command_refused` event).  This
+  covers direct path arguments, `--opt=path` forms, `../` traversals, bare
+  `..`, and absolute/`../` paths embedded inside tokens (e.g. inside a
+  `python3 -c` one-liner) — including the audit JSONL and other workspaces'
+  `.workbench-env.json` files, in both relative and absolute form.
+- **Honest limits**: argv screening is a policy layer at the MCP boundary,
+  not a kernel sandbox.  An allow-listed interpreter can still compute paths
+  at runtime (`python3` builds `'/data/' + 'other/f'` from string parts) —
+  the pod's real defense-in-depth (no secrets mounted, read-only rootfs, no
+  SA token, egress governed outside this server) is unchanged.  Screening is
+  bypassable in exactly the ways the argv *allowlist* always was.
+- **Escape hatch — `WORKBENCH_SHARED_PATHS`**: colon-separated absolute
+  paths the operator explicitly shares with ALL workspaces (e.g. a staging
+  directory).  Shared paths are readable/writable via commands *and* file
+  tools from any workspace; the refusal error message names this variable.
+  Listing `WORKBENCH_ROOT` itself would share everything — don't.
+- Unchanged on purpose: `workspace_list` still shows the names/sizes of all
+  workspaces (workspace discovery), and commands can still read pod paths
+  outside the workbench root (`/etc/hosts`, ... — the rootfs is read-only
+  and mounts no secrets).
 
-Import the packaged chart once into PCAI, then edit the chart's values in the
-PCAI **Helm Values** editor and apply — you never run `helm install` or
-`kubectl apply` for the deployment itself. Every `helm --set a.b=c`
-corresponds 1:1 to a values key. PCAI resolves `${DOMAIN_NAME}` in the
-editor on current builds; if your build does not, substitute the literal
-cluster domain (an unresolved placeholder registers a gateway host that
-matches nothing).
+### Workspace templates (Wave-5 F3 — ADDITIVE, opt-in)
 
-**Required values**:
-
-```yaml
-ezua:
-  enabled: true                      # SITE: expose through the PCAI Istio gateway
-  domainName: <your-domain>          # SITE: literal cluster domain
-  virtualService:
-    endpoint: workbench-mcp.<your-domain>   # SITE: /mcp -> MCP server; / -> web UI
-    istioGateway: istio-system/ezaf-gateway
-    timeout: 660s                    # generous: run_command may legitimately run to its max
-```
-
-Everything else has working defaults — `persistence` (10Gi RWX PVC, the
-point of the server), `workbench.*` (root, allow/denylists, caps), `webui.enabled`,
-`resources`, `securityContext`, `hpe_proxies`/`proxy.*`/`caCert` (needed when
-the cluster sits behind the HPE corporate proxy and `pip` inside
-`run_command` must reach PyPI), `kyverno.enabled`. Complete paste-ready
-documents:
-[helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml)
-and
-[helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
-
-## Connect an MCP client
-
-Any MCP client that speaks streamable-HTTP connects to `/mcp` (stateless —
-no session header needed); humans use the console at `/`:
+`workspace_create(name, template=...)` can bootstrap a workspace from a
+named **operator-defined template**. Templates live in the
+`WORKBENCH_TEMPLATES` env (chart `workbench.templates` → env, rendered ONLY
+when non-empty — the default render has no such env at all):
 
 ```json
 {
-  "mcpServers": {
-    "workbench-mcp": {
-      "url": "https://workbench-mcp.<your-domain>/mcp"
-    }
+  "pytools": {
+    "description": "git scratch with a prepared src/ tree",
+    "extra_allowed": ["pytest"],
+    "canned_setup": [["mkdir", "src"], ["git", "init", "-q"]]
   }
 }
 ```
 
-Clients that want the transport spelled out accept `"type": "http"`
-(Claude Code / Claude Desktop) or `"transport": "streamable-http"` (DSH
-profile, opencode). In-cluster consumers can use the service DNS instead:
-`http://workbench-mcp-service.<namespace>.svc.cluster.local:9103/mcp`. The
-web UI is read/write and unauthenticated at the pod — the endpoint must sit
-behind gateway authn (the PCAI Istio gateway); don't expose the root route
-without it.
+Creating `workspace_create("ws", template="pytools")` then:
 
-## Documentation
+- **widens the exec allowlist for THAT workspace only** — `run_command`
+  inside it accepts base-allowlist ∪ `extra_allowed`.  Hard rules: entries
+  are operator-supplied bare binary names (they match argv[0] basenames);
+  the denylist still wins, so a template can never re-enable a denied
+  binary; and the widened set is **re-derived from the current
+  `WORKBENCH_TEMPLATES` on every call** — only the template NAME is
+  persisted in the workspace (`.workbench-template.json`), so a workspace is
+  never wider than what the operator's config defines right now (template
+  removed → extras vanish; corrupt metadata → base allowlist).
+- **pre-runs `canned_setup`** as argv commands INSIDE the new workspace
+  through the exact `run_command` machinery: D7 argv confinement, allowlist
+  resolution against the server PATH (PATH-erosion defense), timeouts,
+  output caps, and the JSONL audit all apply.  Each setup run is audited as
+  a `workspace_template_setup` event carrying the template name (a refused
+  one as `workspace_template_setup_error`).  The create response reports
+  every setup command (`setup[]` with argv/exit/stdout/stderr, `setup_ok`);
+  a failing setup command never fails the create — the workspace exists and
+  the failed command can simply be re-run via `run_command`.
 
-| Document | Contents |
-|---|---|
-| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), persistence, exec allowlist governance, proxy/CA wiring, ezua/Istio gateway, upgrading |
-| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | MCP handshake + first tool test, optional operator kubectl checks, troubleshooting |
-| [helm/values-examples/README.md](helm/values-examples/README.md) | What the example values files are, how to use them (PCAI editor or `helm -f`) |
+Opt-in posture: with `WORKBENCH_TEMPLATES` unset or empty (the default), the
+`template` parameter is **refused** with the configured template list, and
+every other behavior — response shape, audit events — is byte-identical to
+the pre-template server.  An unknown template name errors with the
+configured ones.  Honest limits: this is convenience + an operator-gated
+allowlist widening, not a sandbox change — the D7 "honest limits" paragraph
+above applies unchanged to template setup runs.  One deliberate edge: the
+metadata file lives inside the workspace, so a workspace command can edit
+it — but the only field consulted is the template NAME, and the widened set
+always comes from the operator's `WORKBENCH_TEMPLATES` at call time, so the
+worst an agent can do is point its workspace at a *different*
+operator-defined template — the same binaries it could get by simply
+creating a new workspace with that template.
+
+### PATH-erosion defense (exec allowlist)
+
+The allowlist resolves **against the server's own PATH**, before any
+workspace-env PATH is applied: a bare argv[0] is located with the server
+PATH and spawned by its resolved absolute path, so a workspace
+`PATH=/ws/evil:$PATH` override can never redirect an allow-listed name to a
+look-alike binary.  A workspace PATH still flows into the child process's
+environment (that is its only power).  A bare name that the server PATH
+cannot find errors with a clear message instead of falling through to the
+workspace PATH.
+
+### read_file streaming
+
+`read_file` streams only the requested slice (open → read `max_bytes`) —
+identical response shape and edge behavior, but memory no longer scales with
+file size: a multi-GB file no longer OOMs the pod for a 64 KiB read.  A
+negative `max_bytes` is refused (it previously sliced off the file tail,
+which required loading the whole file).
+
+### API-key auth — MANDATORY (fleet pattern)
+
+`run_command` is arbitrary process execution, so **every HTTP route except
+`/health`/`/healthz` requires an API key** (`X-API-Key` or
+`Authorization: Bearer`; the bundled console asks for it once and stores it
+in sessionStorage). **The chart never creates the key Secret — you MUST
+pre-deploy it in the target namespace before `helm install`, or the pod
+sits in `CreateContainerConfigError`:**
+
+```bash
+kubectl -n <ns> create secret generic workbench-mcp-apikey \
+  --from-literal="api-keys=$(openssl rand -hex 32)"
+```
+
+Keys are a comma-separated list (`api-keys=new,old`) — that is the rotation
+mechanism: append the new key, move clients over, drop the old; the server
+re-reads the env per request, so no restart is needed. The fleet-universal
+`MCP_API_KEYS` env is honored too (either var works).
+
+## Exec policy — no python by default (fleet decision D18, 2026-09-13)
+
+The DEFAULT allowlist is narrow argv tools only (ls, cat, grep, find, tar, git,
+sort, uniq — no shells by design). **No interpreters (python3) and no package
+managers (pip/pip3)** ship in the default: an allow-listed interpreter can
+compute paths at runtime and sidestep the argv-level workspace confinement
+(a split-string path never appears in argv — the documented honest limit
+below), and pip executes python code (setup.py). The refusal message and
+`run_command`'s tool description tell the model this, so it reaches for the
+specific argv tools instead. Operators re-add interpreters explicitly via
+`WORKBENCH_EXEC_ALLOWLIST` / `values.execAllowlist` (or a template's
+`extra_allowed`) when their threat model accepts the documented residual.
+
+## Configuration
+
+| Env | Default | Meaning |
+|---|---|---|
+| `WORKBENCH_ROOT` | `/data` | PVC mount holding all workspaces |
+| `WORKBENCH_SHARED_PATHS` | — | colon-separated absolute paths shared across ALL workspaces (D7 escape hatch; see "Workspace isolation") |
+| `WORKBENCH_EXEC_ALLOWLIST` | python3, pip, ls, cat, grep, git, ... | argv[0] allowlist (resolved against the server PATH, not a workspace PATH) |
+| `WORKBENCH_EXEC_DENYLIST` | curl,wget,sudo,su,nc,ssh,... | hard deny (wins) |
+| `WORKBENCH_EXEC_TIMEOUT_DEFAULT/MAX` | 60 / 600 s | per-command bounds |
+| `WORKBENCH_MAX_FILE_BYTES` | 8 MiB | write cap |
+| `WORKBENCH_MAX_OUTPUT_BYTES` | 200 KiB | stdout/stderr cap |
+| `WORKBENCH_UI_ENABLED` | `true` | mount the web UI + `/api/*` routes |
+| `WORKBENCH_TEMPLATES` | *(unset)* | JSON object of named workspace templates for `workspace_create(name, template=...)` — `{name: {description, extra_allowed, canned_setup}}`. **Opt-in**: unset/empty = the parameter is refused and behavior is byte-identical to the pre-template server. A template can only WIDEN the workspace's exec allowlist with these operator-supplied bare binary names (denylist still wins) and pre-run its canned setup argv commands inside the new workspace (same guards, audited with the template name). Chart: `workbench.templates` (rendered only when non-empty). See "Workspace templates". |
+| `WORKBENCH_METRICS_ENABLED` | `false` | serve `GET /metrics` — Prometheus self-metrics: `workbench_mcp_tool_requests_total{tool,outcome}` (per-tool call counts, ok/error; nothing else is exported). Chart-gated default-OFF (`metrics.enabled: false` renders no env and no ServiceMonitor — the default pod has no `/metrics` route); when on, `/metrics` is key-free like the probes. See `helm/values.yaml` (which also documents the fleet audit-JSONL searchability convention for `<root>/.audit.jsonl`). |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | passed through to `run_command` children (chart: `hpe_proxies`) so `pip` works behind the corporate proxy |
+| `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`PIP_CERT` | — | corporate MITM CA for pip/requests (chart: `caCert` → `ezaf-root-ca`) |
+
+## Web UI
+
+With `WORKBENCH_UI_ENABLED` (chart `webui.enabled`, default true) the same
+container serves a self-contained HPE-branded console at `/` (no CDN, no
+build step — corporate-proxy safe): workspace switcher, file tree +
+viewer/saver, per-workspace env table editor, a run-command console
+(argv input with the allowlist hint, stdout/stderr/exit/duration), and an
+audit tail. The `/api/*` endpoints call the **same core functions the MCP
+tools use** — path confinement, caps, the argv allowlist and the JSONL
+audit all still apply; the UI gets no new powers. It is unauthenticated at
+the pod: the endpoint must sit behind gateway authn (PCAI Istio gateway).
+
+## Run
+
+```sh
+# stdio (local MCP clients)
+python server.py --transport stdio
+
+# stateless streamable-http (fleet default), port 9103
+python server.py --transport streamable-http --host 0.0.0.0 --port 9103
+```
+
+Health: `GET /health` / `/healthz`.
+
+## Tests
+
+```sh
+python -m pytest tests/ -v     # offline: tmp dirs only, no cluster, no network
+```

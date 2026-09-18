@@ -82,10 +82,12 @@ def _error_status(message: str) -> int:
     Denied namespaces and bad input are the CALLER's fault (403/400);
     everything else the tools report (unreachable API, namespace gone,
     per-pod 404s are non-fatal) means the cluster side failed (502).
+    ReDoS-screened regexes ("unsafe regex ... rejected") are caller input
+    too — the pattern is valid Python regex, just too dangerous to run.
     """
     if _DENIED_MARKER in message:
         return 403
-    if "invalid regex" in message or "must be > 0" in message:
+    if "invalid regex" in message or "unsafe regex" in message or "must be > 0" in message:
         return 400
     return 502
 
@@ -102,7 +104,7 @@ async def _json_body(request) -> dict:
     except Exception as exc:
         raise ValueError(f"invalid JSON body: {exc}") from exc
     if not isinstance(body, dict):
-        raise ValueError("JSON body must be an object")
+        raise TypeError("JSON body must be an object")
     return body
 
 
@@ -147,18 +149,25 @@ def build_ui_routes() -> list[Route]:
                 "server": "logsearch-mcp",
                 "mcp_endpoint": "/mcp",
                 "policy": {
-                    # [] means ALL namespaces allowed (the MCP error strings
-                    # and the values.yaml comments explain the same thing).
+                    # An EMPTY allowlist means DENY-ALL by default (fleet
+                    # decision D8); empty_allows_all reports whether the
+                    # LOGSEARCH_EMPTY_ALLOWS_ALL escape hatch re-opens it.
+                    # The MCP error strings and the values.yaml comments
+                    # explain the same thing.
                     "allowed": allowed,
                     "blocked": blocked,
                     "env_allowed": server.ENV_ALLOWED,
                     "env_blocked": server.ENV_BLOCKED,
+                    "empty_allows_all": server._empty_allows_all(),
                 },
                 "caps": {
                     "max_pods": server._max_pods(),
                     "max_lines_per_pod": server._max_lines_per_pod(),
                     "max_total_lines": server._default_max_total_lines(),
                     "max_output_chars": server._MAX_OUTPUT_CHARS,
+                    "max_line_chars": server._max_line_chars(),
+                    "fetch_concurrency": server._fetch_concurrency(),
+                    "max_regex_chars": server._max_regex_chars(),
                 },
             }
         )
@@ -173,7 +182,7 @@ def build_ui_routes() -> list[Route]:
     async def search(request):
         try:
             body = await _json_body(request)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return JSONResponse({"error": f"Error: {exc}"}, status_code=400)
         namespace = str(body.get("namespace") or "").strip()
         pattern = str(body.get("pattern") or "")
@@ -201,7 +210,7 @@ def build_ui_routes() -> list[Route]:
     async def count(request):
         try:
             body = await _json_body(request)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return JSONResponse({"error": f"Error: {exc}"}, status_code=400)
         namespace = str(body.get("namespace") or "").strip()
         pattern = str(body.get("pattern") or "")

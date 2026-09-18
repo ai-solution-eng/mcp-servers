@@ -27,9 +27,9 @@ def _reset_warning_flag():
 
 def _mock_reads(monkeypatch, files: dict[str, str]):
     """Point _read_cgroup_value at an in-memory 'filesystem'."""
-    monkeypatch.setattr(resources, "_read_cgroup_value", lambda *paths: next(
-        (files[p] for p in paths if p in files), None
-    ))
+    monkeypatch.setattr(
+        resources, "_read_cgroup_value", lambda *paths: next((files[p] for p in paths if p in files), None)
+    )
 
 
 # ------------------------------------------------------------------ memory
@@ -63,11 +63,11 @@ def test_memory_limit_invalid_value(monkeypatch):
 @pytest.mark.parametrize(
     ("cpu_max", "expected"),
     [
-        ("100000 100000", 1.0),   # 1 CPU (the pod's limit)
-        ("200000 100000", 2.0),   # 2 CPUs
-        ("50000 100000", 0.5),    # half a CPU -> threads floor to 1
-        ("max 100000", None),     # unlimited
-        ("bogus", None),          # malformed
+        ("100000 100000", 1.0),  # 1 CPU (the pod's limit)
+        ("200000 100000", 2.0),  # 2 CPUs
+        ("50000 100000", 0.5),  # half a CPU -> threads floor to 1
+        ("max 100000", None),  # unlimited
+        ("bogus", None),  # malformed
     ],
 )
 def test_cpu_limit_cgroup_v2(monkeypatch, cpu_max, expected):
@@ -108,7 +108,7 @@ def test_budget_is_proportional_to_pod_limit(monkeypatch):
     )
     budget = duckdb_budget()
     assert budget["memory_limit"] == "1.2GiB"  # 0.6 x 2Gi, rounded to 1 decimal
-    assert budget["threads"] == 1              # floor of the 1-CPU limit
+    assert budget["threads"] == 1  # floor of the 1-CPU limit
     assert budget["container_memory_bytes"] == 2147483648
     assert budget["container_cpu_count"] == 1.0
     assert budget["temp_directory"] == "/tmp/sqlhandler-duckdb-spill"
@@ -156,11 +156,7 @@ def test_memory_budget_string_formats():
 
 
 def test_process_rss_parses_vm_rss(monkeypatch):
-    status = (
-        "Name:\tpython\n"
-        "VmPeak:\t 1234567 kB\n"
-        "VmRSS:\t     456 kB\n"
-    )
+    status = "Name:\tpython\nVmPeak:\t 1234567 kB\nVmRSS:\t     456 kB\n"
     monkeypatch.setattr(resources, "_read_cgroup_value", lambda *p: status)
     assert process_rss_bytes() == 456 * 1024
 

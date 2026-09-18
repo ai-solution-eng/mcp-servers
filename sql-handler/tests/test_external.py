@@ -1,15 +1,20 @@
 """Tests for the read-only external-database attach support.
 
-Two layers:
+Three layers:
 
 * Unit tests (fake DuckDB connection) pin the config parsing, ATTACH SQL
-  generation, secret scrubbing, and alias detection — the pieces where a
-  regression would be silent.
+  generation (all five types, plus the ``params`` passthrough), secret
+  scrubbing, and alias detection — the pieces where a regression would be
+  silent.
 * Integration tests run against a REAL Postgres via the ``pgserver``
-  package (embedded binaries; skipped when not installed). They pin the
-  security-critical behaviors of the production sequence — ATTACH before
-  the fs lockdown, SELECT working with LocalFileSystem disabled, writes
-  rejected by the READ_ONLY attach, and the fs lockdown still holding.
+  package (embedded binaries; skipped when not installed) and against a
+  real sqlite file through the baked ``sqlite_scanner`` extension (skipped
+  with an explicit reason when the extension is not baked into
+  ``duckdb-ext/`` yet — a separate build step owns that directory). They
+  pin the security-critical behaviors of the production sequence — ATTACH
+  before the fs lockdown, SELECT working with LocalFileSystem disabled,
+  writes rejected by the READ_ONLY attach, and the fs lockdown still
+  holding.
 """
 
 import json
@@ -20,12 +25,22 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+
 # pgserver resolves its runtime/lock dir via platformdirs at import time —
 # point XDG_RUNTIME_DIR at a writable location BEFORE the (lazy) import.
-os.environ.setdefault(
-    "XDG_RUNTIME_DIR", os.path.join(tempfile.gettempdir(), "sqlhandler-pg-runtime")
-)
-os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
+def _pg_runtime_dir() -> str:
+    """A creatable XDG_RUNTIME_DIR (sandboxed CIs may pre-set an unwritable one)."""
+    candidate = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(tempfile.gettempdir(), "sqlhandler-pg-runtime")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        return candidate
+    except OSError:
+        fallback = os.path.join(tempfile.gettempdir(), "sqlhandler-pg-runtime")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+os.environ["XDG_RUNTIME_DIR"] = _pg_runtime_dir()
 
 from sqlhandler.engine import SqlEngine  # noqa: E402
 from sqlhandler.external import (  # noqa: E402
@@ -33,6 +48,7 @@ from sqlhandler.external import (  # noqa: E402
     ExternalAttachError,
     apply_external,
     build_attach_sql,
+    ensure_extensions,
     parse_attach_config,
     scrub_secrets,
     sql_references_attach,
@@ -205,6 +221,179 @@ def test_empty_config_is_empty_list():
 
 
 # ---------------------------------------------------------------------------
+# New attach types: mariadb alias, sqlite, sqlserver, params passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_postgresql_spelling_not_accepted(monkeypatch):
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([{"name": "x", "type": "postgresql", "host": "h", "database": "d", "password_env": ""}]),
+    )
+    with pytest.raises(ValueError, match="type.*not supported"):
+        parse_attach_config()
+
+
+def test_parse_mariadb_alias_keeps_type_and_defaults_to_root(monkeypatch):
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([{"name": "mr", "type": "mariadb", "host": "db", "database": "d", "password_env": "PW"}]),
+    )
+    monkeypatch.setenv("PW", "pw")
+    spec = parse_attach_config()[0]
+    assert spec.type == "mariadb"  # the operator-facing spelling survives
+    assert (spec.port, spec.user) == (3306, "root")  # mariadb shares mysql's defaults
+    assert spec.display_uri == "mariadb://db:3306/d"
+
+
+def test_parse_sqlserver_requires_explicit_user(monkeypatch):
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([{"name": "ms", "type": "sqlserver", "host": "h", "database": "d", "password_env": ""}]),
+    )
+    with pytest.raises(ValueError, match="sqlserver.*'user'"):
+        parse_attach_config()  # no default user — never fall back to 'sa'
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps(
+            [{"name": "ms", "type": "sqlserver", "host": "h", "database": "d", "user": "ro", "password_env": "PW"}]
+        ),
+    )
+    monkeypatch.setenv("PW", "pw")
+    spec = parse_attach_config()[0]
+    assert (spec.type, spec.port, spec.user) == ("sqlserver", 1433, "ro")  # 1433 default port
+
+
+def test_parse_sqlite_happy_path(monkeypatch):
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([{"name": "sdb", "type": "sqlite", "database": "/data/ops.db"}]),  # password_env omitted
+    )
+    spec = parse_attach_config()[0]
+    assert (spec.host, spec.port, spec.user, spec.password_env) == ("", 0, "", "")
+    assert spec.database == "/data/ops.db"
+    assert spec.display_uri == "sqlite:///data/ops.db"  # a file path — no port, no secret
+    assert spec.password() is None
+
+
+def test_sqlite_rejects_server_fields(monkeypatch):
+    base = {"name": "sdb", "type": "sqlite", "database": "/data/ops.db"}
+    for extra, needle in (
+        ({"host": "srv"}, "host"),
+        ({"port": 1234}, "port"),
+        ({"user": "u"}, "user"),
+        ({"user_env": "U"}, "user"),
+        ({"params": {"sslmode": "require"}}, "params"),
+    ):
+        monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, **extra}]))
+        with pytest.raises(ValueError, match=needle):
+            parse_attach_config()
+
+
+def test_sqlite_database_is_minimally_validated_file_path(monkeypatch):
+    base = {"name": "sdb", "type": "sqlite"}
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([base]))
+    with pytest.raises(ValueError, match="database is required"):
+        parse_attach_config()
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, "database": "/data/op\x00s.db"}]))
+    with pytest.raises(ValueError, match="NUL/control"):
+        parse_attach_config()
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, "database": "/data/ops db (v2).db"}]))
+    assert parse_attach_config()[0].database == "/data/ops db (v2).db"  # spaces/parens are fine
+
+
+def test_sqlite_password_env_omitted_ok_but_validated_when_given(monkeypatch):
+    base = {"name": "sdb", "type": "sqlite", "database": "/data/ops.db"}
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([base]))
+    assert parse_attach_config()[0].password() is None
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, "password_env": "MISSING_PW"}]))
+    monkeypatch.delenv("MISSING_PW", raising=False)
+    with pytest.raises(ValueError, match="MISSING_PW"):
+        parse_attach_config()  # when given, the env var must still exist
+
+
+def _params_entry(params: object) -> dict:
+    return {
+        "name": "ops",
+        "type": "postgres",
+        "host": "h",
+        "database": "d",
+        "password_env": "",
+        "params": params,
+    }
+
+
+def test_params_parse_and_coerce_scalars(monkeypatch):
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([_params_entry({"sslmode": "require", "keepalives": 1, "verbose": True})]),
+    )
+    spec = parse_attach_config()[0]
+    # non-string JSON scalars are str()-coerced; insertion order preserved
+    assert spec.params == (("sslmode", "require"), ("keepalives", "1"), ("verbose", "True"))
+
+
+def test_params_rejects_nested_values_with_typeerror(monkeypatch):
+    for params in ({"sslmode": {"deeper": 1}}, {"sslmode": ["require"]}, "not-an-object"):
+        monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([_params_entry(params)]))
+        with pytest.raises(TypeError, match="scalar|JSON object"):
+            parse_attach_config()  # wrong JSON *type* -> TypeError (entry-level convention)
+
+
+def test_params_rejects_unsafe_values(monkeypatch):
+    cases = [
+        ({"sslmode": "x'y"}, "allowed set"),  # single quote
+        ({"sslmode": "a\\b"}, "allowed set"),  # backslash
+        ({"sslmode": "a;b"}, "allowed set"),  # semicolon (ODBC key separator)
+        ({"sslmode": "{a}"}, "allowed set"),  # braces (ODBC quoting)
+        ({"sslmode": "a\tb"}, "allowed set"),  # control character
+        ({"sslmode": "x" * 257}, "256"),  # too long
+    ]
+    for params, needle in cases:
+        monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([_params_entry(params)]))
+        with pytest.raises(ValueError, match=needle):
+            parse_attach_config()
+
+
+def test_params_rejects_invalid_and_reserved_keys(monkeypatch):
+    cases = [
+        ("1sslmode", "not a valid connection parameter"),  # must start with a letter
+        ("ssl-mode", "not a valid connection parameter"),  # dash not allowed
+        ("PASSword", "not allowed"),  # secrets, caught case-insensitively
+        ("passwd", "not allowed"),
+        ("secret", "not allowed"),
+        ("sslpassword", "not allowed"),
+        ("Host", "not allowed"),  # duplicates of the entry's own fields
+        ("PORT", "not allowed"),
+        ("dbname", "not allowed"),
+        ("trusted_connection", "not allowed"),
+    ]
+    for key, needle in cases:
+        monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([_params_entry({key: "x"})]))
+        with pytest.raises(ValueError, match=needle):
+            parse_attach_config()
+
+
+def test_mysql_mariadb_rejects_whitespace_values(monkeypatch):
+    # mysql_scanner serializes DSN values BARE (its parser splits on
+    # whitespace and does not strip quotes) — whitespace would corrupt the
+    # DSN parse, so it is rejected at startup with the field named.
+    base = {"name": "mx", "type": "mysql", "host": "h", "database": "db", "password_env": ""}
+    cases = [
+        ({**base, "host": "my host"}, "field/value host"),
+        ({**base, "database": "two words"}, "field/value database"),
+        ({**base, "params": {"ssl_mode": "verify identity"}}, "field/value params.ssl_mode"),
+        ({**base, "user_env": "MX_USER"}, "field/value user"),  # user_env-resolved value
+        ({**base, "type": "mariadb", "user": "svc user"}, "field/value user"),
+    ]
+    for entry, needle in cases:
+        monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([entry]))
+        monkeypatch.setenv("MX_USER", "svc user")
+        with pytest.raises(ValueError, match=needle):
+            parse_attach_config()
+
+
+# ---------------------------------------------------------------------------
 # SQL generation / detection / scrubbing
 # ---------------------------------------------------------------------------
 
@@ -268,6 +457,171 @@ def test_validate_qualified_name_rejects_injection():
             validate_qualified_name("ops", bad)
 
 
+def test_build_attach_sql_postgres_params_merge_without_duplicates():
+    spec = AttachSpec(
+        "ops",
+        "postgres",
+        "h",
+        5432,
+        "db",
+        "u",
+        "PW",
+        True,
+        (("sslmode", "require"), ("application_name", "sqlhandler")),
+    )
+    sql = build_attach_sql(spec, "pw")
+    # values are _sql_quote'd ('require') and then doubled once more at the
+    # ATTACH-literal level (''require'') — see the escape test above
+    assert "sslmode=''require''" in sql and "application_name=''sqlhandler''" in sql
+    assert "connect_timeout=10" in sql  # default kept alongside the added params
+    assert sql.count("host=") == 1 and sql.count("sslmode=") == 1  # no duplicate keys
+    assert "TYPE postgres" in sql and "READ_ONLY" in sql
+
+
+def test_build_attach_sql_params_override_defaults():
+    spec = AttachSpec("ops", "postgres", "h", 5432, "db", "u", "PW", True, (("connect_timeout", "30"),))
+    sql = build_attach_sql(spec, None)
+    assert "connect_timeout=''30''" in sql and sql.count("connect_timeout") == 1
+    assert "connect_timeout=10" not in sql  # the default was replaced, not duplicated
+
+
+def test_build_attach_sql_mysql_tls_param_forwarded_verbatim():
+    spec = AttachSpec("mx", "mysql", "h", 3306, "db", "u", "PW", True, (("ssl_mode", "verify_identity"),))
+    sql = build_attach_sql(spec, "pw")
+    assert "ssl_mode=verify_identity" in sql  # libmariadb TLS key — NOT postgres' sslmode
+    assert "passwd=pw" in sql and "database=db" in sql and "dbname=" not in sql
+    assert sql.count("ssl_mode=") == 1 and sql.count("passwd=") == 1
+
+
+def test_build_attach_sql_mariadb_attaches_as_mysql():
+    spec = AttachSpec("mr", "mariadb", "h", 3306, "db", "root", "PW")
+    sql = build_attach_sql(spec, "pw")
+    assert "TYPE mysql" in sql  # mariadb rides the mysql attach type...
+    assert "passwd=pw" in sql and "READ_ONLY" in sql
+    assert "TYPE mariadb" not in sql
+
+
+def test_build_attach_sql_mysql_mariadb_values_are_bare():
+    # mysql_scanner's DSN parser splits on whitespace and does NOT strip
+    # quotes: a quoted value would carry literal quote characters into the
+    # connection (empirically host='127.0.0.1' fails with "Unknown server
+    # host ''127.0.0.1''"). Values must therefore be emitted bare.
+    for db_type in ("mysql", "mariadb"):
+        spec = AttachSpec("mx", db_type, "db.internal", 3307, "opsdb", "svc", "PW")
+        sql = build_attach_sql(spec, "pw1")
+        assert "host=db.internal" in sql
+        assert "port=3307" in sql
+        assert "database=opsdb" in sql
+        assert "user=svc" in sql
+        assert "passwd=pw1" in sql
+        assert "host='" not in sql  # no quoted DSN values anywhere
+        assert "''" not in sql  # nothing to double-escape for quote-free values
+        assert "TYPE mysql" in sql and "READ_ONLY" in sql
+
+
+def test_build_attach_sql_mysql_rejects_whitespace_password_without_echo():
+    # A whitespace-bearing password cannot ride the bare DSN: fail loudly
+    # BEFORE embedding it, and never echo the secret in the message.
+    spec = AttachSpec("mx", "mysql", "h", 3306, "db", "u", "PW")
+    with pytest.raises(ValueError, match="resolved password contains whitespace") as ei:
+        build_attach_sql(spec, "secret with spaces")
+    assert "secret with spaces" not in str(ei.value)
+    # mariadb rides the same guard
+    with pytest.raises(ValueError, match="resolved password contains whitespace"):
+        build_attach_sql(AttachSpec("mr", "mariadb", "h", 3306, "db", "root", "PW"), "pw\ttab")
+
+
+def test_apply_external_surfaces_mysql_password_error_scrubbed():
+    # The attach-time guard must surface as ExternalAttachError through
+    # apply_external's scrub path — with the secret still absent.
+    spec = AttachSpec("mx", "mysql", "h", 3306, "db", "u", "PW")
+    with pytest.raises(ExternalAttachError, match="resolved password contains whitespace") as ei:
+        apply_external(_FakeCon(), [spec], {"PW": "secret with spaces"})
+    assert "secret with spaces" not in str(ei.value)
+
+
+def test_postgres_params_value_with_space_still_quoted(monkeypatch):
+    # libpq's conninfo parser strips quotes, so postgres keeps _sql_quote —
+    # values with spaces ride fine there (unlike mysql/mariadb, where any
+    # whitespace is rejected at parse time).
+    monkeypatch.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps(
+            [
+                {
+                    "name": "ops",
+                    "type": "postgres",
+                    "host": "h",
+                    "database": "d",
+                    "password_env": "",
+                    "params": {"options": "-c statement_timeout=30000"},
+                }
+            ]
+        ),
+    )
+    spec = parse_attach_config()[0]  # parses fine — the space is legal for libpq
+    sql = build_attach_sql(spec, None)
+    assert "options=''-c statement_timeout=30000''" in sql  # quoted + ATTACH-literal doubled
+
+
+def test_build_attach_sql_sqlserver_conn_string_defaults():
+    spec = AttachSpec("ms", "sqlserver", "sql.internal", 1433, "adw", "ro", "MS_PW")
+    sql = build_attach_sql(spec, "pw1")
+    assert 'AS "ms" (TYPE mssql, READ_ONLY)' in sql
+    assert "Server=sql.internal,1433;Database=adw;Uid=ro;Pwd=pw1;Encrypt=yes;TrustServerCertificate=yes" in sql
+
+
+def test_build_attach_sql_sqlserver_params_overlay_case_insensitive():
+    spec = AttachSpec(
+        "ms",
+        "sqlserver",
+        "h",
+        1433,
+        "d",
+        "u",
+        "PW",
+        True,
+        (("application_name", "sqlhandler"), ("encrypt", "yes")),  # new key + case-insensitive override
+    )
+    sql = build_attach_sql(spec, "pw")
+    assert "application_name=sqlhandler" in sql
+    assert sql.count("Encrypt=") + sql.count("encrypt=") == 1  # override replaced the default in place
+    assert sql.count("Pwd=") == 1
+
+
+def test_build_attach_sql_sqlite_is_just_the_file_path():
+    spec = AttachSpec("sdb", "sqlite", "", 0, "/data/ops.db", "", "")
+    sql = build_attach_sql(spec, None)
+    assert sql == 'ATTACH \'/data/ops.db\' AS "sdb" (TYPE sqlite, READ_ONLY)'
+    # a quote in the operator-authored path is doubled at the ATTACH-literal level
+    quoted = build_attach_sql(AttachSpec("sdb", "sqlite", "", 0, "/data/a'b.db", "", ""), None)
+    assert quoted == 'ATTACH \'/data/a\'\'b.db\' AS "sdb" (TYPE sqlite, READ_ONLY)'
+
+
+def test_build_attach_sql_unknown_type_fails_loud():
+    with pytest.raises(ValueError, match="unknown attach type"):
+        build_attach_sql(AttachSpec("x", "mssql", "h", 1433, "d", "u", ""), None)
+
+
+def test_ensure_extensions_maps_config_types_to_extensions():
+    con = _FakeCon()
+    ensure_extensions(con, {"postgres", "mysql", "mariadb", "sqlite", "sqlserver"})
+    loads = [c for c in con.calls if c.startswith("LOAD")]
+    # sorted() determinism on the config types, each resolved via _EXTENSIONS
+    assert loads == [
+        "LOAD mysql_scanner",  # mariadb (alias)
+        "LOAD mysql_scanner",  # mysql
+        "LOAD postgres_scanner",
+        "LOAD sqlite_scanner",
+        "LOAD mssql",  # sqlserver -> the community mssql extension
+    ]
+
+
+def test_ensure_extensions_rejects_unknown_type():
+    with pytest.raises(ValueError, match="unknown attach type"):
+        ensure_extensions(_FakeCon(), {"oracle"})
+
+
 # ---------------------------------------------------------------------------
 # Integration: real Postgres via pgserver (skipped when not installed)
 # ---------------------------------------------------------------------------
@@ -315,9 +669,7 @@ def test_engine_reads_attached_pg_under_lockdown(pg_attached):
 
 def test_engine_mixed_lake_and_pg_join(pg_attached):
     engine = pg_attached
-    table = engine.query_duckdb(
-        "SELECT count(*) AS n FROM lake_tbl l JOIN ops.pg_catalog.pg_type p ON p.oid > 0"
-    )
+    table = engine.query_duckdb("SELECT count(*) AS n FROM lake_tbl l JOIN ops.pg_catalog.pg_type p ON p.oid > 0")
     assert table.column("n").to_pylist()[0] > 0
 
 
@@ -367,9 +719,7 @@ def test_attached_databases_lists_tables(pg_attached, pg_server):
     con.execute(f"SET extension_directory='{Path(__file__).resolve().parent.parent / 'duckdb-ext'}'")
     con.execute("LOAD postgres_scanner")
     host = engine.attaches[0].host
-    con.execute(
-        f"ATTACH 'host={host} dbname=postgres user=postgres' AS w (TYPE postgres)"
-    )
+    con.execute(f"ATTACH 'host={host} dbname=postgres user=postgres' AS w (TYPE postgres)")
     con.execute("CREATE OR REPLACE TABLE w.public.agent_test (k int, label text)")
     con.execute("INSERT INTO w.public.agent_test VALUES (1,'a'), (2,'b')")
     con.close()
@@ -381,4 +731,81 @@ def test_attached_databases_lists_tables(pg_attached, pg_server):
     assert "ops.public.agent_test" in qualified
     # and the engine can query it through the read-only attach
     rows = engine.query_duckdb("SELECT count(*) AS n FROM ops.public.agent_test")
+    assert rows.column("n").to_pylist() == [2]
+
+
+# ---------------------------------------------------------------------------
+# Integration: a real sqlite file through the baked sqlite_scanner extension.
+# The scanner .so is baked into <repo>/duckdb-ext/ by a separate build step
+# that runs in parallel — when it has not landed yet these tests SKIP with an
+# explicit reason instead of failing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def sqlite_attached(tmp_path_factory):
+    """Engine with a small real sqlite file attached via sqlite_scanner."""
+    db_path = tmp_path_factory.mktemp("sqlhandler-sqlite") / "ops.db"
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE agent_test (k INTEGER, label TEXT)")
+    con.executemany("INSERT INTO agent_test VALUES (?, ?)", [(1, "a"), (2, "b")])
+    con.commit()
+    con.close()
+
+    extdir = Path(__file__).resolve().parent.parent / "duckdb-ext"
+    # Probe the LOAD on a throwaway connection BEFORE building the engine: a
+    # missing/mismatched sqlite_scanner bake must surface as a skip.
+    import duckdb
+
+    probe = duckdb.connect()
+    try:
+        probe.execute(f"SET extension_directory='{extdir}'")
+        probe.execute("LOAD sqlite_scanner")
+    except Exception as exc:
+        pytest.skip(
+            f"sqlite_scanner extension not baked in <repo>/duckdb-ext yet (parallel bake step): {exc}"
+        )
+    finally:
+        probe.close()
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setenv(
+        "SQLHANDLER_ATTACH",
+        json.dumps([{"name": "sdb", "type": "sqlite", "database": str(db_path)}]),
+    )
+    monkey.setenv("SQLHANDLER_DUCKDB_EXTENSION_DIR", str(extdir))
+    engine = SqlEngine(_OneLakeTable())
+    yield engine
+    monkey.undo()
+
+
+def test_engine_reads_attached_sqlite_under_lockdown(sqlite_attached):
+    engine = sqlite_attached
+    table = engine.query_duckdb("SELECT count(*) AS n FROM sdb.main.agent_test")
+    assert table.column("n").to_pylist() == [2]
+
+
+def test_engine_mixed_lake_and_sqlite_join(sqlite_attached):
+    engine = sqlite_attached
+    table = engine.query_duckdb("SELECT count(*) AS n FROM lake_tbl l JOIN sdb.main.agent_test a ON a.k > 0")
+    assert table.column("n").to_pylist()[0] > 0
+
+
+def test_engine_sqlite_writes_rejected(sqlite_attached):
+    engine = sqlite_attached
+    with pytest.raises(Exception, match="(?i)read.?only|CREATE"):
+        engine.query_duckdb("CREATE TABLE sdb.main.hacked (x int)")
+
+
+def test_engine_attached_sqlite_lists_tables(sqlite_attached):
+    engine = sqlite_attached
+    listing = engine.attached_databases(refresh=True)
+    assert len(listing) == 1 and listing[0]["name"] == "sdb"
+    assert listing[0]["error"] is None
+    assert listing[0]["uri"].startswith("sqlite://")
+    qualified = [t["qualified"] for t in listing[0]["tables"]]
+    assert "sdb.main.agent_test" in qualified
+    rows = engine.query_duckdb("SELECT count(*) AS n FROM sdb.main.agent_test")
     assert rows.column("n").to_pylist() == [2]

@@ -101,3 +101,7 @@ ezua:
     enabled: false
     namespace: istio-system
     providerName: oauth2-proxy
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true

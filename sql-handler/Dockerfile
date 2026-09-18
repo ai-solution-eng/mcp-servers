@@ -34,8 +34,18 @@ RUN uv pip install --system \
 # must be baked. They load from /opt/duckdb-ext (SQLHANDLER_DUCKDB_EXTENSION_DIR,
 # applied by sqlhandler.external before LOAD); the network-facing pod never
 # downloads extensions at runtime — the egress this step needs belongs to the
-# build machine, not the pod.
-RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(f'INSTALL {ext}') for ext in ('postgres_scanner', 'mysql_scanner')]" \
+# build machine, not the pod. Core extensions (postgres_scanner, mysql_scanner,
+# sqlite_scanner) download from extensions.duckdb.org; mssql additionally pulls
+# from community-extensions.duckdb.org — DuckDB's community repo — so BOTH hosts
+# must be reachable at build time. mariadb connections ride mysql_scanner.
+# The SQL Server scanner is published as `mssql` on DuckDB 1.5.x: the older
+# ODBC-based `sqlserver` community extension is no longer published for this
+# version (INSTALL sqlserver 404s and would fail the build). mssql speaks TDS
+# 7.4 natively and needs NO unixODBC/msodbcsql18, so no Microsoft apt repo or
+# EULA'd driver is installed here — dead weight in a network-facing image.
+# The external.py "sqlserver" adapter name refers to this extension; its ATTACH
+# must pass (TYPE mssql) — the casing DuckDB's ATTACH accepts for the type.
+RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community')]" \
     && chmod -R a+rX /opt/duckdb-ext
 ENV SQLHANDLER_DUCKDB_EXTENSION_DIR=/opt/duckdb-ext
 

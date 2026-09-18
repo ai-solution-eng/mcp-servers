@@ -62,6 +62,13 @@ apiKey:
   existingSecret: "k8s-mcp-2-0-apikey"
   existingSecretKey: api-key
 
+# In-cluster callers (e.g. Open WebUI) reach /mcp on the local service DNS;
+# the SDK's DNS-rebinding protection otherwise 421s them after auth. List the
+# svc host(s) here — `host:*` accepts any port. Omit for gateway-only callers.
+extraAllowedHosts: []
+# extraAllowedHosts:
+#   - k8s-mcp-service.<namespace>.svc.cluster.local:*
+
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
 
@@ -132,3 +139,7 @@ ezua:
     enabled: false
     namespace: "istio-system"
     providerName: "oauth2-proxy"
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true

@@ -18,7 +18,6 @@ import pytest
 
 import server
 
-
 # ---------------------------------------------------------------------------
 # Fixtures & fakes
 # ---------------------------------------------------------------------------
@@ -27,15 +26,25 @@ import server
 @pytest.fixture(autouse=True)
 def clean_policy_env(monkeypatch):
     """Start every test from a clean LOGSEARCH_* environment so a developer's
-    shell can never leak policy/caps into these results."""
+    shell can never leak policy/caps into these results.
+
+    The D8 escape hatch is SET here (empty allowlist = open) because the
+    behavioral tests below address pods in a plain 'ns' namespace and are not
+    about the policy; tests that ARE about the default-deny flip override or
+    delete this var explicitly (see tests/test_hardening.py)."""
     for name in (
         server.ENV_ALLOWED,
         server.ENV_BLOCKED,
+        server.ENV_EMPTY_ALLOWS_ALL,
+        server.ENV_MAX_LINE_CHARS,
+        server.ENV_FETCH_CONCURRENCY,
+        server.ENV_MAX_REGEX_CHARS,
         "LOGSEARCH_MAX_PODS",
         "LOGSEARCH_MAX_LINES_PER_POD",
         "LOGSEARCH_MAX_TOTAL_LINES",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(server.ENV_EMPTY_ALLOWS_ALL, "1")
 
 
 def make_pod(name, containers=("main",), restarts=0, started="2026-09-08T00:00:00Z"):
@@ -46,9 +55,9 @@ class FakeK8s:
     """In-memory stand-in for the two kubernetes seams, with call recording."""
 
     def __init__(self, pods, logs, fail_pods=()):
-        self.pods = pods                      # list of pod dicts
-        self.logs = logs                      # {(pod, container): log text}
-        self.fail_pods = set(fail_pods)       # pod names whose read raises
+        self.pods = pods  # list of pod dicts
+        self.logs = logs  # {(pod, container): log text}
+        self.fail_pods = set(fail_pods)  # pod names whose read raises
         self.list_calls = []
         self.read_calls = []
 
@@ -60,8 +69,13 @@ class FakeK8s:
             return [dict(p) for p in k8s.pods]
 
         def fake_read_log(
-            namespace, pod, container, tail_lines, since_seconds=None,
-            timestamps=True, previous=False,
+            namespace,
+            pod,
+            container,
+            tail_lines,
+            since_seconds=None,
+            timestamps=True,
+            previous=False,
         ):
             k8s.read_calls.append(
                 {
@@ -91,13 +105,36 @@ def run(coro):
 # ---------------------------------------------------------------------------
 
 
-def test_policy_empty_allowed_means_all_namespaces(monkeypatch):
+def test_policy_empty_allowed_is_deny_by_default(monkeypatch):
+    """D8 default-deny: an EMPTY allowlist answers NOTHING — the audit's
+    'default-open server' closes. LOGSEARCH_EMPTY_ALLOWS_ALL=1 restores the
+    old open behavior explicitly (see test_policy_empty_allowlist_open_escape)."""
     monkeypatch.setenv(server.ENV_ALLOWED, "")
     monkeypatch.setenv(server.ENV_BLOCKED, "")
-    assert server._namespace_allowed("default")
-    assert server._namespace_allowed("kube-system")
-    assert server._namespace_allowed("team-a-prod-eu-1")
-    assert server._namespace_allowed("anything-goes")
+    monkeypatch.delenv(server.ENV_EMPTY_ALLOWS_ALL, raising=False)
+    assert not server._namespace_allowed("default")
+    assert not server._namespace_allowed("kube-system")
+    assert not server._namespace_allowed("team-a-prod-eu-1")
+    assert not server._namespace_allowed("anything-goes")
+
+
+def test_policy_empty_allowlist_open_escape(monkeypatch):
+    """The D8 escape hatch: =1 (or true/yes/on) restores pre-D8 open access."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "")
+    monkeypatch.setenv(server.ENV_BLOCKED, "")
+    for value, expected in (
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("junk", False),
+    ):
+        monkeypatch.setenv(server.ENV_EMPTY_ALLOWS_ALL, value)
+        assert server._namespace_allowed("default") is expected, value
+    monkeypatch.delenv(server.ENV_EMPTY_ALLOWS_ALL)
+    assert server._namespace_allowed("default") is False  # unset -> deny
 
 
 @pytest.mark.parametrize(
@@ -106,11 +143,11 @@ def test_policy_empty_allowed_means_all_namespaces(monkeypatch):
         # glob allow-list
         ("team-a,prod-*", "", "team-a", True),
         ("team-a,prod-*", "", "prod-eu-1", True),
-        ("team-a,prod-*", "", "prod", False),       # 'prod-*' needs the dash
-        ("team-a,prod-*", "", "team-a2", False),    # prefix is not a match
+        ("team-a,prod-*", "", "prod", False),  # 'prod-*' needs the dash
+        ("team-a,prod-*", "", "team-a2", False),  # prefix is not a match
         ("team-a,prod-*", "", "dev-eu-1", False),
-        ("team-a,prod-*", "", "", False),           # non-empty list denies ''
-        ("app", "", "app", True),                   # exact literal glob
+        ("team-a,prod-*", "", "", False),  # non-empty list denies ''
+        ("app", "", "app", True),  # exact literal glob
         # blocked ALWAYS wins — even over an explicit allow-all
         ("*", "kube-system", "kube-system", False),
         ("*", "kube-*", "kube-public", False),
@@ -129,12 +166,43 @@ def test_policy_empty_allowed_means_all_namespaces(monkeypatch):
         ("prod-*", "", "PROD-EU", False),
         # blocked wildcard blocks everything
         ("*", "*", "default", False),
+        # (the D8 empty-allowlist rows live in test_policy_matrix_deny_on_empty
+        # below — the autouse fixture here sets the escape hatch ON, so an
+        # empty-allowed row in THIS matrix would assert the open behavior)
     ],
 )
 def test_policy_matrix(monkeypatch, allowed, blocked, ns, expected):
     monkeypatch.setenv(server.ENV_ALLOWED, allowed)
     monkeypatch.setenv(server.ENV_BLOCKED, blocked)
     assert server._namespace_allowed(ns) is expected
+
+
+@pytest.mark.parametrize(
+    "ns,expected",
+    [
+        ("default", False),
+        ("kube-system", False),
+        ("team-a", False),
+        ("", False),
+        # blocked always wins even with the escape hatch on
+        ("secret-ns", False),
+    ],
+)
+def test_policy_matrix_deny_on_empty(monkeypatch, ns, expected):
+    """D8: the empty-allowlist rows of the policy matrix, escape hatch OFF."""
+    monkeypatch.delenv(server.ENV_EMPTY_ALLOWS_ALL, raising=False)
+    monkeypatch.setenv(server.ENV_ALLOWED, "")
+    monkeypatch.setenv(server.ENV_BLOCKED, "secret-ns")
+    assert server._namespace_allowed(ns) is expected
+
+
+def test_policy_matrix_empty_with_escape_hatch(monkeypatch):
+    """The escape hatch restores the pre-D8 rows of the matrix."""
+    monkeypatch.setenv(server.ENV_EMPTY_ALLOWS_ALL, "1")
+    monkeypatch.setenv(server.ENV_ALLOWED, "")
+    monkeypatch.setenv(server.ENV_BLOCKED, "secret-ns")
+    assert server._namespace_allowed("default") is True
+    assert server._namespace_allowed("secret-ns") is False  # blocked still wins
 
 
 def test_policy_garbage_int_value_falls_back_to_default(monkeypatch):
@@ -175,10 +243,8 @@ def test_blocked_wins_over_allowed_across_tools(monkeypatch):
 def test_list_log_sources_reports_containers_restarts_age(monkeypatch):
     k8s = FakeK8s(
         [
-            make_pod("b-pod", containers=("api", "sidecar"), restarts=3,
-                     started="2026-09-07T00:00:00Z"),
-            make_pod("a-pod", containers=("worker",), restarts=0,
-                     started="2026-09-08T00:00:00Z"),
+            make_pod("b-pod", containers=("api", "sidecar"), restarts=3, started="2026-09-07T00:00:00Z"),
+            make_pod("a-pod", containers=("worker",), restarts=0, started="2026-09-08T00:00:00Z"),
         ],
         {},
     )
@@ -212,7 +278,7 @@ def test_get_pod_logs_happy_path_and_default_container_resolution(monkeypatch):
     )
     k8s.install(monkeypatch)
     out = json.loads(run(server.get_pod_logs("ns", "multi")))
-    assert out["container"] == "web"          # first container as default
+    assert out["container"] == "web"  # first container as default
     assert out["lines_returned"] == 2
     assert out["previous"] is False
     assert out["truncated"] is False
@@ -224,7 +290,7 @@ def test_get_pod_logs_previous_container_passthrough(monkeypatch):
     k8s.install(monkeypatch)
     out = json.loads(run(server.get_pod_logs("ns", "crashy", previous=True, tail_lines=50)))
     call = k8s.read_calls[-1]
-    assert call["previous"] is True                 # THE triage passthrough
+    assert call["previous"] is True  # THE triage passthrough
     assert call["namespace"] == "ns"
     assert call["pod"] == "crashy"
     assert call["container"] == "app"
@@ -261,7 +327,7 @@ def test_get_pod_logs_output_char_cap(monkeypatch):
     monkeypatch.setattr(server, "_MAX_OUTPUT_CHARS", 40)
     out = json.loads(run(server.get_pod_logs("ns", "p")))
     assert out["truncated"] is True
-    assert len(out["log"]) <= 40      # cut at a newline before the cap
+    assert len(out["log"]) <= 40  # cut at a newline before the cap
     assert out["log"].endswith("line 0003")
 
 
@@ -282,17 +348,16 @@ def test_search_merges_with_provenance_and_chronological_sort(monkeypatch):
         [make_pod("api-a", ("api",)), make_pod("api-b", ("worker",))],
         {
             # Deliberately out of order within a pod, and interleaved across pods.
-            ("api-a", "api"): (
-                "2026-09-08T00:00:10Z ERROR late\n"
-                "2026-09-08T00:00:01Z ERROR early\n"
-            ),
+            ("api-a", "api"): ("2026-09-08T00:00:10Z ERROR late\n2026-09-08T00:00:01Z ERROR early\n"),
             ("api-b", "worker"): "2026-09-08T00:00:05Z ERROR middle\n",
         },
     )
     k8s.install(monkeypatch)
     out = json.loads(run(server.search_logs("ns", "ERROR")))
     assert [m.split("Z ", 1)[1] for m in out["matches"]] == [
-        "ERROR early", "ERROR middle", "ERROR late",
+        "ERROR early",
+        "ERROR middle",
+        "ERROR late",
     ]
     assert out["matches"][0].startswith("api-a/api: ")
     assert out["matches"][1].startswith("api-b/worker: ")
@@ -307,7 +372,7 @@ def test_search_timestamps_passthrough_and_label_selector(monkeypatch):
     k8s.install(monkeypatch)
     run(server.search_logs("ns", "x", label_selector="app=y"))
     assert k8s.list_calls == [("ns", "app=y")]
-    assert k8s.read_calls[-1]["timestamps"] is True   # sort depends on it
+    assert k8s.read_calls[-1]["timestamps"] is True  # sort depends on it
 
 
 def test_search_since_minutes_converts_to_since_seconds(monkeypatch):
@@ -352,7 +417,12 @@ def test_search_bad_pod_regex_clean_error_mentions_pattern(monkeypatch):
     assert "api([" in out
 
 
-def test_search_max_total_lines_truncation_flag_keeps_most_recent(monkeypatch):
+def test_search_budget_stops_fetch_early_keeps_first_matches(monkeypatch):
+    """Early budget enforcement: once max_total_lines matches are in hand the
+    search stops pulling — the kept set is the first matches in (name-sorted)
+    pod order, chronologically sorted, with pods_skipped_budget reporting what
+    was never fetched. This is the Wave-1 change from the pre-D8-era behavior
+    of fetching everything and keeping the most recent slice."""
     k8s = FakeK8s(
         [make_pod("p")],
         {("p", "main"): "".join(f"2026-09-08T00:00:0{i}Z hit {i}\n" for i in range(1, 6))},
@@ -361,9 +431,25 @@ def test_search_max_total_lines_truncation_flag_keeps_most_recent(monkeypatch):
     out = json.loads(run(server.search_logs("ns", "hit", max_total_lines=3)))
     assert out["truncated"] is True
     assert out["match_count"] == 3
-    # Cap keeps the MOST RECENT matches (chronological order preserved):
-    assert "hit 1" not in " ".join(out["matches"])
-    assert "hit 5" in out["matches"][-1]
+    # Budget filled mid-pod: the first three matches are kept, the rest of the
+    # pod is not merged and counts as skipped.
+    assert [m.split("Z ", 1)[1] for m in out["matches"]] == ["hit 1", "hit 2", "hit 3"]
+    assert out["pods_skipped_budget"] == 1
+    assert k8s.read_calls[-1]["tail_lines"] == 200  # the tool's own tail arg, capped per pod as before
+
+
+def test_search_budget_stop_never_fetches_later_pods(monkeypatch):
+    monkeypatch.setenv(server.ENV_FETCH_CONCURRENCY, "2")  # waves of 2 pods
+    pods = [make_pod(f"p{i}") for i in range(6)]
+    logs = {(f"p{i}", "main"): f"2026-09-08T00:00:0{i}Z ERROR hit\n" for i in range(6)}
+    k8s = FakeK8s(pods, logs)
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.search_logs("ns", "ERROR", max_total_lines=2)))
+    assert out["match_count"] == 2
+    assert out["pods_searched"] == 2
+    assert out["pods_skipped_budget"] == 4
+    assert out["truncated"] is True
+    assert len(k8s.read_calls) == 2  # wave 1 filled the budget; wave 2 never scheduled
 
 
 def test_search_no_truncation_flag_when_under_cap(monkeypatch):
@@ -389,17 +475,15 @@ def test_search_case_insensitive_on_and_off(monkeypatch):
         [make_pod("p")],
         {
             ("p", "main"): (
-                "2026-09-08T00:00:01Z ERROR upper\n"
-                "2026-09-08T00:00:02Z error lower\n"
-                "2026-09-08T00:00:03Z fine\n"
+                "2026-09-08T00:00:01Z ERROR upper\n2026-09-08T00:00:02Z error lower\n2026-09-08T00:00:03Z fine\n"
             )
         },
     )
     k8s.install(monkeypatch)
     insensitive = json.loads(run(server.search_logs("ns", "error", case_insensitive=True)))
     sensitive = json.loads(run(server.search_logs("ns", "error", case_insensitive=False)))
-    assert insensitive["match_count"] == 2   # ERROR + error
-    assert sensitive["match_count"] == 1     # error only
+    assert insensitive["match_count"] == 2  # ERROR + error
+    assert sensitive["match_count"] == 1  # error only
 
 
 def test_search_container_filter_skips_pods_without_it(monkeypatch):
@@ -453,10 +537,7 @@ def test_count_matches_aggregates_and_sorts_desc(monkeypatch):
                 "2026-09-08T00:00:05Z ERROR d\n"
                 "2026-09-08T00:00:06Z ERROR e\n"
             ),
-            ("quiet", "main"): (
-                "2026-09-08T00:00:01Z error a\n"
-                "2026-09-08T00:00:02Z error b\n"
-            ),
+            ("quiet", "main"): ("2026-09-08T00:00:01Z error a\n2026-09-08T00:00:02Z error b\n"),
             ("silent", "main"): "2026-09-08T00:00:01Z all good\n",
         },
     )
@@ -531,12 +612,27 @@ def test_count_matches_since_minutes(monkeypatch):
 def test_all_tools_registered_read_only():
     tools = run(server.mcp.list_tools())
     by_name = {t.name: t for t in tools}
-    assert set(by_name) == {"list_log_sources", "get_pod_logs", "search_logs", "count_matches"}
+    # Wave-5 F3 added export_matches (ADDITIVE): the exact search_logs
+    # pipeline whose matched lines go to a file under LOGSEARCH_EXPORT_ROOT.
+    assert set(by_name) == {
+        "list_log_sources",
+        "get_pod_logs",
+        "search_logs",
+        "count_matches",
+        "export_matches",
+    }
     for tool in tools:
         # The SDK stores the hints snake_case; the tools declare camelCase.
-        assert tool.annotations.read_only_hint is True
         assert tool.annotations.open_world_hint is True
         assert tool.title
+    # Every tool is read-only against the cluster — export_matches is the one
+    # honest exception (readOnlyHint=False): it writes ONLY the export file
+    # under the operator-configured LOGSEARCH_EXPORT_ROOT, nothing else about
+    # it mutates (no destructiveHint, same self-describing failure shapes).
+    for name in ("list_log_sources", "get_pod_logs", "search_logs", "count_matches"):
+        assert by_name[name].annotations.read_only_hint is True
+    assert by_name["export_matches"].annotations.read_only_hint is False
+    assert by_name["export_matches"].annotations.destructive_hint is False
 
 
 def test_stateless_http_app_exposes_health_and_mcp_routes():
@@ -568,7 +664,7 @@ def test_decode_log_payload_decodes_bytes():
 def test_decode_log_payload_replacement_chars_and_passthrough():
     from server import _decode_log_payload
 
-    assert _decode_log_payload(b"\xff\xfe garbage") .encode().count(b"\xef\xbf\xbd") == 2  # U+FFFD
+    assert _decode_log_payload(b"\xff\xfe garbage").encode().count(b"\xef\xbf\xbd") == 2  # U+FFFD
     assert _decode_log_payload("already a str") == "already a str"
 
 

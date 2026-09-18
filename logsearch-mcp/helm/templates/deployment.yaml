@@ -37,9 +37,24 @@ spec:
             # does not template inside values.yaml — the prometheus-mcp
             # v0.1.0 release shipped a literal "{{ .Values.x }}" string that
             # way). Empty strings are intentional and meaningful:
-            # allowedNamespaces "" = ALL namespaces allowed.
+            # allowedNamespaces "" = DENY ALL namespaces (default-deny, fleet
+            # decision D8) unless emptyAllowsAll re-opens it.
             - name: LOGSEARCH_ALLOWED_NAMESPACES
               value: {{ .Values.logsearch.allowedNamespaces | quote }}
+            # D8 escape hatch: "true" restores the pre-D8 open default where
+            # an empty allowlist means every namespace is searchable.
+            - name: LOGSEARCH_EMPTY_ALLOWS_ALL
+              value: {{ .Values.logsearch.emptyAllowsAll | quote }}
+            # API keys for /mcp — MANDATORY (fleet decision 2026-09). Always
+            # from an operator-created Secret (existingSecret-only, the
+            # K8S-MCP invariant): the pod fails loud
+            # (CreateContainerConfigError) until the Secret exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: LOGSEARCH_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
             - name: LOGSEARCH_BLOCKED_NAMESPACES
               value: {{ .Values.logsearch.blockedNamespaces | quote }}
             - name: LOGSEARCH_MAX_PODS
@@ -48,11 +63,38 @@ spec:
               value: {{ .Values.logsearch.maxLinesPerPod | quote }}
             - name: LOGSEARCH_MAX_TOTAL_LINES
               value: {{ .Values.logsearch.maxTotalLines | quote }}
+            # Per-line char cap on search output (truncation marker appended).
+            - name: LOGSEARCH_MAX_LINE_CHARS
+              value: {{ .Values.logsearch.maxLineChars | quote }}
+            # Parallel pod fan-out width (bounded semaphore; 1 = sequential).
+            - name: LOGSEARCH_FETCH_CONCURRENCY
+              value: {{ .Values.logsearch.fetchConcurrency | quote }}
+            # ReDoS screen: user regexes longer than this are refused.
+            - name: LOGSEARCH_MAX_REGEX_CHARS
+              value: {{ .Values.logsearch.maxRegexChars | quote }}
+            {{- if .Values.logsearch.exportRoot }}
+            # export_matches destination (Wave-5 F3, ADDITIVE, DEFAULT OFF):
+            # rendered ONLY when the operator sets exportRoot — the default
+            # render has no LOGSEARCH_EXPORT_ROOT env and the tool refuses
+            # (writes nothing). See values.yaml for the suggested workbench/
+            # shared-PVC convention.
+            - name: LOGSEARCH_EXPORT_ROOT
+              value: {{ .Values.logsearch.exportRoot | quote }}
+            {{- end }}
             # Web console gate (webui.enabled): the / and /api/* routes in
             # server._build_http_app. "false" must be passed EXPLICITLY — the
             # server's own default when the env var is absent is enabled.
             - name: LOGSEARCH_WEBUI_ENABLED
               value: {{ .Values.webui.enabled | quote }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
+            # server serves per-tool request counters at /metrics only when
+            # this env is set — nothing here renders when metrics.enabled is
+            # false (the default), so the default pod is unchanged. Pairs
+            # with templates/servicemonitor.yaml.
+            - name: LOGSEARCH_METRICS_ENABLED
+              value: "true"
+            {{- end }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             # HPE corporate proxy (fleet convention, searxng-mcp). Only wired
             # when hpe_proxies=true; the k8s API this server talks to is

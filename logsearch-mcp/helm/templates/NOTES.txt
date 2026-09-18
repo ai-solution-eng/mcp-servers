@@ -1,0 +1,47 @@
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret -}}
+
+logsearch-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+════════════════════════════════════════════════════════════════════
+1. API key — REQUIRED BEFORE THE POD WILL START.
+   Pod logs routinely contain sensitive strings (tokens in stack
+   traces, PII, internal hostnames) — /mcp requires the key. This
+   chart NEVER creates the key Secret (an envsubst apply once emptied
+   a live key Secret — the K8S-MCP lesson). Until the Secret below
+   exists in this namespace, the pod sits in CreateContainerConfigError:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+   Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-keys}' | base64 -d
+
+   ROTATION (zero downtime): the value is a COMMA-SEPARATED list of
+   valid keys — append the new one, move clients over, drop the old:
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=new-key,old-key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+   The server re-reads the env per request — no restart needed. The
+   fleet-universal MCP_API_KEYS env is honored too (either var works).
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints — /mcp REQUIRES the key (X-API-Key or Authorization:
+   Bearer); the read-only search console and /health probes do not.
+  kubectl -n {{ $ns }} port-forward deploy/logsearch-mcp 9101:{{ .Values.service.targetPort }}
+  Console : http://localhost:9101/
+  MCP     : http://localhost:9101/mcp   (X-API-Key: <api-key>)
+
+  MCP client config:
+  { "mcpServers": { "logsearch": { "type": "remote", "url": "http://localhost:9101/mcp", "headers": { "X-API-Key": "<api-key>" } } } }
+
+  Namespace policy (the OTHER access control — tighten it too):
+  allowedNamespaces: {{ .Values.logsearch.allowedNamespaces | quote }}  ("" = ALL namespaces!)
+  blockedNamespaces: {{ .Values.logsearch.blockedNamespaces | quote }}
+
+════════════════════════════════════════════════════════════════════
+3. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/logsearch-mcp
+  kubectl -n {{ $ns }} logs deploy/logsearch-mcp | head -8
+  # → no "LOGSEARCH_API_KEYS is unset" banner; unauthenticated /mcp → 401.

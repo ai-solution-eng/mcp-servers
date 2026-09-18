@@ -31,6 +31,15 @@ capped and range points downsampled (shape preserved) so a busy cluster
 never floods the browser either. Alerts/rules get their own caps with
 accurate ``n_total`` counts, since those lists are for scanning, not for a
 model's context window.
+
+Wave-4 (D14): the dashboard aggregate ``/api/overview`` — ~14 upstream
+queries per refresh — is served from a short-TTL response cache
+(PROMETHEUS_OVERVIEW_CACHE_TTL, default 20s; 0 disables) keyed by the
+request's actual parameter set. Cached responses are honestly marked
+(``cached: true`` + ``cache_age_seconds``); fresh ones say ``cached:
+false``. Failures are never memoized, and concurrent identical overviews
+share a single computation (single-flight). Range steps are clamped via
+prom_client.resolve_step (D14) with a ``step_notice`` when clamped.
 """
 
 from __future__ import annotations
@@ -46,13 +55,44 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 from prom_client import (
+    LABEL_NAME_RE,
     PrometheusError,
     _downsample,
     _metric_str,
     format_value,
-    parse_step,
     parse_timestamp,
+    resolve_step,
 )
+
+# Kept as an alias: the audit referenced webui._LABEL_RE; the rule now lives
+# in prom_client (the client enforces it before URL-path interpolation).
+_LABEL_RE = LABEL_NAME_RE
+
+# /api/overview response cache (Wave-4 D14). Default TTL 20s: a browser
+# refresh within the TTL is instant instead of re-running ~14 upstream
+# queries (30-60s payload on a busy cluster). 0 disables the cache entirely
+# (escape hatch — every refresh recomputes, exactly the pre-D14 behavior).
+_OVERVIEW_CACHE_TTL_DEFAULT = 20.0
+
+
+def _overview_cache_ttl(environ: dict[str, str] | None = None) -> float:
+    """PROMETHEUS_OVERVIEW_CACHE_TTL in seconds (default 20; 0 disables).
+
+    Re-read per request (the fleet env pattern). Non-numeric / negative
+    values fall back to the default; fractional values are honored.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("PROMETHEUS_OVERVIEW_CACHE_TTL") or "").strip()
+    if not raw:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    try:
+        ttl = float(raw)
+    except ValueError:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    if ttl < 0:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    return ttl
+
 
 _HTML_CANDIDATES = (
     Path(__file__).parent / "ui" / "index.html",  # source tree / editable install
@@ -133,7 +173,7 @@ _GPU_QUERIES = (
 _DEFAULT_GPU_DOMAINS = ((0, 1, 2, 3), (4, 5, 6, 7))
 
 
-def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[int, ...], str]:
+def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[tuple[int, ...], ...], str]:
     """Parse the NVLink domain grouping (env override > default)."""
     env = os.environ if environ is None else environ
     raw = env.get("PROM_UI_GPU_NVLINK_DOMAINS", "").strip()
@@ -298,10 +338,11 @@ def _gpu_snapshot(
         return series.get(key, (None, None))[0]
 
     keys = sorted({*util_b.get("series", {}), *used_b.get("series", {})}, key=lambda k: (k[0], k[1]))
-    gpus, by_host = [], {}
+    gpus: list[dict] = []
+    by_host: dict[str, list[dict]] = {}
     for key in keys:
         host, idx = key
-        labels = (util_b.get("series", {}).get(key) or used_b.get("series", {}).get(key) or (None, {}))[1]
+        labels: dict = (util_b.get("series", {}).get(key) or used_b.get("series", {}).get(key) or (None, {}))[1]
         used, free = val("fb_used", key), val("fb_free", key)
         total = (used or 0) + (free or 0) if used is not None or free is not None else None
         xid = val("xid", key)
@@ -458,10 +499,7 @@ def _matrix_rows(data: dict, cap_series: int, cap_points: int) -> tuple[list[dic
     result = data.get("result", [])
     rows = []
     for r in result[:cap_series]:
-        values = [
-            [int(float(t)), format_value(v)]
-            for t, v in _downsample(r.get("values", []), cap_points)
-        ]
+        values = [[int(float(t)), format_value(v)] for t, v in _downsample(r.get("values", []), cap_points)]
         rows.append({"series": _series_id(r.get("metric")), "labels": r.get("metric", {}), "values": values})
     return rows, len(result)
 
@@ -492,8 +530,24 @@ def build_ui_routes(client, config) -> list[Route]:
             }
         )
 
-    async def overview(_request):
-        """Dashboard aggregate. Every block fails soft, independently."""
+    # Per-app-instance cache + single-flight state (closure-scoped: separate
+    # app builds — including tests — never share cache entries).
+    _overview_cache: dict[str, tuple[float, dict]] = {}
+    _overview_inflight: dict[str, asyncio.Future[tuple[dict, bool]]] = {}
+
+    def _mark_overview(base: dict, cached: bool, age: float) -> JSONResponse:
+        """Honest marking (D14): every overview response says whether it came
+        from the cache and how old the payload is (fresh = cached false, 0)."""
+        return JSONResponse({**base, "cached": cached, "cache_age_seconds": round(age, 3)})
+
+    async def _compute_overview() -> tuple[dict, bool]:
+        """Run the dashboard's ~14 upstream queries and build the payload.
+
+        Returns ``(payload, memoizable)``. ``memoizable`` is False when EVERY
+        block failed (upstream down) — failures are never memoized (D14); the
+        normal fail-soft mode (individual cards erroring on a cluster that
+        lacks e.g. DCGM) is a legitimate, cacheable payload.
+        """
         started = time.perf_counter()
 
         async def instant(query: str):
@@ -512,10 +566,7 @@ def build_ui_routes(client, config) -> list[Route]:
             try:
                 rows, _total = _vec_rows(await instant(query), config.max_series)
                 return {
-                    "items": [
-                        {"label": _short_top_label(r["labels"]), "value": r["value"]}
-                        for r in rows
-                    ],
+                    "items": [{"label": _short_top_label(r["labels"]), "value": r["value"]} for r in rows],
                     "query": query,
                 }
             except Exception as exc:
@@ -526,10 +577,13 @@ def build_ui_routes(client, config) -> list[Route]:
             try:
                 s = parse_timestamp(start) or parse_timestamp("now-3h")
                 e = parse_timestamp("now")
-                step = parse_step("", s, e)
+                step, clamp_notice = resolve_step("", s, e)
                 data = await client.range_query(query, s, e, step)
                 rows, _total = _matrix_rows(data, 5, config.max_points)
-                return {"series": rows, "start": s, "end": e, "step": step, "query": query}
+                block = {"series": rows, "start": s, "end": e, "step": step, "query": query}
+                if clamp_notice:
+                    block["step_notice"] = clamp_notice
+                return block
             except Exception as exc:
                 return {"error": str(exc), "query": query}
 
@@ -555,16 +609,49 @@ def build_ui_routes(client, config) -> list[Route]:
             asyncio.gather(*(trend(tw) for tw in _OVERVIEW_TRENDS)),
             alerts_block(),
         )
-        return JSONResponse(
-            {
-                "generated_at": int(time.time()),
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-                "cards": {cq[0]: c for cq, c in zip(_OVERVIEW_CARDS, cards)},
-                "top": {tq[0]: t for tq, t in zip(_OVERVIEW_TOP, tops)},
-                "trends": {tw[0]: t for tw, t in zip(_OVERVIEW_TRENDS, trends)},
-                "alerts": alerts,
-            }
-        )
+        blocks = [*cards, *tops, *trends, alerts]  # gather results, in order
+        memoizable = bool(blocks) and not all("error" in b for b in blocks)
+        payload = {
+            "generated_at": int(time.time()),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "cards": {cq[0]: c for cq, c in zip(_OVERVIEW_CARDS, cards)},
+            "top": {tq[0]: t for tq, t in zip(_OVERVIEW_TOP, tops)},
+            "trends": {tw[0]: t for tw, t in zip(_OVERVIEW_TRENDS, trends)},
+            "alerts": alerts,
+        }
+        return payload, memoizable
+
+    async def overview(request):
+        """Dashboard aggregate, short-TTL cached (D14) and honestly marked.
+
+        Cache key = the request's actual parameter set; entries expire after
+        PROMETHEUS_OVERVIEW_CACHE_TTL seconds (0 disables everything, giving
+        exactly the pre-D14 recompute-every-refresh behavior). Concurrent
+        identical overviews share ONE computation (single-flight) instead of
+        stampeding the upstream. Failures (every block errored) are never
+        memoized.
+        """
+        ttl = _overview_cache_ttl()
+        key = repr(tuple(sorted(request.query_params.items())))
+        if ttl > 0:
+            entry = _overview_cache.get(key)
+            if entry is not None:
+                age = time.monotonic() - entry[0]
+                if age < ttl:
+                    return _mark_overview(entry[1], cached=True, age=age)
+            fut = _overview_inflight.get(key)
+            if fut is None:
+                fut = _overview_inflight[key] = asyncio.ensure_future(_compute_overview())
+        else:
+            fut = asyncio.ensure_future(_compute_overview())
+        try:
+            payload, memoizable = await fut
+        finally:
+            if ttl > 0 and _overview_inflight.get(key) is fut:
+                del _overview_inflight[key]
+        if ttl > 0 and memoizable:
+            _overview_cache[key] = (time.monotonic(), payload)
+        return _mark_overview(payload, cached=False, age=0.0)
 
     async def gpu(_request):
         """NVIDIA GPU (DCGM) aggregate: per-GPU + NVLink-domain + node views.
@@ -606,10 +693,11 @@ def build_ui_routes(client, config) -> list[Route]:
             payload = _gpu_snapshot(blocks, env_domains, {}, env_source)
         payload["generated_at"] = int(time.time())
         payload["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        payload["queries"] = {**{name: query for name, query in _GPU_QUERIES}, "nvlink_domain_info": _NVLINK_DOMAIN_QUERY}
-        payload["domains_detected"] = (
-            {h: [list(g) for g in grps] for h, grps in detected.items()} if detected else None
-        )
+        payload["queries"] = {
+            **{name: query for name, query in _GPU_QUERIES},
+            "nvlink_domain_info": _NVLINK_DOMAIN_QUERY,
+        }
+        payload["domains_detected"] = {h: [list(g) for g in grps] for h, grps in detected.items()} if detected else None
         return JSONResponse(payload)
 
     async def alerts(_request):
@@ -708,23 +796,24 @@ def build_ui_routes(client, config) -> list[Route]:
         try:
             s = parse_timestamp(str(body.get("start") or "") or None) or parse_timestamp("now-1h")
             e = parse_timestamp(str(body.get("end") or "") or None) or parse_timestamp("now")
-            step = parse_step(str(body.get("step") or ""), s, e)
+            step, clamp_notice = resolve_step(str(body.get("step") or ""), s, e)
             started = time.perf_counter()
             data = await client.range_query(q, s, e, step)
             rows, total = _matrix_rows(data, config.max_series, config.max_points)
-            return JSONResponse(
-                {
-                    "resultType": "matrix",
-                    "result": rows,
-                    "n_total": total,
-                    "n_shown": len(rows),
-                    "start": s,
-                    "end": e,
-                    "step": step,
-                    "query": q,
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                }
-            )
+            payload = {
+                "resultType": "matrix",
+                "result": rows,
+                "n_total": total,
+                "n_shown": len(rows),
+                "start": s,
+                "end": e,
+                "step": step,
+                "query": q,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+            if clamp_notice:
+                payload["step_notice"] = clamp_notice
+            return JSONResponse(payload)
         except PrometheusError as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
         except Exception as exc:

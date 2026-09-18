@@ -58,8 +58,18 @@ spec:
           env:
             - name: FORCE_OWNERSHIP
               value: "true"
+            {{- if .Values.searxng.existingSecret }}
+            # SEARXNG_SECRET from a pre-created Secret (preferred: the value
+            # never passes through values files or git).
             - name: SEARXNG_SECRET
-              value: {{ .Values.searxng.secretKey | required "searxng.secretKey is required (SEARXNG_SECRET)" | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.searxng.existingSecret }}
+                  key: {{ .Values.searxng.existingSecretKey | default "secret" }}
+            {{- else }}
+            - name: SEARXNG_SECRET
+              value: {{ .Values.searxng.secretKey | required "searxng.secretKey is required (SEARXNG_SECRET) — or set searxng.existingSecret" | quote }}
+            {{- end }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
@@ -116,6 +126,42 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            {{- if .Values.apiKey.existingSecret }}
+            # OPTIONAL MCP API-key auth (fleet decision 2026-09): wired ONLY
+            # when the values point at a Secret; unset → /mcp runs open with
+            # a loud startup warning (gateway-fronted deployments).
+            - name: SEARXNG_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            {{- end }}
+            {{- with .Values.fetch.allowHosts }}
+            # fetch_content SSRF guard escapes/caps (fleet decision D6 — the
+            # guard itself is default-ON in the server; these only tune it).
+            - name: SEARXNG_FETCH_ALLOW_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.denyExtra }}
+            - name: SEARXNG_FETCH_DENY_EXTRA
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.cacheTtl }}
+            - name: SEARXNG_FETCH_CACHE_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.maxBodyBytes }}
+            - name: SEARXNG_FETCH_MAX_BODY_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.maxScreenshotKb }}
+            - name: SEARXNG_FETCH_MAX_SCREENSHOT_KB
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.maxRedirects }}
+            - name: SEARXNG_FETCH_MAX_REDIRECTS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
@@ -133,6 +179,15 @@ spec:
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy
               value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
+            # MCP container serves per-tool request counters at /metrics only
+            # when this env is set — nothing here renders when
+            # metrics.enabled is false (the default), so the default pod is
+            # unchanged. Pairs with templates/servicemonitor.yaml.
+            - name: SEARXNG_METRICS_ENABLED
+              value: "true"
             {{- end }}
         {{- if .Values.browser.enabled }}
         # ------------------------------------------------------------------

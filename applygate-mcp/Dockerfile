@@ -16,7 +16,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml server.py webui.py ./
+COPY pyproject.toml server.py webui.py mcp_auth.py ./
 # The read-only web console asset: webui.py serves ui/index.html from /app/ui
 # (it also honors an APPLYGATE_WEBUI_HTML override for out-of-image assets).
 COPY ui/ ./ui/

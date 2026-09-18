@@ -130,13 +130,9 @@ def test_run_command_env_injection_and_timeout(root, monkeypatch):
     call(server.workspace_create, "ws")
     call(server.set_env, "ws", "GREETING", "hello")
     monkeypatch.setenv("WORKBENCH_EXEC_ALLOWLIST", "python3")
-    out = json.loads(
-        call(server.run_command, "ws", ["python3", "-c", "import os; print(os.environ['GREETING'])"])
-    )
+    out = json.loads(call(server.run_command, "ws", ["python3", "-c", "import os; print(os.environ['GREETING'])"]))
     assert out["stdout"].strip() == "hello"
-    out = json.loads(
-        call(server.run_command, "ws", ["python3", "-c", "import time; time.sleep(5)"], 1)
-    )
+    out = json.loads(call(server.run_command, "ws", ["python3", "-c", "import time; time.sleep(5)"], 1))
     assert out["timed_out"] is True and out["exit_code"] == 124
 
 
@@ -144,9 +140,7 @@ def test_run_command_caps_output(root, monkeypatch):
     call(server.workspace_create, "ws")
     monkeypatch.setenv("WORKBENCH_EXEC_ALLOWLIST", "python3")
     monkeypatch.setenv("WORKBENCH_MAX_OUTPUT_BYTES", "100")
-    out = json.loads(
-        call(server.run_command, "ws", ["python3", "-c", "print('x' * 1000)"])
-    )
+    out = json.loads(call(server.run_command, "ws", ["python3", "-c", "print('x' * 1000)"]))
     assert len(out["stdout"]) <= 100 and out["truncated"] is True
 
 

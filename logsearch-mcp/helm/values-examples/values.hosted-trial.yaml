@@ -27,21 +27,28 @@ imagePullSecrets: []
 
 # -- Namespace policy (LOUD — this is the server's ONLY access control) --------
 # READ-ONLY by design, but pod logs routinely contain sensitive strings
-# (tokens in stack traces, PII, internal hostnames). EMPTY STRING = ALL
-# namespaces allowed — a trial should set an explicit allowlist.
+# (tokens in stack traces, PII, internal hostnames). The chart is
+# DEFAULT-DENY (fleet decision D8): an empty allowlist denies ALL namespaces —
+# a trial MUST set an explicit allowlist (do NOT reach for emptyAllowsAll).
 logsearch:
   # SITE: namespaces the trial agent may search (fnmatch globs OK) — REQUIRED
-  # for anything beyond a lab cluster
+  # under the default-deny policy
   allowedNamespaces: <ALLOWED_NAMESPACES>
   # SITE: ALWAYS wins over the allowed list — keep the platform namespaces out
   blockedNamespaces: kube-system,kube-public,kube-node-lease
+  # Leave FALSE: the pre-D8 open default must never come back on a trial.
+  emptyAllowsAll: false
 
 # -- Caps (blast-radius limits for agent harnesses) -----------------------------
 # Bound both API-server load and the MCP response size (an agent's context
-# window). Defaults are sane for a trial.
+# window); search stops fetching once maxTotalLines matches are in hand.
+# Defaults are sane for a trial.
   maxPods: 50
   maxLinesPerPod: 1000
   maxTotalLines: 300
+  maxLineChars: 2000
+  fetchConcurrency: 8
+  maxRegexChars: 512
 
 # -- Service exposure ---------------------------------------------------------------------
 service:
@@ -78,7 +85,7 @@ rbac:
 # -- HPE corporate proxy -------------------------------------------------------------------------
 # Off unless the trial cluster sits behind the HPE proxy (the k8s API is
 # in-cluster and covered by the NO_PROXY entries either way).
-hpe_proxies: false
+hpe_proxies: true
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -96,3 +103,14 @@ ezua:
     endpoint: logsearch-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+emptyAllowsAll: false   # hosted-trial: production posture — provide an explicit namespace allowlist
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true

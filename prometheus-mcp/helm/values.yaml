@@ -23,7 +23,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.4.1
+  tag: v0.5.1
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -119,6 +119,24 @@ service:
   type: ClusterIP
   port: 9095
   targetPort: 9095
+
+# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+# The MCP server's OWN self-metrics (it observes Prometheus all day; this is
+# the one counter family about the server itself): prometheus_mcp_tool_
+# requests_total{tool,outcome} — per-tool request counts with outcome ok|error
+# (which tools agents call, how often, how often they fail). No PromQL text,
+# label names, or error strings are ever exported. DEFAULT false: the chart
+# renders NOTHING extra (no env, no ServiceMonitor) and the server serves no
+# /metrics route — the default render is byte-identical to the pre-metrics
+# baseline. Flip to true per site values to enable; /metrics is then served
+# key-free on the same port as /mcp (this server has no auth middleware —
+# read-only surface behind the gateway) so the ServiceMonitor can scrape it.
+metrics:
+  enabled: false
+  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
+  serviceMonitor: true
+  # Scrape interval rendered into the ServiceMonitor.
+  interval: 30s
 
 # -- Resources --------------------------------------------------------------------------------
 resources:

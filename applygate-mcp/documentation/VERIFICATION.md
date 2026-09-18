@@ -57,11 +57,22 @@ curl -s https://applygate-mcp.<your-domain>/mcp \
   }'
 ```
 
-Expect `"ok": true`, `dry_run: true`, and the per-doc verdict
-`"dry-run passed — would be applied; nothing was changed"`. To exercise the
-confirm gate, re-call as `apply_manifest` without `confirm_apply` — expect
+Expect `"ok": true`, `dry_run: true`, the per-doc verdict
+`"dry-run passed — would be applied; nothing was changed"` — and the new
+`manifest_sha256` field. To exercise the confirm gate, re-call as
+`apply_manifest` without `confirm_apply` — expect
 `{"ok": false, "refused": true, "error": "confirm_apply is False — refusing
-to mutate..."}`. The human path: open the read-only console at
+to mutate..."}`.
+
+**D11 plan binding (post-0.1.4):** with `confirm_apply: true` but NO prior
+`plan_apply`, the apply now refuses with
+`"plan binding (D11): refusing apply — no plan_apply has been recorded..."`
+naming `APPLYGATE_UNPLANNED_APPLY` — that is the ratified default, not a
+fault (values `planBinding.unplannedApply: warn|allow` is the migration
+path). The correct end-to-end apply: read `manifest_sha256` from the plan
+result and re-call `apply_manifest` with `confirm_apply: true` and
+`plan_sha256: <manifest_sha256>` — expect `"plan_binding": "enforced"`.
+The human path: open the read-only console at
 `https://applygate-mcp.<your-domain>/`, paste the same manifest in the Plan
 tab (previews are always dry-run), and check the Audit tab for the new lines.
 
@@ -77,6 +88,13 @@ kubectl logs deploy/applygate-mcp -n <namespace> --tail=50
 kubectl exec -n <namespace> deploy/applygate-mcp -- cat /data/audit.jsonl 2>/dev/null | tail -5
 # (exec requires k8s-mcp.io/exec="true" or RBAC your cluster may not grant —
 #  the audit tail is also visible in the web console's Audit tab)
+
+# Audit chain verification (tamper-evidence) — one command:
+kubectl exec -n <namespace> deploy/applygate-mcp -- python -c \
+  "import sys,json; sys.path.insert(0,'/app'); import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
+# → {"ok": true, "entries": N, "legacy_entries": 0, ...}. "ok": false with a
+# line number = the trail was tampered with/truncated/reordered (README
+# documents the manual procedure).
 ```
 
 ## 5. Troubleshooting

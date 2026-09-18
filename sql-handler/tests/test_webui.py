@@ -317,11 +317,7 @@ def _engine(tmp_path):
 
 
 _YAML_CATALOG = (
-    b"tables:\n"
-    b"  orders:\n"
-    b"    description: Order headers (uploaded)\n"
-    b"    columns:\n"
-    b"      qty: Quantity in units\n"
+    b"tables:\n  orders:\n    description: Order headers (uploaded)\n    columns:\n      qty: Quantity in units\n"
 )
 
 
@@ -409,9 +405,12 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
     assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "over HTTP"
     assert client.get("/api/semantic-catalog", headers=auth).json()["active_source"] == "upload"
 
-    assert client.post(
-        "/api/semantic-catalog", content=b'{"tables": {"orders": {"description": "v2"}}}', headers=auth
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/semantic-catalog", content=b'{"tables": {"orders": {"description": "v2"}}}', headers=auth
+        ).status_code
+        == 200
+    )
     assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "v2"
 
     assert client.post("/api/semantic-catalog", content=b"{broken", headers=auth).status_code == 400
@@ -533,9 +532,9 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
     )
     assert r.status_code == 200 and r.json()["ok"] is True
     assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "via http"
-    assert client.post(
-        "/api/semantic-catalog/table", json={"table": "orders"}, headers=auth
-    ).status_code == 400  # missing content
+    assert (
+        client.post("/api/semantic-catalog/table", json={"table": "orders"}, headers=auth).status_code == 400
+    )  # missing content
 
     r = client.post("/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth)
     assert r.status_code == 200

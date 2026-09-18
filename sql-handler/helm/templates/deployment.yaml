@@ -143,6 +143,16 @@ spec:
             - name: SQLHANDLER_CATALOG
               value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.mountPath | default "/etc/sqlhandler") | quote }}
             {{- end }}
+            {{- if .Values.security.apiKey.existingSecret }}
+            # OPTIONAL /mcp API-key auth (fleet decision 2026-09): wired ONLY
+            # when the values point at a Secret; unset → /mcp runs open with
+            # a loud startup warning (gateway-fronted deployments).
+            - name: SQLHANDLER_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.apiKey.existingSecret }}
+                  key: {{ .Values.security.apiKey.existingSecretKey }}
+            {{- end }}
             {{- if .Values.semanticCatalog.store.enabled }}
             # Upload store on the shared PVC (values: semanticCatalog.store):
             # UI/API uploads become cross-pod + durable and still hot-reload.
@@ -200,36 +210,33 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.startupProbe.enabled }}
-          {{- /* gates liveness/readiness until the server is listening, so the
-                 kubelet doesn't restart a healthy pod that is still prewarming
-                 (the old 15s initialDelay was not enough for a cold start) */}}
-          startupProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
-            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
-            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
-          {{- end }}
-          {{- if .Values.livenessProbe.enabled }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
-            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
-            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
-          {{- end }}
-          {{- if .Values.readinessProbe.enabled }}
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: http
-            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
-            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
-            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
-          {{- end }}
+          {{- /* Probes render via the shared fleet library (pcai-fleet-lib,
+                 Chart.yaml dependency — audit §3.5's shared helm library).
+                 Byte-for-byte these lines reproduce the previous inline
+                 block: same order (startup, liveness, readiness), same
+                 /health + /ready paths, same knobs — including the quirk
+                 that the startup probe's timeoutSeconds tracks the LIVENESS
+                 timeout (encoded, not changed). Semantics stay chart-owned
+                 (values below); the library owns only the formatting. */}}
+          {{- include "pcai-fleet-lib.probes" (list
+              (dict "name" "startupProbe" "enabled" .Values.startupProbe.enabled
+                    "httpGet" (dict "path" "/health" "port" "http")
+                    "fields" (list
+                      (dict "key" "periodSeconds" "value" .Values.startupProbe.periodSeconds)
+                      (dict "key" "timeoutSeconds" "value" .Values.livenessProbe.timeoutSeconds)
+                      (dict "key" "failureThreshold" "value" .Values.startupProbe.failureThreshold)))
+              (dict "name" "livenessProbe" "enabled" .Values.livenessProbe.enabled
+                    "httpGet" (dict "path" "/health" "port" "http")
+                    "fields" (list
+                      (dict "key" "initialDelaySeconds" "value" .Values.livenessProbe.initialDelaySeconds)
+                      (dict "key" "periodSeconds" "value" .Values.livenessProbe.periodSeconds)
+                      (dict "key" "timeoutSeconds" "value" .Values.livenessProbe.timeoutSeconds)))
+              (dict "name" "readinessProbe" "enabled" .Values.readinessProbe.enabled
+                    "httpGet" (dict "path" "/ready" "port" "http")
+                    "fields" (list
+                      (dict "key" "initialDelaySeconds" "value" .Values.readinessProbe.initialDelaySeconds)
+                      (dict "key" "periodSeconds" "value" .Values.readinessProbe.periodSeconds)
+                      (dict "key" "timeoutSeconds" "value" .Values.readinessProbe.timeoutSeconds)))) }}
       {{- $needTmp := and .Values.security.hardened .Values.security.readOnlyRootFilesystem }}
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}

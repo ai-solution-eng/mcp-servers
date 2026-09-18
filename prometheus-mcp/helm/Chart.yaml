@@ -6,8 +6,8 @@ description: >-
   Prometheus MCP Server — read-only PromQL queries, series discovery,
   alerts and rules over MCP, behind the PCAI Istio gateway.
 type: application
-version: 0.4.1
-appVersion: "v0.4.1"
+version: 0.5.1
+appVersion: "v0.5.1"
 keywords:
   - mcp
   - prometheus

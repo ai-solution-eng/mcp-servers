@@ -14,11 +14,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml server.py prom_client.py webui.py ./
+COPY pyproject.toml server.py prom_client.py webui.py saved_queries.py ./
+COPY mcp_metrics.py ./mcp_metrics.py
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `prometheus-mcp`
 # script runs from there, not from /app).
 COPY ui/ ./ui/
+RUN chmod -R a+rX /app || true
 RUN uv pip install --system .
 
 EXPOSE 9095

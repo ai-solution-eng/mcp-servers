@@ -9,20 +9,25 @@ ignored" / "pod_name Field required"), plus schema quirks worth knowing.
 Usage:  python3 audit_forms.py [--json]
 Exit 0 = no findings; exit 1 = findings printed.
 """
+
 import json
 import os
 import sys
 import threading
 import time
 import urllib.request
+from collections.abc import Callable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+_install_kubernetes_stubs: Callable[
+    [], None
+]  # bound by the exec below (shared k8s stub installer, see test_namespace_policy docstring)
 _src = open(os.path.join(HERE, "test_namespace_policy.py")).read()
-exec(_src.split("def main()")[0])
-_install_kubernetes_stubs()
-os.environ["K8S_MCP_EXEC_ENABLED"] = "true"   # exec_in_pod registers at import time
+exec(_src.split("def main()")[0])  # noqa: S102 — deliberate: reuse the kubernetes stubs without importing pytest
+_install_kubernetes_stubs()  # noqa: F821 — bound by the exec above
+os.environ["K8S_MCP_EXEC_ENABLED"] = "true"  # exec_in_pod registers at import time
 
 import server  # noqa: E402
 
@@ -44,6 +49,7 @@ def start_server():
     mcp_asgi = server._ApiKeyAuthMiddleware(server.mcp.streamable_http_app(stateless_http=True))
     router = server._ConsoleRouterApp(mcp_asgi, server._ConsoleApp(server._UI_DIR))
     import uvicorn
+
     cfg = uvicorn.Config(router, host="127.0.0.1", port=PORT, log_level="error")
     srv = uvicorn.Server(cfg)
     t = threading.Thread(target=srv.run, daemon=True)
@@ -59,12 +65,15 @@ def start_server():
 
 def post_rpc(payload):
     req = urllib.request.Request(
-        BASE + "/mcp", data=json.dumps(payload).encode(),
+        BASE + "/mcp",
+        data=json.dumps(payload).encode(),
         headers={
             "Authorization": "Bearer audit-key",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-        }, method="POST")
+        },
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=10) as r:
         body = r.read().decode()
         ctype = r.headers.get("content-type", "")
@@ -101,21 +110,21 @@ def infer_kind(name, prop, overrides=None):
 
 # What readForm produces for each kind, given the widget ui/app.js renders.
 WIDGET_YIELDS = {
-    "namespace": "string",     # select of cluster namespaces (or "" = all)
+    "namespace": "string",  # select of cluster namespaces (or "" = all)
     "resourcetype": "string",  # select (curated + discovered) / ✎ other text
-    "command": "array",        # argv builder → [binary, *args]
-    "verb": "string",          # select of read verbs
-    "select": "enum-same",     # select of the schema's own enum values
+    "command": "array",  # argv builder → [binary, *args]
+    "verb": "string",  # select of read verbs
+    "select": "enum-same",  # select of the schema's own enum values
     "bool": "boolean",
     "number": "number",
-    "lines": "array",          # textarea → list[str]
+    "lines": "array",  # textarea → list[str]
     "text": "string",
 }
 
 
 def yield_matches(schema_type, items_type, yields):
     if yields == "enum-same":
-        return True                                  # values come from the schema itself
+        return True  # values come from the schema itself
     if schema_type == "array":
         return yields == "array" and (items_type in (None, "string"))
     if schema_type == "boolean":
@@ -124,7 +133,7 @@ def yield_matches(schema_type, items_type, yields):
         return yields == "number"
     if schema_type == "string" or schema_type is None:
         return yields == "string"
-    return False                                     # unknown server type
+    return False  # unknown server type
 
 
 def main():
@@ -150,17 +159,26 @@ def main():
             if not ok:
                 findings.append(
                     f"{name}.{pname}: widget '{kind}' yields {yields} but server wants "
-                    f"{stype}" + (f" of {items_type}" if items_type else ""))
+                    f"{stype}" + (f" of {items_type}" if items_type else "")
+                )
                 note = "TYPE MISMATCH"
             elif stype == "array" and pname != "command":
                 note = "list[str]"
-            rows.append({
-                "tool": name, "param": pname, "type": stype,
-                "items": items_type or "", "required": pname in required,
-                "kind": kind, "yields": yields, "ok": ok, "note": note,
-            })
+            rows.append(
+                {
+                    "tool": name,
+                    "param": pname,
+                    "type": stype,
+                    "items": items_type or "",
+                    "required": pname in required,
+                    "kind": kind,
+                    "yields": yields,
+                    "ok": ok,
+                    "note": note,
+                }
+            )
         # every screen-overridden kind must exist in the widget table
-        for oname, okind in overrides.items():
+        for okind in overrides.values():
             if okind not in WIDGET_YIELDS:
                 findings.append(f"{name}: screen override kind '{okind}' is unknown")
 
@@ -170,9 +188,11 @@ def main():
         w = max((len(r["tool"]) for r in rows), default=8)
         print(f"{'TOOL'.ljust(w)}  PARAM              TYPE      REQ  KIND          YIELDS     NOTE")
         for r in rows:
-            print(f"{r['tool'].ljust(w)}  {r['param'].ljust(18)} {r['type'].ljust(9)} "
-                  f"{'*' if r['required'] else ' '}    {r['kind'].ljust(13)} "
-                  f"{r['yields'].ljust(10)} {r['note']}")
+            print(
+                f"{r['tool'].ljust(w)}  {r['param'].ljust(18)} {r['type'].ljust(9)} "
+                f"{'*' if r['required'] else ' '}    {r['kind'].ljust(13)} "
+                f"{r['yields'].ljust(10)} {r['note']}"
+            )
     tools_listed = sorted({r["tool"] for r in rows})
     no_params = [t["name"] for t in tools if t["name"] not in tools_listed]
     print(f"\n{len(tools)} tools · {len(rows)} parameters audited")

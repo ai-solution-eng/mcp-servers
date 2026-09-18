@@ -19,6 +19,16 @@ Endpoints (all JSON unless noted):
   GET  /api/query/{id}          -> job status (state, columns, n_rows)
   GET  /api/query/{id}/rows     -> paginated result rows (offset/limit)
   DELETE /api/query/{id}        -> cancel a running job
+  POST /api/jobs                -> async query job (MCP query_submit twin;
+                                   SQLHANDLER_MAX_JOBS cap, submit-time
+                                   read-only guard, fetch-once result)
+  GET  /api/jobs/{id}           -> job status
+  GET  /api/jobs/{id}/result    -> the result, handed over ONCE then freed
+  DELETE /api/jobs/{id}         -> cancel a running job
+  GET    /api/saved-queries            -> saved parameterized queries
+  POST   /api/saved-queries            -> save one (auth-gated write)
+  DELETE /api/saved-queries/{name}     -> delete one (auth-gated write)
+  POST   /api/saved-queries/{name}/run -> run one (bind params, read-only)
   POST /api/preview   -> {"columns": [...], "rows": [[...]], "n_rows", "duration_ms"}
   POST /api/profile   -> column-level statistics (min/max, null %, distinct, quantiles)
   POST /api/export    -> CSV/Parquet file download of a query or table (attachment)
@@ -52,6 +62,19 @@ from pathlib import Path
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from .engine import LakehouseError, QueryJob, SqlEngine, _max_rows, _validate_params, _validate_snapshot_version
+from .jobs import JobError, api_job_cancel, api_job_result, api_job_status, api_job_submit
+from .saved import (
+    NotAuthorized,
+    UnknownSavedQuery,
+    api_saved_delete,
+    api_saved_list,
+    api_saved_run,
+    api_saved_save,
+)
+from .sqlguard import assert_readonly as _guard_assert_readonly
+from .sqlguard import (
+    extract_statement_spans,
+)
 
 _DEFAULT_LIMIT = 100
 # Fallback UI cap when SQLHANDLER_MAX_ROWS is unset or 0 (unlimited for the
@@ -65,34 +88,9 @@ _HTML = (Path(__file__).parent / "ui" / "index.html").read_text(encoding="utf-8"
 # read-only guard
 # ---------------------------------------------------------------------------
 
-
-def _parse_statement_types(sql: str) -> list[str]:
-    """Parse ``sql`` with DuckDB's real parser; return one type per statement.
-
-    Uses DuckDB's own grammar (string literals, comments and multi-statement
-    text are handled correctly), unlike keyword prefix checks. Raises
-    ValueError when the text does not parse at all.
-    """
-    import duckdb
-
-    try:
-        statements = duckdb.extract_statements(sql)
-    except Exception as exc:
-        raise ValueError(f"Could not parse SQL: {exc}") from exc
-    return [str(s.type).split(".")[-1] for s in statements]
-
-
-def _explain_inner_sql(statement: str) -> str:
-    """Strip a leading ``EXPLAIN [ANALYZE] [VERBOSE]`` and return the rest."""
-    rest = statement
-    for keyword in ("EXPLAIN", "ANALYZE", "VERBOSE"):
-        rest = rest.lstrip(" \t\r\n(")
-        parts = rest.split(None, 1)
-        if parts and parts[0].upper() == keyword:
-            rest = parts[1] if len(parts) > 1 else ""
-        else:
-            break
-    return rest
+# The parser lives in sqlhandler.sqlguard (one implementation shared with the
+# MCP run_sql path and the attached-catalog query path). The web surface keeps
+# its own wrapper so error messages keep the historical "Read-only UI" prefix.
 
 
 def assert_readonly(sql: str) -> str:
@@ -104,59 +102,25 @@ def assert_readonly(sql: str) -> str:
     actually executes the insert, so it is rejected. PRAGMA/SET, COPY, and
     every write statement are rejected regardless of position.
 
-    This guards the *web UI / JSON API* only. The MCP ``run_sql`` tool is for
-    trusted agent callers and does not pass through this filter (see README).
+    This guards the *web UI / JSON API* (always on). The MCP ``run_sql`` tool
+    runs the same parser guard under decision D2 (``SQLHANDLER_MCP_READONLY``,
+    default on); queries that can see an attached external catalog are
+    SELECT-only unconditionally (see sqlhandler/engine.py).
     """
-    text = sql.strip()
-    if not text:
-        raise ValueError("Empty SQL statement.")
-    types = _parse_statement_types(text)
-    for stmt_type, statement in zip(types, _split_statements(text), strict=False):
-        # Belt and braces: PRAGMA is a SET alias in DuckDB, and some
-        # table-valued pragmas even parse as SELECT — reject the keyword
-        # itself, the web UI has no use for it.
-        head = statement.lstrip(" \t\r\n(")
-        if head.upper().startswith("PRAGMA"):
-            raise ValueError(
-                "Read-only UI: PRAGMA statements are not allowed. "
-                "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
-            )
-        if stmt_type == "EXPLAIN":
-            inner = _explain_inner_sql(statement)
-            for inner_type in _parse_statement_types(inner):
-                if inner_type != "SELECT":
-                    raise ValueError(
-                        f"Read-only UI: EXPLAIN of a {inner_type} statement is not allowed "
-                        "(EXPLAIN ANALYZE would execute it). Only SELECT queries are permitted."
-                    )
-        elif stmt_type != "SELECT":
-            raise ValueError(
-                f"Read-only UI: {stmt_type} statements are not allowed. "
-                "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
-            )
-    return text
+    return _guard_assert_readonly(sql, context="Read-only UI")
 
 
 def _split_statements(sql: str) -> list[str]:
-    """Best-effort per-statement text slices matching the parsed statements.
+    """Per-statement text slices, taken from the parser's exact spans.
 
-    Only used for EXPLAIN inner-statement inspection, where a rough slice is
-    enough (the inner text is re-parsed, not executed as-is).
+    Was a character-scanning heuristic (single-quote toggle + semicolon
+    split); escaped quotes (''), double-quoted identifiers, dollar-quoted
+    strings and comments confused it. ``duckdb.extract_statements`` provides
+    each statement's exact source text, so the slices are now parser-exact.
+    Only used for EXPLAIN inner-statement inspection, where the slice is
+    re-parsed, not executed as-is.
     """
-    parts, current = [], []
-    in_string = False
-    for char in sql:
-        if char == "'" and not in_string:
-            in_string = True
-        elif char == "'" and in_string:
-            in_string = False
-        if char == ";" and not in_string:
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(char)
-    parts.append("".join(current))
-    return [p for p in (part.strip() for part in parts) if p]
+    return [text for _stmt_type, text in extract_statement_spans(sql) if text.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +553,7 @@ def api_catalog_upload(engine: SqlEngine, body: bytes) -> dict:
     if not engine.catalog_uploads_enabled:
         raise ValueError("Semantic-catalog upload is disabled (SQLHANDLER_CATALOG_UPLOAD=0).")
     if len(body) > _CATALOG_UPLOAD_MAX_BYTES:
-        raise ValueError(
-            f"Catalog upload too large ({len(body)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES})."
-        )
+        raise ValueError(f"Catalog upload too large ({len(body)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES}).")
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -685,9 +647,7 @@ def api_catalog_table_update(engine: SqlEngine, table: str, content: object) -> 
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Provide the edited catalog entry content.")
     if len(content) > _CATALOG_UPLOAD_MAX_BYTES:
-        raise ValueError(
-            f"Catalog entry too large ({len(content)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES})."
-        )
+        raise ValueError(f"Catalog entry too large ({len(content)} bytes; cap is {_CATALOG_UPLOAD_MAX_BYTES}).")
     return engine.catalog_update_table(table.strip(), content)
 
 
@@ -717,8 +677,10 @@ def api_highlight(body: dict) -> dict:
     text = body.get("text")
     if not isinstance(text, str):
         raise ValueError("Provide the text to highlight.")  # noqa: TRY004
-    theme = body.get("theme") if body.get("theme") in _PYG_STYLES else "dark"
-    fmt = body.get("format") if body.get("format") in ("yaml", "json") else "yaml"
+    raw_theme = body.get("theme")
+    theme = raw_theme if isinstance(raw_theme, str) and raw_theme in _PYG_STYLES else "dark"
+    raw_fmt = body.get("format")
+    fmt = raw_fmt if isinstance(raw_fmt, str) and raw_fmt in ("yaml", "json") else "yaml"
     if not _HAVE_PYGMENTS or len(text) > _HIGHLIGHT_MAX_CHARS:
         return {"html": None, "highlighted": False}
     try:
@@ -760,12 +722,17 @@ def register_ui(app, engine_getter) -> None:
     def html_page(_request) -> HTMLResponse:
         return HTMLResponse(_HTML)
 
+    # Every handler below offloads its engine/manager work to a worker
+    # thread (asyncio.to_thread): the JSON API handlers call the engine
+    # synchronously, and without the offload a 30 s query would stall
+    # /health, /metrics and every other route on the same event loop.
+
     async def status(_request) -> JSONResponse:
-        return JSONResponse(api_status(engine_getter()))
+        return JSONResponse(await asyncio.to_thread(api_status, engine_getter()))
 
     async def tables(_request) -> JSONResponse:
         try:
-            return JSONResponse(api_tables(engine_getter()))
+            return JSONResponse(await asyncio.to_thread(api_tables, engine_getter()))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -775,7 +742,7 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            return JSONResponse(api_describe(engine_getter(), str(body.get("table", ""))))
+            return JSONResponse(await asyncio.to_thread(api_describe, engine_getter(), str(body.get("table", ""))))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -786,7 +753,8 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(
-                api_query(
+                await asyncio.to_thread(
+                    api_query,
                     engine_getter(),
                     str(body.get("sql", "")),
                     body.get("limit"),
@@ -804,7 +772,9 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            return JSONResponse(api_preview(engine_getter(), str(body.get("table", "")), body.get("limit")))
+            return JSONResponse(
+                await asyncio.to_thread(api_preview, engine_getter(), str(body.get("table", "")), body.get("limit"))
+            )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -816,7 +786,9 @@ def register_ui(app, engine_getter) -> None:
         try:
             cols = body.get("columns")
             col_list = [str(c) for c in cols if str(c).strip()] if isinstance(cols, list) else None
-            return JSONResponse(api_profile(engine_getter(), str(body.get("table", "")), col_list))
+            return JSONResponse(
+                await asyncio.to_thread(api_profile, engine_getter(), str(body.get("table", "")), col_list)
+            )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -848,12 +820,13 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def query_job_status(request) -> JSONResponse:
-        return _response(api_query_status(manager, request.path_params["query_id"]))
+        return _response(await asyncio.to_thread(api_query_status, manager, request.path_params["query_id"]))
 
     async def query_job_rows(request) -> JSONResponse:
         params = request.query_params
         return _response(
-            api_query_rows(
+            await asyncio.to_thread(
+                api_query_rows,
                 manager,
                 request.path_params["query_id"],
                 params.get("offset", 0),
@@ -862,7 +835,7 @@ def register_ui(app, engine_getter) -> None:
         )
 
     async def query_job_cancel(request) -> JSONResponse:
-        return _response(api_query_cancel(manager, request.path_params["query_id"]))
+        return _response(await asyncio.to_thread(api_query_cancel, manager, request.path_params["query_id"]))
 
     app.add_route("/", html_page, methods=["GET"])
     app.add_route("/ui", html_page, methods=["GET"])
@@ -875,13 +848,142 @@ def register_ui(app, engine_getter) -> None:
     app.add_route("/api/query/{query_id}", query_job_status, methods=["GET"])
     app.add_route("/api/query/{query_id}/rows", query_job_rows, methods=["GET"])
     app.add_route("/api/query/{query_id}", query_job_cancel, methods=["DELETE"])
+
+    # ---- async query jobs (/api/jobs/*): the REST twins of the MCP
+    # query_submit / query_status / query_result / query_cancel tools — the
+    # SAME bounded registry (SQLHANDLER_MAX_JOBS), submit-time read-only
+    # guard, watchdog-enforced query timeout, and fetch-once results.
+    async def jobs_submit(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        try:
+            result = await asyncio.to_thread(api_job_submit, engine_getter(), body)
+        except ValueError as exc:  # read-only guard / payload validation
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except LakehouseError as exc:  # concurrency-gate queue wait expired
+            return JSONResponse({"error": str(exc)}, status_code=429)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if result.get("error"):
+            return JSONResponse({"error": result["error"]}, status_code=result.get("status", 429))
+        return JSONResponse(result)
+
+    async def jobs_status(request) -> JSONResponse:
+        try:
+            return JSONResponse(await asyncio.to_thread(api_job_status, request.path_params["job_id"]))
+        except JobError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def jobs_result(request) -> JSONResponse:
+        try:
+            arrow = await asyncio.to_thread(api_job_result, request.path_params["job_id"])
+        except JobError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        payload = arrow_to_payload(arrow)  # the job's rows are already MAX_ROWS-bounded
+        payload.update({"job_id": request.path_params["job_id"], "total_rows": arrow.num_rows, "result_fetched": True})
+        return JSONResponse(payload)
+
+    async def jobs_cancel(request) -> JSONResponse:
+        try:
+            return JSONResponse(await asyncio.to_thread(api_job_cancel, request.path_params["job_id"]))
+        except JobError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    app.add_route("/api/jobs", jobs_submit, methods=["POST"])
+    app.add_route("/api/jobs/{job_id}", jobs_status, methods=["GET"])
+    app.add_route("/api/jobs/{job_id}/result", jobs_result, methods=["GET"])
+    app.add_route("/api/jobs/{job_id}", jobs_cancel, methods=["DELETE"])
+
+    # ---- saved parameterized queries (/api/saved-queries/*): the REST
+    # twins of the query_save / query_list / query_delete / query_saved MCP
+    # tools. WRITES (save/delete) verify the caller's credential per request
+    # (mutation gate — see sqlhandler/saved.py); reads follow the /api
+    # posture (SQLHANDLER_API_TOKEN middleware).
+    async def saved_list(_request) -> JSONResponse:
+        try:
+            return JSONResponse({"queries": await asyncio.to_thread(api_saved_list)})
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def saved_create(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        try:
+            entry = await asyncio.to_thread(api_saved_save, body, request)
+        except NotAuthorized as exc:
+            return JSONResponse({"error": str(exc)}, status_code=401)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse({"error": f"Cannot write the saved-query store: {exc}"}, status_code=500)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"saved": True, **entry})
+
+    async def saved_delete(request) -> JSONResponse:
+        try:
+            result = await asyncio.to_thread(api_saved_delete, request.path_params["name"], request)
+        except NotAuthorized as exc:
+            return JSONResponse({"error": str(exc)}, status_code=401)
+        except UnknownSavedQuery as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse(result)
+
+    async def saved_run(request) -> JSONResponse:
+        name = request.path_params["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        limit = body.get("limit")
+        if limit is not None and not isinstance(limit, int):
+            return JSONResponse({"error": "limit must be an integer."}, status_code=400)
+        try:
+            sql, params, _entry = await asyncio.to_thread(api_saved_run, name, body)
+        except UnknownSavedQuery as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except LakehouseError as exc:  # concurrency-gate refusal
+            return JSONResponse({"error": str(exc)}, status_code=429)
+        try:
+            arrow = await asyncio.to_thread(engine_getter().query_duckdb, sql, limit, params, body.get("version_as_of"))
+        except (ValueError, LakehouseError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        payload = arrow_to_payload(arrow, limit=limit)
+        payload.update({"query": name})
+        return JSONResponse(payload)
+
+    app.add_route("/api/saved-queries", saved_list, methods=["GET"])
+    app.add_route("/api/saved-queries", saved_create, methods=["POST"])
+    app.add_route("/api/saved-queries/{name}", saved_delete, methods=["DELETE"])
+    app.add_route("/api/saved-queries/{name}/run", saved_run, methods=["POST"])
+
     async def export(request) -> Response:
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            result = api_export(engine_getter(), body)
+            result = await asyncio.to_thread(api_export, engine_getter(), body)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -899,14 +1001,14 @@ def register_ui(app, engine_getter) -> None:
     # ---- semantic catalog: status / upload (JSON or YAML) / clear ----
     async def semantic_catalog_get(_request) -> JSONResponse:
         try:
-            return JSONResponse(api_catalog_status(engine_getter()))
+            return JSONResponse(await asyncio.to_thread(api_catalog_status, engine_getter()))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def semantic_catalog_upload(request) -> JSONResponse:
         body = await request.body()
         try:
-            return JSONResponse({"ok": True, **api_catalog_upload(engine_getter(), body)})
+            return JSONResponse({"ok": True, **await asyncio.to_thread(api_catalog_upload, engine_getter(), body)})
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except OSError as exc:
@@ -924,7 +1026,7 @@ def register_ui(app, engine_getter) -> None:
 
     async def semantic_catalog_delete(_request) -> JSONResponse:
         try:
-            return JSONResponse({"ok": True, **api_catalog_clear(engine_getter())})
+            return JSONResponse({"ok": True, **await asyncio.to_thread(api_catalog_clear, engine_getter())})
         except OSError as exc:
             return JSONResponse({"error": f"Cannot remove the uploaded catalog: {exc}"}, status_code=500)
         except Exception as exc:
@@ -933,7 +1035,9 @@ def register_ui(app, engine_getter) -> None:
     async def semantic_catalog_content(request) -> JSONResponse:
         try:
             return JSONResponse(
-                api_catalog_content(engine_getter(), request.query_params.get("format", "yaml"))
+                await asyncio.to_thread(
+                    api_catalog_content, engine_getter(), request.query_params.get("format", "yaml")
+                )
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -944,8 +1048,11 @@ def register_ui(app, engine_getter) -> None:
         params = request.query_params
         try:
             return JSONResponse(
-                api_catalog_table(
-                    engine_getter(), params.get("table", ""), params.get("format", "yaml")
+                await asyncio.to_thread(
+                    api_catalog_table,
+                    engine_getter(),
+                    params.get("table", ""),
+                    params.get("format", "yaml"),
                 )
             )
         except ValueError as exc:
@@ -961,8 +1068,11 @@ def register_ui(app, engine_getter) -> None:
         if not isinstance(body, dict):
             return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
         try:
-            result = api_catalog_table_update(
-                engine_getter(), body.get("table"), body.get("content")
+            result = await asyncio.to_thread(
+                api_catalog_table_update,
+                engine_getter(),
+                str(body.get("table", "")),
+                body.get("content"),
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -981,8 +1091,8 @@ def register_ui(app, engine_getter) -> None:
 
     async def semantic_catalog_table_delete(request) -> JSONResponse:
         try:
-            result = api_catalog_table_remove(
-                engine_getter(), request.query_params.get("table", "")
+            result = await asyncio.to_thread(
+                api_catalog_table_remove, engine_getter(), request.query_params.get("table", "")
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -998,7 +1108,7 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            return JSONResponse(api_highlight(body))
+            return JSONResponse(await asyncio.to_thread(api_highlight, body))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:

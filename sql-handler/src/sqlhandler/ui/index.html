@@ -361,6 +361,17 @@
     outline: none;
   }
   .sv-editor textarea::selection { background: rgba(1, 169, 130, 0.30); }
+  /* ---- client-side tokenizer token classes (both themes) ----
+     Colors mirror the pygments themes' feel; defined via CSS vars so the
+     theme switch needs no re-highlight. Escaped text gets no span at all —
+     building innerHTML from escaped chunks only around matched spans. */
+  .sv-editor .tok-key { color: var(--accent-2); }        /* YAML/JSON keys */
+  .sv-editor .tok-str { color: var(--green); }           /* strings */
+  .sv-editor .tok-num { color: var(--yellow); }          /* numbers */
+  .sv-editor .tok-bool { color: var(--red); font-style: italic; }  /* bools/null */
+  .sv-editor .tok-cmt { color: var(--muted); font-style: italic; } /* comments */
+  .sv-editor .tok-pct { color: var(--muted); }           /* punctuation : , { } [ ] */
+  .sv-editor .tok-err { color: var(--red); }             /* unterminated quote */
 
   /* ---- global SV editor modal ---- */
   .sv-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
@@ -1043,9 +1054,7 @@ function makeSVEditor(mount, sizing) {
   mount.appendChild(ed);
 
   let clean = "";
-  let timer = null;
-  let seq = 0; // ignore stale highlight responses after newer keystrokes
-  let fmt = "yaml"; // seeds the server's -g-style lexer guess (virtual filename)
+  let fmt = "yaml"; // YAML or JSON — picks the client-side tokenizer
 
   const syncScroll = () => { pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; };
   ta.addEventListener("scroll", syncScroll);
@@ -1059,36 +1068,116 @@ function makeSVEditor(mount, sizing) {
     }
   });
 
-  async function highlightNow() {
-    const text = ta.value;
-    const mine = ++seq;
-    try {
-      const r = await api("/api/highlight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          format: fmt,
-          theme: document.documentElement.dataset.theme === "light" ? "light" : "dark",
-        }),
-      });
-      if (mine !== seq) return;                 // a newer edit already won
-      if (r && r.html) code.innerHTML = r.html; // pygments escapes token text
-      else code.textContent = text;             // no pygments / over cap: plain
-    } catch (err) {
-      if (mine !== seq) return;
-      code.textContent = text;
+  // ---- client-side highlighting (replaces the server /api/highlight round-trip) ----
+  // The old design POSTed the text to the server for pygments on every keystroke
+  // (300ms debounce + RTT): a delete left the colored layer showing STALE text for
+  // seconds, and since clicks land on the textarea (caret layer) while the user aims
+  // at the stale colored layer, clicks appeared to "not align". Highlighting now runs
+  // synchronously in the same frame as the edit — both layers are always in register.
+  // Catalog panes are only ever YAML or JSON, so one small tokenizer covers both;
+  // unknown formats degrade to escaped plain text (the editor always works).
+  const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const span = (cls, t) => '<span class="' + cls + '">' + esc(t) + "</span>";
+
+  function highlightYAML(text) {
+    // Line-based: a line is [indent]key: value | comment | scalar | block indicator.
+    // Values may be quoted strings, numbers, bools/null, or block indicators
+    // (| > with optional chomping/indent markers). Multi-line flow scalars are
+    // out of scope for a highlighter (they render as plain text — harmless).
+    let out = "";
+    for (const line of text.split("\n")) {
+      let i = 0;
+      // full-line comment
+      const c = line.indexOf("#");
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith("#")) { out += span("tok-cmt", line); out += "\n"; continue; }
+      // key (either "key:" or "key: value"); keys may be quoted
+      const m = /^(\s*(- )?)(?:"([^"]*)"|'([^']*)'|([^:#\n]+?))(\s*:)(\s+|$)/.exec(line);
+      if (m) {
+        const [full, indent, dash, dq, sq, bare, colon, ws] = m;
+        out += esc(indent);
+        out += dq !== undefined ? span("tok-key", '"' + dq + '"')
+             : sq !== undefined ? span("tok-key", "'" + sq + "'")
+             : span("tok-key", bare);
+        out += span("tok-pct", colon) + esc(ws ?? "");
+        i = full.length;
+        const rest = line.slice(i);
+        out += highlightScalar(rest);
+      } else {
+        out += highlightScalar(line);
+      }
+      out += "\n";
     }
+    // trailing newline split artifact: text.split adds an empty last element only
+    // when text ends with \n — the extra "\n" above already reproduces it, so
+    // drop one if the original text ended without a newline... (handled by caller join)
+    return out;
+  }
+
+  function highlightScalar(rest) {
+    if (!rest) return "";
+    const t = rest.trim();
+    // trailing / inline comment (space-# to avoid coloring URIs etc.)
+    let body = rest, comment = "";
+    const h = rest.search(/(^|\s)#/);
+    if (h >= 0 && !/^['"]/.test(t)) { body = rest.slice(0, h); comment = rest.slice(h); }
+    const tv = body.trim();
+    if (/^["']/.test(tv)) {
+      const q = tv[0];
+      const closed = tv.length > 1 && tv.lastIndexOf(q) > 0;
+      const cls = closed ? "tok-str" : "tok-err";
+      // keep surrounding whitespace outside the span for exact metrics
+      const lead = body.slice(0, body.indexOf(q));
+      const tail = closed ? body.slice(body.lastIndexOf(q) + 1) : "";
+      const core = closed ? body.slice(body.indexOf(q), body.lastIndexOf(q) + 1) : body.slice(body.indexOf(q));
+      return esc(lead) + span(cls, core) + esc(tail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^-?(\d[\d_]*(\.\d+)?([eE][+-]?\d+)?)$/.test(tv)) {
+      const lead = body.slice(0, body.indexOf(tv));
+      const trail = body.slice(body.indexOf(tv) + tv.length);
+      return esc(lead) + span("tok-num", tv) + esc(trail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^(true|false|null|~|yes|no|on|off)$/i.test(tv)) {
+      const lead = body.slice(0, body.indexOf(tv));
+      const trail = body.slice(body.indexOf(tv) + tv.length);
+      return esc(lead) + span("tok-bool", tv) + esc(trail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^[|>][+-]?\d*$/.test(tv)) { // block scalar indicator
+      const lead = body.slice(0, body.indexOf(tv));
+      return esc(lead) + span("tok-pct", tv) + (comment ? span("tok-cmt", comment) : "");
+    }
+    return esc(body) + (comment ? span("tok-cmt", comment) : "");
+  }
+
+  function highlightJSON(text) {
+    // One regex pass: strings (incl. key context), numbers, bools/null, punctuation.
+    const re = /("(?:[^"\\]|\\.)*")(\s*:)?|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false|null)\b|([{},\[\]])/g;
+    let out = "", last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      out += esc(text.slice(last, m.index));
+      if (m[1] !== undefined) out += span(m[2] ? "tok-key" : "tok-str", m[1]);
+      else if (m[2] !== undefined) out += span("tok-pct", m[2]);
+      else if (m[3] !== undefined) out += span("tok-num", m[3]);
+      else if (m[4] !== undefined) out += span("tok-bool", m[4]);
+      else if (m[5] !== undefined) out += span("tok-pct", m[5]);
+      last = re.lastIndex;
+    }
+    out += esc(text.slice(last));
+    return out;
+  }
+
+  function highlightNow() {
+    const text = ta.value;
+    code.innerHTML = fmt === "json" ? highlightJSON(text) : highlightYAML(text);
     syncScroll();
   }
-  const schedule = (ms) => { clearTimeout(timer); timer = setTimeout(highlightNow, ms); };
-  ta.addEventListener("input", () => { schedule(300); if (ed._onchange) ed._onchange(); });
-  document.addEventListener("sv-theme-change", () => schedule(60)); // restyle for the theme
+  ta.addEventListener("input", () => { highlightNow(); if (ed._onchange) ed._onchange(); });
+  document.addEventListener("sv-theme-change", () => highlightNow()); // colors come from CSS vars, but re-run keeps parity
 
   return {
     el: ed,
     get text() { return ta.value; },
-    set text(v) { ta.value = v; code.textContent = v; clean = v; highlightNow(); },
+    set text(v) { ta.value = v; clean = v; highlightNow(); },
     get format() { return fmt; },
     set format(f) { fmt = f; },
     get dirty() { return ta.value !== clean; },

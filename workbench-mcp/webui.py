@@ -62,6 +62,7 @@ from server import (
     _max_output_bytes,
     _root,
     _run_command,
+    _shared_roots,
     _timeout_default,
     _timeout_max,
     _ws_create,
@@ -116,7 +117,10 @@ async def _json_body(request) -> dict:
     except Exception as exc:
         raise ValueError(f"invalid JSON body: {exc}") from exc
     if not isinstance(body, dict):
-        raise ValueError("JSON body must be an object")
+        # ValueError, not TypeError (TRY004): every /api handler catches exactly
+        # ValueError to map a bad body to HTTP 400 — see the `except ValueError`
+        # blocks in build_ui_routes(); raising TypeError would surface as 500.
+        raise ValueError("JSON body must be an object")  # noqa: TRY004
     return body
 
 
@@ -156,6 +160,9 @@ def build_ui_routes() -> list[Route]:
                 "policy": {
                     "allowlist": sorted(_allowlist()),
                     "denylist": sorted(_denylist()),
+                    # Workspace isolation (D7): directories shared across ALL
+                    # workspaces (WORKBENCH_SHARED_PATHS).
+                    "shared_paths": [str(p) for p in _shared_roots()],
                 },
             }
         )
@@ -185,9 +192,7 @@ def build_ui_routes() -> list[Route]:
         # confirm=true must come from the caller; _ws_delete still enforces
         # it (the UI cannot bypass the core policy).
         try:
-            out = await asyncio.to_thread(
-                _ws_delete, str(body.get("name") or ""), bool(body.get("confirm"))
-            )
+            out = await asyncio.to_thread(_ws_delete, str(body.get("name") or ""), bool(body.get("confirm")))
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse(out)
@@ -244,9 +249,7 @@ def build_ui_routes() -> list[Route]:
         if not path:
             return JSONResponse({"error": "path is required"}, status_code=400)
         try:
-            out = await asyncio.to_thread(
-                _file_delete, ws, path, bool(body.get("confirm"))
-            )
+            out = await asyncio.to_thread(_file_delete, ws, path, bool(body.get("confirm")))
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse(out)
@@ -288,9 +291,7 @@ def build_ui_routes() -> list[Route]:
             return JSONResponse({"error": str(exc)}, status_code=400)
         command = body.get("command")
         if not isinstance(command, list):
-            return JSONResponse(
-                {"error": "command must be a list of argv string tokens"}, status_code=400
-            )
+            return JSONResponse({"error": "command must be a list of argv string tokens"}, status_code=400)
         timeout_raw = body.get("timeout_s")
         try:
             timeout_s = _timeout_default() if timeout_raw is None else int(timeout_raw)

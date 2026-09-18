@@ -413,7 +413,14 @@
 
 <div class="banner">
   <span class="banner-tag">trust model</span>
-  <span class="banner-text"><b>Scratch pad by design</b> — executes allow-listed commands; endpoint must sit behind gateway authn.</span>
+  <span class="banner-text"><b>Scratch pad by design</b> — executes allow-listed commands; every route except /health is API-key gated (X-API-Key / Bearer).</span>
+</div>
+
+<div class="banner" id="authbar" style="display:none">
+  <span class="banner-tag">auth</span>
+  <span class="banner-text">This deployment requires an API key (server env <b>WORKBENCH_API_KEYS</b>).</span>
+  <input id="api-key-input" class="wide" style="flex:1;min-width:220px" placeholder="API key" spellcheck="false" type="password" />
+  <button id="api-key-save" title="Store the key for this tab (sessionStorage only)">unlock</button>
 </div>
 
 <div class="layout">
@@ -575,14 +582,48 @@ function showError(err) {
 function clearError() { $("error").classList.remove("show"); }
 
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  // API-key auth (fleet pattern): every call carries X-API-Key when a key is
+  // set; a 401 clears it and surfaces the unlock bar. sessionStorage only —
+  // never localStorage (the K8S-MCP console rule).
+  const headers = Object.assign({}, (opts && opts.headers) || {});
+  if (state.key) headers["X-API-Key"] = state.key;
+  const res = await fetch(path, Object.assign({}, opts, { headers: headers }));
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (res.status === 401) {
+    setKey("");
+    showAuthBar();
+    throw new Error("401 — enter your API key to unlock this console");
+  }
   if (!res.ok || (data && data.error)) {
     throw new Error((data && data.error) || ("HTTP " + res.status));
   }
   return data;
 }
+
+// ---- API-key gate -----------------------------------------------------------------------
+function setKey(k) {
+  state.key = k;
+  try {
+    if (k) sessionStorage.setItem("workbench-key", k);
+    else sessionStorage.removeItem("workbench-key");
+  } catch (e) { /* sessionStorage unavailable (file://) — key lives in memory only */ }
+}
+function showAuthBar() { $("authbar").style.display = "flex"; $("api-key-input").focus(); }
+function hideAuthBar() { $("authbar").style.display = "none"; }
+$("api-key-save").onclick = () => {
+  const k = $("api-key-input").value.trim();
+  if (!k) return;
+  setKey(k);
+  $("api-key-input").value = "";
+  hideAuthBar();
+  clearError();
+  refreshStatus();
+  loadWorkspaces(false).catch(showError);
+};
+$("api-key-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("api-key-save").onclick();
+});
 
 // ---- state ------------------------------------------------------------------------------
 const state = {
@@ -594,6 +635,7 @@ const state = {
   envLoaded: false,
   auditLoaded: false,
   tab: "files",
+  key: (() => { try { return sessionStorage.getItem("workbench-key") || ""; } catch (e) { return ""; } })(),
 };
 
 function currentWs() { return state.ws || ($("ws-select").value || ""); }

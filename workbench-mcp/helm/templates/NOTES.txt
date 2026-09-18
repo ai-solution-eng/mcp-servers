@@ -1,0 +1,45 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret -}}
+
+workbench-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+════════════════════════════════════════════════════════════════════
+1. API key — REQUIRED BEFORE THE POD WILL START.
+   Workbench executes commands (/api/run, run_command) — EVERY route
+   except /health+/healthz requires the key, so this chart NEVER runs
+   without one and NEVER creates the Secret (an envsubst apply once
+   emptied a live key Secret — the K8S-MCP lesson). Until the Secret
+   below exists in this namespace, the pod sits in
+   CreateContainerConfigError:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+   Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-keys}' | base64 -d
+
+   ROTATION (zero downtime): the value is a COMMA-SEPARATED list of
+   valid keys — append the new one, move clients over, drop the old:
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=new-key,old-key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+   The server re-reads the env per request — no restart needed. The
+   fleet-universal MCP_API_KEYS env is honored too (either var works).
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints — the console asks for the key once (unlock bar,
+   sessionStorage only); MCP clients send the header on every call.
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} {{ .Values.service.port }}:{{ .Values.service.targetPort }}
+  Console : http://localhost:{{ .Values.service.port }}/
+  MCP     : http://localhost:{{ .Values.service.port }}/mcp   (X-API-Key: <api-key>)
+
+  MCP client config:
+  { "mcpServers": { "workbench": { "type": "remote", "url": "http://localhost:{{ .Values.service.port }}/mcp", "headers": { "X-API-Key": "<api-key>" } } } }
+
+════════════════════════════════════════════════════════════════════
+3. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | head -8
+  # → no "WORKBENCH_API_KEYS is unset" banner; unauthenticated / → 401.

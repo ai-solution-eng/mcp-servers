@@ -36,7 +36,7 @@ workbench:
   # Root directory holding all workspaces — MUST match persistence.mountPath.
   root: /data
   # argv[0] allowlist for run_command (comma-separated); no shells by design.
-  execAllowlist: "python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
+  execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
   # Hard deny (WINS over the allowlist): network/escalation binaries.
   execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
   # Per-command timeout bounds (seconds).
@@ -53,7 +53,7 @@ workbench:
 # -- HPE corporate proxy --------------------------------------------------------------------------
 # SITE: off unless the trial cluster sits behind the HPE corporate proxy —
 # when true, proxy env passes through to run_command children so `pip` works.
-hpe_proxies: false
+hpe_proxies: true
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -71,7 +71,7 @@ caCert:
 # -- Kyverno vendor-label policy -------------------------------------------------------------------
 # Enable only where the trial platform enforces the hpe-ezua/* vendor labels.
 kyverno:
-  enabled: false
+  enabled: true
 
 # -- Service exposure -------------------------------------------------------------------
 service:
@@ -118,3 +118,12 @@ ezua:
     endpoint: workbench-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 660s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true

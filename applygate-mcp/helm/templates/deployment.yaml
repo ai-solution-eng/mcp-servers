@@ -7,6 +7,18 @@ metadata:
     app: {{ .Values.deployment.appName }}
 spec:
   replicas: {{ .Values.deployment.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  # RWO-safe rollout: the audit PVC is single-attacher (ReadWriteOnce). The
+  # default RollingUpdate maxSurge=1 DEADLOCKS: the surge pod waits for the
+  # volume the old pod holds, the old pod waits for the surge pod to go
+  # Ready — the upgrade stalls in FailedAttachVolume until timeout/abort
+  # (observed 2026-09-15). Recreate = kill-then-start: the volume frees
+  # before the replacement attaches. Brief downtime per rollout is correct
+  # for a single-replica writer; the audit trail persists on the PVC (the
+  # hash chain is append-only and survives pod replacement).
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Values.deployment.appName }}
@@ -47,11 +59,38 @@ spec:
               value: {{ .Values.kinds.allowed | quote }}
             - name: APPLYGATE_AUDIT_FILE
               value: {{ .Values.audit.file | quote }}
+            {{- if .Values.planBinding.unplannedApply }}
+            # D11 plan-binding transition knob (values: planBinding.unplannedApply).
+            # Only rendered when set — the server's built-in default is deny
+            # (the strictest mode applies out of the box); warn = documented
+            # migration path (applies + logs loudly); allow = pre-D11 behavior;
+            # anything else fails closed to deny.
+            - name: APPLYGATE_UNPLANNED_APPLY
+              value: {{ .Values.planBinding.unplannedApply | quote }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics gate (chart values: metrics.enabled — additive, OFF by
+            # default so the default render stays byte-identical to the Wave-0
+            # baseline). The server serves /metrics on this same container
+            # port; prometheus-client is import-guarded inside the image.
+            - name: APPLYGATE_METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+            {{- end }}
             # Read-only web console gate (chart values: webui.enabled). The
             # console exposes NO apply/delete endpoints — mutations stay
             # behind the MCP tools' confirm flags.
             - name: APPLYGATE_WEBUI_ENABLED
               value: {{ .Values.webui.enabled | quote }}
+            # API keys for /mcp — always from an operator-created Secret
+            # (existingSecret-only, the K8S-MCP invariant): the chart never
+            # creates or inlines a key, and the pod fails loud
+            # (CreateContainerConfigError) until the Secret exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: APPLYGATE_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             # HPE corporate proxy env — wired ONLY when hpe_proxies=true. The
             # Kubernetes API is in-cluster and covered by the NO_PROXY
@@ -124,6 +163,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Values.deployment.appName }}
+  annotations:
+    # The audit trail is the product: never let a release lifecycle destroy it.
+    # helm uninstall keeps this PVC; delete it explicitly when truly intended.
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     {{- toYaml .Values.persistence.accessModes | nindent 4 }}

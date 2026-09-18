@@ -52,15 +52,39 @@ spec:
             - name: MCP_HOSTNAME
               value: {{ .Values.ezua.virtualService.endpoint | quote }}
             {{- end }}
+            {{- with .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist additions
+            # (matched verbatim or as `host:*` by the SDK's transport security).
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if not .Values.console.enabled }}
             - name: K8S_MCP_CONSOLE_ENABLED
               value: "false"
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # Opt-in observability: GET /metrics (counters only; nothing
+            # cluster-derived) + the ServiceMonitor template.
+            - name: K8S_MCP_METRICS_ENABLED
+              value: "true"
             {{- end }}
             {{- /* knobs — values-driven; still kubectl-changeable */}}
             - name: K8S_MCP_ALLOWED_NAMESPACES
               value: {{ .Values.namespaces.allowed | quote }}
             - name: K8S_MCP_BLOCKED_NAMESPACES
               value: {{ .Values.namespaces.blocked | quote }}
+            {{- if .Values.listing.maxItems }}
+            # Cluster-wide list cap (server default 500 when unset; a
+            # truncation marker naming the env appears when the cap bites).
+            - name: K8S_MCP_MAX_LIST_ITEMS
+              value: {{ .Values.listing.maxItems | quote }}
+            {{- end }}
+            {{- if .Values.listing.concurrency }}
+            # Per-namespace fan-out width for rewritten -A queries (server
+            # default 8 when unset).
+            - name: K8S_MCP_LIST_CONCURRENCY
+              value: {{ .Values.listing.concurrency | quote }}
+            {{- end }}
             {{- if .Values.clients.existingSecret }}
             - name: K8S_MCP_CLIENTS
               valueFrom:

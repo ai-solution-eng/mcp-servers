@@ -20,7 +20,6 @@ import pytest
 import server
 import webui
 
-
 # ---------------------------------------------------------------------------
 # Fixtures & fakes (same shape as tests/test_logsearch.py)
 # ---------------------------------------------------------------------------
@@ -29,10 +28,19 @@ import webui
 @pytest.fixture(autouse=True)
 def clean_policy_env(monkeypatch):
     """Start every test from a clean LOGSEARCH_* environment so a developer's
-    shell can never leak policy/caps/UI gating into these results."""
+    shell can never leak policy/caps/UI gating into these results.
+
+    The D8 escape hatch is SET here (empty allowlist = open) because the
+    behavioral tests below address pods in a plain 'ns' namespace and are not
+    about the policy; the deny-on-empty default has its own tests in
+    tests/test_hardening.py."""
     for name in (
         server.ENV_ALLOWED,
         server.ENV_BLOCKED,
+        server.ENV_EMPTY_ALLOWS_ALL,
+        server.ENV_MAX_LINE_CHARS,
+        server.ENV_FETCH_CONCURRENCY,
+        server.ENV_MAX_REGEX_CHARS,
         server.ENV_WEBUI_ENABLED,
         "LOGSEARCH_MAX_PODS",
         "LOGSEARCH_MAX_LINES_PER_POD",
@@ -40,6 +48,7 @@ def clean_policy_env(monkeypatch):
         "LOGSEARCH_UI_HTML",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(server.ENV_EMPTY_ALLOWS_ALL, "1")
 
 
 def make_pod(name, containers=("main",), restarts=0, started="2026-09-08T00:00:00Z"):
@@ -64,8 +73,13 @@ class FakeK8s:
             return [dict(p) for p in k8s.pods]
 
         def fake_read_log(
-            namespace, pod, container, tail_lines, since_seconds=None,
-            timestamps=True, previous=False,
+            namespace,
+            pod,
+            container,
+            tail_lines,
+            since_seconds=None,
+            timestamps=True,
+            previous=False,
         ):
             k8s.read_calls.append(
                 {
@@ -211,8 +225,7 @@ def test_status_reflects_env_policy(monkeypatch):
 def test_sources_lists_pods_containers_restarts_age(monkeypatch):
     k8s = FakeK8s(
         [
-            make_pod("b-pod", containers=("api", "sidecar"), restarts=3,
-                     started="2026-09-07T00:00:00Z"),
+            make_pod("b-pod", containers=("api", "sidecar"), restarts=3, started="2026-09-07T00:00:00Z"),
             make_pod("a-pod", containers=("worker",)),
         ],
         {},
@@ -254,10 +267,7 @@ def test_search_matches_tool_payload_parity(monkeypatch):
     k8s = FakeK8s(
         [make_pod("api-a", ("api",)), make_pod("api-b", ("worker",))],
         {
-            ("api-a", "api"): (
-                "2026-09-08T00:00:10Z ERROR late\n"
-                "2026-09-08T00:00:01Z ERROR early\n"
-            ),
+            ("api-a", "api"): ("2026-09-08T00:00:10Z ERROR late\n2026-09-08T00:00:01Z ERROR early\n"),
             ("api-b", "worker"): "2026-09-08T00:00:05Z ERROR middle\n",
         },
     )
@@ -271,12 +281,14 @@ def test_search_matches_tool_payload_parity(monkeypatch):
     assert data["matches"][0].startswith("api-a/api: ")
     assert data["matches"][1].startswith("api-b/worker: ")
     assert [m.split("Z ", 1)[1] for m in data["matches"]] == [
-        "ERROR early", "ERROR middle", "ERROR late",
+        "ERROR early",
+        "ERROR middle",
+        "ERROR late",
     ]
     assert data["truncated"] is False
 
 
-def test_search_truncation_flag_and_most_recent_kept(monkeypatch):
+def test_search_budget_stop_flag_and_early_exit(monkeypatch):
     k8s = FakeK8s(
         [make_pod("p")],
         {("p", "main"): "".join(f"2026-09-08T00:00:0{i}Z hit {i}\n" for i in range(1, 6))},
@@ -284,8 +296,10 @@ def test_search_truncation_flag_and_most_recent_kept(monkeypatch):
     k8s.install(monkeypatch)
     data = json.loads(post(routes(), "/api/search", {"namespace": "ns", "pattern": "hit", "max_total_lines": 3}).body)
     assert data["truncated"] is True and data["match_count"] == 3
-    assert "hit 1" not in " ".join(data["matches"])
-    assert "hit 5" in data["matches"][-1]
+    # Early budget enforcement (Wave-1): the first matches in pod order are
+    # kept, the rest of the pod is not pulled.
+    assert "hit 5" not in " ".join(data["matches"])
+    assert data["pods_skipped_budget"] == 1
 
 
 def test_search_passthrough_toggles(monkeypatch):
@@ -294,11 +308,17 @@ def test_search_passthrough_toggles(monkeypatch):
         {("p", "main"): "2026-09-08T00:00:01Z ERROR upper\n2026-09-08T00:00:02Z error lower\n"},
     )
     k8s.install(monkeypatch)
-    ins = json.loads(post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "case_insensitive": True}).body)
-    sens = json.loads(post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "case_insensitive": False}).body)
+    ins = json.loads(
+        post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "case_insensitive": True}).body
+    )
+    sens = json.loads(
+        post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "case_insensitive": False}).body
+    )
     assert ins["match_count"] == 2
     assert sens["match_count"] == 1
-    since = json.loads(post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "since_minutes": 2.5}).body)
+    since = json.loads(
+        post(routes(), "/api/search", {"namespace": "ns", "pattern": "error", "since_minutes": 2.5}).body
+    )
     assert since["match_count"] == 2
     assert k8s.read_calls[-1]["since_seconds"] == 150  # same conversion as the tool
 
@@ -384,10 +404,7 @@ def test_count_ranking_descending(monkeypatch):
                 "2026-09-08T00:00:05Z ERROR d\n"
                 "2026-09-08T00:00:06Z ERROR e\n"
             ),
-            ("quiet", "main"): (
-                "2026-09-08T00:00:01Z error a\n"
-                "2026-09-08T00:00:02Z error b\n"
-            ),
+            ("quiet", "main"): ("2026-09-08T00:00:01Z error a\n2026-09-08T00:00:02Z error b\n"),
             ("silent", "main"): "2026-09-08T00:00:01Z all good\n",
         },
     )
@@ -439,8 +456,16 @@ def test_webui_disabled_removes_ui_routes_but_keeps_mcp(monkeypatch):
 
 def test_webui_gate_truthiness_matrix(monkeypatch):
     for raw, expected in (
-        ("", True), ("true", True), ("1", True), ("YES", True), ("on", True),
-        ("false", False), ("0", False), ("no", False), ("off", False), ("junk", True),
+        ("", True),
+        ("true", True),
+        ("1", True),
+        ("YES", True),
+        ("on", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("junk", True),
     ):
         monkeypatch.setenv(server.ENV_WEBUI_ENABLED, raw)
         assert server._webui_enabled() is expected, raw

@@ -10,10 +10,12 @@ once into ``cache_dir`` and every later read of the same bytes is local.
 It is implemented as a ``pa.fs.PyFileSystem`` handler (a thin Python
 ``FileSystemHandler`` delegating to the real filesystem), so it needs NO
 new dependencies and works uniformly across every backend that builds
-datasets through a pyarrow filesystem. Delta tables read through delta-rs
-(``DeltaTable.to_pyarrow_dataset()``) do their own IO inside the Delta
-reader and cannot be wrapped here — those keep their existing
-dataset-handle + snapshot-version caching.
+datasets through a pyarrow filesystem. Delta-rs datasets are wrapped too:
+``OneLakeProvider.open_dataset`` rebuilds the exact ``DeltaStorageHandler``
+``DeltaTable.to_pyarrow_dataset()`` would build internally and hands the
+cache-wrapped filesystem to delta-rs, so repeated Delta scans hit the cache
+instead of re-reading object-store bytes (the NFS/`file` backend's delta
+tables keep delta-rs's internal reader — local disk is the page cache's job).
 
 Opt-in by design: ``SQLHANDLER_BLOCK_CACHE=1``. Off by default because a
 cold BIG sequential scan pays a small Python-layer cost per block, while
@@ -24,6 +26,11 @@ Correctness notes:
 
 * Cache freshness is keyed by (path, file size): an in-place file rewrite
   produces a different key, so stale blocks are never served.
+* Callers can scope keys further with ``scope`` (the OneLake delta path
+  scopes by Delta snapshot version — mirroring the result cache's
+  base-snapshot keying — so a re-open at a different snapshot, ETL commit
+  or time travel, can never serve another snapshot's cached bytes even if
+  a backend rewrote a path in place).
 * Blocks publish with temp-file + atomic rename — concurrent readers
   (DuckDB threads) never observe partial blocks.
 * Every failure in this layer degrades to the plain filesystem: the cache
@@ -66,12 +73,28 @@ def _cfg() -> dict:
     }
 
 
+def block_cache_enabled() -> bool:
+    """Whether the disk block cache is opted in (``SQLHANDLER_BLOCK_CACHE``).
+
+    Lets providers decide BETWEEN build paths — e.g. the OneLake delta
+    reader keeps delta-rs's built-in IO when the cache is off (byte-identical
+    to the unwrapped behavior) and only wires the cache in when it will
+    actually cache.
+    """
+    return _cfg()["enabled"]
+
+
 class _BlockCacheHandler(pafs.FileSystemHandler):
     """A read-only ``FileSystemHandler`` adding a disk block cache."""
 
-    def __init__(self, base: pafs.FileSystem, cfg: dict):
+    def __init__(self, base: pafs.FileSystem, cfg: dict, scope: str = "", sizes: dict[str, int] | None = None):
         self._base = base
         self._cfg = cfg
+        self._scope = scope or ""
+        # Known file sizes from the caller (e.g. the delta log's add-action
+        # stats): skips one stat round-trip per file per open and lets the
+        # cache engage even when the base filesystem cannot stat a path.
+        self._sizes = dict(sizes) if sizes else None
         self._lock = threading.Lock()
         self._bytes_written = 0
 
@@ -82,10 +105,11 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
             isinstance(other, _BlockCacheHandler)
             and self._base == other._base
             and self._cfg["dir"] == other._cfg["dir"]
+            and self._scope == other._scope
         )
 
     def __hash__(self) -> int:  # keep the wrapper usable as a dict key
-        return hash((type(self).__name__, str(self._base), self._cfg["dir"]))
+        return hash((type(self).__name__, str(self._base), self._cfg["dir"], self._scope))
 
     # -- the two hot paths ----------------------------------------------------
 
@@ -95,19 +119,25 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
     def open_input_stream(self, path: str):
         return pa.PythonFile(self._cached_file(path), mode="rb")
 
-    def _cached_file(self, path: str) -> _CachedStream:
+    def _cached_file(self, path: str) -> _RawStream | _CachedStream:
         path = str(path)
         npath = self.normalize_path(path)
-        info = self._base.get_file_info(npath)
-        if not info or info.size < 0:
+        size = self._sizes.get(npath) if self._sizes else None
+        if size is None:
+            info = self._base.get_file_info(npath)
+            # FileInfo.size is -1 (or None, on some handler-backed fs) when
+            # the path cannot be statted.
+            size = info.size if (info and info.size is not None) else -1
+        if size < 0:
             # directories / unstatable paths: serve the raw stream unwrapped
             return _RawStream(self._open_sequential(npath))
         return _CachedStream(
             lambda: self._open_random(npath),  # opened lazily: a fully-warm
             path=npath,  # read never touches the base
-            size=info.size,
+            size=size,
             cfg=self._cfg,
             on_bytes=self._account,
+            scope=self._scope,
         )
 
     def _open_random(self, path: str):
@@ -154,7 +184,15 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
         return [self._base.get_file_info(str(paths))]
 
     def get_file_info_selector(self, selector: pafs.FileSelector):
-        return self._base.get_file_info_selector(selector)
+        # pyarrow >= 21 folded the selector-aware listing into
+        # ``get_file_info(paths_or_selector)`` and REMOVED the dedicated
+        # ``get_file_info_selector`` — calling it raises AttributeError
+        # inside the C++ discovery callback and every cached dataset open
+        # fails (misreported downstream as "table does not exist"). Both
+        # shapes return a list of FileInfo; support either generation.
+        if hasattr(self._base, "get_file_info_selector"):
+            return self._base.get_file_info_selector(selector)
+        return self._base.get_file_info(selector)
 
     def normalize_path(self, path: str) -> str:
         return self._base.normalize_path(str(path))
@@ -219,7 +257,7 @@ class _CachedStream:
     read of N contiguous blocks is N sequential reads (no re-seeks).
     """
 
-    def __init__(self, opener, path: str, size: int, cfg: dict, on_bytes):
+    def __init__(self, opener, path: str, size: int, cfg: dict, on_bytes, scope: str = ""):
         self._opener = opener  # base stream is opened LAZILY on first miss —
         self._s = None  # a fully-warm read never touches the network
         self._path = path
@@ -228,7 +266,13 @@ class _CachedStream:
         self._on_bytes = on_bytes
         self._pos = 0
         self._closed = False
-        key = hashlib.sha256(path.encode()).hexdigest()[:24]
+        # Optional snapshot scope: keys are scoped (never aliased) across
+        # scopes, while the empty scope keeps the historical derivation so
+        # existing cache directories stay warm across upgrades.
+        if scope:
+            key = hashlib.sha256(f"{scope}\x00{path}".encode()).hexdigest()[:24]
+        else:
+            key = hashlib.sha256(path.encode()).hexdigest()[:24]
         self._dir = Path(cfg["dir"]) / f"{key}-{size}"
         self._bs = cfg["block_size"]
 
@@ -335,7 +379,12 @@ class _CachedStream:
         self.close()
 
 
-def maybe_block_cache(fs: pafs.FileSystem, purpose: str = "") -> pafs.FileSystem:
+def maybe_block_cache(
+    fs: pafs.FileSystem,
+    purpose: str = "",
+    scope: str = "",
+    sizes: dict[str, int] | None = None,
+) -> pafs.FileSystem:
     """Wrap ``fs`` in the disk block cache when enabled; never fails.
 
     Disabled by default (``SQLHANDLER_BLOCK_CACHE=1`` opts in). Pure-local
@@ -344,6 +393,12 @@ def maybe_block_cache(fs: pafs.FileSystem, purpose: str = "") -> pafs.FileSystem
     while being network: ``SQLHANDLER_BLOCK_CACHE_INCLUDE_LOCAL=1`` opts
     them in. Any error constructing the wrapper logs a warning and returns
     the original filesystem, so the data path can never break from here.
+
+    ``scope`` namespaces the cache keys (e.g. a Delta snapshot version, so
+    two snapshots of the same table never share blocks); ``sizes`` supplies
+    known file sizes (e.g. from the delta log) so cacheable paths skip a
+    stat round-trip and unknown-size paths are the only ones left to the
+    stat fallback.
     """
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -351,7 +406,7 @@ def maybe_block_cache(fs: pafs.FileSystem, purpose: str = "") -> pafs.FileSystem
     if isinstance(fs, pafs.LocalFileSystem) and not cfg["include_local"]:
         return fs
     try:
-        wrapped = pafs.PyFileSystem(_BlockCacheHandler(fs, cfg))
+        wrapped = pafs.PyFileSystem(_BlockCacheHandler(fs, cfg, scope=scope, sizes=sizes))
         logger.debug("block cache enabled for %s", purpose or type(fs).__name__)
         return wrapped
     except Exception:

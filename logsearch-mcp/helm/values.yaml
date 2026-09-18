@@ -17,7 +17,7 @@ deployment:
 # -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.1.4
+  tag: v0.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -29,29 +29,115 @@ imagePullSecrets: []
 # (tokens in stack traces, PII, internal hostnames). The namespace policy is
 # the control that bounds what an agent harness can reach.
 #
-#   allowedNamespaces: comma-separated fnmatch globs. EMPTY STRING = ALL
-#   namespaces allowed. Set it EXPLICITLY for anything beyond a lab cluster:
+# DEFAULT-DENY (fleet decision D8, 2026-09): an EMPTY allowedNamespaces denies
+# ALL namespaces — an unconfigured release answers nothing instead of
+# everything. Point it at an explicit allowlist (recommended), or set
+# emptyAllowsAll: true to restore the pre-D8 open default on a trusted lab
+# cluster.
+#
+#   allowedNamespaces: comma-separated fnmatch globs. EMPTY = DENY ALL unless
+#   emptyAllowsAll: true. Set it EXPLICITLY for anything beyond a lab cluster:
 #     "team-a,team-b-*"
 #   blockedNamespaces: comma-separated fnmatch globs; ALWAYS wins over the
 #   allowed list — use it to punch holes back out ("*", except "kube-*"):
 #     "kube-system,kube-public,kube-node-lease"
+#   emptyAllowsAll: the LOGSEARCH_EMPTY_ALLOWS_ALL escape hatch. false (the
+#   default) keeps the server closed on an empty allowlist; true re-opens it.
 logsearch:
-  allowedNamespaces: ""     # "" = ALL namespaces allowed — tighten for prod!
+  allowedNamespaces: ""     # "" = DENY ALL (D8) — set globs, or emptyAllowsAll: true
   blockedNamespaces: ""     # e.g. "kube-system,kube-public,kube-node-lease"
-
-# -- Caps (blast-radius limits for agent harnesses) -----------------------------
-# A fan-out search touches up to maxPods pods, tailing maxLinesPerPod lines
-# each, and returns at most maxTotalLines merged matches. These bound both
-# API-server load and the MCP response size (an agent's context window).
+  emptyAllowsAll: false     # true = pre-D8 open default (trusted lab clusters only)
+  # Caps (blast-radius limits for agent harnesses):
+  # A fan-out search touches up to maxPods pods, tailing maxLinesPerPod lines
+  # each, and stops FETCHING as soon as maxTotalLines merged matches are in
+  # hand (the budget is enforced during the fan-out, not after a full fetch;
+  # what was skipped is reported in the response). Every returned line is
+  # additionally capped at maxLineChars characters with an explicit
+  # "...[truncated N chars]" marker, and user regexes are screened for
+  # catastrophic backtracking and refused above maxRegexChars characters (see
+  # README "Regex safety"). fetchConcurrency is the width of the parallel
+  # pod-fetch fan-out (asyncio.gather under a bounded semaphore; 1 = sequential).
+  # NOTE: these keys sat accidentally indented under `apiKey:` before Wave 1,
+  # which rendered the three pre-existing cap env vars EMPTY (the server
+  # silently ran on its built-in defaults, which matched these numbers). Wave 1
+  # moved them under `logsearch:`; the rendered env now matches exactly.
   maxPods: 50
   maxLinesPerPod: 1000
   maxTotalLines: 300
+  maxLineChars: 2000
+  fetchConcurrency: 8
+  maxRegexChars: 512
+  # -- export_matches destination (Wave-5 F3, ADDITIVE, DEFAULT OFF) ------------
+  # The export_matches MCP tool writes matched search lines to
+  # <exportRoot>/<dest_name> so a result set too big for a context window can
+  # be read back from disk. DEFAULT "" renders NO env var at all → the tool
+  # refuses with setup instructions and writes nothing (byte-identical default
+  # server). Set it to an ABSOLUTE directory on a writable volume agents can
+  # read back — fleet convention: a path on the workbench/shared PVC (e.g.
+  # /data/exports, plus workbench's WORKBENCH_SHARED_PATHS=/data/exports) so
+  # any workbench workspace can read exports. dest_name is validated to a
+  # bare file name (no separators/'..'), writes are bounded by the same caps
+  # as search_logs, and the file carries a small #-prefixed header.
+  exportRoot: ""
+
+# -- API keys (MANDATORY — fleet decision 2026-09, fleet pattern: K8S-MCP) -----
+# /mcp requires a key; pod logs routinely contain sensitive strings, so the
+# endpoint must never trust network position alone. The chart NEVER creates a
+# key and NEVER inlines one in values — an envsubst apply once emptied a live
+# key Secret (the K8S-MCP lesson). The deployment references an
+# operator-created Secret and fails loud (CreateContainerConfigError) until
+# it exists:
+#   kubectl -n <ns> create secret generic logsearch-mcp-apikey \
+#     --from-literal=api-keys='key-old,key-new'
+# Comma-SEPARATED keys all authenticate: that is the rotation mechanism —
+# append the new key, move clients over, drop the old one, no downtime. The
+# UNIVERSAL MCP_API_KEYS env is honored too (either var authenticates).
+apiKey:
+  existingSecret: logsearch-mcp-apikey
+  existingSecretKey: api-keys
 
 # -- Service exposure ---------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9101
   targetPort: 9101
+
+# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+# Prometheus self-metrics on the MCP container: ONE counter family,
+# logsearch_mcp_tool_requests_total{tool,outcome} — per-tool request counts
+# with outcome ok|error (which tools agents call, how often, how often they
+# fail — namespace-policy denials surface as errors). No namespace names, pod
+# names, regex patterns, or log content are ever exported. DEFAULT false: the
+# chart renders NOTHING extra (no env, no ServiceMonitor) and the server
+# serves no /metrics route — the default render is byte-identical to the
+# pre-metrics baseline. Flip to true per site values to enable; /metrics is
+# then served key-free (like the probes) on the same port so the
+# ServiceMonitor can scrape it.
+metrics:
+  enabled: false
+  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
+  serviceMonitor: true
+  # Scrape interval rendered into the ServiceMonitor.
+  interval: 30s
+
+# -- Fleet audit-JSONL searchability convention (Wave-3 C3, documentation only) -----
+# THIS server writes no audit JSONL of its own (read-only search surface) —
+# it is the SEARCH side of the fleet convention: audit-writing servers expose
+# their JSONL trail so logsearch can search it. Workbench writes
+# <root>/.audit.jsonl (see the workbench-mcp chart values, "Fleet audit-JSONL
+# searchability convention"); applygate's side of the convention is owned by
+# the applygate chart/agent. FLEET CONVENTION (fleet-audit item 11, plan
+# §7 C3): an audit trail nobody can search is unauditable in practice —
+# operators mount/expose an audit JSONL as pod logs (e.g. a log-tailing
+# sidecar shipping the file to a pod's stdout), keep that namespace inside
+# this chart's `logsearch.allowedNamespaces` policy, and search_logs /
+# count_matches over that namespace then make the trail queryable.
+# Documentation-only (NO behavior change): nothing in this chart renders from
+# an audit.* key — an unconsumed key would be dead config, the exact
+# anti-pattern the fleet audit flags.
+#
+#   audit:
+#     searchableVia: allowedNamespaces   # namespace(s) carrying exposed audit logs
 
 # -- Web console (fleet pattern: prometheus-mcp's webui) --------------------------------------------
 # The HPE-branded log-search console at / and the /api/* JSON endpoints are a
@@ -78,11 +164,20 @@ securityContext:
   runAsUser: 10001
 
 # -- RBAC --------------------------------------------------------------------------------------
-# READ-ONLY, deliberately minimal: pods get/list + pods/log get, in the
-# release namespace ONLY. No secrets, no exec, no write verbs, no cluster
-# scope — see templates/rbac.yaml. Set false to skip creation entirely.
+# READ-ONLY, deliberately minimal: pods get/list + pods/log get — nothing
+# else (no secrets, no exec, no write verbs — see templates/rbac.yaml).
+#   create: false skips RBAC creation entirely (SA falls back to default).
+#   clusterWide: false (default) keeps the rules in the RELEASE namespace
+#     only — blast radius exactly one namespace.
+#   clusterWide: true renders the SAME two rules as a ClusterRole +
+#     ClusterRoleBinding: the SA reads pods/logs cluster-wide. Lab/trusted
+#     clusters only, and keep the namespace policy deliberate — RBAC bounds
+#     what the SA can read, the policy bounds what agents may ask for
+#     (cluster-wide inherently includes kube-system; use
+#     logsearch.blockedNamespaces "kube-*" to hide system logs from agents).
 rbac:
   create: true
+  clusterWide: false
 
 # -- HPE corporate proxy (fleet convention: searxng-mcp) -----------------------------------------
 # Route outbound HTTP(S) traffic through the HPE corporate proxy. Default

@@ -6,8 +6,8 @@ description: >-
   DuckDuckGo MCP Server — metasearch via ddgs (9 engines) + content
   fetcher, exposed over MCP behind the PCAI Istio gateway.
 type: application
-version: 1.0.0
-appVersion: "v1.0"
+version: 1.0.1
+appVersion: "v1.0.1"
 keywords:
   - mcp
   - search

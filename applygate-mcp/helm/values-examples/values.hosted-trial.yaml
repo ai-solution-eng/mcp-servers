@@ -48,7 +48,22 @@ kinds:
 
 # -- Audit ------------------------------------------------------------------------------------
 audit:
+  # Hash-chained, caller-attributed JSONL audit trail (README: "Audit
+  # trail: hash chain + caller identity"). Tamper-evident: each entry
+  # carries prev_sha256. Fleet convention: this audit.path is documented
+  # for ops mount/expose — mount THIS SAME path/PVC into the logsearch pod
+  # so the governed write path's "who did what" becomes searchable.
   file: /data/audit.jsonl
+planBinding:
+  # D11 (ratified 2026-09): apply_manifest is sha256-bound to the planned
+  # bytes; missing plan/tampered bytes refuse BY DEFAULT (server default
+  # deny). Migration path for automation that predates the binding:
+  unplannedApply: ''          # deny (default) | warn (logged) | allow (pre-D11)
+metrics:
+  # /metrics + ServiceMonitor — additive, OFF by default (default render
+  # byte-identical to the Wave-0 baseline); requires prometheus-operator CRDs.
+  enabled: false
+  interval: 30s
 
 # -- Persistence ------------------------------------------------------------------------------
 persistence:
@@ -104,7 +119,7 @@ rbac:
 # -- HPE corporate proxy --------------------------------------------------------------------------
 # Off unless the trial cluster sits behind the HPE proxy (the k8s API is
 # in-cluster and covered by the NO_PROXY entries either way).
-hpe_proxies: false
+hpe_proxies: true
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -114,7 +129,7 @@ proxy:
 # -- Kyverno vendor-label policy ------------------------------------------------------------------
 # Enable only where the trial platform enforces the hpe-ezua/* vendor labels.
 kyverno:
-  enabled: false
+  enabled: true
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration ---------------------------------------------
 # SITE: gateway exposure — applygate-mcp is a WRITE-path MCP; expose it only
@@ -128,3 +143,8 @@ ezua:
     endpoint: applygate-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 120s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"

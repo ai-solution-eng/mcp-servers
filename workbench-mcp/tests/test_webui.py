@@ -7,7 +7,6 @@ caps, argv allowlist, confirm gates, audit) still applies through the UI.
 Follows the prometheus-mcp tests/test_webui.py pattern.
 """
 
-import json
 import re
 
 import pytest
@@ -52,7 +51,7 @@ def test_ui_serves_hpe_branding_and_tabs(client):
     # the trust-model banner is visible and says the load-bearing part
     assert "Scratch pad by design" in html
     assert "allow-listed commands" in html
-    assert "gateway authn" in html
+    assert "API-key gated" in html  # fleet-audit P0: key gate replaced the gateway-only wording
     assert client.get("/ui").status_code == 200
     assert client.get("/ui").text == html
 
@@ -118,8 +117,10 @@ def test_workspace_create_list_delete_via_api(client):
 
 
 def test_workspaces_bad_body(client):
-    assert client.post("/api/workspaces", content=b"not json",
-                       headers={"Content-Type": "application/json"}).status_code == 400
+    assert (
+        client.post("/api/workspaces", content=b"not json", headers={"Content-Type": "application/json"}).status_code
+        == 400
+    )
     # null/missing name -> empty string -> core regex refusal
     assert client.post("/api/workspaces", json={"name": None}).status_code == 400
     assert client.post("/api/workspaces", json={}).status_code == 400
@@ -265,8 +266,9 @@ def test_run_via_api_workspace_env_overrides_passthrough(client, monkeypatch):
     monkeypatch.setenv("HTTP_PROXY", "http://from-pod:8080")
     client.post("/api/workspaces", json={"name": "ws"})
     client.post(ws_url("ws", "/env"), json={"key": "HTTP_PROXY", "value": "http://from-workspace:8080"})
-    r = client.post(ws_url("ws", "/run"),
-                    json={"command": ["python3", "-c", "import os; print(os.environ['HTTP_PROXY'])"]})
+    r = client.post(
+        ws_url("ws", "/run"), json={"command": ["python3", "-c", "import os; print(os.environ['HTTP_PROXY'])"]}
+    )
     assert r.json()["stdout"].strip() == "http://from-workspace:8080"
 
 
@@ -314,8 +316,7 @@ def test_audit_tail_skips_torn_lines(client, root):
 def test_server_mounts_ui_routes():
     app = server._build_http_app()
     paths = {getattr(r, "path", None) for r in app.routes}
-    assert {"/", "/ui", "/api/status", "/api/workspaces", "/api/audit",
-            "/health", "/healthz", "/mcp"} <= paths
+    assert {"/", "/ui", "/api/status", "/api/workspaces", "/api/audit", "/health", "/healthz", "/mcp"} <= paths
 
 
 def test_ui_disabled_removes_ui_routes_but_mcp_keeps_working(monkeypatch, root):

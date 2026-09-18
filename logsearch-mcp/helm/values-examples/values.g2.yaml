@@ -29,24 +29,35 @@ imagePullSecrets: []
 # READ-ONLY by design, but pod logs routinely contain sensitive strings
 # (tokens in stack traces, PII, internal hostnames). The namespace policy is
 # the control that bounds what an agent harness can reach.
-#   allowedNamespaces: comma-separated fnmatch globs. EMPTY STRING = ALL
-#   namespaces allowed. Set it EXPLICITLY for anything beyond a lab cluster.
+#   allowedNamespaces: comma-separated fnmatch globs. EMPTY = DENY ALL
+#   namespaces (default-deny, fleet decision D8) unless emptyAllowsAll: true.
+#   Set it EXPLICITLY for anything beyond a lab cluster.
 #   blockedNamespaces: ALWAYS wins over the allowed list.
 logsearch:
-  # SITE: policy kept at the chart default on this lab cluster — empty
-  # allowlist = ALL namespaces readable (read-only server). Tighten for prod:
+  # SITE: the chart default is now deny-all (D8); this lab cluster keeps the
+  # pre-D8 open default via the explicit escape hatch below. Tighten for prod:
+  #   emptyAllowsAll: false
   #   allowedNamespaces: "team-a,team-b-*"
   allowedNamespaces: ""
   # SITE: punch holes back out of a broad allow-list here
   blockedNamespaces: ""
+  # SITE (lab): pre-D8 open default, set EXPLICITLY — remove for prod
+  emptyAllowsAll: true
+  exportRoot: ""            # default: export_matches refuses with setup instructions;
+                            # convention: point at a workbench-shared dir (see DEPLOYMENT.md)
 
 # -- Caps (blast-radius limits for agent harnesses) -----------------------------
 # A fan-out search touches up to maxPods pods, tailing maxLinesPerPod lines
-# each, and returns at most maxTotalLines merged matches. These bound both
-# API-server load and the MCP response size (an agent's context window).
+# each, and stops FETCHING once maxTotalLines merged matches are in hand
+# (budget enforced during the fan-out). Returned lines are capped at
+# maxLineChars chars with a truncation marker; user regexes are ReDoS-screened
+# above maxRegexChars chars; fetchConcurrency is the parallel fan-out width.
   maxPods: 50
   maxLinesPerPod: 1000
   maxTotalLines: 300
+  maxLineChars: 2000
+  fetchConcurrency: 8
+  maxRegexChars: 512
 
 # -- Service exposure ---------------------------------------------------------------------
 service:
@@ -76,18 +87,21 @@ securityContext:
   runAsUser: 10001
 
 # -- RBAC --------------------------------------------------------------------------------------
-# READ-ONLY, deliberately minimal: pods get/list + pods/log get, in the
-# release namespace ONLY (cross-namespace reads need a one-time admin-applied
-# bootstrap — see documentation/DEPLOYMENT.md). No secrets, no exec, no write
-# verbs, no cluster scope.
+# READ-ONLY, deliberately minimal: pods get/list + pods/log get — nothing
+# else (no secrets, no exec, no write verbs — see templates/rbac.yaml).
+#   clusterWide: false (chart default) = release namespace ONLY (a one-time
+#     admin bootstrap is the alternative for targeted cross-namespace grants
+#     — see documentation/DEPLOYMENT.md).
+# SITE (G2 lab): cluster-wide reads via the opt-in knob below.
 rbac:
   create: true
+  clusterWide: true
 
 # -- HPE corporate proxy (fleet convention: searxng-mcp) -----------------------------------------
 # The only network peer is the IN-CLUSTER Kubernetes API, covered by the
 # NO_PROXY cluster-local entries — the proxy env is effectively inert here;
 # it exists for fleet consistency and any future egress need.
-hpe_proxies: false
+hpe_proxies: true
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -110,3 +124,14 @@ ezua:
     endpoint: logsearch-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true
+  interval: 30s             # ServiceMonitor scrape interval (chart default, now explicit)
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor

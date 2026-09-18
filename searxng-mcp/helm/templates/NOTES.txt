@@ -1,0 +1,31 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret -}}
+
+searxng-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+════════════════════════════════════════════════════════════════════
+1. API key — OPTIONAL (auth is OFF until you enable it).
+   By default /mcp runs OPEN (the chart wires no key env) and relies on
+   the gateway / network position. The fetch tools can reach in-cluster
+   URLs, so enabling the key gate is RECOMMENDED for anything beyond a
+   lab. To enable — the chart NEVER inlines a key in values:
+
+  kubectl -n {{ $ns }} create secret generic searxng-mcp-apikey \
+    --from-literal="api-keys=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  helm upgrade <release> . -n {{ $ns }} --reuse-values \
+    --set apiKey.existingSecret=searxng-mcp-apikey
+
+   ROTATION (zero downtime once enabled): the value is a
+   COMMA-SEPARATED list of valid keys — append the new one, move
+   clients over, drop the old. The server re-reads the env per request
+   — no restart needed. The fleet-universal MCP_API_KEYS env is honored
+   too (either var works).
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints:
+  MCP : http://localhost:8000/mcp   (X-API-Key: <api-key> — only when enabled)
+  Test: curl -s localhost:8000/healthz
+  MCP client config (when enabled):
+  { "mcpServers": { "searxng": { "type": "remote", "url": "http://<host>/mcp", "headers": { "X-API-Key": "<api-key>" } } } }

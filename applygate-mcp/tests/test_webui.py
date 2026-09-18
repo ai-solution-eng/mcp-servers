@@ -32,7 +32,6 @@ from starlette.testclient import TestClient
 import server
 import webui
 
-
 # ---------------------------------------------------------------------------
 # Fixtures / helpers (same conventions as tests/test_applygate.py)
 # ---------------------------------------------------------------------------
@@ -418,11 +417,16 @@ def test_audit_endpoint_missing_file_is_an_empty_trail_not_an_error(monkeypatch,
 
 def test_audit_endpoint_skips_malformed_lines(monkeypatch, tmp_path):
     p = tmp_path / "audit.jsonl"
-    good = {"ts": "2026-01-01T00:00:00Z", "tool": "plan_apply", "namespace": "team-a",
-            "kind": "ConfigMap", "name": "x", "dry_run": True, "outcome": "dry-run"}
-    p.write_text(
-        json.dumps(good) + "\nnot json at all\n" + json.dumps({"not": "an audit entry shape"}) + "\n"
-    )
+    good = {
+        "ts": "2026-01-01T00:00:00Z",
+        "tool": "plan_apply",
+        "namespace": "team-a",
+        "kind": "ConfigMap",
+        "name": "x",
+        "dry_run": True,
+        "outcome": "dry-run",
+    }
+    p.write_text(json.dumps(good) + "\nnot json at all\n" + json.dumps({"not": "an audit entry shape"}) + "\n")
     c = make_client()
     data = c.get("/api/audit").json()
     # the unparseable line AND the wrong-shape dict both count as malformed —
@@ -489,8 +493,16 @@ def test_server_mounts_ui_routes_by_default():
     app = server._build_http_app()
     paths = {getattr(r, "path", None) for r in app.routes}
     assert {
-        "/", "/ui", "/api/status", "/api/policy", "/api/plan",
-        "/api/resource_status", "/api/audit", "/health", "/healthz", "/mcp",
+        "/",
+        "/ui",
+        "/api/status",
+        "/api/policy",
+        "/api/plan",
+        "/api/resource_status",
+        "/api/audit",
+        "/health",
+        "/healthz",
+        "/mcp",
     } <= paths
 
 

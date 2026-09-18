@@ -2,3 +2,4 @@
 # data files — the Docker image copies ui/ explicitly and webui.py has a
 # /app/ui fallback, so this only matters for source installs).
 include ui/index.html
+include saved_queries.py

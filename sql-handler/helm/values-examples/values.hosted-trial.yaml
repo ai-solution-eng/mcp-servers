@@ -121,8 +121,9 @@ backend: s3
 sources: []
 
 # -- External databases (read-only attach) ------------------------------------
-# Postgres/MySQL servers whose tables become queryable — and join-able with
-# lake tables in ONE query — as <name>.<schema>.<table>. STRICTLY read-only:
+# External database servers (postgres | mariadb | mysql | sqlite | sqlserver)
+# whose tables become queryable — and join-able with lake tables in ONE
+# query — as <name>.<schema>.<table>. STRICTLY read-only:
 # DuckDB itself rejects writes on the attached catalog (README: External
 # databases). The generated SQLHANDLER_ATTACH config carries env-var NAMES
 # only (SQLHANDLER_DB_PW_<NAME>); the password values come from the
@@ -132,12 +133,17 @@ sources: []
 # socket) need no password at all.
 #   databases:
 #     - name: ops
-#       type: postgres        # postgres | mysql
+#       type: postgres        # postgres | mariadb | mysql | sqlite | sqlserver
+#                             # (omit `type` for the postgres default)
 #       host: postgresql.postgresql.svc.cluster.local
 #       port: 5432            # default per type when omitted
 #       database: opsdb
 #       user: ro_user
 #       password: ""          # -> db-credentials Secret; "" = trust-auth
+#       params:               # optional TLS / driver options (README: External databases)
+#         sslmode: verify-full
+# sqlite entries: name, type: sqlite, database = FILE PATH - no host/port/
+# user/password, and `params` are not accepted for sqlite.
 databases: []
 
 # -- Naming overrides (rarely needed) ----------------------------------------

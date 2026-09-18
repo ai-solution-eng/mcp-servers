@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workbench-mcp"
-version = "0.1.2"
+version = "0.2.1"
 description = "Workbench MCP Server — persistent per-agent scratch workspaces: files, env, bounded command execution on a PVC"
 requires-python = ">=3.10"
 keywords = ["mcp", "workbench", "workspace", "persistence", "model-context-protocol"]
@@ -19,4 +19,10 @@ dependencies = [
 workbench-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "webui"]
+# DEPLOY-BLOCKER (Wave-6 packaging fix): the Dockerfile does a NON-editable
+# `uv pip install --system .` and runs the installed `workbench-mcp` console
+# script from site-packages. server.py does `import mcp_auth` (auth wave) and
+# `from mcp_fleet_common import …` (G1 vendored package) — both MUST ship in
+# the wheel or the image crash-loops at startup with ModuleNotFoundError.
+py-modules = ["server", "webui", "mcp_auth"]
+packages = ["mcp_fleet_common"]

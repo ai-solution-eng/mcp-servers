@@ -572,6 +572,7 @@
         <div class="query-actions">
           <button id="run">Run (Ctrl+Enter)</button>
           <button id="save-query" class="ghost" title="Save this query in this browser">💾 Save</button>
+          <button id="copy-link" class="ghost" title="Copy a shareable link — the query + time range ride in the URL fragment (#q=…&range=…) and are restored on load">🔗 Link</button>
           <span class="hint">read-only · PromQL</span>
           <span class="spacer"></span>
           <label class="hint" id="time-label">at
@@ -632,7 +633,7 @@
     <!-- ============ MCP TOOLS ============ -->
     <div id="pane-tools" class="pane hidden">
       <div class="panel">
-        <h2>What the six MCP tools are good for <span class="hint">all read-only · same API this page uses</span></h2>
+        <h2>What the MCP tools are good for <span class="hint">all read-only · same API this page uses</span></h2>
         <p class="hint" style="margin-top:0">
           A Kubernetes API (the K8s MCP) sees <b>state</b>: pods, events, logs, instantaneous <code>top</code>.
           Prometheus sees <b>behavior over time</b>: rates, trends, quantiles, alert state. Together they complete
@@ -664,6 +665,51 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<script id="deeplink-core">
+"use strict";
+// Deep-link core (Wave-5 F4) — PURE functions, no DOM: the test suite
+// executes this block verbatim under node (tests/test_wave5_f4.py), so the
+// link format cannot drift between the page and its tests.
+//
+// The query expression + time range live in the URL FRAGMENT only (#…):
+// a shared link re-sends nothing to the server and never lands in access
+// logs. Format (what "copy link" produces, what a load restores):
+//
+//   #q=<urlencoded PromQL>&range=<time>                     -> instant at <time>
+//   #q=<urlencoded PromQL>&range=<start>..<end>[/<step>]    -> range query
+//
+// e.g.  #q=up&range=now
+//       #q=rate(http_requests_total%5B5m%5D)&range=now-6h..now%2F1m
+function deepLinkEncode(state) {
+  const p = new URLSearchParams();
+  p.set("q", String(state && state.q ? state.q : ""));
+  const range = state && state.mode === "range"
+    ? String(state.start || "now-1h") + ".." + String(state.end || "now") + (state.step ? "/" + state.step : "")
+    : String((state && state.t) || "now");
+  p.set("range", range);
+  return "#" + p.toString();
+}
+
+function deepLinkDecode(hash) {
+  if (!hash || hash.charAt(0) !== "#") return null;
+  let p;
+  try { p = new URLSearchParams(hash.slice(1)); } catch (e) { return null; }
+  const q = p.get("q");
+  const range = p.get("range");
+  if (!q || !range) return null;
+  const dd = range.split("..");
+  if (dd.length === 2) {
+    const slash = dd[1].indexOf("/");
+    const end = slash === -1 ? dd[1] : dd[1].slice(0, slash);
+    const step = slash === -1 ? "" : dd[1].slice(slash + 1);
+    if (!dd[0] || !end) return null;
+    return { mode: "range", q: q, start: dd[0], end: end, step: step };
+  }
+  if (dd.length !== 1) return null; // "a..b..c" — malformed, refuse
+  return { mode: "instant", q: q, t: range };
+}
+</script>
 
 <script>
 "use strict";
@@ -1316,6 +1362,7 @@ async function runQuery() {
     markPromOk();
     renderResult(payload);
     pushHistory(q, payload.duration_ms);
+    updateDeepLink();
   } catch (e) {
     $("result").innerHTML = "";
     setError(e.message);
@@ -1487,6 +1534,57 @@ function saveCurrentQuery() {
   toast('Saved "' + name + '"');
 }
 
+// ---- deep links (shareable query state, Wave-5 F4) --------------------------
+// The fragment (#q=…&range=…) is the only thing a shared link carries:
+// decoded on load, refreshed after every successful run (history.replaceState
+// — no reload, no server round-trip), copied verbatim by the 🔗 Link button.
+// Decode output only ever lands in .value assignments and literals (never
+// innerHTML) — the page's escape-clean rule applies to the fragment too.
+function applyDeepLink(st) {
+  if (!st || !st.q) return false;
+  // st.mode is one of the two literals deepLinkDecode returns.
+  setMode(st.mode);
+  $("promql").value = st.q;
+  if (st.mode === "range") {
+    $("q-start").value = st.start;
+    $("q-end").value = st.end;
+    $("q-step").value = st.step || "";
+  } else {
+    $("q-time").value = st.t || "now";
+  }
+  syncModeInputs();
+  return true;
+}
+
+function restoreDeepLink() {
+  const st = deepLinkDecode(location.hash);
+  if (st && applyDeepLink(st)) {
+    switchTab("query");
+    runQuery();
+    toast("Restored shared query link");
+  }
+}
+
+function updateDeepLink() {
+  const frag = deepLinkEncode({
+    q: $("promql").value.trim(),
+    mode: currentMode(),
+    t: $("q-time").value.trim(),
+    start: $("q-start").value.trim(),
+    end: $("q-end").value.trim(),
+    step: $("q-step").value.trim(),
+  });
+  try { history.replaceState(null, "", location.pathname + location.search + frag); } catch (e) { /* ignore */ }
+}
+
+function copyDeepLink() {
+  updateDeepLink();
+  if (!deepLinkDecode(location.hash)) { toast("Run a query first — the link carries it"); return; }
+  navigator.clipboard.writeText(location.href)
+    .then(() => toast("Link copied — query + range ride in the #fragment"))
+    .catch(() => toast("Clipboard unavailable — copy the address bar"));
+}
+
 // ---- MCP tools catalog ----------------------------------------------------------------
 const TOOLS = [
   {
@@ -1622,6 +1720,7 @@ function initThemeToggle() {
 document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
 $("run").onclick = runQuery;
 $("save-query").onclick = saveCurrentQuery;
+$("copy-link").onclick = copyDeepLink;
 $("promql").addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); }
 });
@@ -1660,6 +1759,9 @@ refreshStatus();
 syncModeInputs();
 loadOverview();
 startAuto();
+// A shared deep link (#q=…&range=…) wins over the default empty state:
+// it switches to the Query tab and runs immediately (Wave-5 F4).
+restoreDeepLink();
 </script>
 </body>
 </html>

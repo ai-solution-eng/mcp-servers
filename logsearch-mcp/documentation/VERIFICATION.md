@@ -76,9 +76,10 @@ curl -s https://logsearch-mcp.<your-domain>/api/status
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Error: namespace 'x' is not allowed` (names the policy env vars) | Namespace policy refused it | Adjust `logsearch.allowedNamespaces` / `blockedNamespaces` in the Helm Values editor, re-apply. Note `""` = ALL namespaces allowed. |
+| `Error: namespace 'x' is ... denied by this server's namespace policy` (names the policy env vars) | Namespace policy refused it | Adjust `logsearch.allowedNamespaces` / `blockedNamespaces` in the Helm Values editor, re-apply. The policy is DEFAULT-DENY (fleet decision D8): `""` denies ALL namespaces unless `logsearch.emptyAllowsAll: true` (the pre-D8 open default, lab clusters only). |
 | Policy allows the namespace but pods fail with an API error (403) | The chart Role covers the release namespace only | Apply the one-time read-only RBAC bootstrap for the target namespace (see DEPLOYMENT.md) |
-| Fan-out returns `truncated: true` | `max_total_lines` cap bit (by design — most recent matches kept) | Narrow the regex/pod filter, raise `logsearch.maxTotalLines`, or read one pod with `get_pod_logs` |
+| Fan-out returns `truncated: true` | The `max_total_lines` budget filled and the search stopped pulling further pods (`pods_skipped_budget` counts what was skipped) | Narrow the regex/pod filter, raise `logsearch.maxTotalLines`, or read one pod with `get_pod_logs` |
+| `Error: unsafe regex ... rejected` | The compile-time ReDoS screen refused a pattern whose backtracking can explode (e.g. `(a+)+`) | Rewrite without quantifying a group that already contains a quantifier — see the server README's "Regex safety" |
 | Client hangs or 504 on `/mcp` | Gateway route missing (`ezua.enabled=false`) or timeout too small for wide fan-outs | Enable ezua with a literal endpoint; `timeout: 300s` default suits fan-outs |
 | Console 404s at `/` but `/mcp` works | `webui.enabled=false` | Re-enable, re-apply |
 | One pod errors while others return matches | Dead/crashed pod or missing logs — the fan-out completes per-pod by design | Retry that pod with `get_pod_logs` and `previous: true` |

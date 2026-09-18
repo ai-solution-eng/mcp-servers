@@ -15,6 +15,10 @@ spec:
       labels:
         app: {{ .Values.deployment.appName }}
     spec:
+      # The server makes zero Kubernetes API calls — an automounted SA token
+      # behind the exec allowlist (python3) was a live credential-theft path
+      # (fleet-audit HIGH). Automount explicitly OFF.
+      automountServiceAccountToken: false
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
@@ -28,6 +32,12 @@ spec:
         - name: {{ .Values.deployment.appName }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          # Read-only rootfs + no priv-esc + dropped caps (fleet-audit P0):
+          # run_command children can write only the PVC and /tmp.
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # No args: the image CMD already pins the transport/host/port, and
           # k8s `args` REPLACES the entire CMD when the image has no
           # ENTRYPOINT — passing bare flags here makes the runtime exec
@@ -60,10 +70,47 @@ spec:
               value: {{ .Values.workbench.maxListEntries | quote }}
             - name: WORKBENCH_LOG_LEVEL
               value: {{ .Values.workbench.logLevel | quote }}
+            {{- if .Values.workbench.templates }}
+            # Workspace templates (Wave-5 F3, ADDITIVE, DEFAULT OFF): the
+            # optional template parameter of workspace_create. Rendered ONLY
+            # when the operator defines templates — the default render has no
+            # WORKBENCH_TEMPLATES env at all and the server behaves exactly
+            # as before (the parameter is refused). A template can only
+            # WIDEN a workspace's exec allowlist with these operator-supplied
+            # binaries (denylist still wins) and pre-run canned setup argv
+            # commands inside the new workspace (same guards, audited with
+            # the template name).
+            - name: WORKBENCH_TEMPLATES
+              value: {{ .Values.workbench.templates | toJson | quote }}
+            {{- end }}
             # Web UI + /api/* toggle (chart: webui.enabled). The /api/*
             # endpoints reuse the MCP tools' core functions — no new powers.
             - name: WORKBENCH_UI_ENABLED
               value: {{ .Values.webui.enabled | toString | quote }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
+            # server serves per-tool request counters at /metrics only when
+            # this env is set — nothing here renders when metrics.enabled is
+            # false (the default), so the default pod is unchanged. Pairs
+            # with templates/servicemonitor.yaml.
+            - name: WORKBENCH_METRICS_ENABLED
+              value: "true"
+            {{- end }}
+            # Read-only-rootfs scratch: HOME on a per-pod emptyDir keeps
+            # pip/tempfile inside run_command functional (their writes reset
+            # with the pod; workspaces persist on the PVC).
+            - name: HOME
+              value: /tmp
+            # API keys — every route except /health requires one. Always from
+            # an operator-created Secret (existingSecret-only, the K8S-MCP
+            # invariant): the chart never creates or inlines a key, and the
+            # pod fails loud (CreateContainerConfigError) until it exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: WORKBENCH_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             # Corporate proxy: reaches fetch/pip from the server process AND
             # every run_command child (the server passes these through).
@@ -119,6 +166,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            - name: tmp
+              mountPath: /tmp
             {{- if .Values.caCert.enabled }}
             # The ezaf-root-ca ConfigMap key normalized to a fixed path via
             # items+subPath (the DshChart pattern) — env vars point here.
@@ -141,6 +190,10 @@ spec:
         - name: data
           emptyDir: {}
         {{- end }}
+        # Read-only-rootfs scratch (paired with HOME=/tmp): subprocess
+        # tempfile/pip-cache writes land here and reset with the pod.
+        - name: tmp
+          emptyDir: {}
         {{- if .Values.caCert.enabled }}
         - name: ca-cert
           configMap:

@@ -39,6 +39,7 @@ ezua:
 | `resources` | `100m`/`128Mi` requests, `512Mi` memory limit | A query proxy, not a compute node. |
 | `ezua.authorizationPolicy.enabled` | `false` | Gateway-level auth gate (Istio `AuthorizationPolicy`, action CUSTOM) delegating this host to the PCAI **oauth2-proxy** extension — external callers then need a valid PCAI token. OFF by default: the rotating 30-min SSO token is a known pain for machine MCP callers (accepted lab trade — flip on per environment if the trust posture changes). `namespace: istio-system`, `providerName: oauth2-proxy`. |
 | `service.type` / `port` / `targetPort` | `ClusterIP` / `9095` | Don't move the port without moving the probes' target. |
+| `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (one counter family: per-tool request counts with outcome ok/error — no PromQL text, label names, or error strings exported). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is served key-free on the same port (this server has no auth middleware — read-only surface behind the gateway) so the ServiceMonitor can scrape it. Requires prometheus-operator CRDs. |
 
 There is deliberately NO `webui` toggle: the read-only console at `/` and its
 `/api/*` endpoints are always served by the same container (every dashboard
@@ -53,12 +54,23 @@ these directly):
 |---|---|
 | `PROM_URL` | `prometheusUrl` |
 | `PROM_UI_GPU_NVLINK_DOMAINS` | `gpuNvlinkDomains` (JSON string or YAML list — both render to the same value; omitted when empty) |
+| `PROMETHEUS_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
 
 Server-side env knobs not wired by the chart (sane defaults built in,
 documented for completeness): `PROM_TIMEOUT` (30 s), `PROM_MAX_SERIES` (20),
 `PROM_MAX_POINTS` (60 per range series), `PROM_MAX_LABEL_VALUES` (200),
 `PROM_BEARER_TOKEN_ENV` (name of an env var holding a bearer token, if your
-Prometheus requires auth — the token value itself never appears in config).
+Prometheus requires auth — the token value itself never appears in config),
+`PROMETHEUS_MIN_STEP_SECONDS` (range-query step floor, default **15**: a
+caller-supplied step below the floor is clamped up to it with an honest
+notice in the result; `0` disables — decision D14, caps `step=1s`-style
+point floods), `PROMETHEUS_OVERVIEW_CACHE_TTL` (short-TTL cache for the
+`/api/overview` dashboard payload, default **20** s; `0` disables — a
+refresh within the TTL is served instantly and marked `cached=true` with
+`cache_age_seconds`, and concurrent identical overviews share one
+computation), and `PROMETHEUS_SAVED_QUERIES_PATH` (saved-query store: unset
+= in-memory for the session, tool results say so; set = durable, written
+atomically).
 
 ## Gateway exposure (ezua / Istio + oauth2-proxy)
 

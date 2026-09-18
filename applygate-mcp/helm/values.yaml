@@ -4,9 +4,21 @@ deployment:
   replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.1.4
+  tag: v0.2.2
   pullPolicy: IfNotPresent
 imagePullSecrets: []
+# API keys for the /mcp endpoint (fleet pattern: K8S-MCP). The chart NEVER
+# creates a key and NEVER inlines one in values — an envsubst apply once
+# emptied a live key Secret (the K8S-MCP lesson). The deployment references
+# an operator-created Secret and fails loud (CreateContainerConfigError)
+# until it exists:
+#   kubectl -n <ns> create secret generic applygate-mcp-apikey \
+#     --from-literal=api-keys='key-old,key-new'
+# Comma-SEPARATED keys all authenticate: that is the rotation mechanism —
+# append the new key, move clients over, drop the old one, no downtime.
+apiKey:
+  existingSecret: applygate-mcp-apikey
+  existingSecretKey: api-keys
 webui:
   enabled: true
 namespaces:
@@ -15,7 +27,40 @@ namespaces:
 kinds:
   allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
 audit:
+  # Hash-chained, caller-attributed JSONL audit trail — see README
+  # ("Audit trail: hash chain + caller identity"). Every entry carries
+  # prev_sha256 (sha256 of the previous line; 64-zero genesis on an empty
+  # trail) and a non-secret caller fingerprint, making the trail
+  # tamper-evident (verify with server.verify_audit_chain() or the README
+  # procedure). Fleet convention for observability: this audit.path is
+  # documented for ops mount/expose — mount THIS SAME path/PVC into the
+  # logsearch pod (shared PVC or extraVolumes) so the governed write path's
+  # "who did what" becomes logsearch-searchable (FLEET-AUDIT §3.3, C3/C4
+  # Wave-3 convention).
   file: /data/audit.jsonl
+planBinding:
+  # Decision D11 (ratified 2026-09): apply_manifest is sha256-bound to the
+  # EXACT bytes plan_apply recorded — missing plan or tampered bytes refuse
+  # BY DEFAULT (the server's built-in default is deny). This knob renders
+  # the APPLYGATE_UNPLANNED_APPLY env ONLY when set, so the DEFAULT render
+  # stays byte-identical and the strictest mode applies out of the box:
+  #   unplannedApply: ''     # (default; renders nothing → deny enforced)
+  #   unplannedApply: warn   # migration path: applies without a plan but
+  #                          # logs loudly (stderr + audit "plan_binding")
+  #   unplannedApply: allow  # pre-D11 behavior (automation unaffected)
+  # Any other value fails closed to deny. Intentionally breaks apply-without-
+  # plan automation — that is the ratified point; warn is the migration path.
+  unplannedApply: ''
+metrics:
+  # /metrics + ServiceMonitor — ADDITIVE and OFF by default (fleet
+  # convention): enabled=false renders NOTHING, keeping the default render
+  # byte-identical to the Wave-0 baseline. When true, the deployment gets
+  # APPLYGATE_METRICS_ENABLED=on (the server serves /metrics on the SAME
+  # container port; prometheus-client is import-guarded — a slim image
+  # serves an honest fallback text) and the ServiceMonitor below ships.
+  # Requires the prometheus-operator ServiceMonitor CRD in-cluster.
+  enabled: false
+  interval: 30s
 persistence:
   enabled: true
   size: 1Gi

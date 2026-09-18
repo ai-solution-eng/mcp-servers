@@ -323,6 +323,11 @@ class OneLakeProvider(DataProvider):
         """Open the Delta table as a pyarrow Dataset (cached by the engine).
 
         ``version`` pins a historical Delta snapshot for time travel.
+
+        When the disk block cache is enabled (``SQLHANDLER_BLOCK_CACHE=1``)
+        the delta DATA-file reads are routed through it (see
+        :meth:`_delta_data_fs`); with the cache off the dataset is built
+        exactly as before, entirely inside delta-rs.
         """
         if version is not None:
             _validate_snapshot_version(version, "Delta")
@@ -330,6 +335,75 @@ class OneLakeProvider(DataProvider):
         else:
             dt = self._open_delta(info)
         try:
-            return dt.to_pyarrow_dataset()
+            fs = self._delta_data_fs(dt, info, version)
+            if fs is None:
+                return dt.to_pyarrow_dataset()
+            return dt.to_pyarrow_dataset(filesystem=fs)
         except Exception as exc:
             raise LakehouseError(f"Could not open Delta dataset {info.path!r}: {exc}") from exc
+
+    def _delta_data_fs(self, dt, info: TableInfo, version: int | None):
+        """The block-cache-wrapped filesystem for Delta data-file reads, or None.
+
+        ``DeltaTable.to_pyarrow_dataset()`` does its data IO inside delta-rs's
+        own object-store client, which bypassed ``maybe_block_cache``
+        entirely — OneLake scans never cached bytes (audit finding). When the
+        block cache is ON this rebuilds the SAME handler delta-rs would build
+        internally (``DeltaStorageHandler`` over the table URI with this
+        provider's storage options, seeded with the snapshot's file sizes
+        from the delta log), wraps it in the disk block cache, and hands it
+        back so parquet footers/column chunks are fetched once and re-served
+        from pod-local disk. Delta-log/checkpoint IO stays inside delta-rs
+        either way (small, and already cached by the engine's dataset
+        handles). Returns None — leaving delta-rs's built-in path in place —
+        when the cache is disabled or anything fails: the cache is an
+        accelerator, never a dependency.
+
+        Snapshot consistency: block keys are scoped by the Delta snapshot
+        version, mirroring the engine result cache's base-snapshot keying.
+        Delta data files are immutable per the protocol (so path+size alone
+        is already snapshot-safe), and the engine re-opens the dataset when
+        ``check_version`` sees a new ETL commit; the scope additionally
+        guarantees that a re-open at a different snapshot — a new commit or
+        a time-travel read — can never be served another snapshot's cached
+        bytes even if a backend rewrote a path in place.
+        """
+        from .blockcache import block_cache_enabled, maybe_block_cache
+
+        if not block_cache_enabled():
+            return None
+        try:
+            import pyarrow.fs as pafs
+            from deltalake.fs import DeltaStorageHandler
+
+            handler = DeltaStorageHandler(
+                self.table_uri(info),
+                options=self._storage_options(),
+                known_sizes=self._delta_file_sizes(dt),
+            )
+            snapshot = int(version) if version is not None else int(dt.version())
+            return maybe_block_cache(
+                pafs.PyFileSystem(handler),
+                purpose=f"onelake:{info.path}",
+                scope=f"delta-v{snapshot}",
+            )
+        except Exception:
+            logger.warning("OneLake block-cache wrap failed; reading uncached", exc_info=True)
+            return None
+
+    @staticmethod
+    def _delta_file_sizes(dt) -> dict[str, int] | None:
+        """Relative data-file path -> size, from the snapshot's add actions.
+
+        The delta log already carries every file's size, so seeding the
+        handler with it (exactly what delta-rs does internally) saves one
+        HEAD request per file per open. Returns None when the stats cannot
+        be read and the cache falls back to stat()-per-file behavior.
+        """
+        try:
+            import pyarrow as pa
+
+            adds = pa.table(dt.get_add_actions(flatten=True))
+            return dict(zip(adds.column("path").to_pylist(), adds.column("size_bytes").to_pylist()))
+        except Exception:
+            return None

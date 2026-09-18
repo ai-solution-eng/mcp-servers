@@ -13,6 +13,7 @@ same with `-f <values-file>`; per-cluster secrets-bearing values live in
 | `namespaces.allowed` | The namespace allowlist — THE write guardrail (comma-separated, `fnmatch` globs like `team-*`). | `""` = **default-deny**: the server starts, probes pass, and every write is refused loudly. A deployment without it is a no-op writer by design. |
 | `namespaces.blocked` | Blocklist that ALWAYS wins over the allowlist. | `""` (no explicit blocklist; cluster-scoped/Secret refusals still apply). |
 | `ezua.enabled` + `ezua.domainName` + `ezua.virtualService.endpoint` | Gateway exposure through the PCAI Istio gateway. | `ezua.enabled: false` = ClusterIP-only (in-cluster MCP clients only). |
+| `apiKey.existingSecret` / `existingSecretKey` | **Required before the pod will start** — `/mcp` requires an API key (`X-API-Key` or `Authorization: Bearer`); the chart NEVER creates the key Secret, and the pod sits in `CreateContainerConfigError` until it exists (`kubectl -n <ns> create secret generic applygate-mcp-apikey --from-literal="api-keys=$(openssl rand -hex 32)"` — the chart's NOTES.txt prints this verbatim). Comma-separated keys (`api-keys=new,old`) are the zero-downtime rotation mechanism (env re-read per request); the fleet-universal `MCP_API_KEYS` env is honored too. The console (`/`, `/api/*`) and health endpoints stay key-free (read-only + inert). | Pod fails loud until the Secret exists. |
 
 ```yaml
 # Required block — adjust the # SITE: lines and apply
@@ -35,7 +36,9 @@ ezua:
 | `kinds.allowed` | `ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler` | Narrows the write surface. Can NEVER widen it: `Secret` and cluster-scoped kinds are refused even if allowlisted, and kinds unknown to the built-in registry are refused because their scope cannot be proven. |
 | `webui.enabled` | `true` | The strictly read-only HPE-branded console at `/` (+ `/api/*`). It exposes NO apply/delete endpoints; `false` strips `/`, `/ui`, `/api/*` while `/mcp` and health endpoints keep serving. |
 | `persistence.enabled` / `size` / `accessModes` / `storageClass` | `true` / `1Gi` / `ReadWriteOnce` | Audit-trail PVC at `/data`. With `false`, an `emptyDir` is mounted instead (trail lost on restart — labs only); `readOnlyRootFilesystem` keeps working either way. |
-| `audit.file` | `/data/audit.jsonl` | JSONL audit sink path inside the volume. |
+| `audit.file` | `/data/audit.jsonl` | JSONL audit sink path inside the volume. The trail is **hash-chained** (tamper-evident; verify with `server.verify_audit_chain` — README procedure) and caller-attributed. Fleet convention: this audit.path is documented for ops mount/expose — mount the same path/PVC into the logsearch pod to make it searchable. |
+| `planBinding.unplannedApply` | `''` (renders nothing) | D11 transition knob — renders `APPLYGATE_UNPLANNED_APPLY` ONLY when set. Unset = the server's built-in default **deny**: `apply_manifest` refuses without a matching `plan_apply` (sha256-bound to the planned bytes). `warn` = documented migration path (applies + logs loudly); `allow` = pre-D11 behavior. Unknown values fail closed. |
+| `metrics.enabled` / `metrics.interval` | `false` / `30s` | ADDITIVE and OFF by default (default render stays byte-identical to the Wave-0 baseline). Renders `APPLYGATE_METRICS_ENABLED` + the ServiceMonitor; `/metrics` serves on the same container port (prometheus-client import-guarded — honest fallback without it). Requires prometheus-operator CRDs. |
 | `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request. |
 | `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml`/`pyproject.toml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
@@ -59,6 +62,9 @@ touch these directly:
 | `APPLYGATE_ALLOWED_KINDS` | `kinds.allowed` |
 | `APPLYGATE_AUDIT_FILE` | `audit.file` |
 | `APPLYGATE_WEBUI_ENABLED` | `webui.enabled` |
+| `APPLYGATE_UNPLANNED_APPLY` | `planBinding.unplannedApply` (only when set; unset = server default deny) |
+| `APPLYGATE_METRICS_ENABLED` | `metrics.enabled` (only when true) |
+| `APPLYGATE_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` |
 
 ## Gateway exposure (ezua / Istio)
@@ -67,9 +73,11 @@ When `ezua.enabled=true` the chart renders one VirtualService on
 `istio-system/ezaf-gateway`: `/mcp` routes to the MCP server (port 9102,
 `ezua.virtualService.timeout`), and when `webui.enabled` the root route sends
 `/` and `/api/*` to the same service. The console is strictly read-only, so
-the gateway surface gains no mutation path — but this is a WRITE-path server:
+the gateway surface gains no mutation path, and `/mcp` itself requires the
+API key at the pod (the mandatory `apiKey.existingSecret` above) — but this
+is still a WRITE-path server:
 expose it only where the gateway enforces real auth (SSO/bearer at the
-ezaf-gateway). This chart deliberately ships no auth template; where your
+ezaf-gateway). This chart deliberately ships no AuthorizationPolicy template; where your
 PCAI build offers the oauth2-proxy extension-provider pattern (see
 prometheus-mcp's `ezua.authorizationPolicy`), apply the equivalent policy for
 this host at the platform level. PCAI resolves `${DOMAIN_NAME}` in ezua

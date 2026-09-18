@@ -14,7 +14,6 @@ import os
 import sys
 import tempfile
 import threading
-import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,8 +40,10 @@ server._ssa_apply = fake_apply
 server._get_status = fake_status
 server._delete = fake_delete
 
-from mcp.client._memory import InMemoryTransport
-from mcp.client.session import ClientSession
+# The server module must be imported (and its k8s seams patched) before the
+# client-side pieces are imported.
+from mcp.client._memory import InMemoryTransport  # noqa: E402
+from mcp.client.session import ClientSession  # noqa: E402
 
 MANIFEST = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\ndata:\n  k: v\n"
 
@@ -56,8 +57,20 @@ async def in_memory():
         print("[stdio] plan ok:", not r.is_error, "|", json.loads(r.content[0].text)["summary"])
         r = await s.call_tool("apply_manifest", {"namespace": "team-a", "manifest": MANIFEST})
         print("[stdio] apply without confirm refused:", json.loads(r.content[0].text)["refused"] is True)
-        r = await s.call_tool("apply_manifest", {"namespace": "team-a", "manifest": MANIFEST, "confirm_apply": True})
-        print("[stdio] apply confirmed ok:", json.loads(r.content[0].text)["ok"] is True)
+        # D11: apply is bound to the planned bytes — plan first, carry the sha.
+        planned = json.loads(
+            (await s.call_tool("plan_apply", {"namespace": "team-a", "manifest": MANIFEST})).content[0].text
+        )
+        r = await s.call_tool(
+            "apply_manifest",
+            {
+                "namespace": "team-a",
+                "manifest": MANIFEST,
+                "confirm_apply": True,
+                "plan_sha256": planned["manifest_sha256"],
+            },
+        )
+        print("[stdio] apply planned+confirmed ok:", json.loads(r.content[0].text)["ok"] is True)
         r = await s.call_tool("get_resource_status", {"namespace": "team-a", "kind": "Deployment", "name": "web"})
         print("[stdio] status excerpt:", json.loads(r.content[0].text)["status"]["summary"])
 
@@ -72,8 +85,26 @@ async def main():
     srv = uvicorn.Server(cfg)
     t = threading.Thread(target=srv.run, daemon=True)
     t.start()
-    time.sleep(2)
+    await asyncio.sleep(2)
 
+    await asyncio.to_thread(_http_checks)
+
+    srv.should_exit = True
+    t.join(timeout=5)
+
+    with open(os.environ["APPLYGATE_AUDIT_FILE"]) as fh:
+        lines = [json.loads(line) for line in fh]
+    print("[audit] lines:", [(e["tool"], e["outcome"]) for e in lines])
+    assert any(e["outcome"] == "refused" for e in lines)
+    assert sum(1 for e in lines if e["outcome"] == "applied") == 2
+    print("SMOKE OK")
+
+
+def _http_checks():
+    """Blocking HTTP assertions against the uvicorn server thread.
+
+    Runs via asyncio.to_thread so the event loop is never blocked
+    (the urllib calls here are deliberately sequential and blocking)."""
     health = json.loads(urllib.request.urlopen("http://127.0.0.1:9189/healthz").read())
     print("[http] /healthz:", health)
     assert health["status"] == "ok" and health["namespaces_enabled"] is True
@@ -114,24 +145,33 @@ async def main():
     listing = rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     names = sorted(t["name"] for t in listing["result"]["tools"])
     print("[http] tools/list:", names)
+    planned = rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "plan_apply", "arguments": {"namespace": "team-a", "manifest": MANIFEST}},
+        }
+    )["result"]["content"][0]["text"]
+    planned = json.loads(planned)
+    print("[http] plan manifest_sha256:", planned["manifest_sha256"][:16], "…")
     call = rpc(
         {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "apply_manifest", "arguments": {"namespace": "team-a", "manifest": MANIFEST, "confirm_apply": True}},
+            "params": {
+                "name": "apply_manifest",
+                "arguments": {
+                    "namespace": "team-a",
+                    "manifest": MANIFEST,
+                    "confirm_apply": True,
+                    "plan_sha256": planned["manifest_sha256"],
+                },
+            },
         }
     )
     print("[http] tools/call apply ok:", json.loads(call["result"]["content"][0]["text"])["ok"] is True)
-    srv.should_exit = True
-    t.join(timeout=5)
-
-    with open(os.environ["APPLYGATE_AUDIT_FILE"]) as fh:
-        lines = [json.loads(line) for line in fh]
-    print("[audit] lines:", [(e["tool"], e["outcome"]) for e in lines])
-    assert any(e["outcome"] == "refused" for e in lines)
-    assert sum(1 for e in lines if e["outcome"] == "applied") == 2
-    print("SMOKE OK")
 
 
 asyncio.run(main())

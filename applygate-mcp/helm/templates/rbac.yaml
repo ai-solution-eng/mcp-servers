@@ -23,11 +23,12 @@ metadata:
 # OWN namespace. Writes into OTHER namespaces (mm-rag, sqlhandler, …) are
 # enabled by the ONE-TIME bootstrap manifest at
 # helm/local/rbac-bootstrap.se-g2.yaml — applied interactively by an admin
-# with god rights over those namespaces (kubectl apply -f …), NOT by this
-# release. The server's namespace policy (APPLYGATE_ALLOWED_NAMESPACES) must
-# stay a subset of the namespaces that bootstrap covers; a namespace in the
-# policy without a bootstrap Role means the tool's policy passes but the API
-# answers 403.
+# (kubectl apply -f …), NOT by this release. To target additional namespaces,
+# add the necessary namespaces to the allowlist in values (namespaces.allowed)
+# AND extend the bootstrap manifest to cover them: the server's namespace
+# policy (APPLYGATE_ALLOWED_NAMESPACES) must stay a subset of the namespaces
+# that bootstrap covers; a namespace in the policy without a bootstrap Role
+# means the tool's policy passes but the API answers 403.
 #
 # Resource list mirrors the server's kind allowlist (core "" group + apps +
 # batch + networking + policy + autoscaling apiGroups). Extend per site ONLY

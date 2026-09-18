@@ -23,7 +23,7 @@ image:
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a deploy WITHOUT a profile file uses, and a stale
   # default is how an "old MCP + new chart" pod happens.
-  tag: v0.3.1
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -63,8 +63,32 @@ apiKey:
   existingSecret: ""         # empty = "<deployment.name>-apikey"
   existingSecretKey: api-key
 
+# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
+# Extra Host header values the MCP SDK's DNS-rebinding protection accepts, for
+# in-cluster callers that address the server by its service DNS name instead of
+# the public FQDN (e.g. Open WebUI →
+# http://<name>-service.<ns>.svc.cluster.local:9090/mcp). Joined into
+# MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the `host:*`
+# form to accept any port. The pinned public FQDN (ezua.virtualService.endpoint)
+# and loopback are always allowed; without this knob behaviour is unchanged.
+# List of strings:
+extraAllowedHosts: []
+
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
+
+# -- Cluster-wide listing guardrails (performance) -----------------------------------------------------------
+# The server caps and parallelizes cluster-wide listings by itself; these keys
+# only OVERRIDE the server defaults when set ("" = server default, and an unset
+# key renders NO env var — the default chart render stays byte-identical).
+listing:
+  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 500): cap on -A/cluster-wide list results, with a truncation marker naming the env
+  concurrency: ""            # K8S_MCP_LIST_CONCURRENCY (server default 8): bounded-semaphore width for the per-namespace -A fan-out
+
+# -- Observability (opt-in; default off = byte-identical render) -----------------------------------------------
+metrics:
+  enabled: false             # K8S_MCP_METRICS_ENABLED=true: serve GET /metrics (counters only) + the ServiceMonitor below
+  interval: 30s              # ServiceMonitor scrape interval
 
 # -- Cluster access (read-only RBAC — this chart talks to the K8s API) --------------------------------------
 rbac:

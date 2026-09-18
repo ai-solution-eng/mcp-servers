@@ -73,6 +73,9 @@ ezua:
 | `exec.allowedCommands` | `""` | Extra binaries beyond the built-in read-only allowlist (`K8S_MCP_EXEC_ALLOWED_COMMANDS`). |
 | `exec.autoRbac` | `true` | Cluster scope only: the server binds its own pods/exec RoleBindings at startup (`K8S_MCP_EXEC_AUTO_RBAC`). |
 | `clients.value` / `clients.existingSecret` | `""` | Per-user keys with per-user exec assignments (`K8S_MCP_CLIENTS`, `name:key[:ns-patterns];…`). CONTAINS SECRETS — prefer `existingSecret`. |
+| `listing.maxItems` | `""` | `K8S_MCP_MAX_LIST_ITEMS` (server default 500) — cap on `-A`/cluster-wide list results; a truncation marker naming the env appears when the cap bites. `""` = server default (renders no env; the default chart render is unchanged). |
+| `listing.concurrency` | `""` | `K8S_MCP_LIST_CONCURRENCY` (server default 8) — bounded-semaphore width for the parallel per-namespace `-A` fan-out. `""` = server default. |
+| `metrics.enabled` / `metrics.interval` | `false` / `30s` | Opt-in observability: `K8S_MCP_METRICS_ENABLED=true` serves `GET /metrics` (counters only) and renders the Prometheus Operator ServiceMonitor (scrape port `mcp`, path `/metrics`). Default off — the default chart render is byte-identical to the pre-metrics baseline. |
 | `podAnnotations` / `nodeSelector` / `tolerations` / `affinity` | istio sidecar injection off | Scheduling knobs. |
 | `ezua.authorizationPolicy.*` | `enabled: false` | Gateway-level auth gate (oauth2-proxy / SSO bearer). Off by default — the rotating-token pain for machine MCP callers is an accepted lab trade; the template is real, so flipping it on enforces tokens for this host **on top of** the API key. |
 

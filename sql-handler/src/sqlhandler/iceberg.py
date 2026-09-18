@@ -46,8 +46,7 @@ class IcebergProvider(DataProvider):
         """Wrap a pyiceberg catalog + its storage credentials."""
         if not config.is_configured:
             raise LakehouseError(
-                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI "
-                "(and ICEBERG_CATALOG_TYPE=rest|sql)."
+                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI (and ICEBERG_CATALOG_TYPE=rest|sql)."
             )
         self.config = config
         self._cat = None
@@ -148,7 +147,9 @@ class IcebergProvider(DataProvider):
         travel); ``None`` scans the current snapshot.
         """
         table = self._load_table(info)
-        scan = table.scan() if version is None else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
+        scan = (
+            table.scan() if version is None else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
+        )
         try:
             files = [f.file.file_path for f in scan.plan_files()]
         except Exception as exc:

@@ -452,8 +452,7 @@ def test_catalog_hot_reload_on_mtime_change(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path)
     # path-keyed entry wins (lookup order: path, qualified, bare name)
     assert (
-        eng.describe_table("workorder/work_order")["description"]
-        == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
     )
     # Rewrite with a new description and bump the mtime.
     _write_catalog(tmp_path, {"tables": {"workorder/work_order": {"description": "updated"}}})
@@ -501,13 +500,10 @@ def test_catalog_store_upload_overrides_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
     eng, _ = _make_engine(tmp_path)
     assert (
-        eng.describe_table("workorder/work_order")["description"]
-        == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
     )
     # Upload as YAML text — the friendlier format must work end to end.
-    res = eng.set_catalog_text(
-        "tables:\n  workorder/work_order:\n    description: uploaded\n"
-    )
+    res = eng.set_catalog_text("tables:\n  workorder/work_order:\n    description: uploaded\n")
     assert res["tables"] == 1
     assert eng.describe_table("workorder/work_order")["description"] == "uploaded"
     status = eng.catalog_status()
@@ -529,8 +525,7 @@ def test_catalog_clear_falls_back_to_configured(tmp_path, monkeypatch):
     status = eng.catalog_status()
     assert status["active_source"] == "configured"
     assert (
-        eng.describe_table("workorder/work_order")["description"]
-        == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
     )
     assert eng.clear_catalog() is False  # nothing left to remove
 
@@ -539,11 +534,11 @@ def test_set_catalog_text_rejects_invalid(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
     eng, _ = _make_engine(tmp_path)
     bad_inputs = [
-        "{not json or yaml",                    # neither format parses
-        "[1, 2]",                               # valid YAML but not an object
-        '"a scalar"',                           # valid JSON but not an object
-        '{"no_tables_key": {}}',                # missing the tables mapping
-        '{"tables": {"t": "not-a-mapping"}}',   # entry must be a mapping
+        "{not json or yaml",  # neither format parses
+        "[1, 2]",  # valid YAML but not an object
+        '"a scalar"',  # valid JSON but not an object
+        '{"no_tables_key": {}}',  # missing the tables mapping
+        '{"tables": {"t": "not-a-mapping"}}',  # entry must be a mapping
     ]
     for text in bad_inputs:
         with pytest.raises(ValueError):
@@ -640,15 +635,11 @@ def test_catalog_update_table_creates_and_roundtrips(tmp_path, monkeypatch):
     monkeypatch.delenv("SQLHANDLER_CATALOG", raising=False)
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
     eng, _ = _make_engine(tmp_path)
-    eng.catalog_update_table(
-        "workorder/work_order", '{"description": "from json", "aliases": ["wo"]}'
-    )
+    eng.catalog_update_table("workorder/work_order", '{"description": "from json", "aliases": ["wo"]}')
     d = eng.catalog_table_entry("workorder/work_order")
     assert d["found"] is True and "from json" in d["text"]
     # a single-entry `tables:` wrapper is forgiven and unwrapped
-    eng.catalog_update_table(
-        "workorder/work_order", "tables:\n  whatever:\n    description: wrapped\n"
-    )
+    eng.catalog_update_table("workorder/work_order", "tables:\n  whatever:\n    description: wrapped\n")
     assert eng.catalog_table_entry("workorder/work_order")["text"].startswith("description: wrapped")
 
 

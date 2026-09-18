@@ -4,8 +4,9 @@ Security model
 --------------
 - kubectl is never invoked through a shell: every call is an argv list via
   asyncio.create_subprocess_exec, gated by a read-verb allowlist and a
-  rejected-flag list (--server/--token/--kubeconfig/... cannot redirect the
-  API connection or leak the service-account token).
+  rejected-flag list (--server/--token/--kubeconfig/--as/... cannot redirect
+  the API connection, leak the service-account token, or impersonate
+  another identity).
 - Tool parameters (namespace, name, resource type, output) are validated
   against DNS-label/name character sets before they reach kubectl or the
   Kubernetes API.
@@ -37,8 +38,8 @@ same /mcp endpoint with the same API key, so the console inherits every
 auth/policy layer above. Disable with K8S_MCP_CONSOLE_ENABLED=false.
 """
 
-import asyncio
 import ast
+import asyncio
 import base64
 import contextvars
 import datetime
@@ -50,14 +51,14 @@ import re
 import shlex
 import sys
 import tempfile
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
-from mcp.server.caching import CacheHint
-from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
+from mcp.server.caching import CacheHint
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 # Initialize MCP server (MCP SDK v2 / protocol 2026-07-28).
 # Transport options (host, port, stateless_http, ...) are passed to run(),
@@ -82,7 +83,7 @@ mcp = MCPServer(
 
 # Disable proxy for in-cluster K8s API access
 _saved_proxies = {}
-for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'):
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     val = os.environ.pop(key, None)
     if val:
         _saved_proxies[key] = val
@@ -128,8 +129,7 @@ def _parse_ns_patterns(raw: str) -> tuple:
             continue
         if not _NS_PATTERN_RE.fullmatch(pattern):
             raise ValueError(
-                f"invalid namespace pattern {pattern!r} in {raw!r}: use "
-                "lowercase DNS labels with optional * / ? globs"
+                f"invalid namespace pattern {pattern!r} in {raw!r}: use lowercase DNS labels with optional * / ? globs"
             )
         patterns.append(pattern)
     return tuple(patterns)
@@ -170,10 +170,7 @@ def namespace_violation(namespace: str):
     if not ns:
         return None
     if not _NS_NAME_RE.fullmatch(ns):
-        return (
-            f"invalid namespace {namespace!r}: must be a lowercase DNS "
-            "label (max 63 chars)"
-        )
+        return f"invalid namespace {namespace!r}: must be a lowercase DNS label (max 63 chars)"
     try:
         allowed, blocked = _namespace_policy()
     except ValueError as e:
@@ -234,50 +231,115 @@ def _validated_name(name: str) -> str:
 
 def _validated_output(output: str) -> str:
     out = (output or "").strip()
-    if out in {"yaml", "json", "wide", "name"} or out.startswith(("jsonpath=", "custom-columns=")):
-        if "\n" not in out and "\x00" not in out:
-            return out
+    if (
+        (out in {"yaml", "json", "wide", "name"} or out.startswith(("jsonpath=", "custom-columns=")))
+        and "\n" not in out
+        and "\x00" not in out
+    ):
+        return out
     raise ValueError(
-        f"unsupported output format {output!r}; use yaml, json, wide, name, "
-        "jsonpath=... or custom-columns=..."
+        f"unsupported output format {output!r}; use yaml, json, wide, name, jsonpath=... or custom-columns=..."
     )
 
 
 # ─── kubectl execution (no shell, argv only) ─────────────────────────────
 
 KUBECTL_TIMEOUT_SECONDS = 30
-KUBECTL_READ_VERBS = frozenset({
-    "get", "describe", "logs", "top", "explain", "api-resources",
-    "api-versions", "cluster-info", "version", "auth", "events",
-})
+KUBECTL_READ_VERBS = frozenset(
+    {
+        "get",
+        "describe",
+        "logs",
+        "top",
+        "explain",
+        "api-resources",
+        "api-versions",
+        "cluster-info",
+        "version",
+        "auth",
+        "events",
+    }
+)
 # Verbs whose results carry namespace-scoped object data.
 KUBECTL_NS_DATA_VERBS = frozenset({"get", "describe", "logs", "top", "events"})
-# Flags that could redirect the API connection, swap credentials, or leak the
-# service-account token; rejected outright.
-KUBECTL_UNSAFE_FLAGS = frozenset({
-    "--server", "--token", "--kubeconfig", "--client-certificate",
-    "--client-key", "--username", "--password", "--certificate-authority",
-    "--insecure-skip-tls-verify",
-})
-_CLUSTER_SCOPED_RESOURCES = frozenset({
-    "nodes", "node", "no", "namespaces", "namespace", "ns",
-    "persistentvolumes", "pv", "customresourcedefinitions",
-    "customresourcedefinition", "crd", "crds", "clusterroles",
-    "clusterrolebindings", "storageclasses", "storageclass", "sc",
-    "priorityclasses", "priorityclass", "pc", "ingressclasses", "ingressclass",
-    "runtimeclasses", "runtimeclass", "mutatingwebhookconfigurations",
-    "mutatingwebhookconfiguration", "validatingwebhookconfigurations",
-    "validatingwebhookconfiguration", "validatingadmissionpolicies",
-    "validatingadmissionpolicy", "validatingadmissionpolicybindings",
-    "validatingadmissionpolicybinding", "csidrivers", "csidriver", "csinodes",
-    "csinode", "volumeattachments", "volumeattachment",
-    "certificatesigningrequests", "certificatesigningrequest", "csr",
-    "apiservices", "apiservice", "flowschemas", "flowschema",
-    "prioritylevelconfigurations", "prioritylevelconfiguration",
-    "clusterroles", "clusterrole", "clusterrolebindings", "clusterrolebinding",
-    "clusterissuers", "componentstatuses", "componentstatus",
-    "persistentvolumes", "persistentvolume",
-})
+# Flags that could redirect the API connection, swap credentials, leak the
+# service-account token, or impersonate another identity; rejected outright.
+# Impersonation flags are defense in depth: the shipped read-only ClusterRole
+# grants no `impersonate` verb, so `--as` fails at the API server today —
+# the denylist keeps the attempt from ever reaching it as someone else.
+KUBECTL_UNSAFE_FLAGS = frozenset(
+    {
+        "--server",
+        "--token",
+        "--kubeconfig",
+        "--client-certificate",
+        "--client-key",
+        "--username",
+        "--password",
+        "--certificate-authority",
+        "--insecure-skip-tls-verify",
+        "--as",
+        "--as-group",
+        "--as-uid",
+    }
+)
+_CLUSTER_SCOPED_RESOURCES = frozenset(
+    {
+        "nodes",
+        "node",
+        "no",
+        "namespaces",
+        "namespace",
+        "ns",
+        "persistentvolumes",
+        "pv",
+        "customresourcedefinitions",
+        "customresourcedefinition",
+        "crd",
+        "crds",
+        "clusterroles",
+        "clusterrolebindings",
+        "storageclasses",
+        "storageclass",
+        "sc",
+        "priorityclasses",
+        "priorityclass",
+        "pc",
+        "ingressclasses",
+        "ingressclass",
+        "runtimeclasses",
+        "runtimeclass",
+        "mutatingwebhookconfigurations",
+        "mutatingwebhookconfiguration",
+        "validatingwebhookconfigurations",
+        "validatingwebhookconfiguration",
+        "validatingadmissionpolicies",
+        "validatingadmissionpolicy",
+        "validatingadmissionpolicybindings",
+        "validatingadmissionpolicybinding",
+        "csidrivers",
+        "csidriver",
+        "csinodes",
+        "csinode",
+        "volumeattachments",
+        "volumeattachment",
+        "certificatesigningrequests",
+        "certificatesigningrequest",
+        "csr",
+        "apiservices",
+        "apiservice",
+        "flowschemas",
+        "flowschema",
+        "prioritylevelconfigurations",
+        "prioritylevelconfiguration",
+        "clusterrole",
+        "clusterrolebinding",
+        "clusterissuers",
+        "componentstatuses",
+        "componentstatus",
+        "persistentvolume",
+    }
+)
 
 
 class KubectlError(Exception):
@@ -346,7 +408,8 @@ async def _kubectl_run(argv: list):
     """Run one kubectl invocation; returns (returncode, stdout, stderr)."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl", *argv,
+            "kubectl",
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_kubectl_env(),
@@ -354,10 +417,8 @@ async def _kubectl_run(argv: list):
     except (OSError, ValueError) as e:
         raise KubectlError(f"could not execute kubectl: {e}") from e
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=KUBECTL_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=KUBECTL_TIMEOUT_SECONDS)
+    except TimeoutError:
         # The child may exit between the cancellation and the kill; never let
         # reaping errors or orphaned grandchildren stall the caller.
         try:
@@ -366,11 +427,9 @@ async def _kubectl_run(argv: list):
             pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
-        raise KubectlError(
-            f"kubectl timed out after {KUBECTL_TIMEOUT_SECONDS} seconds"
-        ) from None
+        raise KubectlError(f"kubectl timed out after {KUBECTL_TIMEOUT_SECONDS} seconds") from None
     out = stdout.decode("utf-8", errors="replace").strip()
     err = stderr.decode("utf-8", errors="replace").strip()
     return proc.returncode, out, err
@@ -422,9 +481,7 @@ async def _expand_allowed(allowed) -> list:
     try:
         ns_list = await asyncio.to_thread(v1.list_namespace)
     except ApiException as e:
-        raise NamespacePolicyError(
-            f"could not expand namespace glob patterns: {e.reason}"
-        ) from e
+        raise NamespacePolicyError(f"could not expand namespace glob patterns: {e.reason}") from e
     matched = {n.metadata.name for n in ns_list.items if _visible(n.metadata.name)}
     return sorted(matched)
 
@@ -452,8 +509,7 @@ async def _namespace_plan(argv: list):
         return [(None, argv)]
     if not allns:
         raise NamespacePolicyError(
-            "no namespace given and a namespace policy is active; pass "
-            f"-n <namespace>.{_policy_hint()}"
+            f"no namespace given and a namespace policy is active; pass -n <namespace>.{_policy_hint()}"
         )
     if allowed is None:
         raise NamespacePolicyError(
@@ -462,9 +518,7 @@ async def _namespace_plan(argv: list):
         )
     expanded = await _expand_allowed(allowed)
     if not expanded:
-        raise NamespacePolicyError(
-            f"the {ALLOWED_NAMESPACES_ENV} patterns matched no live namespaces."
-        )
+        raise NamespacePolicyError(f"the {ALLOWED_NAMESPACES_ENV} patterns matched no live namespaces.")
     if len(expanded) > MAX_NS_QUERY_REWRITE:
         raise NamespacePolicyError(
             f"{len(expanded)} allowed namespaces exceed the "
@@ -483,17 +537,29 @@ async def _kubectl_plan_execute(argv: list) -> str:
         return f"Error: {e}"
     if len(plan) == 1:
         try:
-            return await _kubectl_exec(plan[0][1])
+            result = await _kubectl_exec(plan[0][1])
         except KubectlError as e:
-            return f"Error: {e}"
-    blocks = []
-    for label, args in plan:
-        try:
-            out = await _kubectl_exec(args)
-        except KubectlError as e:
-            out = f"Error: {e}"
-        blocks.append(f"=== namespace {label} ===\n{out}")
-    return _truncate("\n".join(blocks))
+            result = f"Error: {e}"
+    else:
+        # Multi-namespace rewrite: run the per-namespace queries CONCURRENTLY
+        # under a bounded semaphore (asyncio.gather preserves the plan's order,
+        # so the merged output stays byte-identical to the old sequential loop —
+        # same sections, namespace-sorted — while N sequential kubectl spawns
+        # shrink to K8S_MCP_LIST_CONCURRENCY at a time).
+        semaphore = asyncio.Semaphore(_list_concurrency())
+
+        async def _run_one(label: str, args: list) -> str:
+            async with semaphore:
+                try:
+                    out = await _kubectl_exec(args)
+                except KubectlError as e:
+                    out = f"Error: {e}"
+            return f"=== namespace {label} ===\n{out}"
+
+        blocks = await asyncio.gather(*(_run_one(label, args) for label, args in plan))
+        result = _truncate("\n".join(blocks))
+    _metrics_inc("kubectl_batch", "error" if result.startswith("Error:") else "ok")
+    return result
 
 
 def _parse_kubectl_command(command: str) -> list:
@@ -506,8 +572,7 @@ def _parse_kubectl_command(command: str) -> list:
         raise KubectlError("empty command")
     if argv[0] not in KUBECTL_READ_VERBS:
         raise KubectlError(
-            f"command '{argv[0]}' is not allowed; allowed read verbs: "
-            + ", ".join(sorted(KUBECTL_READ_VERBS))
+            f"command '{argv[0]}' is not allowed; allowed read verbs: " + ", ".join(sorted(KUBECTL_READ_VERBS))
         )
     for tok in argv[1:]:
         head = tok.split("=", 1)[0]
@@ -518,10 +583,11 @@ def _parse_kubectl_command(command: str) -> list:
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
+
 def _age(ts):
     if not ts:
         return "Unknown"
-    delta = datetime.datetime.now(datetime.timezone.utc) - ts
+    delta = datetime.datetime.now(datetime.UTC) - ts
     secs = int(delta.total_seconds())
     if secs < 60:
         return f"{secs}s"
@@ -538,7 +604,67 @@ def _truncate(text: str, max_len: int = 50000) -> str:
     return text
 
 
+# ─── Cluster-wide listing guardrails ─────────────────────────────────────
+#
+# K8S_MCP_LIST_CONCURRENCY — width of the bounded-semaphore fan-out when a
+#   whitelist rewrites one -A query into up to MAX_NS_QUERY_REWRITE
+#   per-namespace kubectl spawns (>= 1; malformed values fall back to the
+#   default — a perf knob, not a policy).
+# K8S_MCP_MAX_LIST_ITEMS — cap on what a CLUSTER-WIDE (namespace omitted /
+#   -A) Python-API listing may render. Namespaced listings are untouched;
+#   when the cap bites, a truncation marker naming this env is appended so
+#   operators can page per-namespace or raise it. (kubectl-backed output
+#   stays bounded by _truncate's 50k-char cap, as before.)
+LIST_CONCURRENCY_ENV = "K8S_MCP_LIST_CONCURRENCY"
+DEFAULT_LIST_CONCURRENCY = 8
+MAX_LIST_ITEMS_ENV = "K8S_MCP_MAX_LIST_ITEMS"
+DEFAULT_MAX_LIST_ITEMS = 500
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def _list_concurrency() -> int:
+    """Width of the bounded-semaphore per-namespace kubectl fan-out (>= 1)."""
+    return max(1, _env_int(LIST_CONCURRENCY_ENV, DEFAULT_LIST_CONCURRENCY))
+
+
+def _max_list_items() -> int:
+    """Cluster-wide list cap (>= 1; malformed values keep the default)."""
+    return max(1, _env_int(MAX_LIST_ITEMS_ENV, DEFAULT_MAX_LIST_ITEMS))
+
+
+def _cap_cluster_wide(items: list) -> tuple:
+    """(items, truncation_marker) for a cluster-wide listing.
+
+    Returns the input unchanged (marker None) when at or below the cap, so
+    the rendered output is byte-identical to the uncapped form. Above the
+    cap the first _max_list_items() items pass and the marker names the env.
+    """
+    cap = _max_list_items()
+    total = len(items)
+    if total <= cap:
+        return items, None
+    _metrics_inc("list_truncation")
+    marker = (
+        f"  ... ({total - cap} more items not shown — cluster-wide listing "
+        f"truncated at {cap} by {MAX_LIST_ITEMS_ENV}; list per-namespace "
+        f"with -n or raise the env)"
+    )
+    return items[:cap], marker
+
+
+def _cap_suffix(marker) -> str:
+    """Marker as an output suffix ("" when the listing was not truncated)."""
+    return f"\n{marker}" if marker else ""
+
+
 # ─── Generic K8s API Tools ───────────────────────────────────────────────
+
 
 @mcp.tool()
 async def get_resource(
@@ -604,6 +730,7 @@ async def list_api_resources() -> str:
 
 # ─── Cluster Health ──────────────────────────────────────────────────────
 
+
 @mcp.tool()
 async def cluster_health() -> str:
     """Get overall cluster health: node status, component status, resource usage.
@@ -611,6 +738,9 @@ async def cluster_health() -> str:
     sections = []
     policy_on = _namespace_policy_active()
 
+    nodes_res: Any
+    ns_res: Any
+    pods_res: Any
     nodes_res, ns_res, pods_res = await asyncio.gather(
         asyncio.to_thread(v1.list_node),
         asyncio.to_thread(v1.list_namespace),
@@ -626,15 +756,18 @@ async def cluster_health() -> str:
         for n in nodes_res.items:
             conditions = {c.type: c.status for c in n.status.conditions}
             ready = conditions.get("Ready", "Unknown")
-            roles = ",".join(
-                l.replace("node-role.kubernetes.io/", "")
-                for l in n.metadata.labels or {}
-                if l.startswith("node-role.kubernetes.io/")
-            ) or "worker"
+            roles = (
+                ",".join(
+                    l.replace("node-role.kubernetes.io/", "")
+                    for l in n.metadata.labels or {}
+                    if l.startswith("node-role.kubernetes.io/")
+                )
+                or "worker"
+            )
             alloc = n.status.allocatable or {}
             node_lines.append(
                 f"  {n.metadata.name}: Ready={ready}, Roles={roles}, "
-                f"CPU={alloc.get('cpu','?')}, Mem={alloc.get('memory','?')}, "
+                f"CPU={alloc.get('cpu', '?')}, Mem={alloc.get('memory', '?')}, "
                 f"GPU={alloc.get('nvidia.com/gpu', '0')}"
             )
         sections.append("NODES:\n" + "\n".join(node_lines))
@@ -656,13 +789,12 @@ async def cluster_health() -> str:
         pending = sum(1 for p in pod_items if p.status.phase == "Pending")
         failed = sum(1 for p in pod_items if p.status.phase == "Failed")
         crash = sum(
-            1 for p in pod_items
-            if p.status.container_statuses
-            and any(c.restart_count > 5 for c in p.status.container_statuses)
+            1
+            for p in pod_items
+            if p.status.container_statuses and any(c.restart_count > 5 for c in p.status.container_statuses)
         )
         sections.append(
-            f"PODS: {total} total, {running} running, {pending} pending, "
-            f"{failed} failed, {crash} high-restart (>5)"
+            f"PODS: {total} total, {running} running, {pending} pending, {failed} failed, {crash} high-restart (>5)"
         )
 
     # Top nodes (if metrics available)
@@ -676,6 +808,7 @@ async def cluster_health() -> str:
 
 
 # ─── Namespaces ──────────────────────────────────────────────────────────
+
 
 @mcp.tool()
 async def list_namespaces() -> str:
@@ -697,6 +830,7 @@ async def list_namespaces() -> str:
 
 # ─── Pods ────────────────────────────────────────────────────────────────
 
+
 @mcp.tool()
 async def list_pods(namespace: str = "", label_selector: str = "") -> str:
     """List pods with health status, restarts, and age.
@@ -715,6 +849,9 @@ async def list_pods(namespace: str = "", label_selector: str = "") -> str:
         else:
             pods = await asyncio.to_thread(v1.list_pod_for_all_namespaces, **kwargs)
             items = _filter_visible(pods.items) if _namespace_policy_active() else pods.items
+        marker = None
+        if not namespace:
+            items, marker = _cap_cluster_wide(items)
 
         if not items:
             return "No pods found."
@@ -725,7 +862,7 @@ async def list_pods(namespace: str = "", label_selector: str = "") -> str:
             restarts = sum(c.restart_count for c in p.status.container_statuses) if p.status.container_statuses else 0
             age = _age(p.status.start_time)
             lines.append(f"  {ns}/{p.metadata.name}: {p.status.phase} | Restarts: {restarts} | Age: {age}")
-        return f"PODS ({len(lines)}):\n" + "\n".join(lines)
+        return f"PODS ({len(lines)}):\n" + "\n".join(lines) + _cap_suffix(marker)
     except ApiException as e:
         return f"K8s API Error: {e.reason} ({e.status})"
 
@@ -779,12 +916,12 @@ async def get_pod_logs(
         m = re.search(r"choose one of: \[([^\]]+)\]", detail)
         if m:
             names = ", ".join(n.strip() for n in m.group(1).split(",") if n.strip())
-            return (f"Error reading logs: pod {pod_name!r} runs multiple containers — "
-                    f"set container to one of: {names}")
+            return f"Error reading logs: pod {pod_name!r} runs multiple containers — set container to one of: {names}"
         return f"Error reading logs: {e.reason}" + (f" ({detail})" if detail else "")
 
 
 # ─── Events ──────────────────────────────────────────────────────────────
+
 
 @mcp.tool()
 async def get_events(
@@ -812,7 +949,10 @@ async def get_events(
             items = [e for e in items if resource_name in (e.involved_object.name or "")]
 
         # Sort by last timestamp, most recent first
-        items.sort(key=lambda e: e.last_timestamp or e.event_time or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)
+        items.sort(
+            key=lambda e: e.last_timestamp or e.event_time or datetime.datetime.min.replace(tzinfo=datetime.UTC),
+            reverse=True,
+        )
         items = items[:100]  # limit
 
         if not items:
@@ -832,6 +972,7 @@ async def get_events(
 
 # ─── Deployments / StatefulSets / DaemonSets ─────────────────────────────
 
+
 @mcp.tool()
 async def list_workloads(namespace: str = "") -> str:
     """List all workloads (Deployments, StatefulSets, DaemonSets, Jobs) in a
@@ -848,34 +989,70 @@ async def list_workloads(namespace: str = "") -> str:
         except ApiException:
             return None
         items = _filter_visible(result.items) if (policy_on and not namespace) else result.items
+        marker = None
+        if not namespace:
+            items, marker = _cap_cluster_wide(items)
         if not items:
             return None
-        return "\n".join(fmt(i) for i in items)
+        return "\n".join(fmt(i) for i in items) + _cap_suffix(marker)
 
     if namespace:
-        deps = _section(asyncio.to_thread(apps_v1.list_namespaced_deployment, namespace),
-                        lambda d: f"  Deployment {d.metadata.namespace}/{d.metadata.name}: {d.status.ready_replicas or 0}/{d.spec.replicas} ready")
-        sts = _section(asyncio.to_thread(apps_v1.list_namespaced_stateful_set, namespace),
-                       lambda s: f"  StatefulSet {s.metadata.namespace}/{s.metadata.name}: {s.status.ready_replicas or 0}/{s.spec.replicas} ready")
-        ds = _section(asyncio.to_thread(apps_v1.list_namespaced_daemon_set, namespace),
-                      lambda d: f"  DaemonSet {d.metadata.namespace}/{d.metadata.name}: {d.status.number_ready}/{d.status.desired_number_scheduled} ready")
-        jobs = _section(asyncio.to_thread(batch_v1.list_namespaced_job, namespace),
-                        lambda j: f"  Job {j.metadata.namespace}/{j.metadata.name}: succeeded={j.status.succeeded or 0}, failed={j.status.failed or 0}")
+        deps = _section(
+            asyncio.to_thread(apps_v1.list_namespaced_deployment, namespace),
+            lambda d: (
+                f"  Deployment {d.metadata.namespace}/{d.metadata.name}: {d.status.ready_replicas or 0}/{d.spec.replicas} ready"
+            ),
+        )
+        sts = _section(
+            asyncio.to_thread(apps_v1.list_namespaced_stateful_set, namespace),
+            lambda s: (
+                f"  StatefulSet {s.metadata.namespace}/{s.metadata.name}: {s.status.ready_replicas or 0}/{s.spec.replicas} ready"
+            ),
+        )
+        ds = _section(
+            asyncio.to_thread(apps_v1.list_namespaced_daemon_set, namespace),
+            lambda d: (
+                f"  DaemonSet {d.metadata.namespace}/{d.metadata.name}: {d.status.number_ready}/{d.status.desired_number_scheduled} ready"
+            ),
+        )
+        jobs = _section(
+            asyncio.to_thread(batch_v1.list_namespaced_job, namespace),
+            lambda j: (
+                f"  Job {j.metadata.namespace}/{j.metadata.name}: succeeded={j.status.succeeded or 0}, failed={j.status.failed or 0}"
+            ),
+        )
     else:
-        deps = _section(asyncio.to_thread(apps_v1.list_deployment_for_all_namespaces),
-                        lambda d: f"  Deployment {d.metadata.namespace}/{d.metadata.name}: {d.status.ready_replicas or 0}/{d.spec.replicas} ready")
-        sts = _section(asyncio.to_thread(apps_v1.list_stateful_set_for_all_namespaces),
-                       lambda s: f"  StatefulSet {s.metadata.namespace}/{s.metadata.name}: {s.status.ready_replicas or 0}/{s.spec.replicas} ready")
-        ds = _section(asyncio.to_thread(apps_v1.list_daemon_set_for_all_namespaces),
-                      lambda d: f"  DaemonSet {d.metadata.namespace}/{d.metadata.name}: {d.status.number_ready}/{d.status.desired_number_scheduled} ready")
-        jobs = _section(asyncio.to_thread(batch_v1.list_job_for_all_namespaces),
-                        lambda j: f"  Job {j.metadata.namespace}/{j.metadata.name}: succeeded={j.status.succeeded or 0}, failed={j.status.failed or 0}")
+        deps = _section(
+            asyncio.to_thread(apps_v1.list_deployment_for_all_namespaces),
+            lambda d: (
+                f"  Deployment {d.metadata.namespace}/{d.metadata.name}: {d.status.ready_replicas or 0}/{d.spec.replicas} ready"
+            ),
+        )
+        sts = _section(
+            asyncio.to_thread(apps_v1.list_stateful_set_for_all_namespaces),
+            lambda s: (
+                f"  StatefulSet {s.metadata.namespace}/{s.metadata.name}: {s.status.ready_replicas or 0}/{s.spec.replicas} ready"
+            ),
+        )
+        ds = _section(
+            asyncio.to_thread(apps_v1.list_daemon_set_for_all_namespaces),
+            lambda d: (
+                f"  DaemonSet {d.metadata.namespace}/{d.metadata.name}: {d.status.number_ready}/{d.status.desired_number_scheduled} ready"
+            ),
+        )
+        jobs = _section(
+            asyncio.to_thread(batch_v1.list_job_for_all_namespaces),
+            lambda j: (
+                f"  Job {j.metadata.namespace}/{j.metadata.name}: succeeded={j.status.succeeded or 0}, failed={j.status.failed or 0}"
+            ),
+        )
 
     sections = [s for s in await asyncio.gather(deps, sts, ds, jobs) if s]
     return "WORKLOADS:\n" + "\n".join(sections) if sections else "No workloads found."
 
 
 # ─── Services & Networking ───────────────────────────────────────────────
+
 
 @mcp.tool()
 async def list_services(namespace: str = "") -> str:
@@ -892,18 +1069,22 @@ async def list_services(namespace: str = "") -> str:
         else:
             svcs = await asyncio.to_thread(v1.list_service_for_all_namespaces)
             items = _filter_visible(svcs.items) if _namespace_policy_active() else svcs.items
+        marker = None
+        if not namespace:
+            items, marker = _cap_cluster_wide(items)
         if not items:
             return "No services found."
         lines = []
         for s in items:
             ports = ",".join(f"{p.port}/{p.protocol}" for p in (s.spec.ports or []))
             lines.append(f"  {s.metadata.namespace}/{s.metadata.name}: {s.spec.type} {s.spec.cluster_ip} [{ports}]")
-        return f"SERVICES ({len(lines)}):\n" + "\n".join(lines)
+        return f"SERVICES ({len(lines)}):\n" + "\n".join(lines) + _cap_suffix(marker)
     except ApiException as e:
         return f"K8s API Error: {e.reason}"
 
 
 # ─── ConfigMaps & Secrets ────────────────────────────────────────────────
+
 
 @mcp.tool()
 async def get_configmap(name: str, namespace: str = "default") -> str:
@@ -932,14 +1113,16 @@ async def list_secrets(namespace: str = "default") -> str:
         secrets = await asyncio.to_thread(v1.list_namespaced_secret, namespace)
         if not secrets.items:
             return "No secrets found."
-        lines = [f"  {s.metadata.name}: type={s.type}, keys={list(s.data.keys()) if s.data else []}"
-                 for s in secrets.items]
+        lines = [
+            f"  {s.metadata.name}: type={s.type}, keys={list(s.data.keys()) if s.data else []}" for s in secrets.items
+        ]
         return f"SECRETS ({len(lines)}):\n" + "\n".join(lines)
     except ApiException as e:
         return f"K8s API Error: {e.reason}"
 
 
 # ─── PVCs & Storage ─────────────────────────────────────────────────────
+
 
 @mcp.tool()
 async def list_pvcs(namespace: str = "") -> str:
@@ -956,6 +1139,9 @@ async def list_pvcs(namespace: str = "") -> str:
         else:
             pvcs = await asyncio.to_thread(v1.list_persistent_volume_claim_for_all_namespaces)
             items = _filter_visible(pvcs.items) if _namespace_policy_active() else pvcs.items
+        marker = None
+        if not namespace:
+            items, marker = _cap_cluster_wide(items)
         if not items:
             return "No PVCs found."
         lines = []
@@ -965,20 +1151,305 @@ async def list_pvcs(namespace: str = "") -> str:
                 f"  {p.metadata.namespace}/{p.metadata.name}: {p.status.phase} "
                 f"| {cap} | SC: {p.spec.storage_class_name}"
             )
-        return f"PVCs ({len(lines)}):\n" + "\n".join(lines)
+        return f"PVCs ({len(lines)}):\n" + "\n".join(lines) + _cap_suffix(marker)
     except ApiException as e:
         return f"K8s API Error: {e.reason}"
 
 
+# ─── Fleet triage (composite read, additive) ─────────────────────────────
+#
+# triage(namespace, app) — a one-call namespace health summary assembled from
+# the SAME governed read paths the individual tools use; the composite only
+# composes, it never bypasses:
+#   - namespace policy: checked up front with namespace_violation, exactly
+#     like list_pods (denied namespace → the same refusal);
+#   - reads: namespaced Python-API calls only (list_pods/list_workloads/
+#     get_events/list_pvcs' exact call pattern) under asyncio.to_thread —
+#     no kubectl spawn, so the read-verb allowlist is not involved; being
+#     namespaced-only it never touches the -A rewrite or the cluster-wide
+#     D9 cap paths;
+#   - events keep get_events' Warning filter, last-timestamp sort, and
+#     100-item cap;
+#   - the COMPOSITE output is bounded by its own cap so one triage call can
+#     never flood the context:
+#
+# K8S_MCP_TRIAGE_MAX_LINES — maximum lines one triage render may emit
+#     (default 150; >= 1, malformed values keep the default). When the cap
+#     bites, a truncation marker naming this env is appended — narrow the
+#     triage with app= or raise the env.
+#
+# The app filter narrows the PODS and WORKLOADS sections (and the attention
+# list that derives from them): label match on app / app.kubernetes.io/name
+# first, then a name-substring match — the label-first convention of
+# list_pods' label_selector. Events and PVCs stay namespace-wide context.
+# ATTENTION renders first (the cap then can only truncate the detail
+# sections, never the findings). Log correlation stays agent-orchestrated:
+# triage summarizes state, it does not read pod logs.
+
+TRIAGE_MAX_LINES_ENV = "K8S_MCP_TRIAGE_MAX_LINES"
+DEFAULT_TRIAGE_MAX_LINES = 150
+
+
+def _triage_max_lines() -> int:
+    """Composite triage output cap (>= 1; malformed values keep the default)."""
+    return max(1, _env_int(TRIAGE_MAX_LINES_ENV, DEFAULT_TRIAGE_MAX_LINES))
+
+
+_TRIAGE_APP_LABELS = ("app", "app.kubernetes.io/name")
+
+
+def _triage_app_match(meta, app: str) -> bool:
+    """list_pods-consistent app narrowing: label match first, then substring."""
+    labels = getattr(meta, "labels", None) or {}
+    for label in _TRIAGE_APP_LABELS:
+        if labels.get(label) == app:
+            return True
+    return app in (meta.name or "")
+
+
+def _triage_pod_restarts(p) -> int:
+    """Total container restarts for a pod (0 when statuses are absent)."""
+    statuses = getattr(p.status, "container_statuses", None)
+    return sum(c.restart_count for c in statuses) if statuses else 0
+
+
+def _triage_pod_waiting(p) -> list:
+    """Waiting reasons of the pod's containers (crash/OOM/pull failures)."""
+    reasons = []
+    for c in getattr(p.status, "container_statuses", None) or []:
+        state = getattr(c, "state", None)
+        waiting = getattr(state, "waiting", None) if state else None
+        reason = getattr(waiting, "reason", None) if waiting else None
+        if reason:
+            reasons.append(reason)
+    return reasons
+
+
+def _triage_pod_ready(p):
+    """True/False from the pod's Ready condition; None when unreported."""
+    for cond in getattr(p.status, "conditions", None) or []:
+        if getattr(cond, "type", None) == "Ready":
+            return cond.status == "True"
+    return None
+
+
+def _triage_pod_attention(p):
+    """One ATTENTION line for a pod worth flagging, or None when healthy.
+
+    Flags (the audit's triage criteria): a container waiting reason
+    (CrashLoopBackOff / OOMKilled / ImagePullBackOff / …), a Pending/Failed/
+    Unknown phase, Ready=False on a Running pod, and any restarts. Succeeded
+    pods (completed Jobs) are a normal terminal state and stay unflagged.
+    """
+    phase = getattr(p.status, "phase", None) or "Unknown"
+    if phase == "Succeeded":
+        return None
+    flags = []
+    waiting = sorted(set(_triage_pod_waiting(p)))
+    if waiting:
+        flags.append("/".join(waiting))
+    elif phase in ("Pending", "Failed", "Unknown"):
+        flags.append(phase)
+    if phase == "Running" and _triage_pod_ready(p) is False:
+        flags.append("not Ready")
+    restarts = _triage_pod_restarts(p)
+    if restarts > 0:
+        flags.append(f"{restarts} restarts")
+    if not flags:
+        return None
+    return f"  {p.metadata.name}: " + " — ".join(flags)
+
+
+def _triage_exc_message(exc) -> str:
+    """Honest per-section error text for a failed namespaced read."""
+    reason = getattr(exc, "reason", None)
+    if reason:
+        status = getattr(exc, "status", None)
+        return f"{reason} ({status})" if status else str(reason)
+    return str(exc) or exc.__class__.__name__
+
+
+@mcp.tool()
+async def triage(namespace: str, app: str = "") -> str:
+    """One-call namespace triage: an attention list (restarts, not-Ready,
+    OOMKilled/CrashLoopBackOff, failing probes) followed by the pods,
+    workloads (ready vs desired), recent Warning events, and PVC states it
+    is derived from — assembled from this server's own governed read paths.
+    The namespace policy applies exactly as it does to list_pods.
+    Args:
+        namespace: target namespace (required — triage is a namespaced
+            summary; use list_pods / get_events for cluster-wide views).
+        app: optional narrowing of PODS and WORKLOADS (label match on app /
+            app.kubernetes.io/name, else name substring; the attention list
+            follows the same narrowing). Events and PVCs stay namespace-wide.
+    Output is capped at K8S_MCP_TRIAGE_MAX_LINES lines (default 150)."""
+    ns = (namespace or "").strip().lower()
+    if not ns:
+        return (
+            "Error: triage requires a namespace (it is a namespaced "
+            "summary; use list_pods or get_events for cluster-wide views)"
+        )
+    violation = namespace_violation(ns)
+    if violation:
+        return f"Error: {violation}"
+    app_name = ""
+    if (app or "").strip():
+        try:
+            app_name = _validated_name(app.strip())
+        except ValueError as e:
+            return f"Error: {e}"
+
+    pods_res: Any
+    deps_res: Any
+    sts_res: Any
+    ds_res: Any
+    events_res: Any
+    pvcs_res: Any
+    pods_res, deps_res, sts_res, ds_res, events_res, pvcs_res = await asyncio.gather(
+        asyncio.to_thread(v1.list_namespaced_pod, ns),
+        asyncio.to_thread(apps_v1.list_namespaced_deployment, ns),
+        asyncio.to_thread(apps_v1.list_namespaced_stateful_set, ns),
+        asyncio.to_thread(apps_v1.list_namespaced_daemon_set, ns),
+        asyncio.to_thread(v1.list_namespaced_event, ns),
+        asyncio.to_thread(v1.list_namespaced_persistent_volume_claim, ns),
+        return_exceptions=True,
+    )
+
+    if isinstance(pods_res, BaseException):
+        # The pod read is the core of the triage — fail it like list_pods.
+        _metrics_inc("triage", "error")
+        reason = getattr(pods_res, "reason", None)
+        if reason:
+            return f"K8s API Error: {reason} ({getattr(pods_res, 'status', '?')})"
+        return f"K8s API Error: {_triage_exc_message(pods_res)}"
+
+    pod_items = list(pods_res.items)
+    if app_name:
+        pod_items = [p for p in pod_items if _triage_app_match(p.metadata, app_name)]
+
+    # Attention first: the findings, then the sections they derive from.
+    attention = []
+    for p in pod_items:
+        line = _triage_pod_attention(p)
+        if line:
+            attention.append(line)
+    warning_items = []
+    if isinstance(events_res, BaseException):
+        events_error = _triage_exc_message(events_res)
+    else:
+        warning_items = [e for e in events_res.items if e.type == "Warning"]
+        # get_events' existing cap and ordering, reused verbatim.
+        warning_items.sort(
+            key=lambda e: e.last_timestamp or e.event_time or datetime.datetime.min.replace(tzinfo=datetime.UTC),
+            reverse=True,
+        )
+        warning_items = warning_items[:100]
+        for ev in warning_items:
+            if getattr(ev, "reason", None) == "Unhealthy" and (
+                not app_name or app_name in (ev.involved_object.name or "")
+            ):
+                attention.append(f"  {ev.involved_object.name}: probe failing — {ev.message}")
+
+    workload_lines = []
+    workload_count = 0
+    for label, res in (("Deployment", deps_res), ("StatefulSet", sts_res), ("DaemonSet", ds_res)):
+        if isinstance(res, BaseException):
+            workload_lines.append(f"  {label}: Error - {_triage_exc_message(res)}")
+            continue
+        items = list(res.items)
+        if app_name:
+            items = [w for w in items if _triage_app_match(w.metadata, app_name)]
+        workload_count += len(items)
+        for w in items:
+            if label == "DaemonSet":
+                ready = w.status.number_ready
+                desired = w.status.desired_number_scheduled
+            else:
+                ready = w.status.ready_replicas or 0
+                desired = w.spec.replicas
+            workload_lines.append(f"  {label} {w.metadata.namespace}/{w.metadata.name}: {ready}/{desired} ready")
+
+    pod_lines = []
+    for p in pod_items:
+        node = getattr(getattr(p, "spec", None), "node_name", None)
+        pod_lines.append(
+            f"  {p.metadata.namespace}/{p.metadata.name}: {p.status.phase} | "
+            f"Restarts: {_triage_pod_restarts(p)} | Age: {_age(p.status.start_time)} | "
+            f"Node: {node or 'unscheduled'}"
+        )
+
+    sections = []
+    sections.append(f"ATTENTION ({len(attention)}):" + ("" if attention else "\n  (none) — all clear"))
+    sections.extend(attention)
+    sections.append(f"PODS ({len(pod_lines)}):" if pod_lines else "PODS: none")
+    sections.extend(pod_lines)
+    sections.append("WORKLOADS:" if workload_lines else "WORKLOADS: none")
+    sections.extend(workload_lines)
+    if isinstance(events_res, BaseException):
+        sections.append(f"EVENTS (Warning): Error - {events_error}")
+        warnings_count = 0
+    else:
+        warnings_count = len(warning_items)
+        sections.append(f"EVENTS (Warning) ({len(warning_items)}):" if warning_items else "EVENTS (Warning): none")
+        for ev in warning_items:
+            age = _age(ev.last_timestamp or ev.event_time)
+            sections.append(
+                f"  [{ev.type}] {ev.involved_object.kind}/{ev.involved_object.name} "
+                f"in {ev.metadata.namespace}: {ev.reason} - {ev.message} (Age: {age})"
+            )
+    if isinstance(pvcs_res, BaseException):
+        sections.append(f"PVCs: Error - {_triage_exc_message(pvcs_res)}")
+        pvcs_count = 0
+    else:
+        pvc_lines = []
+        for p in pvcs_res.items:
+            cap = p.status.capacity.get("storage", "?") if p.status.capacity else "?"
+            pvc_lines.append(
+                f"  {p.metadata.namespace}/{p.metadata.name}: {p.status.phase} "
+                f"| {cap} | SC: {p.spec.storage_class_name}"
+            )
+        pvcs_count = len(pvc_lines)
+        sections.append(f"PVCs ({len(pvc_lines)}):" if pvc_lines else "PVCs: none")
+        sections.extend(pvc_lines)
+
+    where = f" (app='{app_name}')" if app_name else ""
+    header = (
+        f"TRIAGE {ns}{where}: pods={len(pod_items)} "
+        f"workloads={workload_count} warnings={warnings_count} "
+        f"pvcs={pvcs_count} attention={len(attention)}"
+    )
+    lines = [header]
+    for section in sections:
+        lines.extend(section.split("\n"))
+
+    cap = _triage_max_lines()
+    if len(lines) > cap:
+        _metrics_inc("triage_truncation")
+        omitted = len(lines) - cap
+        lines = lines[:cap] + [
+            (
+                f"  ... ({omitted} more lines not shown — triage output truncated "
+                f"at {cap} by {TRIAGE_MAX_LINES_ENV}; narrow with app= or raise the env)"
+            )
+        ]
+    _metrics_inc("triage", "ok")
+    return "\n".join(lines)
+
+
 # ─── Custom Resources (CRDs) ────────────────────────────────────────────
+
 
 @mcp.tool()
 async def list_crds() -> str:
     """List all Custom Resource Definitions (CRDs) installed in the cluster."""
-    return await _kubectl_plan_execute([
-        "get", "crd", "-o",
-        "custom-columns=NAME:.metadata.name,GROUP:.spec.group,SCOPE:.spec.scope",
-    ])
+    return await _kubectl_plan_execute(
+        [
+            "get",
+            "crd",
+            "-o",
+            "custom-columns=NAME:.metadata.name,GROUP:.spec.group,SCOPE:.spec.scope",
+        ]
+    )
 
 
 @mcp.tool()
@@ -1008,7 +1479,9 @@ async def get_custom_resource(
 
     try:
         resource = await asyncio.to_thread(
-            dyn_client.resources.get, api_version=f"{group}/{version}", plural=plural,
+            dyn_client.resources.get,
+            api_version=f"{group}/{version}",
+            plural=plural,
         )
         if name:
             obj = await asyncio.to_thread(resource.get, name=name, namespace=ns or None)
@@ -1018,10 +1491,13 @@ async def get_custom_resource(
             instances = list(getattr(listing, "items", None) or [])
         if _namespace_policy_active() and not ns:
             instances = _filter_visible(instances)
+        marker = None
+        if not ns:
+            instances, marker = _cap_cluster_wide(instances)
         if not instances:
             return "No custom resources found."
         payload = json.dumps([i.to_dict() for i in instances], indent=2, default=str)
-        return _truncate(payload)
+        return _truncate(payload) + _cap_suffix(marker)
     except (ApiException, ResourceNotFoundError, ValueError, TypeError, AttributeError):
         # Discovery or schema issues fall back to kubectl for reliability.
         argv = ["get", f"{plural}.{group}"]
@@ -1068,7 +1544,7 @@ def _iso_age(ts) -> str:
         return "Unknown"
     if isinstance(ts, str):
         try:
-            ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ts = datetime.datetime.fromisoformat(ts)
         except ValueError:
             return "Unknown"
     return _age(ts)
@@ -1125,9 +1601,7 @@ def _vs_summary(item: dict) -> list:
     meta = item.get("metadata") or {}
     spec = item.get("spec") or {}
     ns = meta.get("namespace") or "cluster-scoped"
-    lines = [
-        f"  {ns}/{meta.get('name', '?')} (Age: {_iso_age(meta.get('creationTimestamp'))})"
-    ]
+    lines = [f"  {ns}/{meta.get('name', '?')} (Age: {_iso_age(meta.get('creationTimestamp'))})"]
     hosts = spec.get("hosts") or []
     if hosts:
         lines.append(f"    hosts: {', '.join(str(h) for h in hosts)}")
@@ -1183,8 +1657,7 @@ async def list_virtual_services(namespace: str = "", name: str = "") -> str:
         # ResourceInstances varies across kubernetes-client versions.
         dicts = [i.to_dict() if hasattr(i, "to_dict") else i for i in instances]
         if vs_name and not ns:
-            dicts = [d for d in dicts
-                     if (d.get("metadata") or {}).get("name") == vs_name]
+            dicts = [d for d in dicts if (d.get("metadata") or {}).get("name") == vs_name]
         if _namespace_policy_active() and not ns:
             dicts = [d for d in dicts if _dict_visible(d)]
     except (ApiException, ResourceNotFoundError, ValueError, TypeError, AttributeError):
@@ -1206,17 +1679,22 @@ async def list_virtual_services(namespace: str = "", name: str = "") -> str:
         return "No VirtualServices found."
     if vs_name and ns:
         return _truncate(json.dumps(dicts[0], indent=2, default=str))
-    dicts.sort(key=lambda d: ((d.get("metadata") or {}).get("namespace") or "",
-                              (d.get("metadata") or {}).get("name") or ""))
+    dicts.sort(
+        key=lambda d: ((d.get("metadata") or {}).get("namespace") or "", (d.get("metadata") or {}).get("name") or "")
+    )
+    marker = None
+    if not ns:
+        dicts, marker = _cap_cluster_wide(dicts)
     where = f"in namespace '{ns}'" if ns else "across all namespaces"
     header = f"VIRTUALSERVICES {where} ({len(dicts)}):"
     lines = []
     for d in dicts:
         lines.extend(_vs_summary(d))
-    return _truncate(header + "\n" + "\n".join(lines))
+    return _truncate(header + "\n" + "\n".join(lines)) + _cap_suffix(marker)
 
 
 # ─── RBAC ────────────────────────────────────────────────────────────────
+
 
 @mcp.tool()
 async def check_rbac(
@@ -1329,10 +1807,7 @@ def exec_namespace_violation(namespace: str, key_patterns=None, header_patterns=
         return f"exec namespace policy is misconfigured: {e}"
     if deployment is not None and not _pattern_hit(deployment, ns):
         shown = ", ".join(sorted(deployment))[:200]
-        return (
-            f"namespace '{ns}' is not in the exec namespace list ({shown}); "
-            f"extend {EXEC_NAMESPACES_ENV} to debug it"
-        )
+        return f"namespace '{ns}' is not in the exec namespace list ({shown}); extend {EXEC_NAMESPACES_ENV} to debug it"
     for label, patterns in (
         ("the caller's exec assignment", key_patterns),
         (f"the {EXEC_NS_HEADER} header", header_patterns),
@@ -1383,7 +1858,7 @@ def _all_exec_patterns():
     deployment = _exec_namespace_policy()
     if deployment:
         merged.extend(deployment)
-    for _, (_, patterns) in _parse_clients(os.environ.get(CLIENTS_ENV, "")).items():
+    for _, patterns in _parse_clients(os.environ.get(CLIENTS_ENV, "")).values():
         if patterns:
             merged.extend(patterns)
     return tuple(dict.fromkeys(merged)) if merged else None
@@ -1404,7 +1879,7 @@ def provision_exec_rbac(patterns=None) -> str:
     """
     try:
         return _provision_exec_rbac(patterns)
-    except Exception as e:  # noqa: BLE001 — degrade loudly, keep serving
+    except Exception as e:
         return f"RBAC provisioning failed (server continues; exec RBAC may be incomplete): {e}"
 
 
@@ -1419,8 +1894,7 @@ def _provision_exec_rbac(patterns=None) -> str:
     sa_name, sa_ns = _own_service_account()
     if not (sa_name and sa_ns):
         return (
-            "RBAC provisioning: cannot determine this pod's ServiceAccount — "
-            f"set {SA_NAME_ENV} and {SA_NAMESPACE_ENV}"
+            f"RBAC provisioning: cannot determine this pod's ServiceAccount — set {SA_NAME_ENV} and {SA_NAMESPACE_ENV}"
         )
     try:
         rbac_v1.read_cluster_role(EXEC_TEMPLATE_ROLE)
@@ -1428,7 +1902,7 @@ def _provision_exec_rbac(patterns=None) -> str:
         if e.status == 404:
             return (
                 f"RBAC provisioning: template ClusterRole '{EXEC_TEMPLATE_ROLE}' "
-                "is missing — apply k8s-mcp-2-0-server.yaml (see documentation/DEPLOYMENT.md)"
+                "is missing — apply k8s-mcp-2-0-server.yaml (see DEPLOYMENT.md)"
             )
         return f"RBAC provisioning: cannot read template ClusterRole: {e.reason}"
 
@@ -1441,9 +1915,9 @@ def _provision_exec_rbac(patterns=None) -> str:
                 skipped.append((pattern, f"cannot list namespaces: {e.reason}"))
                 continue
             matches = sorted(
-                n.metadata.name for n in ns_list.items
-                if fnmatch.fnmatchcase(n.metadata.name, pattern)
-                and _visible(n.metadata.name)
+                n.metadata.name
+                for n in ns_list.items
+                if fnmatch.fnmatchcase(n.metadata.name, pattern) and _visible(n.metadata.name)
             )
             if matches:
                 targets.extend(matches)
@@ -1483,9 +1957,7 @@ def _provision_exec_rbac(patterns=None) -> str:
                     "kind": "ClusterRole",
                     "name": EXEC_TEMPLATE_ROLE,
                 },
-                "subjects": [
-                    {"kind": "ServiceAccount", "name": sa_name, "namespace": sa_ns}
-                ],
+                "subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": sa_ns}],
             }
             try:
                 rbac_v1.create_namespaced_role_binding(namespace=ns, body=binding)
@@ -1495,12 +1967,14 @@ def _provision_exec_rbac(patterns=None) -> str:
                 refused.append((ns, e.reason))
             continue
         role_ref = getattr(existing, "role_ref", None)
-        if role_ref is not None and getattr(role_ref, "name", "") == EXEC_TEMPLATE_ROLE \
-                and getattr(role_ref, "kind", "") == "ClusterRole":
+        if (
+            role_ref is not None
+            and getattr(role_ref, "name", "") == EXEC_TEMPLATE_ROLE
+            and getattr(role_ref, "kind", "") == "ClusterRole"
+        ):
             subjects = getattr(existing, "subjects", None) or []
             subject_ok = any(
-                getattr(s, "name", "") == sa_name and getattr(s, "namespace", "") == sa_ns
-                for s in subjects
+                getattr(s, "name", "") == sa_name and getattr(s, "namespace", "") == sa_ns for s in subjects
             )
             if subject_ok:
                 kept.append(ns)
@@ -1510,21 +1984,21 @@ def _provision_exec_rbac(patterns=None) -> str:
             # Same name + same roleRef, so the patch is ownership-safe.
             try:
                 rbac_v1.patch_namespaced_role_binding(
-                    name=EXEC_BINDING_NAME, namespace=ns,
-                    body={"subjects": [
-                        {"kind": "ServiceAccount", "name": sa_name, "namespace": sa_ns}
-                    ]},
+                    name=EXEC_BINDING_NAME,
+                    namespace=ns,
+                    body={"subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": sa_ns}]},
                 )
                 updated.append(ns)
                 print(
-                    f"AUDIT rbac provisioning repointed RoleBinding {EXEC_BINDING_NAME} "
-                    f"in {ns} to {sa_ns}/{sa_name}",
+                    f"AUDIT rbac provisioning repointed RoleBinding {EXEC_BINDING_NAME} in {ns} to {sa_ns}/{sa_name}",
                     flush=True,
                 )
             except ApiException as e:
                 refused.append((ns, e.reason))
         else:
-            refused.append((ns, f"a binding named '{EXEC_BINDING_NAME}' with a different roleRef already exists; not touching it"))
+            refused.append(
+                (ns, f"a binding named '{EXEC_BINDING_NAME}' with a different roleRef already exists; not touching it")
+            )
 
     return (
         f"RBAC provisioning: SA {sa_ns}/{sa_name} bound to '{EXEC_TEMPLATE_ROLE}' — "
@@ -1533,22 +2007,64 @@ def _provision_exec_rbac(patterns=None) -> str:
         f"skipped: {skipped or 'none'}; refused: {refused or 'none'}"
     )
 
+
 # Read-only introspection binaries. Deliberately NO env/printenv (dumps every
 # secret the container holds) and NO curl/wget/nc (network exfil channel);
 # operators may add such binaries consciously via K8S_MCP_EXEC_ALLOWED_COMMANDS.
-_EXEC_DEFAULT_COMMANDS = frozenset({
-    "ps", "ls", "cat", "tail", "head", "grep", "df", "du", "free", "uptime",
-    "hostname", "id", "whoami", "uname", "date", "stat", "ss", "netstat",
-    "ip", "wc", "sleep",
-})
+_EXEC_DEFAULT_COMMANDS = frozenset(
+    {
+        "ps",
+        "ls",
+        "cat",
+        "tail",
+        "head",
+        "grep",
+        "df",
+        "du",
+        "free",
+        "uptime",
+        "hostname",
+        "id",
+        "whoami",
+        "uname",
+        "date",
+        "stat",
+        "ss",
+        "netstat",
+        "ip",
+        "wc",
+        "sleep",
+    }
+)
 # Never runnable, even when allowlisted via env: a shell or interpreter here
 # makes the whole allowlist moot; the escalation binaries escape the
 # container's boundaries. (Removing entries is a deliberate code change.)
-_EXEC_HARD_DENIED = frozenset({
-    "sh", "bash", "ash", "dash", "zsh", "fish", "ksh", "csh", "tcsh",
-    "python", "python3", "perl", "ruby", "php", "node",
-    "su", "sudo", "doas", "nsenter", "unshare", "mount", "setsid",
-})
+_EXEC_HARD_DENIED = frozenset(
+    {
+        "sh",
+        "bash",
+        "ash",
+        "dash",
+        "zsh",
+        "fish",
+        "ksh",
+        "csh",
+        "tcsh",
+        "python",
+        "python3",
+        "perl",
+        "ruby",
+        "php",
+        "node",
+        "su",
+        "sudo",
+        "doas",
+        "nsenter",
+        "unshare",
+        "mount",
+        "setsid",
+    }
+)
 # Argument tokens that turn an allowlisted binary into an arbitrary-execution
 # primitive (find -exec) or escape the container's namespaces (ip netns).
 _EXEC_TOKEN_DENIED = frozenset({"-exec", "-execdir", "-ok", "-okdir", "netns"})
@@ -1584,10 +2100,7 @@ def _exec_command_error(command) -> "str | None":
     allowed = _exec_allowed_commands()
     if binary not in allowed:
         shown = ", ".join(sorted(allowed))[:200]
-        return (
-            f"binary '{binary}' is not in the exec allowlist ({shown}...); "
-            f"extend {EXEC_COMMANDS_ENV} to add more"
-        )
+        return f"binary '{binary}' is not in the exec allowlist ({shown}...); extend {EXEC_COMMANDS_ENV} to add more"
     return None
 
 
@@ -1631,6 +2144,7 @@ if _exec_enabled():
         header_patterns = caller.header_exec_patterns if caller else None
 
         async def deny(reason: str) -> str:
+            _metrics_inc("exec_decision", "denied")
             print(
                 f"AUDIT exec decision=denied client={caller_name or 'shared'} "
                 f"pod={namespace}/{pod_name} reason={reason}",
@@ -1654,9 +2168,7 @@ if _exec_enabled():
         if cmd_err:
             return await deny(cmd_err)
         if pod == os.environ.get("HOSTNAME", ""):
-            return await deny(
-                "refusing exec into the MCP server's own pod (credential isolation)"
-            )
+            return await deny("refusing exec into the MCP server's own pod (credential isolation)")
         if _exec_require_label():
             try:
                 pod_obj = await asyncio.to_thread(v1.read_namespaced_pod, pod, namespace)
@@ -1664,18 +2176,19 @@ if _exec_enabled():
                 return await deny(f"cannot read pod for label check: {e.reason}")
             labels = pod_obj.metadata.labels or {}
             if labels.get(EXEC_LABEL) != "true":
-                return await deny(
-                    f"pod lacks label {EXEC_LABEL}=\"true\"; label the workload to opt it in to exec"
-                )
+                return await deny(f'pod lacks label {EXEC_LABEL}="true"; label the workload to opt it in to exec')
         print(
             f"AUDIT exec decision=allowed client={caller_name or 'shared'} "
             f"pod={namespace}/{pod} container={container or 'default'} command={command!r}",
             flush=True,
         )
-        return await _kubectl_plan_execute(_exec_argv(ns, pod, command, cont))
+        result = await _kubectl_plan_execute(_exec_argv(ns, pod, command, cont))
+        _metrics_inc("exec_decision", "allowed")
+        return result
 
 
 # ─── kubectl (generic escape hatch) ─────────────────────────────────────
+
 
 @mcp.tool()
 async def run_kubectl(command: str) -> str:
@@ -1693,7 +2206,9 @@ async def run_kubectl(command: str) -> str:
     Only read verbs are allowed: get, describe, logs, top, explain,
     api-resources, api-versions, cluster-info, version, auth, events.
     Everything else (apply, delete, run, exec, port-forward, proxy, ...) is
-    rejected, as are connection flags (--server, --token, --kubeconfig, ...).
+    rejected, as are connection flags (--server, --token, --kubeconfig, ...)
+    and impersonation flags (--as, --as-group, --as-uid, in every =-joined
+    form too).
     Container exec is never available here — when enabled, use the dedicated
     exec_in_pod tool instead.
     Namespace policy applies: namespaced queries need -n; -A/--all-namespaces
@@ -1708,17 +2223,81 @@ async def run_kubectl(command: str) -> str:
 
 # ─── HTTP API-key auth (transport layer) ─────────────────────────────────
 
-API_KEY_ENV = "K8S_MCP_API_KEY"          # shared key: deployment-wide exec ceiling
-CLIENTS_ENV = "K8S_MCP_CLIENTS"          # per-user keys: "name:key[:exec-ns-patterns];…"
-EXEC_NS_HEADER = "x-exec-namespaces"     # optional client-side NARROWING (never widening)
+API_KEY_ENV = "K8S_MCP_API_KEY"  # shared key: deployment-wide exec ceiling
+CLIENTS_ENV = "K8S_MCP_CLIENTS"  # per-user keys: "name:key[:exec-ns-patterns];…"
+UNIVERSAL_API_KEYS_ENV = "MCP_API_KEYS"  # fleet one-address wiring (pcai_utils/mcp_auth.py)
+
+
+def _shared_keys() -> list:
+    """Deployment-wide shared keys: K8S_MCP_API_KEY plus every comma-separated
+    key in the fleet-universal MCP_API_KEYS (either authenticates — union).
+    Env re-read on every call, so a Secret rotation applies without restart."""
+    keys = []
+    raw_shared = os.environ.get(API_KEY_ENV, "").strip()
+    if raw_shared:
+        keys.append(raw_shared)
+    for k in os.environ.get(UNIVERSAL_API_KEYS_ENV, "").split(","):
+        k = k.strip()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+HOSTS_ENV = "MCP_EXTRA_ALLOWED_HOSTS"  # in-cluster Host-header allowlist additions
+
+
+def _parse_extra_allowed_hosts(raw: str) -> list:
+    """Parse MCP_EXTRA_ALLOWED_HOSTS into Host-header allowlist additions.
+
+    Comma-separated entries for in-cluster callers that address the server by
+    its service DNS name instead of the public FQDN (e.g. Open WebUI →
+    http://<name>-service.<ns>.svc.cluster.local:9090/mcp). The SDK's
+    transport security matches entries verbatim, or uses the `host:*` form to
+    accept any port. Order kept, surrounding whitespace and empties dropped,
+    duplicates deduplicated.
+    """
+    hosts: list = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if entry and entry not in hosts:
+            hosts.append(entry)
+    return hosts
+
+
+def _build_transport_security():
+    """TransportSecuritySettings for the streamable-HTTP MCP app, or None.
+
+    With neither MCP_HOSTNAME nor MCP_EXTRA_ALLOWED_HOSTS set (local dev), the
+    SDK's implicit loopback-only protection applies untouched (None). With
+    either set, protection is explicitly ON and the Host allowlist is: the
+    pinned public FQDN (when set) + the extra in-cluster hosts + loopback.
+    allowed_origins stays the https-only browser-form of the pinned FQDN
+    (in-cluster callers send no Origin header).
+    """
+    mcp_hostname = os.environ.get("MCP_HOSTNAME", "").strip()
+    extra_hosts = _parse_extra_allowed_hosts(os.environ.get(HOSTS_ENV, ""))
+    if not mcp_hostname and not extra_hosts:
+        return None
+    allowed_hosts = [mcp_hostname] if mcp_hostname else []
+    allowed_hosts += extra_hosts
+    allowed_hosts += ["localhost:*", "127.0.0.1:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=([f"https://{mcp_hostname}"] if mcp_hostname else []),
+    )
+
+
+EXEC_NS_HEADER = "x-exec-namespaces"  # optional client-side NARROWING (never widening)
 _UNAUTHORIZED_BODY = b'{"error": "unauthorized: missing or invalid API key"}'
 
 
 class _Caller(NamedTuple):
     """Resolved identity of the request's API key + exec scoping for the call."""
-    name: str | None                     # client entry name; None = shared key
-    key_exec_patterns: tuple | None      # per-key exec namespace patterns (None = deployment ceiling)
-    header_exec_patterns: tuple | None   # X-Exec-Namespaces narrowing (set by middleware)
+
+    name: str | None  # client entry name; None = shared key
+    key_exec_patterns: tuple | None  # per-key exec namespace patterns (None = deployment ceiling)
+    header_exec_patterns: tuple | None  # X-Exec-Namespaces narrowing (set by middleware)
 
 
 _caller_context: contextvars.ContextVar = contextvars.ContextVar("mcp_caller", default=None)
@@ -1731,7 +2310,7 @@ def _parse_clients(raw: str) -> dict:
     (patterns comma-separated, fnmatch globs). A missing/empty third field
     inherits the deployment-wide exec list. Keys must not contain ':' or ';'.
     """
-    entries = {}
+    entries: dict[str, tuple[str, tuple | None]] = {}
     raw = (raw or "").strip()
     if not raw:
         return entries
@@ -1763,11 +2342,18 @@ def _header_value(scope, lowercase_name: bytes) -> "str | None":
     return None
 
 
-def _authenticate(presented: list, shared: str, clients: dict):
-    """Resolve the presented key(s) to a _Caller, or None when unauthorized."""
+def _authenticate(presented: list, shared_keys, clients: dict):
+    """Resolve the presented key(s) to a _Caller, or None when unauthorized.
+
+    ``shared_keys`` is a LIST of deployment-wide shared keys (K8S_MCP_API_KEY
+    plus the fleet-universal MCP_API_KEYS entries — one-address wiring,
+    pcai_utils/mcp_auth.py): any one of them authenticates as the shared
+    caller. All comparisons constant-time.
+    """
     for candidate in presented:
-        if shared and hmac.compare_digest(candidate.encode("utf-8"), shared.encode("utf-8")):
-            return _Caller(name=None, key_exec_patterns=None, header_exec_patterns=None)
+        for shared in shared_keys:
+            if hmac.compare_digest(candidate.encode("utf-8"), shared.encode("utf-8")):
+                return _Caller(name=None, key_exec_patterns=None, header_exec_patterns=None)
         for key, (name, patterns) in clients.items():
             if hmac.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
                 return _Caller(name=name, key_exec_patterns=patterns, header_exec_patterns=None)
@@ -1826,16 +2412,16 @@ class _ApiKeyAuthMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        shared = os.environ.get(API_KEY_ENV, "").strip()
+        shared_keys = _shared_keys()
         clients = _parse_clients(os.environ.get(CLIENTS_ENV, ""))
-        if not shared and not clients:
-            await self.app(scope, receive, send)   # auth disabled (dev mode)
+        if not shared_keys and not clients:
+            _metrics_inc("http_request", "open")  # auth disabled (dev mode)
+            await self.app(scope, receive, send)  # auth disabled (dev mode)
             return
-        caller = _authenticate(_presented_api_keys(scope), shared, clients)
+        caller = _authenticate(_presented_api_keys(scope), shared_keys, clients)
         if caller is None:
-            for message in _json_asgi_response(
-                send, 401, _UNAUTHORIZED_BODY, [(b"www-authenticate", b"Bearer")]
-            ):
+            _metrics_inc("http_request", "unauthorized")
+            for message in _json_asgi_response(send, 401, _UNAUTHORIZED_BODY, [(b"www-authenticate", b"Bearer")]):
                 await send(message)
             return
         header_patterns = None
@@ -1844,16 +2430,120 @@ class _ApiKeyAuthMiddleware:
             try:
                 header_patterns = _parse_ns_patterns(header_raw.strip().lower())
             except ValueError as e:
+                _metrics_inc("http_request", "bad_header")
                 for message in _json_asgi_response(
-                    send, 400,
-                    f'{{"error": "invalid {EXEC_NS_HEADER} header: {e}"}}'.encode("utf-8"),
+                    send,
+                    400,
+                    f'{{"error": "invalid {EXEC_NS_HEADER} header: {e}"}}'.encode(),
                 ):
                     await send(message)
                 return
-        _caller_context.set(
-            caller._replace(header_exec_patterns=header_patterns)
-        )
+        _caller_context.set(caller._replace(header_exec_patterns=header_patterns))
+        _metrics_inc("http_request", "ok")
         await self.app(scope, receive, send)
+
+
+# ─── /metrics (opt-in Prometheus exposition) ─────────────────────────────
+#
+# Additive and default-off: K8S_MCP_METRICS_ENABLED=true makes the router
+# serve GET /metrics (Prometheus text exposition 0.0.4). Counters only —
+# no namespace/pod names, no error strings, nothing cluster-derived. When
+# prometheus_client is importable it renders the exposition; otherwise a
+# dependency-free fallback registry emits the same counter family (the
+# SQLhandler pattern: metrics must never cost an install or affect a tool
+# call). The chart's ServiceMonitor is gated separately by values
+# `metrics.enabled` (default false — the default chart render is unchanged).
+
+METRICS_ENABLED_ENV = "K8S_MCP_METRICS_ENABLED"
+_METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+_METRICS_HELP = "k8s-mcp server events, by kind and outcome."
+
+
+def _metrics_enabled() -> bool:
+    return os.environ.get(METRICS_ENABLED_ENV, "").strip().lower() == "true"
+
+
+try:
+    import prometheus_client as _prom
+
+    # Private per-import registry: module reloads (tests, config changes)
+    # re-execute this block, and re-registering on the default global
+    # registry would raise DuplicateTimeseries.
+    _PROM_REGISTRY = _prom.CollectorRegistry(auto_describe=True)
+    _PROM_EVENTS = _prom.Counter(
+        "k8s_mcp_server_events_total",
+        _METRICS_HELP,
+        ["kind", "outcome"],
+        registry=_PROM_REGISTRY,
+    )
+    _METRICS_BACKEND = "prometheus_client"
+
+    def _metrics_inc(kind: str, outcome: str = "ok", amount: float = 1) -> None:
+        """Record one server event (best-effort; must never affect a call)."""
+        try:
+            _PROM_EVENTS.labels(kind=kind, outcome=outcome).inc(amount)
+        except Exception:
+            pass
+
+    def _metrics_render() -> bytes:
+        return _prom.generate_latest(_PROM_REGISTRY)
+
+except ImportError:  # prometheus-client absent — dependency-free fallback counters
+    import threading
+
+    class _FallbackEvents:
+        """Labeled monotonic counters rendered in the Prometheus exposition."""
+
+        def __init__(self, name: str, help_text: str, label_names: tuple):
+            self.name, self.help, self.label_names = name, help_text, label_names
+            self._values: dict[tuple, float] = {}
+            self._lock = threading.Lock()
+
+        def inc(self, labels: tuple, amount: float = 1) -> None:
+            with self._lock:
+                self._values[labels] = self._values.get(labels, 0) + amount
+
+        def render(self) -> bytes:
+            with self._lock:
+                values = dict(self._values)
+            lines = [
+                f"# HELP {self.name} {self.help}",
+                f"# TYPE {self.name} counter",
+            ]
+            for labels in sorted(values):
+                rendered = ",".join(f'{name}="{value}"' for name, value in zip(self.label_names, labels))
+                lines.append(f"{self.name}{{{rendered}}} {values[labels]}")
+            return ("\n".join(lines) + "\n").encode()
+
+    _FALLBACK_EVENTS = _FallbackEvents("k8s_mcp_server_events_total", _METRICS_HELP, ("kind", "outcome"))
+    _METRICS_BACKEND = "stdlib"
+
+    def _metrics_inc(kind: str, outcome: str = "ok", amount: float = 1) -> None:
+        """Record one server event (best-effort; must never affect a call)."""
+        try:
+            _FALLBACK_EVENTS.inc((kind, outcome), amount)
+        except Exception:
+            pass
+
+    def _metrics_render() -> bytes:
+        return _FALLBACK_EVENTS.render()
+
+
+async def _metrics_response(send):
+    """Minimal ASGI 200 for GET /metrics."""
+    body = _metrics_render()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", _METRICS_CONTENT_TYPE.encode("ascii")),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"cache-control", b"no-store"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 # ─── Built-in ops console (static shell, same pod) ──────────────────────
@@ -1879,10 +2569,14 @@ _UI_CONTENT_TYPES = {
     ".woff2": "font/woff2",
 }
 _UI_SECURITY_HEADERS = [
-    (b"content-security-policy",
-     b"default-src 'none'; style-src 'self'; script-src 'self'; "
-     b"connect-src 'self'; img-src 'self' data:; font-src 'self'; "
-     b"base-uri 'none'; frame-ancestors 'none'"),
+    (
+        b"content-security-policy",
+        (
+            b"default-src 'none'; style-src 'self'; script-src 'self'; "
+            b"connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+            b"base-uri 'none'; frame-ancestors 'none'"
+        ),
+    ),
     (b"x-content-type-options", b"nosniff"),
     (b"referrer-policy", b"no-referrer"),
 ]
@@ -1893,11 +2587,13 @@ def _console_enabled() -> bool:
 
 
 async def _redirect_response(send, location: str):
-    await send({
-        "type": "http.response.start", "status": 302,
-        "headers": [(b"location", location.encode("ascii")),
-                    (b"content-length", b"0")],
-    })
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 302,
+            "headers": [(b"location", location.encode("ascii")), (b"content-length", b"0")],
+        }
+    )
     await send({"type": "http.response.body", "body": b""})
 
 
@@ -1922,7 +2618,7 @@ class _ConsoleApp:
         if path != "/ui" and not path.startswith("/ui/"):
             await self._not_found(send)
             return
-        rel = path[len("/ui"):].lstrip("/") or "index.html"
+        rel = path[len("/ui") :].lstrip("/") or "index.html"
         candidate = os.path.realpath(os.path.join(self.root, rel))
         # Path-traversal guard: the resolved file must stay inside the
         # console directory, no matter what the URL says.
@@ -1943,15 +2639,18 @@ class _ConsoleApp:
             return
         ext = os.path.splitext(candidate)[1].lower()
         ctype = _UI_CONTENT_TYPES.get(ext, "application/octet-stream").encode("ascii")
-        await send({
-            "type": "http.response.start", "status": 200,
-            "headers": [
-                (b"content-type", ctype),
-                (b"cache-control", b"no-cache"),
-                (b"content-length", str(len(body)).encode("ascii")),
-                *_UI_SECURITY_HEADERS,
-            ],
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", ctype),
+                    (b"cache-control", b"no-cache"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    *_UI_SECURITY_HEADERS,
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
 
@@ -1971,6 +2670,12 @@ class _ConsoleRouterApp:
             path = scope.get("path", "")
             if path in ("", "/", "/ui") or path.startswith("/ui/"):
                 await self.console_app(scope, receive, send)
+                return
+            # Opt-in observability: GET /metrics only when
+            # K8S_MCP_METRICS_ENABLED=true; disabled = exactly today's
+            # routing (the path falls through to the MCP app untouched).
+            if path == "/metrics" and _metrics_enabled():
+                await _metrics_response(send)
                 return
         await self.mcp_app(scope, receive, send)
 
@@ -1996,7 +2701,7 @@ if __name__ == "__main__":
     # no Mcp-Session-Id header. stateless_http=True keeps 2025-era clients
     # served without a shared session store, so this can sit behind a plain
     # round-robin load balancer.
-    if not os.environ.get(API_KEY_ENV, "").strip() and not _parse_clients(os.environ.get(CLIENTS_ENV, "")):
+    if not _shared_keys() and not _parse_clients(os.environ.get(CLIENTS_ENV, "")):
         print(
             "WARNING: neither K8S_MCP_API_KEY nor K8S_MCP_CLIENTS is set — the "
             "MCP endpoint is UNAUTHENTICATED. Configure a key (in-cluster: "
@@ -2007,21 +2712,19 @@ if __name__ == "__main__":
     # the SDK's protection ON but allowlist the real public hostname. The
     # SDK's implicit default (loopback-only) rejects every gateway-fronted
     # request with 421 "Invalid Host header" AFTER auth — only valid-key
-    # requests ever saw it. Without MCP_HOSTNAME (local dev), the SDK's
-    # implicit loopback protection applies untouched.
-    mcp_hostname = os.environ.get("MCP_HOSTNAME", "").strip()
-    transport_security = None
-    if mcp_hostname:
-        transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[mcp_hostname, "localhost:*", "127.0.0.1:*"],
-            allowed_origins=[f"https://{mcp_hostname}"],
-        )
+    # requests ever saw it. MCP_EXTRA_ALLOWED_HOSTS adds in-cluster svc-DNS
+    # hosts so local clients (e.g. Open WebUI) can call the server directly.
+    # Without either env (local dev), the SDK's implicit loopback protection
+    # applies untouched.
+    transport_security = _build_transport_security()
     uvicorn.run(
         _ConsoleRouterApp(
-            _ApiKeyAuthMiddleware(mcp.streamable_http_app(
-                stateless_http=True, transport_security=transport_security,
-            )),
+            _ApiKeyAuthMiddleware(
+                mcp.streamable_http_app(
+                    stateless_http=True,
+                    transport_security=transport_security,
+                )
+            ),
             _ConsoleApp(_UI_DIR),
         ),
         host="0.0.0.0",

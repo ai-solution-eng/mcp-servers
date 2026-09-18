@@ -13,6 +13,10 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .provider import DataProvider
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -286,7 +290,7 @@ def load_backend_config(env: dict | None = None) -> tuple[str, object]:
     return "onelake", load_config(env)
 
 
-def load_source_providers(env: dict | None = None) -> object | None:
+def load_source_providers(env: dict | None = None) -> DataProvider | None:
     """Build a federated :class:`MultiProvider` from ``SQLHANDLER_SOURCES``.
 
     ``SQLHANDLER_SOURCES`` is an optional JSON array of source objects. When
@@ -461,9 +465,7 @@ def load_dotenv(path: str | None = None) -> None:
         # the tree — picking up an unrelated sibling project's .env is worse
         # than finding nothing.
         here = os.path.dirname(os.path.abspath(__file__))
-        for candidate in (
-            os.path.join(here, "..", "..", "config", ".env"),
-        ):
+        for candidate in (os.path.join(here, "..", "..", "config", ".env"),):
             if os.path.exists(candidate):
                 path = candidate
                 break

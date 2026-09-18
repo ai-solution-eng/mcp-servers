@@ -81,7 +81,6 @@ def test_search_tables_error_path(monkeypatch):
 
 def test_engine_search_matches_name_and_catalog(tmp_path, monkeypatch):
 
-
     # Real engine over parquet fixtures + catalog descriptions.
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True)
@@ -188,9 +187,7 @@ def test_run_sql_named_params_passthrough(monkeypatch):
 
     eng = ParamsEngine(pa.table({"id": [2], "kind": ["b"]}))
     monkeypatch.setattr(server, "_handler", lambda: eng)
-    out = server.run_sql(
-        "SELECT * FROM work_order WHERE kind = $k", params={"k": "b"}
-    )
+    out = server.run_sql("SELECT * FROM work_order WHERE kind = $k", params={"k": "b"})
     assert eng.last_params == {"k": "b"}
     assert "Error" not in out
 
@@ -200,9 +197,7 @@ def test_engine_params_named_and_positional(tmp_path):
 
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True)
-    pq.write_table(
-        pa.table({"id": [1, 2, 3], "kind": ["a", "b", "a"]}), d / "p.parquet"
-    )
+    pq.write_table(pa.table({"id": [1, 2, 3], "kind": ["a", "b", "a"]}), d / "p.parquet")
 
     class P:
         kind = "fake"

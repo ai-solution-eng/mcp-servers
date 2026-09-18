@@ -1,0 +1,22 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor }}
+# Prometheus Operator ServiceMonitor scraping the MCP container's /metrics
+# (Wave-3 C3 — ADDITIVE, DEFAULT OFF: renders NOTHING unless
+# metrics.enabled=true, so the default chart render is byte-identical to the
+# baseline). Port name matches templates/service.yaml — /metrics is served by
+# the MCP container on the same port as /mcp.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  endpoints:
+    - port: mcp
+      path: /metrics
+      interval: {{ .Values.metrics.interval | quote }}
+{{- end }}

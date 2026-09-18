@@ -44,6 +44,15 @@ spec:
               value: {{ . | toJson | quote }}
               {{- end }}
             {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
+            # server serves ITS OWN per-tool request counters at /metrics only
+            # when this env is set — nothing here renders when metrics.enabled
+            # is false (the default), so the default pod is unchanged. Pairs
+            # with templates/servicemonitor.yaml.
+            - name: PROMETHEUS_METRICS_ENABLED
+              value: "true"
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health

@@ -243,24 +243,61 @@ from a Secret instead of embedding keys in values.
 
 ### 5.6 External databases (read-only attach)
 
-Postgres/MySQL servers whose tables become queryable — and join-able with lake
-tables in **one** query — as `<name>.<schema>.<table>`. Read-only is enforced
-by DuckDB itself (`ATTACH ... READ_ONLY`).
+External database servers — Postgres, MySQL/MariaDB, SQLite files, SQL Server —
+whose tables become queryable — and join-able with lake tables in **one** query
+— as `<name>.<schema>.<table>`. Read-only is enforced by DuckDB itself
+(`ATTACH ... READ_ONLY`).
 
 ```yaml
 databases:
   - name: ops
-    type: postgres        # postgres | mysql
+    type: postgres        # postgres | mariadb | mysql | sqlite | sqlserver
+                          # (omit `type` to default to postgres)
     host: postgresql.postgresql.svc.cluster.local
     port: 5432
     database: opsdb
     user: ro_user
     password: ""          # "" → manage the <release>-db-credentials Secret out-of-band
+    params:               # driver options (TLS etc.) merged into the DSN
+      sslmode: verify-full
+      sslrootcert: /etc/sqlhandler/certs/ca.crt
 ```
+
+Valid types are `postgres`, `mariadb`, `mysql`, `sqlite`, `sqlserver`
+(`postgresql` is not accepted). The per-entry `params` object carries driver
+options — notably TLS, which many production endpoints require — merged over
+each type's built-in DSN keys: an existing key is overridden in place, a new
+key is appended, no duplicate key is ever emitted. Keys that would carry
+secrets or duplicate the entry's own fields (`password`, `user`, `host`,
+`port`, `database`, `server`, …) are rejected loudly, and values are restricted
+to an injection-safe charset. MySQL/MariaDB TLS rides the libmariadb keys
+(`ssl_mode` — default `preferred` — plus `ssl_ca`, `ssl_cert`, `ssl_key`). Note
+that the mysql/mariadb scanner takes DSN values bare (whitespace-split, no
+quote handling): for those two types the entry fields (`host`/`database`/`user`)
+and `params` values must not contain whitespace — a resolved password with
+whitespace is rejected at attach time; postgres (libpq-quoted) and sqlserver
+(semicolon-delimited) accept spaces.
 
 The generated `SQLHANDLER_ATTACH` config carries env-var **names** only
 (`SQLHANDLER_DB_PW_<NAME>`); password values come from the Secret. A database
 that is down does not fail the lake.
+
+`type: sqlite` attaches a **file**, not a server: `database` is the sqlite FILE
+PATH and there is no host/port/user (`password_env` may be omitted; `params`
+are not accepted). The file is read at query time through the extension's own
+bundled sqlite3 library — outside DuckDB's filesystem lockdown — but the path
+is operator-configured in `SQLHANDLER_ATTACH` (never model-chosen), the same
+trust model as the nfs backend. `READ_ONLY` is still enforced.
+
+`type: sqlserver` rides DuckDB's community **`mssql`** extension, baked into
+the image (the old ODBC-based `sqlserver` extension does not exist on DuckDB
+1.5.x). It speaks native TDS 7.4 — no unixODBC and no Microsoft ODBC driver
+are needed. An explicit `user`/`user_env` is required (there is no `sa`
+default). TLS is ON by default: `Encrypt=yes;TrustServerCertificate=yes` are
+lenient defaults that `params` can override — in the mssql extension the two
+keys are synonyms, so set only one of them; see the
+[mssql extension docs](https://duckdb.org/community_extensions/extensions/mssql)
+for TLS options.
 
 > **DuckDB file access is locked down** on every query connection: local-file
 > reads (`read_csv`, `COPY ... TO`) and URL fetches fail closed; all

@@ -1,0 +1,39 @@
+{{- $name := include "sqlhandler.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.security.apiKey.existingSecret -}}
+
+sqlhandler {{ .Chart.Version }} deployed to namespace {{ $ns }}.
+
+════════════════════════════════════════════════════════════════════
+1. MCP API key — OPTIONAL (auth is OFF until you enable it).
+   By default /mcp runs OPEN (the chart wires no key env) and relies on
+   the gateway / network position; /api/* keeps its separate
+   SQLHANDLER_API_TOKEN middleware (set SQLHANDLER_API_TOKEN to enable
+   that one). To turn on the /mcp key gate — the chart NEVER inlines a
+   key in values:
+
+  kubectl -n {{ $ns }} create secret generic sqlhandler-apikey \
+    --from-literal="api-keys=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  helm upgrade <release> . -n {{ $ns }} --reuse-values \
+    --set security.apiKey.existingSecret=sqlhandler-apikey
+
+   ROTATION (zero downtime once enabled): the value is a
+   COMMA-SEPARATED list of valid keys — append the new one, move
+   clients over, drop the old. The server re-reads the env per request
+   — no restart needed. The fleet-universal MCP_API_KEYS env is honored
+   too (either var works).
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints:
+  MCP   : /mcp   (X-API-Key: <api-key> — only when enabled)
+  API/UI: /  and /api/*  (SQLHANDLER_API_TOKEN when set)
+  Probes: /health /ready /metrics (always public)
+  MCP client config (when enabled):
+  { "mcpServers": { "sqlhandler": { "type": "remote", "url": "http://<host>/mcp", "headers": { "X-API-Key": "<api-key>" } } } }
+
+════════════════════════════════════════════════════════════════════
+3. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | grep -i "API-key auth"
+  # → "ENABLED" when a Secret is wired; "OPEN (optional-auth mode)" otherwise.

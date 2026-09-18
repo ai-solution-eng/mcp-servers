@@ -14,7 +14,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml server.py webui.py MANIFEST.in ./
+# mcp_metrics.py MUST be in the build context: server.py imports it
+# (Wave-3 C3) and the non-editable `uv pip install --system .` only ships
+# what pyproject py-modules declares + what gets COPY'd here — a rebuilt
+# image crash-loops at startup without it (same class as mcp_auth).
+COPY pyproject.toml server.py webui.py mcp_auth.py mcp_metrics.py MANIFEST.in ./
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `logsearch-mcp`
 # script runs from there, not from /app).

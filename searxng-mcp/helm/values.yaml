@@ -20,7 +20,7 @@ image:
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
-  tag: v1.2.2
+  tag: v1.3.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -43,8 +43,16 @@ searxng:
     tag: "2026.9.8-3fdc6d753"
     pullPolicy: IfNotPresent
   # Secret key used by SearXNG for session/crypto. CHANGE THIS for any real
-  # deployment (kubectl create secret is an alternative — wire envFrom then).
+  # deployment — or better, leave the default and point existingSecret below
+  # at a pre-created Secret so the value never passes through values/git
+  # (kubectl create secret generic <name> --from-literal=secret=$(openssl rand -hex 32)).
   secretKey: "change-me-searxng-secret"
+  # Reference to a pre-created Secret holding SEARXNG_SECRET. When set, the
+  # literal secretKey above is ignored and the container gets
+  #   SEARXNG_SECRET from secretKeyRef <existingSecret>/<existingSecretKey>.
+  # This is the preferred wiring (rotation = update the Secret + restart).
+  existingSecret: ""
+  existingSecretKey: secret
   # Public base URL of the SearXNG UI (rendered into settings.yml
   # server.base_url). Leave "" to omit — the JSON API works without it; set
   # the literal https://<endpoint>/ in site values for correct UI links.
@@ -121,6 +129,61 @@ browser:
 env:
   - name: SEARXNG_URL
     value: "http://localhost:8080"
+
+# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+# Prometheus self-metrics on the MCP container (NOT the SearXNG sidecar): ONE
+# counter family, searxng_mcp_tool_requests_total{tool,outcome} — per-tool
+# request counts with outcome ok|error for search + fetch_content (which tools
+# agents call, how often, how often they fail — SSRF-policy refusals surface
+# as fetch errors). No queries, URLs, or error text are ever exported.
+# DEFAULT false: the chart renders NOTHING extra (no env, no ServiceMonitor)
+# and the server serves no /metrics route — the default render is
+# byte-identical to the pre-metrics baseline. Flip to true per site values to
+# enable; /metrics is then served key-free on the MCP port (the auth gate
+# protects only /mcp — "/metrics" is not "/mcp..." — matching the probes' no
+# key posture) so the ServiceMonitor can scrape it.
+metrics:
+  enabled: false
+  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
+  serviceMonitor: true
+  # Scrape interval rendered into the ServiceMonitor.
+  interval: 30s
+
+# -- API keys (OPTIONAL — fleet decision 2026-09, fleet pattern: K8S-MCP) ------
+# /mcp (both transports) requires a key ONLY when existingSecret is set; the
+# fetch tools' SSRF surface is exactly why unauthenticated callers shouldn't
+# reach them in-cluster, so prefer setting this. Leave empty for
+# gateway-fronted deployments (the server then runs open, with a loud startup
+# warning). The chart NEVER inlines a key in values. Comma-separated keys all
+# authenticate: that is the rotation mechanism — append the new key, move
+# clients over, drop the old one, no downtime. The fleet-universal
+# MCP_API_KEYS env is honored too (either var authenticates).
+apiKey:
+  existingSecret: ""
+  existingSecretKey: api-keys
+
+# -- fetch_content SSRF policy (fleet decision D6 — guard default-ON) ----------
+# Escapes/caps for the fetch SSRF guard (mcp url_policy.py + fetcher.py).
+# Empty strings keep the built-in defaults, so rendering is unchanged unless
+# an operator sets them. Loopback/pod-local/metadata targets are NEVER
+# fetchable regardless of these values.
+fetch:
+  # SEARXNG_FETCH_ALLOW_HOSTS — comma-separated hostnames (exact or ".suffix"),
+  # IP literals or CIDRs that may resolve to private/cluster-internal space
+  # (e.g. "minio.internal.example,10.0.0.0/8").
+  allowHosts: ""
+  # SEARXNG_FETCH_DENY_EXTRA — comma-separated entries denied on top of the
+  # built-in list (deny wins over the allowlist).
+  denyExtra: ""
+  # SEARXNG_FETCH_CACHE_TTL — fetch result cache seconds ("" = built-in 300;
+  # "0" disables caching).
+  cacheTtl: ""
+  # SEARXNG_FETCH_MAX_BODY_BYTES — response-body cap ("" = built-in 5000000).
+  maxBodyBytes: ""
+  # SEARXNG_FETCH_MAX_SCREENSHOT_KB — screenshot data-URL cap ("" = 512).
+  maxScreenshotKb: ""
+  # SEARXNG_FETCH_MAX_REDIRECTS — redirect hops, each re-validated ("" = 5).
+  maxRedirects: ""
 
 # -- HPE corporate proxy -------------------------------------------------------------------------------
 # Route outbound HTTP(S) traffic through the HPE corporate proxy.

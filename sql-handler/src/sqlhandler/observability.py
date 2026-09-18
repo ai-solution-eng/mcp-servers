@@ -91,9 +91,7 @@ class Metrics:
     """Registry of the server's counters/histograms/gauges + text rendering."""
 
     def __init__(self):
-        self.queries = _Counter(
-            "sqlhandler_queries_total", "Queries executed, by outcome.", "outcome"
-        )
+        self.queries = _Counter("sqlhandler_queries_total", "Queries executed, by outcome.", "outcome")
         self.duration = _Histogram(
             "sqlhandler_query_duration_seconds", "Query wall time in seconds.", _DURATION_BUCKETS
         )
@@ -131,11 +129,9 @@ class Metrics:
             cumulative = 0
             for i, bucket in enumerate(self.duration.buckets):
                 cumulative = counts[i]  # counts are cumulative by construction
-                lines.append(
-                    f'{self.duration.name}_bucket{{outcome="{outcome}",le="{bucket}"}} {cumulative}'
-                )
+                lines.append(f'{self.duration.name}_bucket{{outcome="{outcome}",le="{bucket}"}} {cumulative}')
             lines.append(f'{self.duration.name}_bucket{{outcome="{outcome}",le="+Inf"}} {total_n}')
-            emit_count = f"{self.duration.name}_sum{{outcome=\"{outcome}\"}} {round(total_sum, 6)}"
+            emit_count = f'{self.duration.name}_sum{{outcome="{outcome}"}} {round(total_sum, 6)}'
             lines.append(emit_count)
             lines.append(f'{self.duration.name}_count{{outcome="{outcome}"}} {total_n}')
         r = self.rows.snapshot()

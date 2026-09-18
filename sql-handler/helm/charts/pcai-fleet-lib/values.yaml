@@ -1,0 +1,40 @@
+# pcai-fleet-lib is a LIBRARY chart: these values are documentation of the
+# contract only — they are never rendered (a library chart ships no resources,
+# and every template takes an explicit dict argument from the caller).
+#
+# The fleet's semantics live in the CONSUMING chart's values.yaml. The shapes
+# below record what the fleet's charts use today, so a new chart can start
+# from the same numbers:
+#
+# MCP-trio httpGet pattern (workbench, applygate, logsearch, prometheus):
+#   startupProbe:   httpGet /healthz, periodSeconds 5,  failureThreshold 12
+#   readinessProbe: httpGet /healthz, periodSeconds 10, failureThreshold 3
+#   livenessProbe:  httpGet /healthz, periodSeconds 30, failureThreshold 3
+#
+# SQLhandler pattern (httpGet /health + /ready; startup timeout mirrors the
+# liveness timeout — encoded, not changed, by the pilot adoption):
+#   livenessProbe:  initialDelay 15, period 20, timeout 5
+#   readinessProbe: initialDelay 5,  period 10, timeout 20 (real backend check)
+#   startupProbe:   period 5, failureThreshold 24, timeout = liveness timeout
+#
+# Hardened securityContext profile (workbench, SQLhandler security.hardened):
+#   pod:       runAsNonRoot true, runAsUser 10001, fsGroup 10001 (workbench),
+#              seccompProfile RuntimeDefault, automountServiceAccountToken false
+#   container: readOnlyRootFilesystem true, allowPrivilegeEscalation false,
+#              capabilities.drop ALL (workbench block-style, SQLhandler flow)
+#
+# Metrics (default OFF — the default-off gate is part of the contract):
+#   metrics:
+#     enabled: false        # or serviceMonitor: false (RAG's knob name)
+#     interval: 30s
+#
+# Kyverno vendor-label policy (default OFF — cluster-scoped):
+#   kyverno:
+#     enabled: false
+#
+# AuthorizationPolicy (default OFF — prometheus's existing pattern):
+#   ezua:
+#     authorizationPolicy:
+#       enabled: false
+#       namespace: istio-system
+#       providerName: oauth2-proxy

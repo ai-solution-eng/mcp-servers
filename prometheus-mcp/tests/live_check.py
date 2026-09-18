@@ -17,8 +17,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import httpx
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
+from mcp.types import CallToolResult, TextContent
 
 import server
+
+
+def _first_text(result: CallToolResult) -> str:
+    """Text of the first TextContent block (these tools all return text)."""
+    for block in result.content:
+        if isinstance(block, TextContent):
+            return block.text
+    raise AssertionError(f"no text content in tool result: {result.content!r}")
 
 
 async def main() -> None:
@@ -41,7 +50,7 @@ async def main() -> None:
 
         # 1. Instant query — up
         r = await session.call_tool("prom_query", {"query": "count(up == 1)"})
-        text = r.content[0].text
+        text = _first_text(r)
         print("\n=== prom_query: count(up == 1) ===")
         print(text[:400])
         assert not r.is_error
@@ -49,9 +58,9 @@ async def main() -> None:
         # 2. Range query with relative times
         r = await session.call_tool(
             "prom_query_range",
-            {"query": "avg(rate(node_cpu_seconds_total{mode!=\"idle\"}[5m]))", "start": "now-30m", "end": "now"},
+            {"query": 'avg(rate(node_cpu_seconds_total{mode!="idle"}[5m]))', "start": "now-30m", "end": "now"},
         )
-        text = r.content[0].text
+        text = _first_text(r)
         print("\n=== prom_query_range: node cpu (30m) ===")
         print(text[:400])
         assert not r.is_error
@@ -60,23 +69,21 @@ async def main() -> None:
         r = await session.call_tool("prom_series", {"match": "up", "start": "now-15m"})
         assert not r.is_error
         print("\n=== prom_series: up (15m) ===")
-        print(r.content[0].text[:400])
-        r = await session.call_tool(
-            "prom_label_values", {"label": "namespace", "match": "up"}
-        )
+        print(_first_text(r)[:400])
+        r = await session.call_tool("prom_label_values", {"label": "namespace", "match": "up"})
         assert not r.is_error
         print("\n=== prom_label_values: namespace (via up) ===")
-        print(r.content[0].text[:400])
+        print(_first_text(r)[:400])
 
         # 4. Alerts + rules (may legitimately be empty)
         r = await session.call_tool("prom_alerts", {})
         assert not r.is_error
         print("\n=== prom_alerts ===")
-        print(r.content[0].text[:600])
+        print(_first_text(r)[:600])
         r = await session.call_tool("prom_rules", {})
         assert not r.is_error
         print("\n=== prom_rules ===")
-        print(r.content[0].text[:600])
+        print(_first_text(r)[:600])
 
     print("\nALL LIVE CHECKS PASSED")
 

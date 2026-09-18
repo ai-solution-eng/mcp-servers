@@ -1,0 +1,37 @@
+{{- if .Values.metrics.podMonitor.enabled }}
+{{- /* Prometheus PodMonitor: lets the prometheus-operator scrape /metrics
+       (Prometheus text exposition, engine gauges included). Lives in THIS
+       namespace — picks up the pod selector below; the operator's
+       podMonitorSelector must admit it (add release: prometheus below via
+       .Values.metrics.podMonitor.additionalLabels if your operator requires
+       a selector label — the usual culprit when a target never appears). */}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # Select the app's own pods (the deployment's selector labels).
+  selector:
+    matchLabels:
+      {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      {{- if .Values.security.metricsAuth }}
+      # metricsAuth enabled: Prometheus must authenticate. The SA token is
+      # NOT valid here (the gate wants SQLHANDLER_API_TOKEN or /mcp keys).
+      # Set .Values.metrics.podMonitor.bearerTokenSecret to a Secret that
+      # carries one of those, e.g.:
+      #   bearerTokenSecret: {name: sqlhandler-apitoken, key: token}
+      {{- with .Values.metrics.podMonitor.bearerTokenSecret }}
+      bearerTokenSecret:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+{{- end }}

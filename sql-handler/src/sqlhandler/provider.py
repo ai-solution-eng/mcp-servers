@@ -36,10 +36,7 @@ def _validate_snapshot_version(version: object, backend: str) -> int:
     are ints in Python but are never a legitimate snapshot id).
     """
     if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-        raise LakehouseError(
-            f"{backend} time travel needs a non-negative integer snapshot version, "
-            f"got {version!r}."
-        )
+        raise LakehouseError(f"{backend} time travel needs a non-negative integer snapshot version, got {version!r}.")
     return version
 
 

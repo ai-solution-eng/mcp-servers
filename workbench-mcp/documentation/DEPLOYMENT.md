@@ -36,6 +36,9 @@ ezua:
 | `workbench.maxOutputBytes` | `204800` (200 KiB) | stdout/stderr cap per `run_command`. |
 | `workbench.maxListEntries` | `500` | Entries per `list_files` response. |
 | `workbench.logLevel` | `INFO` | Server logging level. |
+| `workbench.templates` | `{}` | Workspace templates for `workspace_create(name, template=<name>)` — **default OFF: an empty object renders no env at all and the tool's `template` parameter is refused**, exactly the pre-templates behavior. Each named template may only (a) **widen** that workspace's exec allowlist with operator-supplied *bare binary names* (`extra_allowed` — the denylist still wins, so a template can never re-enable a denied binary) and (b) pre-run `canned_setup` argv commands **inside the new workspace through the exact `run_command` machinery** (confinement, server-PATH allowlist resolution, timeouts, output caps, audit — each setup run is audited as a `workspace_template_setup` event carrying the template name). Only the template *name* persists in the workspace; the widened allowlist is re-derived from the current values on every call, so removing a template shrinks its workspaces back to the base allowlist. See the `helm/values.yaml` comment block for a worked example. |
+| `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (per-tool request counters, nothing else). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is key-free like the probes. |
+| `apiKey.existingSecret` / `existingSecretKey` | `workbench-mcp-apikey` / `api-keys` | **Mandatory wiring, never created by the chart**: every route except `/health`/`/healthz` requires an API key, so the Secret must exist in the target namespace before `helm install` or the pod sits in `CreateContainerConfigError`. Comma-separated keys (`api-keys=new,old`) are the zero-downtime rotation mechanism (env re-read per request). |
 | `webui.enabled` | `true` | The HPE-branded console at `/` — workspace switcher, file tree + viewer/saver, env editor, run-command console, audit tail. The UI is read/write and calls the SAME core functions (confinement, caps, allowlist, audit all still apply) but is unauthenticated at the pod: keep it behind gateway authn. |
 | `deployment.replicaCount` | `1` | Stateless MCP — any replica serves any request (needs the RWX volume to share state). |
 | `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml` by release tooling — leave at the chart default; a stale tag in a site file is how an "old MCP server" pod happens. |
@@ -60,6 +63,10 @@ these directly):
 | `WORKBENCH_MAX_FILE_BYTES` / `WORKBENCH_MAX_OUTPUT_BYTES` / `WORKBENCH_MAX_LIST_ENTRIES` | `workbench.maxFileBytes` / `maxOutputBytes` / `maxListEntries` |
 | `WORKBENCH_UI_ENABLED` | `webui.enabled` |
 | `WORKBENCH_LOG_LEVEL` | `workbench.logLevel` |
+| `WORKBENCH_TEMPLATES` | `workbench.templates` as JSON — rendered ONLY when the object is non-empty (default: no env at all, template parameter refused) |
+| `WORKBENCH_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
+| `HOME` | fixed `/tmp` (read-only-rootfs scratch so pip/tempfiles keep working; resets with the pod — workspaces persist on the PVC) |
+| `WORKBENCH_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` (passed through to `run_command` children) |
 | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `PIP_CERT` | `caCert.*`, only when `caCert.enabled=true` |
 

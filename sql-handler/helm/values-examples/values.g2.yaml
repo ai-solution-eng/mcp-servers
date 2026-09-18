@@ -1,216 +1,51 @@
-# ============================================================================
-# SQLhandler — SE G2 site values (EXAMPLE — sanitized, no credentials)
-#
-# This file lives in helm/values-examples/, a folder that is hardlink-synced
-# to GitHub: it is intentionally SECRET-FREE. The real per-site file with
-# credentials is helm/local/values.g2.yaml (gitignored + hardlink-excluded —
-# never commit, never package). Replace every <UPPER_SNAKE> placeholder before
-# applying; markers on lines a site may edit: '# SITE:'.
-#
-# Site        : SE G2 — pcai-se-ai-application.hst.rdlabs.hpecorp.net
-#               (PCAI assigns each user a project-user-* namespace)
-# Data source : in-cluster MinIO — bucket "test-parquet" (benchmark dataset)
-# Fleet 2026-09-08: 4 replicas + HPA — benchmark showed 1 replica collapses
-#   under concurrency (2.7 qps @16 clients) while 4 held ~6 qps flat
-# Anything NOT listed below = chart default (helm/values.yaml is the field
-# reference; catalog spec: docs/semantic-catalog.md)
-# ============================================================================
-
-# ── Deployment & scaling ───────────────────────────────────────────────────────
-# HPA owns the replica count (4-8, CPU@80% — burst/runaway protection, not
-# load-following); replicaCount below is advisory. PDB keeps 2 through drains.
-
-# ============================================================================
-# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
-# Paste-ready: this file alone is the full values document.
-# (Supersedes the "Anything NOT listed below = chart default" note in the
-#  original header above — every chart key is now listed below.)
-# (Image tag below is v1.6.1 — the packaged chart default; bump it only to
-#  track a newer released image.)
-# ============================================================================
-
-# SQLhandler MCP server — PCAI (HPE Ezmeral Unified Analytics) deployment.
-# Deploys SQLhandler as a MCP 2.0 (streamable-http) server exposed at
-# <endpoint>/mcp through the PCAI Istio gateway.
-
-# -- Deployment ---------------------------------------------------------------
-# Scale OUT, not UP — benchmark evidence (G2, 2026-09-08, 9-query workload):
-# a single replica's throughput COLLAPSES under concurrent clients (5.5 qps at
-# 1 client -> 2.7 qps at 16, p95 17.8s) because the embedded DuckDB engine
-# serializes requests per process, while 4 replicas held a flat ~6 qps at 16
-# clients (p50 3.1-4.0s) using only 0.24 cores / 1.3GiB fleet-wide peak. CPU
-# and memory bumps on a single replica buy nothing (limits went unused).
-replicaCount: 4  # SITE: advisory while HPA is on — HPA owns the count (chart default: 1)
-
-# -- Horizontal autoscaling -----------------------------------------------------
-# HorizontalPodAutoscaler (autoscaling/v2). Requires metrics-server for the
-# CPU metric. CAUTION, from the same benchmark: steady-state CPU is ~8% of
-# limits even at full concurrent load, so the CPU target below fires only on
-# heavy scan bursts (runaway-query protection) — NOT on request volume. For
-# load-following scale-out add a custom metric (needs prometheus-adapter),
-# e.g. requests-per-second per pod targeted at ~1.5, the measured per-pod
-# saturation point:
-#   extraMetrics:
-#     - type: Pods
-#       pods:
-#         metric:
-#           name: sqlhandler_http_requests_per_second
-#         target:
-#           type: AverageValue
-#           averageValue: "1.5"
+replicaCount: 4
 autoscaling:
-  enabled: true  # SITE: HPA on: burst/runaway protection, not load-following (chart default: false)
-  minReplicas: 4  # SITE: chart default: 2
+  enabled: true
+  minReplicas: 4
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
-  # Raw extra HPA metrics appended verbatim (autoscaling/v2 schema).
   extraMetrics: []
   behavior:
-    # Scale-up reacts quickly; scale-down is deliberately slow so a burst of
-    # MCP tool calls doesn't thrash the fleet.
     scaleUpStabilizationSeconds: 30
     scaleDownStabilizationSeconds: 300
-
-# Spread replicas across nodes (ScheduleAnyway keeps scheduling permissive on
-# single-node clusters).
 topologySpread:
-  enabled: true  # SITE: spread replicas across nodes (chart default: false)
+  enabled: true
   maxSkew: 1
   topologyKey: kubernetes.io/hostname
   whenUnsatisfiable: ScheduleAnyway
-
-# Budget for voluntary disruptions (node drains) once replicaCount > 1.
 podDisruptionBudget:
-  enabled: true  # SITE: keep 2 pods through node drains (chart default: false)
-  minAvailable: 2  # SITE: chart default: 1
-
-# Grace period for in-flight MCP tool calls on rollout (gateway allows up
-# to 3600s per call; the pod gets this many seconds to finish draining).
+  enabled: true
+  minAvailable: 2
 terminationGracePeriodSeconds: 90
-
 image:
-  # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
-  # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
   tag: v1.6.1
-  # Optional: pin by digest for production (e.g. "sha256:abcd...").
-  digest: ""
+  digest: ''
   pullPolicy: IfNotPresent
-
-# -- Backend selection -------------------------------------------------------
-# One data source is read at a time:
-#   s3 | minio    - S3-compatible object store (Parquet files), e.g. MinIO
-#                   [default — in-cluster MinIO test bucket]
-#   onelake       - Microsoft Fabric OneLake (Delta Lake over ABFS)
-#   iceberg       - Apache Iceberg tables through a REST or SQL catalog
-#   nfs           - mounted directory (PVC/hostPath) of Parquet/Delta
-# NOTE: when using onelake you MUST set backend: onelake explicitly — the
-# per-backend credential wiring (and Secret creation) is gated on it.
 backend: s3
-
-# -- Federated multi-source mode ---------------------------------------------
-# When `sources` is non-empty it OVERRIDES `backend` above: the engine
-# federates every source behind one endpoint (cross-source joins work).
-# Each entry mirrors the per-backend env vars; `name` becomes the source
-# prefix used in the UI and in SQL (name "warehouse" + table "orders" ->
-# `warehouse_orders`).
-#   sources:
-#     - name: sales
-#       backend: s3
-#       endpointUrl: http://minio.minio.svc.cluster.local:9000
-#       bucket: sales-bucket
-#       prefix: ""
-#       accessKey: ""
-#       secretKey: ""
-#     - name: inventory
-#       backend: s3
-#       endpointUrl: http://minio.minio.svc.cluster.local:9000
-#       bucket: inventory-bucket
-#       prefix: raw
-# Credentials land in the ConfigMap (SQLHANDLER_SOURCES as JSON) — for
-# production, mount that env var from a Secret instead of values.yaml.
 sources: []
-
-# -- External databases (read-only attach) ------------------------------------
-# Postgres/MySQL servers whose tables become queryable — and join-able with
-# lake tables in ONE query — as <name>.<schema>.<table>. STRICTLY read-only:
-# DuckDB itself rejects writes on the attached catalog (README: External
-# databases). The generated SQLHANDLER_ATTACH config carries env-var NAMES
-# only (SQLHANDLER_DB_PW_<NAME>); the password values come from the
-# <fullname>-db-credentials Secret — rendered here ONLY for entries with a
-# non-empty `password`. Prefer managing that Secret out-of-band (kubectl
-# create secret) and leaving `password` empty; trust-auth entries (unix
-# socket) need no password at all.
-#   databases:
-#     - name: ops
-#       type: postgres        # postgres | mysql
-#       host: postgresql.postgresql.svc.cluster.local
-#       port: 5432            # default per type when omitted
-#       database: opsdb
-#       user: ro_user
-#       password: ""          # -> db-credentials Secret; "" = trust-auth
 databases: []
-
-# -- Naming overrides (rarely needed) ----------------------------------------
-nameOverride: ""
-fullnameOverride: ""
-
-# -- Service account ----------------------------------------------------------
-# SQLhandler does not need RBAC to read k8s Secrets by default; keep this
-# simple unless you add a SecretProvider tier that requires it.
+nameOverride: ''
+fullnameOverride: ''
 serviceAccount:
   create: false
-  name: ""
+  name: ''
   annotations: {}
-
-# -- Service exposure ---------------------------------------------------------
-# The MCP streamable-http endpoint is served on port 9097 at path /mcp.
-# 9097 is aligned with the other MCP servers in this environment; the
-# container listens on the same port (see mcp.port below).
 service:
   type: ClusterIP
   port: 9097
   targetPort: 9097
-
-# -- MCP endpoint configuration ----------------------------------------------
 mcp:
-  transport: streamable-http   # MCP 2.0 transport
-  path: /mcp                   # FastMCP default; VirtualService routes on it
-  port: 9097                   # container + service port
-
-# -- Resources ----------------------------------------------------------------
-# Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
-# at 16 concurrent clients with a fleet-wide peak of 0.24 cores / 1.3GiB, so
-# the REQUESTS below are all the reservation the scheduler needs — the
-# workload idles near-zero and bursts only during scans. LIMITS stay generous
-# because the actual target is big data:
-#   - memory: DuckDB's in-query budget is duckdbMemoryFraction (0.6) x the
-#     memory LIMIT — 16Gi keeps a ~9.6Gi budget before DuckDB spills to
-#     spillDir instead of being OOMKilled mid-join (which also wipes every
-#     in-process cache).
-#   - cpu: the limit governs how many threads ONE wide scan/aggregate can use
-#     in parallel (DuckDB defaults its thread count to the core limit).
-# The memory REQUEST is purely a scheduler reservation (DuckDB's budget keys
-# off the LIMIT — see src/sqlhandler/resources.py) — but keep it at or above
-# steady-state RSS: under node memory pressure the kubelet evicts pods whose
-# usage exceeds their request first. 1Gi covers observed usage (~0.3GiB fresh,
-# ~1.1GiB long-warmed) with margin; don't go below that.
-# Raise the limits (not the requests) on sites running very wide tables or
-# large joins; the requests can stay put in every case observed so far.
-# SITE note (preserved from previous sparse file):
-# CPU limit 800m = ~1 DuckDB thread — THE constraint for wide scans; raise
-# to 4-8 if large-table scans need speed (Omnilife runs 16). Memory: DuckDB
-# budget = 0.6 x 16Gi = 9.6Gi before spilling to /tmp.
+  transport: streamable-http
+  path: /mcp
+  port: 9097
 resources:
   requests:
     cpu: 250m
     memory: 1Gi
   limits:
-    cpu: "800m"  # SITE: benchmark-pinned 2026-09-08: 800m = ~1 DuckDB thread, THE constraint for wide scans (chart default: "4")
+    cpu: 800m
     memory: 16Gi
-
-# -- Probes --------------------------------------------------------------------
-# /health and /ready are served by the container (server.py).
 livenessProbe:
   enabled: true
   initialDelaySeconds: 15
@@ -220,151 +55,64 @@ readinessProbe:
   enabled: true
   initialDelaySeconds: 5
   periodSeconds: 10
-  # /ready performs a real backend check (server allows ~17s: 2s handler +
-  # 15s connection test). A 3s timeout here would flap a slow-but-healthy
-  # backend out of the Service before the server can answer.
   timeoutSeconds: 20
 startupProbe:
-  # Gates liveness/readiness until the server is listening — prewarm (and a
-  # cold parquet discovery on first describe) can outlive the old 15s
-  # initialDelay, and without this the kubelet restarts a healthy pod that
-  # was merely still warming up.
   enabled: true
   periodSeconds: 5
   failureThreshold: 24
-
-# -- Workload security hardening ------------------------------------------------
-# Defense-in-depth for a network-facing SQL endpoint. Each piece can be
-# turned off individually without leaving the hardened profile.
-# SITE note (preserved from previous sparse file):
-# Hardened profile = chart defaults: non-root 1000, read-only rootfs (+/tmp
-# emptyDir), no SA token, seccomp, dropped caps. Ingress NetworkPolicy stays
-# OFF = in-cluster callers open by design (ClusterIP, gateway authn below).
 security:
-  # Master switch: run as non-root, seccomp RuntimeDefault, no privilege
-  # escalation, dropped capabilities, read-only root filesystem, no
-  # auto-mounted ServiceAccount token, plus an optional ingress
-  # NetworkPolicy (security.networkPolicy.enabled below, default false).
   hardened: true
-  # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
-  # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
-  # Egress is NOT restricted (the server must reach AAD/OneLake/S3).
-  #
-  # DEFAULT OFF: in-cluster callers (MCP agents, OWUI, DSH, ...) reach the
-  # Service directly with zero friction — the right posture for short-lived
-  # test deployments. The Service stays ClusterIP, so nothing is exposed
-  # outside the cluster. Turn this ON for production / real-data
-  # deployments, and add direct-caller namespaces to allowedNamespaces
-  # below (flipping it on re-breaks any caller not listed).
   networkPolicy:
     enabled: false
     gatewayNamespace: istio-system
-    # Extra namespaces whose pods may call this service directly
-    # (in-cluster MCP clients, OWUI, DSH, ...). Cluster-internal access
-    # stays frictionless: add the client's namespace here.
     allowedNamespaces: []
-    # Raw extra NetworkPolicy `from:` peers (CIDRs, podSelectors...),
-    # appended verbatim to the ingress rules.
     additionalIngress: []
-  # Pod-level Istio AuthorizationPolicy (east-west, service-to-service).
-  # Off by default: principal names are deployment-specific and a wrong
-  # list locks the service completely. The gateway authz (ezua.*) plus the
-  # NetworkPolicy above already cover the common cases. When enabled, at
-  # least one of principals/namespaces is REQUIRED (an ALLOW policy with
-  # no rules would deny everything).
   authorizationPolicy:
     enabled: false
-    # e.g. ["cluster.local/ns/istio-system/sa/ezaf-gateway-service-account"]
     principals: []
-    # Allowed caller namespaces (Istio identity namespaces).
     namespaces: []
   runAsUser: 1000
   readOnlyRootFilesystem: true
-  # The app never calls the Kubernetes API; don't hand it a token.
   automountServiceAccountToken: false
-
-# -- OneLake / Fabric connection ---------------------------------------------
-# Sensitive values go in a Kubernetes Secret; non-secret connection details
-# go in a ConfigMap. NEVER put the service-principal secret in values.yaml.
-#
-# fabric.credentialsSecret.name refers to a Secret you create separately
-# (via `kubectl create secret`, or by the chart when
-# fabric.credentialsSecret.create is true).
-# SITE note (preserved from previous sparse file): unused backends
-# kept verbatim for future backend flips.
+  apiKey:
+    existingSecret: mcp-fleet-apikeys
+    existingSecretKey: api-keys
 fabric:
-  # Secret name + keys holding the Entra service-principal credential.
   credentialsSecret:
     name: fabric-credentials
     tenantIdKey: tenant-id
     clientIdKey: client-id
     clientSecretKey: client-secret
-    # Set create: true AND fill the values below ONLY to have the chart
-    # create the Secret for you (e.g. a non-production bootstrap). Prefer
-    # creating the Secret out-of-band with `kubectl create secret` or a
-    # sealed/encrypted Secret so the service-principal secret never lands
-    # in a values file. NEVER commit real credentials.
     create: false
     values:
-      tenantId: ""
-      clientId: ""
-      clientSecret: ""
-
-  # Non-secret connection details injected via ConfigMap.
-  lakehouseAbfssUrl: ""          # e.g. abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>
-  workspaceId: ""                # fallback (if no full URL)
-  lakehouseId: ""                # fallback (if no full URL)
+      tenantId: ''
+      clientId: ''
+      clientSecret: ''
+  lakehouseAbfssUrl: ''
+  workspaceId: ''
+  lakehouseId: ''
   authority: onelake.dfs.fabric.microsoft.com
-
-# -- S3 / MinIO backend (used when backend: s3) ------------------------------------
-# Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
-# key and secret go through a Kubernetes Secret - NEVER in values.yaml.
-# SITE note (preserved from previous sparse file): bucket below stays
-# EXPLICIT even though it equals the chart default — never inherit the
-# bucket silently.
 s3:
-  # Secret name + keys holding the S3 credentials. Create the Secret
-  # out-of-band (the default), e.g.:
-  #   kubectl -n <namespace> create secret generic s3-credentials \
-  #     --from-literal=access-key=<S3_ACCESS_KEY> \
-  #     --from-literal=secret-key=<S3_SECRET_KEY>
-  # Retrieve/rotate later with:
-  #   kubectl -n <namespace> get secret s3-credentials -o jsonpath='{.data.access-key}' | base64 -d
-  #   kubectl -n <namespace> get secret s3-credentials -o jsonpath='{.data.secret-key}' | base64 -d
-  # Dev/local credentials that must stay out of git belong in helm/local/
-  # (gitignored — see helm/local/README.md).
   credentialsSecret:
     name: s3-credentials
     accessKeyKey: access-key
     secretKeyKey: secret-key
-    # Keep false: with create: true the chart renders the Secret FROM the
-    # values below, which then live in values files and the Helm release
-    # secret (readable via `helm get values <release> -a`). Only for
-    # throwaway clusters, never for a shared chart.
-    create: true  # SITE: chart renders the s3-credentials Secret from the values below — LOCAL-ONLY dev pattern (chart default: false)
+    create: true
     values:
-      accessKey: "<S3_ACCESS_KEY>"  # SITE: filler — real key lives in helm/local/ (chart default: "")
-      secretKey: "<S3_SECRET_KEY>"  # SITE: filler — real key lives in helm/local/ (chart default: "")
-
-  # MinIO/S3 connection details (non-secret -> ConfigMap).
-  endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # in-cluster MinIO
+      accessKey: <S3_ACCESS_KEY>
+      secretKey: <S3_SECRET_KEY>
+  endpointUrl: http://minio.minio.svc.cluster.local:9000
   region: us-east-1
-  bucket: "test-parquet"
-  prefix: ""                  # optional sub-tree within the bucket
-  anonymous: false            # read public buckets without keys
-  useSsl: false               # force https when endpointUrl has no scheme
-
-# -- Iceberg backend (used when backend: iceberg) ---------------------------------
-# Tables are discovered through an Iceberg catalog; the Parquet data files
-# live in your object store (S3_* storage vars) or on a local disk. The
-# catalog token (REST) and S3 keys go through a Secret, never values.yaml.
+  bucket: test-parquet
+  prefix: ''
+  anonymous: false
+  useSsl: false
 iceberg:
-  catalogType: rest            # rest | sql
-  catalogUri: ""              # e.g. http://rest-catalog:8181 or sqlite:///path
-  catalogName: sqlhandler      # SQL catalogs partition by this name
-  warehouse: ""               # optional table location root
-  namespace: ""               # optional namespace filter
-  # Credentials Secret: REST token + S3 access/secret keys (create out-of-band).
+  catalogType: rest
+  catalogUri: ''
+  catalogName: sqlhandler
+  warehouse: ''
+  namespace: ''
   credentialsSecret:
     name: iceberg-credentials
     tokenKey: token
@@ -372,113 +120,36 @@ iceberg:
     secretKeyKey: secret-key
     create: false
     values:
-      token: ""
-      accessKey: ""
-      secretKey: ""
-  # S3 storage for the Iceberg data files (optional).
+      token: ''
+      accessKey: ''
+      secretKey: ''
   storage:
-    endpointUrl: ""
+    endpointUrl: ''
     region: us-east-1
     anonymous: false
-
-# -- NFS / local filesystem backend (used when backend: nfs) ---------------------
-# Reads Parquet files from a directory mounted into the container (hostPath,
-# NFS via a PV/PVC, or any volume). No credentials required.
 nfs:
-  # Absolute path of the mounted directory containing Parquet files.
-  rootDir: "/data"
-  # Optional volume to mount providing the data (only when backend: nfs).
+  rootDir: /data
   mount:
     enabled: false
-    pvcName: ""           # PVC to mount
-    mountPath: "/data"    # where it is mounted inside the container
+    pvcName: ''
+    mountPath: /data
     readOnly: true
-
-
-# -- Metadata caching --------------------------------------------------------
-# In-process cache for list_tables / describe_table (see README "Performance
-# & caching"). These map to SQLHANDLER_CACHE_TTL / SQLHANDLER_PREWARM_TABLES.
 cache:
-  # Seconds to keep list_tables / describe_table results in memory (0 disables).
   ttl: 3600
-  # How often (seconds) a Delta snapshot version is re-checked to invalidate a
-  # cached Dataset (0 = every query; default 10).
   versionCheckInterval: 10
-  # Comma-separated table names whose data should be warmed at startup,
-  # e.g. "work_order_header,work_order_note_recent".
-  prewarmTables: ""
-  # Serve list_tables from the cache immediately and refresh it in the
-  # background (plus automatically once per `ttl` seconds), so callers never
-  # block on the slow S3/DFS listing. Set false for fully synchronous calls.
+  prewarmTables: ''
   listAsyncRefresh: true
-  # DuckDB query-engine budget as a fraction of the POD's memory limit (see
-  # src/sqlhandler/resources.py) — DuckDB spills to `spillDir` when a query
-  # would otherwise grow RSS past the pod limit and get OOMKilled (which
-  # wipes every in-process cache). "0" disables the cap (DuckDB defaults).
-  duckdbMemoryFraction: "0.6"
-  # Directory DuckDB spills to — under /tmp, which the hardened profile
-  # backs with an emptyDir that survives container restarts.
+  duckdbMemoryFraction: '0.6'
   spillDir: /tmp/sqlhandler-duckdb-spill
-  # Directory for the disk-warm metadata cache (survives container restarts
-  # so the first describe after an OOMKill is not cold). Point at a PVC
-  # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
-  # -- Virtual-table performance (SITE, 2026-09: bench-first validation) -----
-  # The G2 catalog carries a virtual table (vw_top_orders, uploaded via the
-  # Data Explorer panel; it lives in the PVC upload store, which overrides
-  # the ConfigMap catalog below). Defaults are fine for static bench data.
-  # Shared RWX catalog-store PVC: materialize once per deployment (4-8 HPA
-  # replicas) instead of once per pod.
   virtualCacheDir: /var/lib/sqlhandler-catalog
-  # -- Disk block cache (SITE: ON — the s3/MinIO backend's pyarrow parquet IO
-  # is exactly what it accelerates, and the bench re-reads the same tables
-  # constantly). Measure with the bench suite before/after; the cap is
-  # conservative for the /tmp emptyDir.
   blockCache:
     enabled: true
-    maxBytes: "1073741824"   # 1GiB
-
-# -- Semantic catalog ----------------------------------------------------------
-# The "semantic view": human-written table/column descriptions merged into
-# list_tables / describe_table output (and the MCP resources), so agents see
-# business meaning, not just dtypes. Full spec + shareable data-owner guide:
-# docs/semantic-catalog.md (README: "Semantic catalog").
-#
-# Deploy = set enabled: true and paste your catalog AS NATIVE YAML under
-# `tables:` below — no stringification, it is ordinary values structure. The
-# chart renders it into a ConfigMap, mounts it read-only at
-# <mountPath>/semantic-catalog.json, and points SQLHANDLER_CATALOG at it.
-# The engine hot-reloads the file on change (mtime), so a catalog edit via
-# `helm upgrade` (or a PCAI re-deploy) updates the docs WITHOUT a pod
-# restart. A broken catalog never breaks queries — it degrades to empty.
-#
-# Zero-values alternative: deploy as-is, then upload a .json/.yaml catalog
-# from the data explorer's "Semantic catalog" panel (POST
-# /api/semantic-catalog; store defaults next to cache.cacheDir). Uploads are
-# per-replica and pod-local (emptyDir) unless SQLHANDLER_CATALOG_STORE points
-# at a PVC — the values route below is the durable, all-replica one.
-# SITE note (preserved from previous sparse file):
-# Spec + examples: docs/semantic-catalog.md. Seed = STARTER read from
-# bench/workload_g2.json (orders columns straight from its SQL) — correct or
-# extend from the Data Explorer "Semantic catalog" panel (upload JSON/YAML;
-# hot-reloads, no restart). The shared store below reaches every HPA replica
-# (4-8) and survives rescheduling; RWX StorageClass required.
+    maxBytes: '1073741824'
 semanticCatalog:
-  enabled: true  # SITE: G2 starter catalog seeded from bench/workload_g2.json (chart default: false)
-  # Directory inside the pod where the catalog ConfigMap is mounted (the
-  # file lands at <mountPath>/semantic-catalog.json). Rarely changed.
+  enabled: true
   mountPath: /etc/sqlhandler
-  # The catalog as NATIVE values — paste plain YAML, no stringification:
-  #   tables:
-  #     <schema/name | source-qualified | bare>:
-  #       description: ...
-  #       aliases: [...]
-  #       columns: {col: doc}
-  #       definition: |      # optional — single SELECT/WITH (DuckDB dialect) -> VIRTUAL table
-  # Rendered to canonical JSON into the ConfigMap. Entry shapes are validated
-  # at render time (each table entry must be a mapping) — operator-authored
-  # config must not fail silently (same philosophy as SQLHANDLER_ATTACH).
-  tables:  # SITE: site-authored semantic-catalog entries — app-consumed free-form config, not in chart values.yaml; preserved key-for-key
+  tables:
     orders:
       description: Orders fact table used by the G2 benchmark workload
       columns:
@@ -489,104 +160,71 @@ semanticCatalog:
         qty: Quantity sold — bench sums it
     employees:
       description: Employee dimension table used by the G2 benchmark workload
-  # Alternative: the catalog as an inline JSON STRING ({"tables": {...}}) —
-  # for machine-generated catalogs. Mutually exclusive with `tables` and
-  # `yaml` (setting more than one non-empty fails the render).
-  json: ""
-  # Alternative: the catalog as an inline YAML STRING — verbatim paste of a
-  # semantic-catalog.yaml file, no re-indenting needed. The engine reads YAML
-  # natively, so the string is stored as-is. Mutually exclusive with `tables`
-  # and `json`.
-  yaml: ""
-  # Alternative for teams managing the catalog out-of-band (like credential
-  # Secrets): name of an EXISTING ConfigMap carrying a `semantic-catalog.json`
-  # key. When set, the chart renders no ConfigMap of its own but still mounts
-  # it and wires the env var.
-  existingConfigMap: ""
-  # -- Upload store: persisted + cross-pod --------------------------------------
-  # By default UI/API catalog uploads land next to the disk cache on the pod's
-  # tmp emptyDir: per-replica, and gone on reschedule. Enable the store to
-  # back uploads with a PVC instead — an upload from any replica then reaches
-  # every replica and survives rescheduling, still with NO rollout (the
-  # engine hot-reloads the file on mtime change). Works standalone too (with
-  # enabled: false above): deploy, then seed the catalog from the UI. Until a
-  # first upload exists, the values catalog above — if any — is what every
-  # pod serves.
-  # REQUIREMENT: ReadWriteMany storage whenever replicas can exceed 1. RWO
-  # classes (EBS, local-path, ...) attach on one node only and strand the
-  # other replicas Pending — the render fails loudly on that mismatch.
+    orders_eu:
+      definition: SELECT order_id, region, product, unit_price, qty FROM orders WHERE
+        region = 'EU'
+      description: 'EU orders slice — the simplest virtual table: a filtered view
+        over the physical scan (user filters push down into it).'
+    orders_line_totals:
+      definition: SELECT *, unit_price * qty AS line_total FROM orders WHERE unit_price
+        > 250
+      description: Premium orders with a computed line_total — expressions in definitions;
+        also the composition base for orders_eu_premium.
+    orders_eu_premium:
+      definition: SELECT order_id, product, unit_price * qty AS line_total FROM orders_line_totals
+        WHERE region = 'EU'
+      description: 'Composed virtual table: builds on orders_line_totals (which builds
+        on orders) — definitions compose, nothing is stored.'
+    revenue_by_region:
+      definition: SELECT region, count(*) AS orders, sum(unit_price * qty) AS revenue,
+        round(avg(unit_price), 2) AS avg_unit_price FROM orders GROUP BY region ORDER
+        BY revenue DESC
+      description: Region revenue rollup — an aggregate virtual table; the materialized
+        cache (TTL 3600s, auto-sorted) serves repeat queries.
+  json: ''
+  yaml: ''
+  existingConfigMap: ''
   store:
-    enabled: true  # SITE: shared 1Gi PVC → durable + cross-pod uploads for every HPA replica (chart default: false)
-    # When set, mount this existing PVC (no PVC is created). Leave "" to
-    # have the chart create one named <release>-catalog.
-    existingClaim: ""
-    # Catalog content is KBs of text — 1Gi is ~100x headroom.
+    enabled: true
+    existingClaim: ''
     size: 1Gi
-    # "" = cluster default StorageClass; it must offer the access mode below.
-    storageClass: ""
-    # [ReadWriteOnce] ONLY for single-replica deployments (replicaCount: 1,
-    # autoscaling off) — PVC access modes are immutable once created.
-    # (site note preserved: RWX required — replicas can exceed 1)
-    accessModes: [ReadWriteMany]
-    # Where the store volume is mounted; SQLHANDLER_CATALOG_STORE points at
-    # <mountPath>/semantic-catalog.json. The upload API writes here, so the
-    # mount is read-write (unlike the values-catalog ConfigMap mount).
+    storageClass: ''
+    accessModes:
+    - ReadWriteMany
     mountPath: /var/lib/sqlhandler-catalog
-
-# -- Runtime arguments for the sqlhandler entrypoint --------------------------
+  __comment: null
 containerArgs:
-  - --transport
-  - streamable-http
-  - --host
-  - 0.0.0.0
-  - --port
-  - "9097"
-
-# -- Ingress (optional; PCAI normally uses the Istio VirtualService below) ----
+- --transport
+- streamable-http
+- --host
+- 0.0.0.0
+- --port
+- '9097'
 ingress:
   enabled: false
-  className: ""
+  className: ''
   annotations: {}
   hosts:
-    - host: sqlhandler.local
-      paths:
-        - path: /
-          pathType: Prefix
+  - host: sqlhandler.local
+    paths:
+    - path: /
+      pathType: Prefix
   tls: []
-
-# -- Pod-level annotations / node placement -------------------------------------
 podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
-
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------
-# When enabled, deploys the Istio VirtualService, Istio AuthorizationPolicy,
-# and a Kyverno ClusterPolicy that tags this workload as a vendor-service so
-# the PCAI platform can discover and monitor the MCP endpoint.
 ezua:
   enabled: true
-  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
-
-  # Kyverno ClusterPolicy that tags this workload as a PCAI vendor-service.
-  # Disable on clusters without the kyverno.io CRD — the post-install hook
-  # would otherwise fail the whole release (the same labels are already set
-  # directly by sqlhandler.ezua.labels in _helpers.tpl).
+  domainName: ${DOMAIN_NAME}
   kyverno:
     enabled: true
-
   virtualService:
-    # Public endpoint on the PCAI gateway. MCP clients connect to:
-    #   https://<endpoint>/mcp
-    endpoint: "sqlhandler.${DOMAIN_NAME}"
-    istioGateway: "istio-system/ezaf-gateway"
-    # Default for normal calls (health etc.); the /mcp route uses longTimeout.
+    endpoint: sqlhandler.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
     timeout: 60s
-    # MCP streamable-http is long-lived (tool calls, streaming responses).
     longTimeout: 3600s
-
-  # configure the authorization policy (oauth2-proxy in front of PCAI).
   authorizationPolicy:
-    enabled: false  # SITE: gateway authz off — in-cluster callers open by design (chart default: true)
-    namespace: "istio-system"
-    providerName: "oauth2-proxy"
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

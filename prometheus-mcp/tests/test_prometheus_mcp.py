@@ -73,8 +73,7 @@ def _vector_result(n, prefix="m"):
     return {
         "resultType": "vector",
         "result": [
-            {"metric": {"__name__": "up", "pod": f"{prefix}-{i}"}, "value": [1757337600, "1"]}
-            for i in range(n)
+            {"metric": {"__name__": "up", "pod": f"{prefix}-{i}"}, "value": [1757337600, "1"]} for i in range(n)
         ],
     }
 
@@ -109,7 +108,7 @@ def test_shape_range_caps_series_and_handles_empty():
 
 
 def test_metric_str_trims_long_labels():
-    assert _metric_str({"__name__": "up", "a": "1"}) == 'up{a=1}'
+    assert _metric_str({"__name__": "up", "a": "1"}) == "up{a=1}"
     metric = {f"l{i}": str(i) for i in range(12)}
     out = _metric_str(metric)
     assert out.count("=") == 8 and out.endswith(",…}")
@@ -129,9 +128,7 @@ def test_client_maps_http_and_prom_errors():
         asyncio.run(c.instant_query("up"))
 
     def handler_query_error(request):
-        return httpx.Response(
-            200, json={"status": "error", "errorType": "bad_data", "error": "parse error at char 5"}
-        )
+        return httpx.Response(200, json={"status": "error", "errorType": "bad_data", "error": "parse error at char 5"})
 
     c = make_client(handler_query_error)
     with pytest.raises(PrometheusError, match="bad_data.*parse error"):
@@ -196,10 +193,26 @@ def test_all_six_tools_registered_read_only():
         "prom_alerts",
         "prom_rules",
     } <= names
+    # Wave-5 F4 additions: the saved-query store's four tools.
+    assert {"query_save", "query_list", "query_delete", "query_saved"} <= names
+    # Annotation honesty: everything that only READS Prometheus/state is
+    # marked read-only; the two store MUTATORS (save/delete) are not.
+    read_only = {
+        "prom_query",
+        "prom_query_range",
+        "prom_series",
+        "prom_label_values",
+        "prom_alerts",
+        "prom_rules",
+        "query_list",
+        "query_saved",
+    }
+    mutating = {"query_save", "query_delete"}
+    assert read_only | mutating == names
     for t in tools.tools:
         assert t.description
-        if t.name != "prom_query":
-            assert t.annotations and t.annotations.read_only_hint is True
+        assert t.annotations, t.name
+        assert t.annotations.read_only_hint is (t.name in read_only), t.name
 
 
 def test_prom_query_wire_round_trip(monkeypatch):
@@ -318,9 +331,7 @@ def test_prom_query_range_wire(monkeypatch):
             assert query == "up" and start.isdigit() and end.isdigit() and step
             return {
                 "resultType": "matrix",
-                "result": [
-                    {"metric": {"__name__": "up", "pod": "p1"}, "values": [["1757337600", "1"]]}
-                ],
+                "result": [{"metric": {"__name__": "up", "pod": "p1"}, "values": [["1757337600", "1"]]}],
             }
 
     monkeypatch.setattr(server, "client", StubClient())
@@ -330,9 +341,7 @@ def test_prom_query_range_wire(monkeypatch):
     async def run():
         async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
             await session.initialize()
-            return await session.call_tool(
-                "prom_query_range", {"query": "up", "start": "now-10m"}
-            )
+            return await session.call_tool("prom_query_range", {"query": "up", "start": "now-10m"})
 
     result = asyncio.run(run())
     text = result.content[0].text
@@ -359,9 +368,14 @@ def test_streamable_http_smoke_serves_mcp_after_lifespan():
         port = s.getsockname()[1]
     proc = subprocess.Popen(
         [
-            sys.executable, str(server_path),
-            "--transport", "streamable-http",
-            "--host", "127.0.0.1", "--port", str(port),
+            sys.executable,
+            str(server_path),
+            "--transport",
+            "streamable-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -385,9 +399,12 @@ def test_streamable_http_smoke_serves_mcp_after_lifespan():
                 "Accept": "application/json, text/event-stream",
             },
             json={
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
                 "params": {
-                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
                     "clientInfo": {"name": "smoke", "version": "0"},
                 },
             },

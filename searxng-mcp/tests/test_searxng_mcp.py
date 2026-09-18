@@ -5,7 +5,7 @@ Live end-to-end check (needs a reachable SearXNG): see tests/live_check.py
 """
 
 import asyncio
-import json
+from typing import Any
 
 import httpx
 import pytest
@@ -50,7 +50,7 @@ def make_transport(responder) -> httpx.MockTransport:
 
 
 def make_client(responder, **kwargs) -> SearXNGClient:
-    defaults = dict(base_url="http://searxng.test:8080", requests_per_minute=1000)
+    defaults: dict[str, Any] = {"base_url": "http://searxng.test:8080", "requests_per_minute": 1000}
     defaults.update(kwargs)
     return SearXNGClient(transport=make_transport(responder), **defaults)
 
@@ -207,9 +207,7 @@ def test_format_response_empty():
     out = format_search_response(resp, 10)
     assert out == "No results were found. Try rephrasing your search query."
 
-    resp_unresponsive = SearXNGClient._parse(
-        {"results": [], "unresponsive_engines": [["bing", "timeout"]]}, "q"
-    )
+    resp_unresponsive = SearXNGClient._parse({"results": [], "unresponsive_engines": [["bing", "timeout"]]}, "q")
     assert "bing" in format_search_response(resp_unresponsive, 10)
 
 
@@ -293,9 +291,7 @@ def test_fetch_and_parse_pagination(monkeypatch):
     assert "Showing characters 0-8000" in first
     assert "Use start_index=8000 to see more" in first
 
-    second = asyncio.run(
-        fetcher.fetch_and_parse("https://example.com/x", ctx, start_index=8000, backend="bs4")
-    )
+    second = asyncio.run(fetcher.fetch_and_parse("https://example.com/x", ctx, start_index=8000, backend="bs4"))
     assert "Showing characters 8000-" in second
 
 
@@ -307,7 +303,6 @@ def test_fetch_and_parse_unreachable(monkeypatch):
 
     async def fake_impersonated(url):
         fetcher.last_fetch_error = "403 (simulated)"
-        return None
 
     monkeypatch.setattr(fetcher, "_get_html", fake_get_html)
     monkeypatch.setattr(fetcher, "_get_html_impersonated", fake_impersonated)
@@ -325,7 +320,6 @@ def test_fetch_escalates_to_impersonated(monkeypatch):
     async def fake_plain(url):
         calls["plain"] += 1
         fetcher.last_fetch_error = "403 (simulated)"
-        return None
 
     async def fake_impersonated(url):
         calls["impersonated"] += 1
@@ -381,8 +375,7 @@ def test_mcp_tools_registered():
         if t.name == "search":
             params = t.input_schema.get("properties", {})
             # parity params + free extras
-            for p in ("query", "max_results", "region", "backend",
-                      "category", "time_range", "safesearch", "pageno"):
+            for p in ("query", "max_results", "region", "backend", "category", "time_range", "safesearch", "pageno"):
                 assert p in params, f"missing param {p}"
             assert t.annotations and t.annotations.read_only_hint is True
         if t.name == "fetch_content":
@@ -405,10 +398,9 @@ def test_mcp_search_end_to_end_mocked(monkeypatch):
     server.searcher._client = httpx.AsyncClient(transport=make_transport(handler))
 
     async def run():
-        async with InMemoryTransport(server.mcp) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                return await session.call_tool("search", {"query": "python mcp"})
+        async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            return await session.call_tool("search", {"query": "python mcp"})
 
     result = asyncio.run(run())
     assert not result.is_error
@@ -431,13 +423,12 @@ def test_mcp_fetch_content_end_to_end_mocked(monkeypatch):
     server.fetcher._get_html = fake_get_html
 
     async def run():
-        async with InMemoryTransport(server.mcp) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                return await session.call_tool(
-                    "fetch_content",
-                    {"url": "https://example.com/x", "backend": "bs4", "max_length": 100},
-                )
+        async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            return await session.call_tool(
+                "fetch_content",
+                {"url": "https://example.com/x", "backend": "bs4", "max_length": 100},
+            )
 
     result = asyncio.run(run())
     assert not result.is_error
