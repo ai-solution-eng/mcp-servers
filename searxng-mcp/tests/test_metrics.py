@@ -14,7 +14,7 @@ The contract being pinned:
 These tests build the app through server._build_http_app — the same assembly
 main() uses (extracted Wave-3 C3, the fleet convention) — and drive it with
 starlette's TestClient, the searxng suite's existing pattern (runs under the
-conda fleet env, where httpx + prometheus_client are both available; the
+conda fleet env, where httpx2 + prometheus_client are both available; the
 assertions stay backend-agnostic regardless).
 """
 

@@ -1,4 +1,11 @@
-from typing import Literal
+"""Shared request models for the statistical-visualization MCP server (v0.1).
+
+v0.1 redesign: data arrives BY REFERENCE (a SQL query executed via the
+sqlhandler MCP server, or an https:// URL returning JSON/CSV) or inline
+for tiny datasets. The model never re-transmits large row payloads.
+"""
+
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -29,55 +36,81 @@ FacetPlotKind = Literal[
     "count",
 ]
 
+# Inline data is tolerated for convenience but discouraged past this size.
+MAX_INLINE_ROWS = 200
+# Hard cap on rows pulled from sqlhandler / URL fetch (bounding memory +
+# render cost server-side, independent of the query the model writes).
+MAX_FETCH_ROWS = 20_000
+# Response budget: PNG bytes returned to the caller.
+MAX_PNG_BYTES = 600_000
+
 
 class PlotRequest(BaseModel):
-    data: list[dict[str, object]] = Field(
-        ...,
-        description="Tabular data as a list of JSON records.",
-    )
-    kind: PlotKind = Field(
-        ...,
-        description="Type of plot to create.",
-    )
-    x: str | None = Field(
+    """One plotting request. Provide ONE of: ``sql``, ``data_url``, ``data``."""
+
+    # --- data source (exactly one) ---
+    sql: str | None = Field(
         default=None,
-        description="Column to use for the x-axis.",
+        description=(
+            "Read-only SQL SELECT executed via the sqlhandler MCP server "
+            "(SQLHANDLER_MCP_URL). Preferred source: the model never carries "
+            "row data through the tool call."
+        ),
     )
-    y: str | None = Field(
+    data_url: str | None = Field(
         default=None,
-        description="Column to use for the y-axis.",
+        description=(
+            "https:// URL returning JSON records or CSV. Internal/loopback/"
+            "metadata targets are refused (SSRF guard)."
+        ),
     )
-    hue: str | None = Field(
+    data: list[dict[str, Any]] | None = Field(
         default=None,
-        description="Column used to color or group observations.",
+        description=(
+            f"Inline records. Discouraged: use sql/data_url for anything over "
+            f"{MAX_INLINE_ROWS} rows."
+        ),
     )
-    size: str | None = Field(
+
+    # --- chart ---
+    kind: PlotKind = Field(..., description="Type of plot to create.")
+    x: str | None = Field(default=None, description="Column for the x-axis.")
+    y: str | None = Field(default=None, description="Column for the y-axis.")
+    hue: str | None = Field(default=None, description="Column to color/group by.")
+    size: str | None = Field(default=None, description="Column to size marks where supported.")
+    style: str | None = Field(default=None, description="Column to style marks where supported.")
+    row: str | None = Field(default=None, description="Row facet variable.")
+    col: str | None = Field(default=None, description="Column facet variable.")
+    title: str | None = Field(default=None, description="Optional chart title.")
+    bins: int | None = Field(default=None, description="Bin count for histogram-like charts.")
+
+    # --- response shaping ---
+    include_html: bool = Field(
+        default=False,
+        description=(
+            "Return interactive HTML (plotly + seaborn/mpld3) for UI callers. "
+            "Default OFF: HTML dominates the payload and is useless to an LLM."
+        ),
+    )
+    include_png: bool = Field(
+        default=False,
+        description="Return a base64 PNG of the chart (LLM/vision-friendly, size-capped).",
+    )
+    sample_rows: int = Field(
+        default=10,
+        ge=0,
+        le=100,
+        description="How many sample rows to echo back (for the model's sanity check).",
+    )
+
+
+class DescribeRequest(BaseModel):
+    """Profiling request. Same data-source selection as PlotRequest."""
+
+    sql: str | None = Field(default=None, description="SELECT run via sqlhandler.")
+    data_url: str | None = Field(default=None, description="https:// JSON/CSV URL.")
+    data: list[dict[str, Any]] | None = Field(
         default=None,
-        description="Column used to size marks where supported.",
+        description=f"Inline records (discouraged over {MAX_INLINE_ROWS} rows).",
     )
-    style: str | None = Field(
-        default=None,
-        description="Column used to style marks where supported.",
-    )
-    row: str | None = Field(
-        default=None,
-        description="Column used as the row facet variable.",
-    )
-    col: str | None = Field(
-        default=None,
-        description="Column used as the column facet variable.",
-    )
-    title: str | None = Field(
-        default=None,
-        description="Optional chart title.",
-    )
-    bins: int | None = Field(
-        default=None,
-        description="Number of bins for histogram-like charts.",
-    )
-    max_return_rows: int = Field(
-        default=500,
-        ge=1,
-        le=5000,
-        description="Maximum number of sampled data rows returned in the JSON response.",
-    )
+    sample_rows: int = Field(default=10, ge=0, le=100)

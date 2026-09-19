@@ -27,7 +27,7 @@ No network, no live Prometheus; the MCP tests ride the in-memory transport
 import asyncio
 import time
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
@@ -46,7 +46,7 @@ from prom_client import (
 
 def make_prom_client(handler, **overrides) -> PrometheusClient:
     cfg = PromConfig(base_url="http://prom.test:9090", **overrides)
-    return PrometheusClient(cfg, transport=httpx.MockTransport(handler))
+    return PrometheusClient(cfg, transport=httpx2.MockTransport(handler))
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +386,8 @@ def test_overview_failure_is_never_memoized(monkeypatch):
 
 
 async def _gather_two(app):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as ac:
         return await asyncio.gather(ac.get("/api/overview"), ac.get("/api/overview"))
 
 
@@ -437,7 +437,7 @@ def test_client_label_values_valid_names_reach_the_server():
         name = parts[4]
         seen.append(name)
         assert LABEL_NAME_RE.match(name)
-        return httpx.Response(200, json={"status": "success", "data": {"result": ["ns1"]}})
+        return httpx2.Response(200, json={"status": "success", "data": {"result": ["ns1"]}})
 
     c = make_prom_client(handler)
     assert asyncio.run(c.label_values("namespace")) == ["ns1"]
@@ -454,7 +454,7 @@ def test_mcp_prom_label_values_rejects_weird_and_accepts_valid(monkeypatch):
 
         def __init__(self):
             self._inner = make_prom_client(
-                lambda request: httpx.Response(200, json={"status": "success", "data": {"result": ["ns1", "ns2"]}})
+                lambda request: httpx2.Response(200, json={"status": "success", "data": {"result": ["ns1", "ns2"]}})
             )
 
         async def label_values(self, label, match=None):

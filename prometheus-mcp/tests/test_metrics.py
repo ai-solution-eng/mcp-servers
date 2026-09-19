@@ -10,7 +10,7 @@ The contract being pinned:
   counters increment as MCP tool calls flow through mcp.call_tool — including
   the error outcome (this server reports failures as "Error: ..." strings).
 
-Test env note: this suite runs under the conda fleet env (it needs httpx),
+Test env note: this suite runs under the conda fleet env (it needs httpx2),
 where prometheus_client IS importable — but the assertions are
 backend-agnostic (rendered exposition only), so they hold under the
 dependency-free fallback too.

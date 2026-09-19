@@ -19,10 +19,15 @@ spec:
     spec:
       containers:
       - name: mcp-seaborn-server
-        image: fcaliva/seaborn-mcp:0.0.3
+        image: fcaliva/seaborn-mcp:0.1.0
+        env:
+        - name: SQLHANDLER_MCP_URL
+          value: http://sqlhandler.sqlhandler.svc.cluster.local:9097/mcp
+        - name: MPLCONFIGDIR
+          value: /tmp/matplotlib
         ports:
         - containerPort: 9092
-          name: mcp-sse
+          name: mcp-http
         resources:
           requests:
             cpu: "100m"

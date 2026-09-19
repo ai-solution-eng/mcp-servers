@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import httpx
+import httpx2
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 from mcp.types import CallToolResult, TextContent
@@ -33,7 +33,7 @@ def _first_text(result: CallToolResult) -> str:
 async def main() -> None:
     url = server.config.base_url
     try:
-        await httpx.AsyncClient(timeout=5).get(url.rstrip("/") + "/-/ready")
+        await httpx2.AsyncClient(timeout=5).get(url.rstrip("/") + "/-/ready")
         print(f"Prometheus reachable at {url}")
     except Exception as e:
         print(f"Prometheus NOT reachable at {url}: {e}")

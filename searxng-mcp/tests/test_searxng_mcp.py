@@ -7,7 +7,7 @@ Live end-to-end check (needs a reachable SearXNG): see tests/live_check.py
 import asyncio
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 from fetcher import WebContentFetcher, clean_markdown_cruft, extract_via_bs4
@@ -45,8 +45,8 @@ SAMPLE_RESPONSE = {
 }
 
 
-def make_transport(responder) -> httpx.MockTransport:
-    return httpx.MockTransport(responder)
+def make_transport(responder) -> httpx2.MockTransport:
+    return httpx2.MockTransport(responder)
 
 
 def make_client(responder, **kwargs) -> SearXNGClient:
@@ -93,9 +93,9 @@ def test_normalize_language(raw, expected):
 def test_search_maps_params_and_parses():
     captured = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(dict(request.url.params))
-        return httpx.Response(200, json=SAMPLE_RESPONSE)
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
 
     client = make_client(handler, default_language="en-US")
     resp = asyncio.run(
@@ -132,9 +132,9 @@ def test_search_maps_params_and_parses():
 def test_search_auto_omits_engines():
     captured = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(dict(request.url.params))
-        return httpx.Response(200, json=SAMPLE_RESPONSE)
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
 
     client = make_client(handler)
     asyncio.run(client.search("test"))
@@ -144,8 +144,8 @@ def test_search_auto_omits_engines():
 
 
 def test_search_403_gives_json_format_hint():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, text="Forbidden")
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(403, text="Forbidden")
 
     client = make_client(handler)
     with pytest.raises(SearXNGError, match="json"):
@@ -155,11 +155,11 @@ def test_search_403_gives_json_format_hint():
 def test_search_400_retries_without_language():
     calls = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         calls.append(dict(request.url.params))
         if "language" in request.url.params:
-            return httpx.Response(400, text="bad language")
-        return httpx.Response(200, json=SAMPLE_RESPONSE)
+            return httpx2.Response(400, text="bad language")
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
 
     client = make_client(handler)
     resp = asyncio.run(client.search("test", language="xx-xx"))
@@ -169,8 +169,8 @@ def test_search_400_retries_without_language():
 
 
 def test_search_unreachable_raises():
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("connection refused")
 
     client = make_client(handler)
     with pytest.raises(SearXNGError, match="could not reach SearXNG"):
@@ -391,11 +391,11 @@ def test_mcp_search_end_to_end_mocked(monkeypatch):
 
     import server
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         assert request.url.params["format"] == "json"
-        return httpx.Response(200, json=SAMPLE_RESPONSE)
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
 
-    server.searcher._client = httpx.AsyncClient(transport=make_transport(handler))
+    server.searcher._client = httpx2.AsyncClient(transport=make_transport(handler))
 
     async def run():
         async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:

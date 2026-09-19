@@ -83,7 +83,7 @@ async def main() -> None:
         # JS-rendered page. Skips cleanly when no sidecar is reachable
         # (degradation message instead of a failure).
         try:
-            import httpx as _hx
+            import httpx2 as _hx
 
             await _hx.AsyncClient(timeout=3).get(
                 os.environ.get("BROWSER_CDP_URL", "http://127.0.0.1:9222") + "/json/version"

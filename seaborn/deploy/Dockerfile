@@ -1,12 +1,18 @@
-FROM python:3.11-slim
+# statistical-visualization-mcp (seaborn MCP) — v0.1.0
+# MCP 2.0 SDK (MCPServer), stateless streamable-http, httpx2-only.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+# OS trust store for httpx2 (TLS via truststore) + build deps for
+# matplotlib/numpy wheels on slim. ca-certificates is explicit by fleet
+# convention (python:3.12-slim bundles the CA store, but we pin it visibly).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libfreetype6-dev \
     libpng-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -17,7 +23,9 @@ COPY utils ./utils
 COPY renderers ./renderers
 COPY tools ./tools
 
-RUN find /app -name "types.py" -delete 2>/dev/null || true
+# Writable matplotlib/font cache (read-only HOME breaks fontconfig in K8s)
+ENV MPLCONFIGDIR=/tmp/matplotlib \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 9092
 

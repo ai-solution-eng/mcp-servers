@@ -7,7 +7,7 @@ SEARXNG_FETCH_DENY_EXTRA escapes, the TTL cache + single-flight coalescing,
 and the screenshot / response-body caps.
 
 No network, no playwright, no extraction deps: DNS is faked at
-``url_policy.resolve_host_ips``, HTTP at ``httpx.MockTransport``, the
+``url_policy.resolve_host_ips``, HTTP at ``httpx2.MockTransport``, the
 browser at a stub, and extraction at a stubbed trafilatura.
 """
 
@@ -15,7 +15,7 @@ import asyncio
 import sys
 import types
 
-import httpx
+import httpx2
 import pytest
 
 import fetcher as fetcher_mod
@@ -80,7 +80,7 @@ def make_fetcher(monkeypatch, responder, **kwargs):
 
     def make_client(*, pinned):
         client = base_make(pinned=pinned)
-        client._transport = httpx.MockTransport(responder)
+        client._transport = httpx2.MockTransport(responder)
         return client
 
     monkeypatch.setattr(fetcher, "_make_client", make_client)
@@ -262,9 +262,9 @@ def test_fetch_connects_to_validated_ip(monkeypatch):
     check-time resolution is what connects, not fetch-time DNS."""
     seen = []
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         seen.append((str(request.url), request.headers.get("host"), dict(request.extensions)))
-        return httpx.Response(200, text="<html>ok</html>")
+        return httpx2.Response(200, text="<html>ok</html>")
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -298,11 +298,11 @@ def test_fetch_through_proxy_keeps_hostname(monkeypatch):
 def test_redirect_chain_followed_with_pinned_hops(monkeypatch):
     seen = []
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         seen.append((str(request.url), request.headers.get("host")))
         if request.url.path == "/start":
-            return httpx.Response(302, headers={"location": "https://moved.example.com/destination"})
-        return httpx.Response(200, text="<html>final</html>")
+            return httpx2.Response(302, headers={"location": "https://moved.example.com/destination"})
+        return httpx2.Response(200, text="<html>final</html>")
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -316,10 +316,10 @@ def test_redirect_chain_followed_with_pinned_hops(monkeypatch):
 
 
 def test_redirect_relative_location_resolved(monkeypatch):
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/start":
-            return httpx.Response(301, headers={"location": "/next?page=2"})
-        return httpx.Response(200, text="<html>rel</html>")
+            return httpx2.Response(301, headers={"location": "/next?page=2"})
+        return httpx2.Response(200, text="<html>rel</html>")
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -343,9 +343,9 @@ def test_redirect_into_blocked_space_aborts(monkeypatch, target):
     and refused — the second request is never issued."""
     seen = []
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         seen.append(str(request.url))
-        return httpx.Response(302, headers={"location": target})
+        return httpx2.Response(302, headers={"location": target})
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -359,9 +359,9 @@ def test_redirect_into_blocked_space_aborts(monkeypatch, target):
 def test_redirect_hop_cap(monkeypatch):
     count = {"n": 0}
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         count["n"] += 1
-        return httpx.Response(302, headers={"location": "/next"})
+        return httpx2.Response(302, headers={"location": "/next"})
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -377,8 +377,8 @@ def test_policy_error_surfaces_from_ladder(monkeypatch):
     no browser escalation, no generic 'could not access' text."""
     stub_extraction(monkeypatch)
 
-    def responder(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(302, headers={"location": "http://127.0.0.1:9222/"})
+    def responder(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(302, headers={"location": "http://127.0.0.1:9222/"})
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -418,10 +418,10 @@ def test_blocked_redirect_is_terminal_without_curl_cffi(monkeypatch):
     stub_extraction(monkeypatch)
     monkeypatch.setitem(sys.modules, "curl_cffi", None)  # backend absent
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/start":
-            return httpx.Response(302, headers={"location": "http://127.0.0.1:9222/"})
-        return httpx.Response(200, text="<html>should never happen</html>")
+            return httpx2.Response(302, headers={"location": "http://127.0.0.1:9222/"})
+        return httpx2.Response(200, text="<html>should never happen</html>")
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -444,9 +444,9 @@ def test_redirect_hop_cap_is_terminal_without_curl_cffi(monkeypatch):
     stub_extraction(monkeypatch)
     monkeypatch.setitem(sys.modules, "curl_cffi", None)  # backend absent
 
-    def responder(request: httpx.Request) -> httpx.Response:
+    def responder(request: httpx2.Request) -> httpx2.Response:
         n = int(request.url.path.strip("/").split("-")[-1])
-        return httpx.Response(302, headers={"location": f"https://example.com/hop-{n + 1}"})
+        return httpx2.Response(302, headers={"location": f"https://example.com/hop-{n + 1}"})
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -467,8 +467,8 @@ def test_genuine_failure_still_reports_backend_unavailable(monkeypatch):
     stub_extraction(monkeypatch)
     monkeypatch.setitem(sys.modules, "curl_cffi", None)  # backend absent
 
-    def responder(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection reset by peer")
+    def responder(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("connection reset by peer")
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -798,8 +798,8 @@ def test_failed_ladder_not_cached(monkeypatch):
 def test_response_body_capped_during_stream(monkeypatch):
     big = "<p>x</p>" * 100000  # ~700 KB
 
-    def responder(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=big)
+    def responder(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, text=big)
 
     no_proxy(monkeypatch)
     set_dns(monkeypatch, PUBLIC_DNS)
@@ -812,8 +812,8 @@ def test_response_body_capped_during_stream(monkeypatch):
 def test_body_cap_notice_in_tool_output(monkeypatch):
     big = "<p>word </p>" * 5000
 
-    def responder(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=big)
+    def responder(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, text=big)
 
     stub_extraction(monkeypatch)
     no_proxy(monkeypatch)

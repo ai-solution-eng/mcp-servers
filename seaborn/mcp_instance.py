@@ -1,19 +1,5 @@
-from fastmcp import FastMCP
+"""MCP 2.0 server instance (MCPServer, was FastMCP pre-v2)."""
 
-_mcp = FastMCP("statistical-visualization-mcp")
+from mcp.server.mcpserver import MCPServer
 
-
-def get_mcp():
-    return _mcp
-
-
-class _McpProxy:
-    """Proxy that defers mcp lookup until decorator is called."""
-    def tool(self):
-        return get_mcp().tool
-
-    def run(self, **kwargs):
-        return get_mcp().run(**kwargs)
-
-
-mcp = _McpProxy()
+mcp = MCPServer("statistical-visualization-mcp")

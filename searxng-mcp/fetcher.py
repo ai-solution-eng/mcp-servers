@@ -8,7 +8,7 @@ Fetch phase (getting the HTML):
    that was validated, not to whatever the name resolves to at
    connect-time. Requests through an HTTP(S) proxy skip the pin (the proxy
    performs egress DNS; the denylist still applies).
-1. plain httpx — browser-like headers, honors HTTP(S)_PROXY / NO_PROXY
+1. plain httpx2 — browser-like headers, honors HTTP(S)_PROXY / NO_PROXY
 2. curl_cffi impersonating Chrome — escalation for sites whose anti-bot
    edge rejects python's TLS fingerprint with 403 (wikipedia does this from
    some egress paths); restores the ddgs-lite primp capability without the
@@ -19,7 +19,7 @@ Fetch phase (getting the HTML):
    the page, then feeds the resulting DOM through the same extraction
    chain below.
 
-Redirects are NOT followed blindly: the httpx client is created with
+Redirects are NOT followed blindly: the httpx2 client is created with
 ``follow_redirects=False`` and a manual hop loop re-validates every
 ``Location`` (scheme, resolved IPs, pin) before the next request, up to
 ``SEARXNG_FETCH_MAX_REDIRECTS`` hops.
@@ -60,7 +60,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin
 
-import httpx
+import httpx2
 
 import url_policy
 from browser_client import (
@@ -130,7 +130,7 @@ def _bs4_parser() -> str:
 
 
 def env_proxies() -> dict[str, str] | None:
-    """Proxy mapping for curl_cffi from the environment (httpx trust_env
+    """Proxy mapping for curl_cffi from the environment (httpx2 trust_env
     equivalent). libcurl honors NO_PROXY from the environment itself."""
     p = (
         os.environ.get("HTTPS_PROXY")
@@ -331,7 +331,7 @@ class WebContentFetcher:
                 ttl = 300.0
         self.result_cache = FetchResultCache(ttl_seconds=ttl)
 
-    def _make_client(self, *, pinned: bool) -> httpx.AsyncClient:
+    def _make_client(self, *, pinned: bool) -> httpx2.AsyncClient:
         """One short-lived client per logical fetch.
 
         ``pinned=True`` (default when no proxy env is set) connects to the
@@ -340,8 +340,8 @@ class WebContentFetcher:
         configured) keeps trust_env so corporate-egress deployments keep
         working; the proxy then performs egress DNS.
         """
-        return httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout),
+        return httpx2.AsyncClient(
+            timeout=httpx2.Timeout(self.timeout),
             follow_redirects=False,  # manual hop loop re-validates every Location
             trust_env=not pinned,
             headers=FETCH_HEADERS,
@@ -422,7 +422,7 @@ class WebContentFetcher:
         self.last_fetch_error = f"{url} exceeded the redirect hop limit"
         return None
 
-    async def _read_body_capped(self, response: httpx.Response) -> tuple[str, bool]:
+    async def _read_body_capped(self, response: httpx2.Response) -> tuple[str, bool]:
         """Stream the response body up to ``max_body_bytes``; returns
         (text, truncated). The connection is closed as soon as the cap is
         hit — a huge document never fully downloads."""
@@ -661,7 +661,7 @@ class WebContentFetcher:
                     outcome.text, outcome.source = text, source
                     outcome.screenshot_b64 = self._cap_screenshot(shot, outcome)
 
-            # ---- fetch phase, rungs 1-2: plain httpx, escalating to a
+            # ---- fetch phase, rungs 1-2: plain httpx2, escalating to a
             # browser-grade TLS fingerprint when the site rejects plain
             # clients. (A per-hop policy rejection shows up in
             # self.last_policy_error, checked by the rungs below.) A POLICY

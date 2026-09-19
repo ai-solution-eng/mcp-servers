@@ -40,7 +40,7 @@ import re
 import time
 from dataclasses import dataclass
 
-import httpx
+import httpx2
 
 _PROM_URL_RE = re.compile(r"^https?://")
 
@@ -259,11 +259,11 @@ def format_value(value: str | None) -> str | None:
 class PrometheusClient:
     """Read-only async client for one Prometheus server."""
 
-    def __init__(self, config: PromConfig | None = None, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, config: PromConfig | None = None, transport: httpx2.AsyncBaseTransport | None = None):
         self.config = config or load_config()
-        self._client = httpx.AsyncClient(
+        self._client = httpx2.AsyncClient(
             base_url=self.config.base_url,
-            timeout=httpx.Timeout(self.config.timeout),
+            timeout=httpx2.Timeout(self.config.timeout),
             transport=transport,  # None -> default; tests inject a mock
             headers=({"Authorization": f"Bearer {self.config.bearer_token}"} if self.config.bearer_token else {}),
         )
@@ -275,11 +275,11 @@ class PrometheusClient:
         params = {k: v for k, v in params.items() if v is not None}
         try:
             resp = await self._client.get(path, params=params)
-        except httpx.TimeoutException as e:
+        except httpx2.TimeoutException as e:
             raise PrometheusError(
                 f"Prometheus at {self.config.base_url} timed out after {self.config.timeout}s ({type(e).__name__})"
             ) from e
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             raise PrometheusError(f"Prometheus at {self.config.base_url} unreachable: {type(e).__name__}: {e}") from e
         if resp.status_code != 200:
             detail = resp.text[:200]

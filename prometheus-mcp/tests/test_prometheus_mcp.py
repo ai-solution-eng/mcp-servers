@@ -6,7 +6,7 @@ Live end-to-end check (needs a reachable Prometheus): tests/live_check.py
 
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 
 from prom_client import (
@@ -26,7 +26,7 @@ from prom_client import (
 
 def make_client(handler, **overrides) -> PrometheusClient:
     cfg = PromConfig(base_url="http://prom.test:9090", **overrides)
-    return PrometheusClient(cfg, transport=httpx.MockTransport(handler))
+    return PrometheusClient(cfg, transport=httpx2.MockTransport(handler))
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +121,14 @@ def test_metric_str_trims_long_labels():
 
 def test_client_maps_http_and_prom_errors():
     def handler_500(request):
-        return httpx.Response(500, text="boom")
+        return httpx2.Response(500, text="boom")
 
     c = make_client(handler_500)
     with pytest.raises(PrometheusError, match="HTTP 500"):
         asyncio.run(c.instant_query("up"))
 
     def handler_query_error(request):
-        return httpx.Response(200, json={"status": "error", "errorType": "bad_data", "error": "parse error at char 5"})
+        return httpx2.Response(200, json={"status": "error", "errorType": "bad_data", "error": "parse error at char 5"})
 
     c = make_client(handler_query_error)
     with pytest.raises(PrometheusError, match="bad_data.*parse error"):
@@ -136,7 +136,7 @@ def test_client_maps_http_and_prom_errors():
 
     def handler_ok(request):
         assert request.url.params["query"] == "up"
-        return httpx.Response(200, json={"status": "success", "data": {"resultType": "vector", "result": []}})
+        return httpx2.Response(200, json={"status": "success", "data": {"resultType": "vector", "result": []}})
 
     c = make_client(handler_ok)
     assert asyncio.run(c.instant_query("up")) == {"resultType": "vector", "result": []}
@@ -385,14 +385,14 @@ def test_streamable_http_smoke_serves_mcp_after_lifespan():
         deadline = time.time() + 20
         while time.time() < deadline:
             try:
-                if httpx.get(f"{base}/health", timeout=1).status_code == 200:
+                if httpx2.get(f"{base}/health", timeout=1).status_code == 200:
                     break
             except Exception:
                 time.sleep(0.3)
         else:
             raise AssertionError("server never became healthy")
 
-        r = httpx.post(
+        r = httpx2.post(
             f"{base}/mcp",
             headers={
                 "Content-Type": "application/json",

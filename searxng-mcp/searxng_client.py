@@ -12,7 +12,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2
 
 
 class SearXNGError(Exception):
@@ -187,7 +187,7 @@ def normalize_language(value: str) -> str:
 class SearXNGClient:
     """Talks to one SearXNG instance over its JSON API.
 
-    ``transport`` is a test hook (httpx.MockTransport) — leave None in
+    ``transport`` is a test hook (httpx2.MockTransport) — leave None in
     production.
     """
 
@@ -198,13 +198,13 @@ class SearXNGClient:
         timeout: float = 10.0,
         verify_tls: bool = True,
         requests_per_minute: int = 30,
-        transport: httpx.AsyncBaseTransport | None = None,
+        transport: httpx2.AsyncBaseTransport | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.default_language = default_language
         self.rate_limiter = RateLimiter(requests_per_minute)
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+        self._client = httpx2.AsyncClient(
+            timeout=httpx2.Timeout(timeout),
             verify=verify_tls,
             # In-cluster the instance is reached over plain HTTP on localhost
             # or a .svc.cluster.local address — environment proxies must NOT
@@ -266,7 +266,7 @@ class SearXNGClient:
         retry), or raises SearXNGError for anything else."""
         try:
             resp = await self._client.get(f"{self.base_url}/search", params=params)
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             raise SearXNGError(f"could not reach SearXNG at {self.base_url}: {e}") from e
 
         if resp.status_code == 403:
