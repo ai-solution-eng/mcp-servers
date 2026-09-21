@@ -23,7 +23,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.5.1
+  tag: v0.5.2
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -120,7 +120,33 @@ service:
   port: 9095
   targetPort: 9095
 
+# -- Saved-query persistence (Wave-5 F4 — ADDITIVE, DEFAULT OFF) --------------------
+# `query_save`/`query_list`/`query_delete`/`query_saved` keep user-defined
+# queries in one JSON store. The store's path comes from
+# PROMETHEUS_SAVED_QUERIES_PATH: UNSET (chart default) → in-memory for the
+# session — every pod update/reschedule silently forgets every saved query
+# (the observed "the system forgets my queries" complaint). persistence.enabled
+# wires the env to a file on a dedicated PVC instead, so saved queries survive
+# pod updates. The JSON store is atomic (temp+rename). replicaCount > 1 with a
+# RWO class strands extra replicas Pending — flip accessModes to a class that
+# supports it (gl4f-filesystem RWX on G2), or keep 1 replica (this chart's
+# fleet default).
+persistence:
+  enabled: false
+  # Where the store volume mounts; the rendered env points
+  # PROMETHEUS_SAVED_QUERIES_PATH at <mountPath>/<savedQueriesFile>.
+  mountPath: /data
+  size: 1Gi
+  # "" = cluster default StorageClass.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  # Store file INSIDE the mount, pinned explicitly so a moved mountPath
+  # cannot silently orphan an existing store.
+  savedQueriesFile: saved-queries.json
+
 # -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+
 # The MCP server's OWN self-metrics (it observes Prometheus all day; this is
 # the one counter family about the server itself): prometheus_mcp_tool_
 # requests_total{tool,outcome} — per-tool request counts with outcome ok|error

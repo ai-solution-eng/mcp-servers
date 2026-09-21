@@ -73,7 +73,20 @@ service:
   port: 9095
   targetPort: 9095
 
-# -- Resources --------------------------------------------------------------------------------
+# -- Saved-query persistence ---------------------------------------------------------
+# SITE: enabled — user-defined queries must survive pod updates (the whole
+# point of saving them); the chart default stays OFF for new sites.
+persistence:
+  enabled: true
+  mountPath: /data
+  size: 1Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteMany   # gl4f-filesystem (cluster default) is RWX
+  savedQueriesFile: saved-queries.json
+
+# -- Resources ---
+#---------------------------------------------------------------------------
 resources:
   requests:
     cpu: 100m

@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.1.3
+  tag: v2.1.4
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -469,6 +469,7 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
+
   # -- Virtual-table performance (README: "Virtual tables") -----------------
   # Seconds a virtual table's materialized result is reused. The cache key
   # covers the definition (and everything it builds on) plus every base
@@ -524,6 +525,22 @@ cache:
 # /api/semantic-catalog; store defaults next to cache.cacheDir). Uploads are
 # per-replica and pod-local (emptyDir) unless SQLHANDLER_CATALOG_STORE points
 # at a PVC — the values route below is the durable, all-replica one.
+# -- Saved-query store (query_save / query_list / query_delete / query_saved) --
+# Where the saved-parameterized-queries JSON file lives. EMPTY (default) →
+# next to the disk-warm cache — in every hardened deployment that is /tmp,
+# an emptyDir, so a POD RESCHEDULE (image update, node drain, OOMKill
+# eviction) silently forgot every user-saved query. Two durable fixes, in
+# precedence order:
+#   1. set savedQueriesPath here (or the env var directly) — absolute path;
+#      MUST sit on a mounted volume (the readOnlyRootFilesystem posture
+#      leaves only mounts writable);
+#   2. leave empty + semanticCatalog.store.enabled=true (the catalog PVC) —
+#      the chart then renders <store mountPath>/saved-queries.json, durable
+#      with zero extra volumes. RWX store class + replicas > 1: saves race
+#      benignly (last write wins, atomic per write).
+# Same file semantics in every mode: atomic temp+rename, 0600, corrupt file
+# degrades to an empty store rather than an error.
+savedQueriesPath: ""
 semanticCatalog:
   enabled: false
   # Directory inside the pod where the catalog ConfigMap is mounted (the

@@ -53,6 +53,17 @@ spec:
             - name: PROMETHEUS_METRICS_ENABLED
               value: "true"
             {{- end }}
+            {{- if .Values.persistence.enabled }}
+            # Saved-query store (Wave-5 F4, ADDITIVE, DEFAULT OFF): rendered
+            # ONLY when persistence.enabled — the default render has no
+            # PROMETHEUS_SAVED_QUERIES_PATH env and the server keeps its
+            # documented in-memory default (byte-identical pod). Set → the
+            # store is a JSON file on the PVC, so user-saved queries survive
+            # pod updates (the atomic temp+rename write makes the file
+            # crash-safe; nothing else in this server writes to the volume).
+            - name: PROMETHEUS_SAVED_QUERIES_PATH
+              value: {{ printf "%s/%s" .Values.persistence.mountPath .Values.persistence.savedQueriesFile | quote }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /health
@@ -73,3 +84,16 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath | quote }}
+          {{- end }}
+      {{- if .Values.persistence.enabled }}
+      volumes:
+        # PVC-backed: user-saved queries survive pod updates and reschedules.
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.deployment.name }}-data
+      {{- end }}
+

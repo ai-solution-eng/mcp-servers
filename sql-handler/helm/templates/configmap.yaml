@@ -149,6 +149,25 @@ data:
   SQLHANDLER_DUCKDB_MEMORY_FRACTION: {{ .Values.cache.duckdbMemoryFraction | quote }}
   SQLHANDLER_DUCKDB_TEMP_DIR: {{ .Values.cache.spillDir | quote }}
   SQLHANDLER_CACHE_DIR: {{ .Values.cache.cacheDir | quote }}
+  {{- /* Saved parameterized queries (query_save / query_list / query_delete /
+         query_saved): user-defined named queries. The store defaults next to
+         the disk cache — fine for the in-process session, but /tmp is an
+         emptyDir, so a POD RESCHEDULE (image update, node drain) silently
+         forgot every saved query. When the durable catalog store is mounted
+         (semanticCatalog.store.enabled — a PVC by construction), point the
+         store there instead: same file semantics (atomic temp+rename,
+         0600), but it survives pod rescheduling like every other durable
+         knob. Explicit savedQueriesPath (chart value or env) always wins. */}}
+  {{- $savedPath := .Values.savedQueriesPath }}
+  {{- if not $savedPath }}
+  {{- if and .Values.semanticCatalog.enabled .Values.semanticCatalog.store.enabled }}
+  {{- $savedPath = printf "%s/saved-queries.json" .Values.semanticCatalog.store.mountPath }}
+  {{- end }}
+  {{- end }}
+  {{- with $savedPath }}
+  SQLHANDLER_SAVED_QUERIES_PATH: {{ . | quote }}
+  {{- end }}
+
   {{- /* Virtual-table materialization + query result caches (README:
          "Virtual tables" + performance). TTL 0 disables each layer; cache
          keys carry base-snapshot versions so ETL commits invalidate

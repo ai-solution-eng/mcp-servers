@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
       - name: mcp-seaborn-server
-        image: fcaliva/seaborn-mcp:0.1.0
+        image: ghcr.io/ai-solution-eng/seaborn-mcp-2.0:1.0.0
         env:
         - name: SQLHANDLER_MCP_URL
           value: http://sqlhandler.sqlhandler.svc.cluster.local:9097/mcp
