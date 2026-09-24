@@ -22,7 +22,7 @@ image:
   # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
   # tags) — a stale default is how an "old MCP + new sidecar" pod happens.
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.2.2
+  tag: v1.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -43,7 +43,12 @@ searxng:
     pullPolicy: IfNotPresent
   # SITE: session/crypto secret — MUST be replaced for any real deployment
   # (e.g. openssl rand -hex 32). This example file never carries a real one.
+  # Preferred alternative: pre-create the Secret and point existingSecret
+  # below at it — the literal secretKey is then ignored ("" = literal wiring).
+  #   kubectl -n <ns> create secret generic searxng-secret --from-literal=secret=$(openssl rand -hex 32)
   secretKey: "<SECRET_KEY>"
+  existingSecret: ""
+  existingSecretKey: secret
   # SITE: public base URL of the SearXNG UI (rendered into settings.yml
   # server.base_url); set the literal https://<endpoint>/ for correct UI links.
   baseUrl: "https://searxng-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net/"
@@ -87,7 +92,7 @@ browser:
   enabled: true
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.2.2
+    tag: v1.4.0
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -111,6 +116,18 @@ browser:
 env:
   - name: SEARXNG_URL
     value: "http://localhost:8080"
+
+# -- fetch_content SSRF policy (fleet decision D6 — guard default-ON) ----------
+# Escapes/caps for the fetch SSRF guard. Empty strings keep the built-in
+# defaults (see chart values.yaml 'fetch'); loopback/pod-local/metadata
+# targets are never fetchable regardless. SITE: chart defaults.
+fetch:
+  allowHosts: ""
+  denyExtra: ""
+  cacheTtl: ""
+  maxBodyBytes: ""
+  maxScreenshotKb: ""
+  maxRedirects: ""
 
 # -- HPE corporate proxy -------------------------------------------------------------------------------
 # SITE: ON for SE-G2 — this cluster has no direct internet egress: SearXNG
@@ -148,3 +165,5 @@ apiKey:
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
+  serviceMonitor: true
+  interval: 30s

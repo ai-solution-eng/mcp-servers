@@ -18,7 +18,7 @@ deployment:
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.1.4
+  tag: v0.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -38,6 +38,11 @@ logsearch:
   blockedNamespaces: kube-system,kube-public,kube-node-lease
   # Leave FALSE: the pre-D8 open default must never come back on a trial.
   emptyAllowsAll: false
+  # export_matches destination: "" renders NO env var → the tool refuses with
+  # setup instructions (writes nothing). Point at an ABSOLUTE dir on a
+  # writable volume agents can read back — fleet convention: a workbench-shared
+  # PVC path (e.g. /data/exports plus workbench's WORKBENCH_SHARED_PATHS).
+  exportRoot: ""
 
 # -- Caps (blast-radius limits for agent harnesses) -----------------------------
 # Bound both API-server load and the MCP response size (an agent's context
@@ -76,16 +81,21 @@ securityContext:
   runAsUser: 10001
 
 # -- RBAC --------------------------------------------------------------------------------------
-# READ-ONLY, release namespace only (pods get/list + pods/log get). Searching
-# OTHER trial namespaces needs a one-time admin-applied read-only bootstrap
-# per namespace (see documentation/DEPLOYMENT.md).
+# READ-ONLY, deliberately minimal (pods get/list + pods/log get — nothing
+# else). SITE: clusterWide: false (chart default) on a trial — blast radius
+# exactly one namespace. Searching OTHER trial namespaces needs a one-time
+# admin-applied read-only bootstrap per namespace (see
+# documentation/DEPLOYMENT.md). true renders ClusterRole/ClusterRoleBinding
+# (lab/trusted clusters only).
 rbac:
   create: true
+  clusterWide: false
 
 # -- HPE corporate proxy -------------------------------------------------------------------------
-# Off unless the trial cluster sits behind the HPE proxy (the k8s API is
-# in-cluster and covered by the NO_PROXY entries either way).
-hpe_proxies: true
+# SITE: off unless the trial cluster sits behind the HPE proxy — the k8s API
+# is in-cluster and covered by the NO_PROXY entries either way (fleet
+# consistency only).
+hpe_proxies: false
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -109,8 +119,10 @@ apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
 
-emptyAllowsAll: false   # hosted-trial: production posture — provide an explicit namespace allowlist
-
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
-  enabled: true
+  # SITE: flip to true where the trial wants per-tool counters (requires the
+  # prometheus-operator ServiceMonitor CRD).
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval

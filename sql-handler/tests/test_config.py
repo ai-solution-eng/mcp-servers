@@ -1,6 +1,5 @@
 """Unit tests for SQLhandler config + backend selection (no network)."""
 
-import os
 
 import pytest
 
@@ -48,9 +47,15 @@ def test_unconfigured_onelake_raises():
         make_provider(FabricConfig())
 
 
-def test_env_not_polluted_by_dotenv(tmp_path):
+def test_env_not_polluted_by_dotenv(tmp_path, monkeypatch):
     # load_dotenv should not clobber existing variables.
-    os.environ["SQLHANDLER_ENV_FILE"] = str(tmp_path / "missing.env")
+    # monkeypatch restores the var after the test — a bare os.environ write
+    # here leaked into every later test in the same session: load_dotenv()
+    # then saw SQLHANDLER_ENV_FILE pointing at this (garbage-collected)
+    # tmp_path and skipped config/.env, so provider-configured tests failed
+    # or passed depending on suite ORDER, not content.
+    monkeypatch.setenv("SQLHANDLER_ENV_FILE", str(tmp_path / "missing.env"))
+
     from sqlhandler.config import load_dotenv
 
     load_dotenv()  # no crash when file absent
@@ -182,7 +187,9 @@ def test_iceberg_config_from_env():
 
 
 def test_iceberg_sql_catalog():
-    cfg = load_iceberg_config({"ICEBERG_CATALOG_TYPE": "sql", "ICEBERG_CATALOG_URI": "sqlite:///tmp/x.db"})
+    cfg = load_iceberg_config(
+        {"ICEBERG_CATALOG_TYPE": "sql", "ICEBERG_CATALOG_URI": "sqlite:///tmp/x.db"}
+    )
     assert cfg.catalog_type == "sql"
     assert cfg.is_configured
 

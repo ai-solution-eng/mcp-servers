@@ -18,7 +18,7 @@ deployment:
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.1.4
+  tag: v0.3.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -148,3 +148,13 @@ ezua:
 apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
+
+# Wave-6 caller attribution — both optional; chart defaults (unset = fp-only
+# audit, byte-identical render). Flip on only when a trusted relay emits
+# X-MCP-Caller (set callerPassthrough.trustedCidrs to its CIDRs) and/or a
+# caller-name registry is wanted (create the clients Secret out of band):
+clients:
+  existingSecret: ''
+  existingSecretKey: clients
+callerPassthrough:
+  trustedCidrs: ''

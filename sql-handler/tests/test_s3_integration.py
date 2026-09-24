@@ -89,7 +89,9 @@ def test_minio_end_to_end():
         f"{unique}/sales/customers/part-0.parquet",
         pa.table({"cust_id": [1, 2], "name": ["a", "b"]}),
     )
-    _upload(fs, bucket, f"{unique}/hr/employees/year=2024/part.parquet", pa.table({"emp_id": [7, 8]}))
+    _upload(
+        fs, bucket, f"{unique}/hr/employees/year=2024/part.parquet", pa.table({"emp_id": [7, 8]})
+    )
 
     eng = SqlEngine(S3Provider(_cfg(prefix=unique)))
     names = sorted(t.path for t in eng.list_tables())

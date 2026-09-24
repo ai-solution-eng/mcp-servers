@@ -22,6 +22,7 @@ Design notes (kept from the original OneLake handler):
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -41,7 +42,10 @@ import pyarrow as pa
 if TYPE_CHECKING:
     import duckdb
 
+from . import errors as _errors
 from . import observability, resources
+from . import policy as policy_mod
+from . import writes as writes_mod
 from .external import (
     AttachSpec,
     apply_external,
@@ -49,10 +53,46 @@ from .external import (
     sql_references_attach,
     validate_qualified_name,
 )
+from .l2cache import L2ResultCache, load_l2_config
+from .policy import TableRule, policy_store
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
-from .sqlguard import assert_attached_readonly
+from .rawfiles import is_raw_format
+from .sqlguard import _explain_inner_sql, assert_attached_readonly
 
 logger = logging.getLogger("sqlhandler.engine")
+
+# The CURRENT caller, carried per request by the server layer (Stage 1) and
+# passed EXPLICITLY into the engine's entry points (keyword ``caller``).
+# contextvars DO work within one request's async task (the middleware sets
+# the caller there and the tool handler reads it in the same task), but they
+# do NOT cross QueryJob's raw threading.Thread — so the engine's query path
+# takes the caller as an argument and hands it to the job/audit directly
+# (the verified thread-boundary hazard). This module-level contextvar is the
+# ASYNC-side default only.
+_CALLER_CONTEXT: contextvars.ContextVar = contextvars.ContextVar("sqlhandler_engine_caller", default=None)
+
+
+def set_current_caller(caller) -> object:
+    """Bind the caller for the CURRENT async context (the server middleware
+    sets it; tool handlers read it via :func:`current_caller`). Returns the
+    token for :func:`reset_current_caller`."""
+    return _CALLER_CONTEXT.set(caller)
+
+
+def reset_current_caller(token) -> None:
+    _CALLER_CONTEXT.reset(token)
+
+
+def current_caller():
+    """The caller bound in this context, or None (anonymous/dev/stdio)."""
+    return _CALLER_CONTEXT.get()
+
+
+def _caller_key_fp(caller) -> str | None:
+    """The caller's key fingerprint when one exists ('' never — None only)."""
+    if caller is None:
+        return None
+    return getattr(caller, "key_fp", None)
 
 
 def _query_memory_size() -> int:
@@ -153,8 +193,10 @@ class _QueryGate:
         timeout = _queue_timeout()
         if not sem.acquire(timeout=timeout):
             raise LakehouseError(
-                f"Too many concurrent queries (limit {_max_concurrent_queries()}), and the "
-                f"queue wait of {_queue_timeout()}s expired. Retry later."
+                _errors.enrich(
+                    f"Too many concurrent queries (limit {_max_concurrent_queries()}), and the "
+                    f"queue wait of {_queue_timeout()}s expired. Retry later."
+                )
             )
 
     def release(self) -> None:
@@ -190,6 +232,7 @@ class QueryJob:
         params: object | None = None,
         version_as_of: int | None = None,
         row_cap: int | None = None,
+        caller=None,
     ):
         if version_as_of is not None:
             _validate_snapshot_version(version_as_of, "Time travel")
@@ -202,6 +245,10 @@ class QueryJob:
         # The export endpoint raises it so a file download isn't truncated
         # by the (much lower) default LLM-payload cap.
         self._row_cap = row_cap
+        # THREAD-BOUNDARY RULE (identity spine): contextvars do NOT cross a
+        # raw threading.Thread — the caller rides the job object so the
+        # outcome record (query memory + audit) attributes correctly.
+        self._caller = caller
         self._lock = threading.Lock()
         self._con: duckdb.DuckDBPyConnection | None = None  # live only while the query runs (cancel handle)
         self._state = "running"
@@ -249,7 +296,10 @@ class QueryJob:
                 apply_external(con, self._engine.attaches)
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
-            self._engine._register_schema(con, self.sql, version=self._version)
+            # THE CALLER CROSSES THE THREAD BOUNDARY HERE: the masking views
+            # (policy enforcement) register under the JOB's caller — inside
+            # this worker thread the ambient contextvar is empty.
+            self._engine._register_schema(con, self.sql, version=self._version, caller=self._caller)
             rel = con.sql(self.sql, params=self._params)
             # Row-cap semantics: a LIMIT is pushed into the query so an
             # unbounded SELECT can't materialize millions of rows in memory.
@@ -276,7 +326,9 @@ class QueryJob:
                     self._state = "done"
                     self._elapsed_ms = (time.monotonic() - self._t0) * 1000
             if self._state == "done":
-                self._engine._record_outcome(self.sql, self._elapsed_ms, arrow_table.num_rows, state="ok")
+                self._engine._record_outcome(
+                    self.sql, self._elapsed_ms, arrow_table.num_rows, state="ok", caller=self._caller
+                )
         except Exception as exc:
             elapsed = (time.monotonic() - self._t0) * 1000
             with self._lock:
@@ -288,7 +340,9 @@ class QueryJob:
                     self._state = "error"
                     hinted = _with_hints(self._engine, self.sql, exc)
                     self._error = f"DuckDB query failed: {hinted}"
-            self._engine._record_outcome(self.sql, elapsed, None, state=self._state, error=self._error)
+            self._engine._record_outcome(
+                self.sql, elapsed, None, state=self._state, error=self._error, caller=self._caller
+            )
         finally:
             try:
                 con.close()
@@ -392,6 +446,34 @@ def _max_rows() -> int:
         return 1000
 
 
+def _preview_fastpath_enabled() -> bool:
+    """Whether bare-LIMIT previews take the first-row-group fast path.
+
+    ``SQLHANDLER_PREVIEW_FASTPATH`` — on by default (the empty/unset value
+    means ON, matching ``SQLHANDLER_LIST_ASYNC_REFRESH``'s default-true
+    convention; "0/false/no/off" switches it off, anything else keeps it
+    on). Cheap per call (one env read), never raises — the fast path is an
+    accelerator, and a garbage value must degrade to "on", not break
+    queries.
+    """
+    return os.environ.get("SQLHANDLER_PREVIEW_FASTPATH", "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _prewarm_rowgroups() -> int:
+    """Row groups to prewarm per table (SQLHANDLER_PREWARM_ROWGROUPS, default 1).
+
+    0 disables the data prewarm entirely (describe-cache warming only —
+    the historical behavior). Kept small by design: the point is the first
+    query of the day hitting warm object-store blocks, not staging the
+    table.
+    """
+    raw = os.environ.get("SQLHANDLER_PREWARM_ROWGROUPS", "")
+    try:
+        return max(int(raw), 0) if raw else 1
+    except ValueError:
+        return 1
+
+
 def _profile_max_rows() -> int:
     """Row cap for the profiling input (SQLHANDLER_PROFILE_MAX_ROWS).
 
@@ -406,6 +488,23 @@ def _profile_max_rows() -> int:
         return max(int(raw), 0) if raw else 1_000_000
     except ValueError:
         return 1_000_000
+
+
+def _resolve_sample_limit(limit: int | None) -> int | None:
+    """Resolve a sample_rows limit with scan_table's D4 semantics.
+
+    ``None``/negative means "no explicit limit": resolve to the
+    ``SQLHANDLER_MAX_ROWS`` cap (a positive int, or ``None`` when the cap
+    is disabled — the caller then applies the PROFILE cap or scans unbounded
+    exactly as scan_arrow does). An explicit positive limit is honored
+    exactly; an explicit ``0`` stays an explicit empty sample. Mirrors
+    server._resolve_scan_limit so both tools behave identically at the
+    boundary.
+    """
+    if limit is None or limit < 0:
+        cap = _max_rows()
+        return cap if cap > 0 else None
+    return limit
 
 
 def _duckdb_fs_lockdown(con) -> None:
@@ -499,8 +598,6 @@ def _safe_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-
-
 def _normalize_cache_sql(sql: str) -> str:
     """Whitespace-normalize SQL for result-cache keys (quote-aware, fail-open).
 
@@ -589,7 +686,17 @@ def _validate_params(params: object) -> object | None:
         raise ValueError(  # noqa: TRY004
             "Query params must be an object ({$name: value}) or an array (positional ?)."
         )
-    scalars = (str, int, float, bool, bytes, datetime.datetime, datetime.date, datetime.time, Decimal)
+    scalars = (
+        str,
+        int,
+        float,
+        bool,
+        bytes,
+        datetime.datetime,
+        datetime.date,
+        datetime.time,
+        Decimal,
+    )
     for v in values:
         if v is not None and not isinstance(v, scalars):
             raise ValueError(
@@ -721,13 +828,13 @@ def _with_hints(engine: SqlEngine, sql: str, exc: Exception) -> Exception:
             hints = _suggest(m.group(1), names)
             if hints:
                 exc = LakehouseError(f"{msg}\nDid you mean one of: {', '.join(hints)}?")
-            return exc
+            return _attach_structured_tail(exc)
         m = _COLUMN_ERROR.search(msg)
         if m:
             # DuckDB >= 1.x already prints "Candidate bindings: ..." for
             # unknown columns — don't duplicate its suggestions.
             if "Candidate bindings" in msg:
-                return exc
+                return _attach_structured_tail(exc)
             columns: list[str] = []
             for info in engine._referenced_tables(sql):
                 try:
@@ -738,9 +845,26 @@ def _with_hints(engine: SqlEngine, sql: str, exc: Exception) -> Exception:
             hints = _suggest(m.group(1), columns)
             if hints:
                 exc = LakehouseError(f"{msg}\nDid you mean one of: {', '.join(hints)}?")
-            return exc
+            return _attach_structured_tail(exc)
     except Exception:
         return exc
+    return _attach_structured_tail(exc)
+
+
+def _attach_structured_tail(exc: Exception) -> Exception:
+    """Append the stable code/fix_hints JSON tail to a resolution error's text.
+
+    Table/column errors are the two classes agents actually self-correct on,
+    so this wraps the `_with_hints` result (the human "Did you mean" line
+    stays primary; the machine tail is additive). Best-effort: any failure
+    returns the exception untouched.
+    """
+    try:
+        tail = _errors.enrich(str(exc))
+        if tail != str(exc):
+            return LakehouseError(tail)
+    except Exception:
+        pass
     return exc
 
 
@@ -806,6 +930,12 @@ class SqlEngine:
         self._definition_verdicts: dict[str, str | None] = {}
         # and the rewritten (Snowflake -> DuckDB) SQL, memoized the same way.
         self._definition_rewrites: dict[str, str] = {}
+        # Policy row filters already binder-validated against a real table
+        # (policy-as-code): filter text -> True. Load-time validation covers
+        # tables with known columns; this memoizes first-use validation for
+        # the rest (a hot-reloaded policy resets the memo by TEXT change —
+        # a changed filter is a new key).
+        self._validated_filters: dict[str, bool] = {}
         # Virtual-table materialization cache: an unfiltered query against a
         # virtual table must run its whole definition (blocking aggregates
         # defeat LIMIT), which for big base tables is a multi-second payment
@@ -861,12 +991,35 @@ class SqlEngine:
         self._result_cache_bytes = 0
         self._result_cache_hits = 0
         self._result_cache_writes = 0
+        # Write-tier side map: cache key -> the SQL that produced it (the
+        # stored key is a sha256 hex, so a post-write eviction cannot
+        # path-match stored keys without this). Bounded WITH the cache:
+        # entries are dropped wherever cache entries are.
+        self._result_cache_sql: OrderedDict[str, str] = OrderedDict()
+        # Shared L2 result cache (sqlhandler/l2cache.py): the same key-space
+        # published to a directory every replica can read (k8s: an RWX PVC),
+        # so a warm result computed by one replica serves all of them. Purely
+        # additive — self._l2_cache is None (everything byte-identical to the
+        # memory-only behavior) unless SQLHANDLER_L2_DIR is set AND
+        # SQLHANDLER_L2_ENABLED is not 0. Virtual-table and attach-DB queries
+        # stay excluded automatically: _result_cache_key already returns None
+        # for both, and that must not "fixed".
+        l2_cfg = load_l2_config()
+        self._l2_cache: L2ResultCache | None = L2ResultCache(l2_cfg["dir"], ttl=l2_cfg["ttl"]) if l2_cfg else None
+        self._l2_min_bytes = l2_cfg["min_bytes"] if l2_cfg else 0
+        self._l2_max_bytes = l2_cfg["max_bytes"] if l2_cfg else 0
         # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
         # config parses loudly at startup (operator-authored, security
         # relevant — a typo should kill the pod, not silently skip a source).
         # Connections attach on demand per query; see sqlhandler/external.py.
         self.attaches: list[AttachSpec] = parse_attach_config()
         self._attached_listing: tuple[float, list[dict]] | None = None
+        # Write tier (review §4): the frozen set of source-table locations,
+        # snapshotted lazily at the FIRST write-target resolution (before
+        # this process has written anything). A scratch write may never
+        # resolve onto a covered source table; anything written later is
+        # not in this set and stays overwritable by its owner.
+        self._write_tier_source_paths: set[str] | None = None
         # Query memory: recent query outcomes for the query-memory MCP
         # resource (self-improving loop — agents reuse proven patterns).
         self._query_memory: deque = deque(maxlen=_query_memory_size())
@@ -922,9 +1075,16 @@ class SqlEngine:
                 daemon=True,
                 name="sqlhandler-list-autorefresh",
             ).start()
+        # One daemon sweep of the shared L2 dir (expired sidecars; lazy
+        # deletion on lookup is the guaranteed path — this is the backstop
+        # for keys this replica never looks up again). The virtual
+        # materialization cache deliberately gets NO such sweeper in this
+        # slice: adding GC there is a separate decision, not L2 scope.
+        if self._l2_cache is not None:
+            self._l2_cache.start_sweeper()
 
     # ---------------------------------------------------------------- list
-    def list_tables(self) -> list[TableInfo]:
+    def list_tables(self, *, caller=None) -> list[TableInfo]:
         """Every addressable table: the provider's physical tables plus the
         semantic catalog's virtual tables (entries carrying a ``definition``).
 
@@ -934,9 +1094,31 @@ class SqlEngine:
         ``_register_schema``). The disk-warm cache and the provider caches
         below stay physical-only: virtual tables always derive live from the
         hot-reloaded catalog.
+
+        Identity spine: policy-HIDDEN tables are OMITTED for a caller whose
+        groups hide them (invisible — list/search/describe/profile/scan all
+        refuse or omit consistently). Enforcement off (or no groups) returns
+        the full list byte-identically. The underlying provider cache is
+        UNCHANGED — filtering is per-call on top of the shared cached list.
         """
         tables = self._provider_tables()
-        return tables + self._virtual_infos(tables)
+        tables = tables + self._virtual_infos(tables)
+        if not policy_mod.policy_enabled():
+            return tables
+        pol = policy_store().get()
+        if not pol.groups:
+            return tables
+        effective_caller = caller if caller is not None else current_caller()
+        if effective_caller is None:
+            # NO caller context (engine internals, tests, pre-middleware):
+            # the unfiltered list. A real HTTP request ALWAYS carries a
+            # Caller (anonymous at worst) from the identity middleware, so
+            # this branch is internal-only and never a policy bypass.
+            return tables
+        groups = pol.groups_for(getattr(effective_caller, "subject", None), getattr(effective_caller, "key_fp", None))
+        if not groups:
+            return tables
+        return [t for t in tables if not pol.rule_for_table(t.path, t.name, groups).hidden]
 
     def _provider_tables(self) -> list[TableInfo]:
         """List the tables the provider exposes (cached for cache_ttl).
@@ -1400,7 +1582,10 @@ class SqlEngine:
         """
         info = self._resolve(table)
         for t in self.list_tables():
-            if info.qualified_name == t.qualified_name or (info.path, info.name) == (t.path, t.name):
+            if info.qualified_name == t.qualified_name or (info.path, info.name) == (
+                t.path,
+                t.name,
+            ):
                 return info
         raise LakehouseError(f"Table '{table}' not found in data source")
 
@@ -1652,6 +1837,13 @@ class SqlEngine:
         for info in self.list_tables():
             if info.path == table or info.name == table or info.qualified_name == table:
                 return info
+        # Policy-hidden tables resolve from the UNFILTERED provider list: the
+        # registration path needs their TableInfo (schema) to serve the empty
+        # relation / refuse honestly. _resolve does not decide VISIBILITY —
+        # every caller-facing surface checks the rule after resolving.
+        for info in self._provider_tables() + self._virtual_infos(self._provider_tables()):
+            if info.path == table or info.name == table or info.qualified_name == table:
+                return info
         if "/" in table:
             schema, name = table.split("/", 1)
             if schema and name:
@@ -1734,20 +1926,34 @@ class SqlEngine:
         return dset
 
     # ------------------------------------------------------------ describe
-    def describe_table(self, table: str) -> dict:
+    def describe_table(self, table: str, *, caller=None) -> dict:
         """Return column names/types and the canonical URI for a table.
 
         Cached in-process for cache_ttl seconds keyed by the resolved table
         path, so frequently-described tables come from memory instead of
         re-opening the metadata on every agent call.
+
+        Identity spine: the cache key appends the caller's policy hash when
+        non-empty (a masked caller's describe omits masked columns — caching
+        it under the raw key would serve the MASKED shape to an unmasked
+        caller, and the full shape to a masked one; distinct keys, distinct
+        results). A HIDDEN table raises ``LakehouseError`` — for this caller
+        it does not exist (list/search never advertise it either).
         """
+        effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
             return self._describe_external(*ext)
         info = self._resolve(table)
+        rule = self._effective_rule(info, effective_caller)
+        if rule.hidden:
+            raise LakehouseError(f"Table '{table}' not found in data source")
         if info.format == "virtual":
             return self._describe_virtual(info, table)
-        key = (info.source, info.path)
+        policy_hash = self._caller_policy_hash(effective_caller)
+        key: tuple = (info.source, info.path)
+        if policy_hash:
+            key = (info.source, info.path, policy_hash)
         now = time.monotonic()
         # Poll the catalog's mtime BEFORE the cache lookup: catalog
         # documentation is merged into cached describe results, so an edited
@@ -1761,12 +1967,25 @@ class SqlEngine:
                 return hit[1]
         dset = self._open_dataset(info)
         schema = dset.schema
+        columns_out: list[dict] = [{"name": f.name, "type": str(f.type)} for f in schema]
+        # Policy: masked columns are OMITTED from describe (the caller cannot
+        # SELECT them — the masking view does not expose them — so advertising
+        # them would invite queries that fail, or worse, profile leaks).
+        if rule.column_masks:
+            masked = {c.lower() for c in rule.column_masks}
+            columns_out = [c for c in columns_out if c["name"].lower() not in masked]
         result = {
             "table": table,
             "uri": self.provider.table_uri(info),
-            "columns": [{"name": f.name, "type": str(f.type)} for f in schema],
-            "n_columns": len(schema),
+            "columns": columns_out,
+            "n_columns": len(columns_out),
         }
+        # Raw-format marker (landing zone): surfaced so the MCP layer / web UI
+        # can badge the table "RAW" the way virtual tables badge "VIRTUAL" —
+        # additive; every other format omits the key exactly as before.
+        if is_raw_format(info.format):
+            result["format"] = info.format
+            result["raw"] = True
         # Merge semantic-catalog documentation when present: a table-level
         # description plus per-column notes. LLMs write far better SQL with
         # the business meaning attached, and the catalog is optional — no
@@ -2047,7 +2266,7 @@ class SqlEngine:
         return result
 
     # ------------------------------------------------------------- search
-    def search_tables(self, query: str, limit: int = 20) -> list[dict]:
+    def search_tables(self, query: str, limit: int = 20, *, caller=None) -> list[dict]:
         """Find tables matching a free-text query (names, columns, catalog docs).
 
         Deliberately cheap: matches against the cached table list, the
@@ -2067,6 +2286,11 @@ class SqlEngine:
         Substring bonuses are strictly larger than fuzzy bonuses, so exact
         hits always outrank near-misses, and a query that is neither a
         substring nor close to any name still returns an empty list.
+
+        Identity spine: iterates the CALLER-VISIBLE table list (policy-hidden
+        tables are never searched/advertised — ``list_tables(caller=...)``
+        applies the same filter), so a hidden table cannot be discovered by
+        search either.
         """
         q = query.strip().lower()
         if not q:
@@ -2075,7 +2299,7 @@ class SqlEngine:
         results: list[dict] = []
         with self._lock:
             cached_describes = {k: v for k, v in self._describe_cache.items()}
-        for info in self.list_tables():
+        for info in self.list_tables(caller=caller):
             entry = self._catalog_for(info)
             desc = str(entry.get("description") or "")
             aliases = [str(a) for a in entry.get("aliases") or []]
@@ -2177,7 +2401,7 @@ class SqlEngine:
         return results[: max(limit, 0)]
 
     # ------------------------------------------------------------- profile
-    def profile_table(self, table: str, columns: Sequence[str] | None = None) -> dict:
+    def profile_table(self, table: str, columns: Sequence[str] | None = None, *, caller=None) -> dict:
         """Column-level statistics for a table (cached like describe_table).
 
         Runs DuckDB's ``SUMMARIZE`` over the table's registered Dataset, so
@@ -2194,15 +2418,25 @@ class SqlEngine:
             table: table name (``schema/name`` when the source uses schemas;
                 ``<db-alias>.<schema>.<table>`` for an attached database).
             columns: optional subset of columns to profile (default: all).
+            caller: keyword-only (identity spine). Policy enforcement
+                profiles through the MASKING VIEW (a masked caller's stats
+                describe the masked rows/columns only — never the raw data),
+                the cache key folds the caller's policy hash when non-empty,
+                and a HIDDEN table raises not-found.
         """
+        effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
             return self._profile_external(*ext, columns=columns)
         info = self._resolve(table)
+        rule = self._effective_rule(info, effective_caller)
+        if rule.hidden:
+            raise LakehouseError(f"Table '{table}' not found in data source")
         if info.format == "virtual":
-            return self._profile_virtual(info, table, columns)
+            return self._profile_virtual(info, table, columns, caller=effective_caller)
+        policy_hash = self._caller_policy_hash(effective_caller)
         col_key = tuple(columns) if columns else ()
-        key = (info.source, info.path, col_key)
+        key = (info.source, info.path, col_key, policy_hash) if policy_hash else (info.source, info.path, col_key)
         now = time.monotonic()
         with self._lock:
             hit = self._profile_cache.get(key)
@@ -2213,9 +2447,12 @@ class SqlEngine:
         dset = self._open_dataset(info)
 
         # Full-table row count from metadata (Parquet row-group counts /
-        # Delta log stats) — no data IO for well-formed files.
+        # Delta log stats) — no data IO for well-formed files. A policy-
+        # covered table does NOT get the raw metadata count: the row count
+        # of the UNMASKED table leaks through min/max-free metadata. The
+        # masked SUMMARIZE's own count (profiled_rows) is the honest number.
         try:
-            n_rows: int | None = int(dset.count_rows())
+            n_rows: int | None = None if not rule.empty else int(dset.count_rows())
         except Exception:
             n_rows = None
 
@@ -2227,7 +2464,28 @@ class SqlEngine:
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
             view = "_sqlhandler_profile_target"
-            con.register(view, dset)
+            if rule.empty:
+                con.register(view, dset)
+            else:
+                # Profile through the masking view: same builder as the query
+                # path, so stats describe EXACTLY what run_sql would return.
+                base = "__sqlhandler_profile_base"
+                con.register(base, dset)
+                mask_sql = policy_mod.build_mask_select(
+                    base, [f.name for f in dset.schema], rule.column_masks, rule.row_filter
+                )
+                con.execute(f"CREATE OR REPLACE VIEW {view} AS ({mask_sql})")
+            # Masked columns are omitted up front: SUMMARIZE over the view
+            # already excludes them, but an explicit column subset naming a
+            # masked column must be refused honestly (not silently dropped).
+            if rule.column_masks and columns:
+                masked = {c.lower() for c in rule.column_masks}
+                offending = [c for c in columns if c.lower() in masked]
+                if offending:
+                    raise LakehouseError(
+                        f"Column(s) {', '.join(offending)} on table '{table}' are masked for this "
+                        "caller and cannot be profiled."
+                    )
             col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
             inner = f"SELECT {col_sel} FROM {view}"
             if cap > 0:
@@ -2237,7 +2495,8 @@ class SqlEngine:
             # min(n_rows, cap) rows), so SUMMARIZE is the only query that
             # touches the data — the separate count(*) ran the same scan
             # twice (audit performance finding). The count query only comes
-            # back for the rare metadata-unreadable case.
+            # back for the rare metadata-unreadable case (or policy-covered
+            # tables, where n_rows starts as None by design).
             if n_rows is not None:
                 profiled_rows = min(n_rows, cap) if cap > 0 else n_rows
             else:
@@ -2245,6 +2504,8 @@ class SqlEngine:
             summary = con.sql(f"SUMMARIZE {inner}").arrow()
             if isinstance(summary, pa.RecordBatchReader):
                 summary = summary.read_all()
+        except LakehouseError:
+            raise
         except Exception as exc:
             raise LakehouseError(f"Profiling failed for table '{table}': {exc}") from exc
         finally:
@@ -2259,6 +2520,8 @@ class SqlEngine:
             "n_columns": len(summary),
             "columns": self._summarize_columns(summary),
         }
+        if not rule.empty:
+            result["policy_applied"] = True
         with self._lock:
             self._profile_misses += 1
             if self.cache_ttl > 0:
@@ -2297,7 +2560,7 @@ class SqlEngine:
             for r in summary.to_pylist()
         ]
 
-    def _profile_virtual(self, info: TableInfo, table: str, columns: Sequence[str] | None) -> dict:
+    def _profile_virtual(self, info: TableInfo, table: str, columns: Sequence[str] | None, *, caller=None) -> dict:
         """Profile a virtual table by running its definition under SUMMARIZE.
 
         Unlike physical profiling there is no metadata shortcut: both the row
@@ -2305,9 +2568,16 @@ class SqlEngine:
         DuckDB path as run_sql, with the summary bounded by
         ``SQLHANDLER_PROFILE_MAX_ROWS``. Cached like the physical path, so
         repeated profiling pays the definition cost once per TTL.
+
+        ``caller`` rides into ``_register_schema``: the definition composes
+        over masked base views (transitive masking) and the cache key folds
+        the caller's policy hash — a masked caller's virtual profile is a
+        DISTINCT cached entry from an unmasked one.
         """
+        effective_caller = caller if caller is not None else current_caller()
+        policy_hash = self._caller_policy_hash(effective_caller)
         col_key = tuple(columns) if columns else ()
-        key = (info.source, info.path, col_key)
+        key = (info.source, info.path, col_key, policy_hash) if policy_hash else (info.source, info.path, col_key)
         now = time.monotonic()
         with self._lock:
             hit = self._profile_cache.get(key)
@@ -2322,7 +2592,7 @@ class SqlEngine:
         try:
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
-            self._register_schema(con, f"SELECT * FROM {target}")
+            self._register_schema(con, f"SELECT * FROM {target}", caller=effective_caller)
             try:
                 counted = con.sql(f"SELECT count(*) FROM {target}").fetchone()
                 n_rows: int | None = int(counted[0]) if counted else None
@@ -2350,6 +2620,8 @@ class SqlEngine:
             "n_columns": len(summary),
             "columns": self._summarize_columns(summary),
         }
+        if policy_hash:
+            result["policy_applied"] = True
         with self._lock:
             self._profile_misses += 1
             if self.cache_ttl > 0:
@@ -2357,7 +2629,7 @@ class SqlEngine:
         return result
 
     # -------------------------------------------------------- column stats
-    def column_stats(self, table: str, column: str, top_n: int = 5) -> dict:
+    def column_stats(self, table: str, column: str, top_n: int = 5, *, caller=None) -> dict:
         """Statistics for ONE column over a bounded sample (additive, Wave 5).
 
         A focused complement to :meth:`profile_table` (which stays untouched):
@@ -2371,14 +2643,30 @@ class SqlEngine:
         row count still comes from Parquet/Delta metadata where it is free
         (physical tables); virtual/attached tables report ``n_rows: None``
         and the sample sizes instead. Cached like describe/profile.
+
+        Identity spine: a MASKED column is refused honestly (its stats would
+        describe values the caller cannot read — and a hash mask's top-values
+        list would be a frequency oracle over the raw column); stats over a
+        covered-but-unmasked column run through the masking VIEW (the row
+        filter applies); hidden tables raise not-found; the cache key folds
+        the caller's policy hash when non-empty.
         """
+        effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
             return self._column_stats_external(*ext, column, top_n)
         info = self._resolve(table)
+        rule = self._effective_rule(info, effective_caller)
+        if rule.hidden:
+            raise LakehouseError(f"Table '{table}' not found in data source")
         cap = _profile_max_rows()
+        policy_hash = self._caller_policy_hash(effective_caller)
         col_key = (str(column).strip().lower(),)
-        key = ("colstats", info.source, info.path, col_key)
+        key = (
+            ("colstats", info.source, info.path, col_key, policy_hash)
+            if policy_hash
+            else ("colstats", info.source, info.path, col_key)
+        )
         now = time.monotonic()
         with self._lock:
             hit = self._profile_cache.get(key)
@@ -2386,8 +2674,10 @@ class SqlEngine:
                 self._profile_hits += 1
                 return hit[1]
 
-        described = self.describe_table(table)
+        described = self.describe_table(table, caller=effective_caller)
         col, col_type = _validate_column(described, column, table)
+        if rule.column_masks and col.lower() in {c.lower() for c in rule.column_masks}:
+            raise LakehouseError(f"Column '{col}' on table '{table}' is masked for this caller and cannot be profiled.")
         import duckdb
 
         con = duckdb.connect()
@@ -2396,17 +2686,30 @@ class SqlEngine:
             _apply_memory_budget(con)
             if info.format == "virtual":
                 target = _safe_ident(info.name)
-                self._register_schema(con, f"SELECT * FROM {target}")
+                self._register_schema(con, f"SELECT * FROM {target}", caller=effective_caller)
                 n_rows: int | None = None  # the definition's full count is not paid for a column sample
                 virtual = True
             else:
                 dset = self._open_dataset(info)
-                try:
-                    n_rows = int(dset.count_rows())
-                except Exception:
+                if rule.empty:
+                    try:
+                        n_rows = int(dset.count_rows())
+                    except Exception:
+                        n_rows = None
+                else:
+                    # Row count of the UNMASKED table is metadata the caller
+                    # has not earned — the masked view's own count is honest.
                     n_rows = None
                 target = "_sqlhandler_colstats_target"
-                con.register(target, dset)
+                if rule.empty:
+                    con.register(target, dset)
+                else:
+                    base = "__sqlhandler_colstats_base"
+                    con.register(base, dset)
+                    mask_sql = policy_mod.build_mask_select(
+                        base, [f.name for f in dset.schema], rule.column_masks, rule.row_filter
+                    )
+                    con.execute(f"CREATE OR REPLACE VIEW {target} AS ({mask_sql})")
                 virtual = False
             stats = _column_stats_queries(con, target, col, cap, top_n, col_type)
         except LakehouseError:
@@ -2426,6 +2729,8 @@ class SqlEngine:
         }
         if virtual:
             result["virtual"] = True
+        if not rule.empty:
+            result["policy_applied"] = True
         with self._lock:
             self._profile_misses += 1
             if self.cache_ttl > 0:
@@ -2481,45 +2786,77 @@ class SqlEngine:
         return tuple(path for (_, path), _ in ranked[: max(n, 0)])
 
     # -------------------------------------------------------- query memory
-    def note_query(self, sql: str, duration_ms: float, n_rows: int | None, error: str | None = None) -> None:
+    def note_query(
+        self,
+        sql: str,
+        duration_ms: float,
+        n_rows: int | None,
+        error: str | None = None,
+        caller=None,
+    ) -> None:
         """Record one query outcome for the query-memory resource (best-effort).
 
         SQL text is truncated; failures are recorded too so agents can see
-        what NOT to repeat.
+        what NOT to repeat. ``caller`` (keyword-only, default None) rides the
+        entry so the query-memory RESOURCE can owner-scope entries when
+        policy enforcement is on (cross-caller query patterns would leak
+        table knowledge a caller's policy hides).
         """
         if self._query_memory.maxlen and self._unsaved_opens >= _USAGE_SAVE_EVERY:
             self._unsaved_opens = 0
             self._save_cache_to_disk()
         if not self._query_memory.maxlen:
             return
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "sql": sql[:500],
+            "duration_ms": round(duration_ms, 1),
+            "n_rows": n_rows,
+            "error": error[:200] if error else None,
+        }
+        # Owner scope — set ONLY when the caller is known (enforcement keeps
+        # the shared byte-identical shape when off: entries stay 5-key).
+        if caller is not None and policy_mod.policy_enabled():
+            entry["owner"] = policy_mod.owner_key(caller)
         with self._lock:
-            self._query_memory.append(
-                {
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-                    "sql": sql[:500],
-                    "duration_ms": round(duration_ms, 1),
-                    "n_rows": n_rows,
-                    "error": error[:200] if error else None,
-                }
-            )
+            self._query_memory.append(entry)
 
-    def query_memory(self) -> list[dict]:
-        """Recent query outcomes, oldest first (a snapshot copy)."""
+    def query_memory(self, caller=None) -> list[dict]:
+        """Recent query outcomes, oldest first (a snapshot copy).
+
+        With policy enforcement ON and a caller given: only that caller's
+        OWN entries (owner-scoped — another caller's SQL text can reveal
+        hidden tables/columns). With enforcement off (or no caller):
+        everything, byte-identical to the shared-history behavior.
+        """
         with self._lock:
-            return list(self._query_memory)
+            snapshot = list(self._query_memory)
+        if caller is not None and policy_mod.policy_enabled():
+            owner = policy_mod.owner_key(caller)
+            return [e for e in snapshot if e.get("owner") == owner]
+        return snapshot
 
     def _record_outcome(
-        self, sql: str, duration_ms: float | None, n_rows: int | None, state: str, error: str | None = None
+        self,
+        sql: str,
+        duration_ms: float | None,
+        n_rows: int | None,
+        state: str,
+        error: str | None = None,
+        caller=None,
     ) -> None:
         """Single outcome choke point: query memory + metrics + audit log.
 
         Called by QueryJob for every finished query (ok, error, cancelled);
         each consumer is individually best-effort so observability can never
-        break a query.
+        break a query. ``caller`` (explicit, default None — the QueryJob
+        thread boundary) feeds the audit ``caller`` field and the caller-class
+        metric; None keeps every existing series byte-identical.
         """
-        self.note_query(sql, duration_ms or 0.0, n_rows, error)
+        self.note_query(sql, duration_ms or 0.0, n_rows, error, caller=caller)
         observability.metrics.record_query(state, (duration_ms or 0.0) / 1000.0, n_rows)
-        observability.audit_query(sql, state, duration_ms, n_rows, error)
+        observability.metrics.record_caller_query(getattr(caller, "cls", None) or "anonymous")
+        observability.audit_query(sql, state, duration_ms, n_rows, error, caller=caller)
 
     # ------------------------------------------------------------- scans
     def scan_arrow(
@@ -2529,6 +2866,8 @@ class SqlEngine:
         filters: Sequence | None = None,
         limit: int | None = None,
         version_as_of: int | None = None,
+        *,
+        caller=None,
     ) -> pa.Table:
         """Read a table as an in-memory Arrow table.
 
@@ -2543,13 +2882,40 @@ class SqlEngine:
 
         ``version_as_of`` reads a historical snapshot (Delta version or
         Iceberg snapshot id) instead of the current one.
+
+        ``caller`` (keyword-only, identity spine): when policy enforcement
+        covers this table, the scan DELEGATES to the SQL path (the masking
+        views) — pyarrow predicates cannot express row filters/column masks,
+        the same refusal posture ``_scan_virtual`` already has for virtual
+        tables. Uncovered tables scan exactly as before (byte-identical).
         """
+        effective_caller = caller if caller is not None else current_caller()
         if limit is None or limit < 0:
             cap = _max_rows()
             limit = cap if cap > 0 else None
         info = self._resolve(table)
+        rule = self._effective_rule(info, effective_caller)
+        if rule.hidden:
+            raise LakehouseError(f"Table '{table}' not found in data source")
         if info.format == "virtual":
-            return self._scan_virtual(info, columns, filters, limit, version_as_of)
+            return self._scan_virtual(info, columns, filters, limit, version_as_of, caller=effective_caller)
+        # Policy enforcement: a covered table canNOT go through the pyarrow
+        # scanner (masks/row filters have no pyarrow predicate form) — the
+        # SQL path serves it from the masking view instead.
+        if not rule.empty:
+            if filters:
+                raise LakehouseError(
+                    f"scan_table filters cannot push into policy-covered table '{info.name}' — "
+                    "the table is masked for this caller; use run_sql with a WHERE clause instead"
+                )
+            return self._sql_scan(
+                info,
+                columns,
+                limit,
+                version_as_of,
+                caller=effective_caller,
+                note="policy-covered: delegated to the SQL path",
+            )
         _validate_snapshot_version(version_as_of, "Time travel") if version_as_of is not None else None
         dset = self._open_dataset(info, version_as_of)
 
@@ -2568,6 +2934,291 @@ class SqlEngine:
             return scan.head(limit)
         return scan.to_table()
 
+    def _sql_scan(
+        self,
+        info: TableInfo,
+        columns: Sequence[str] | None,
+        limit: int | None,
+        version_as_of: int | None,
+        *,
+        caller=None,
+        note: str = "",
+    ) -> pa.Table:
+        """One table through the SQL path with column projection + limit.
+
+        The scan_arrow-under-policy and _scan_virtual shared body (both
+        surface "read this table as rows" through DuckDB, where masking
+        views / virtual definitions live). Time travel passes through.
+        """
+        target = _safe_ident(info.name)
+        col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+        if note:
+            logger.debug("scan %s: %s", info.name, note)
+        return self.query_duckdb(
+            f"SELECT {col_sel} FROM {target}",
+            limit=limit if (limit is not None and limit >= 0) else None,
+            version_as_of=version_as_of,
+            caller=caller,
+        )
+
+    # -------------------------------------------------------- sample rows
+    def sample_rows(
+        self,
+        table: str,
+        limit: int | None = None,
+        columns: Sequence[str] | None = None,
+        *,
+        caller=None,
+    ) -> dict:
+        """Head-of-table sample + per-column fill rates (agent productivity).
+
+        One bounded look at the DATA (describe/profile give schema and
+        statistics; this shows actual rows). Returns::
+
+            {"table", "uri", "n_rows", "sampled_rows", "sample_limit",
+             "columns": [{name, type, fill_count, fill_pct, null_count}...],
+             "rows": [{col: value, ...}, ...]}
+
+        Posture per surface:
+
+        * **Physical tables** — the profile-sampler posture: a pyarrow
+          scanner projection over the dataset with ``.head(limit)`` (head()
+          stops the scan early — never a full-table read to fetch N rows).
+          The limit is resolved with the same D4 semantics as scan_table
+          (``SQLHANDLER_MAX_ROWS`` caps a missing/negative limit).
+        * **Virtual tables** — routed through the SQL path
+          (``SELECT ... LIMIT n``): they have no Dataset, and pyarrow
+          predicates/projections cannot push into their definitions (the
+          same refusal ``scan_arrow`` shows for virtual tables).
+        * **Attached external tables** — SQL ``LIMIT`` runs server-side on
+          the attached catalog (the profile-external posture).
+
+        ``SQLHANDLER_PROFILE_MAX_ROWS`` bounds the sample (the fill rates
+        and the rows must describe the SAME sample, so the cap applies to
+        both), and the per-row payload respects the
+        ``SQLHANDLER_MAX_OUTPUT_ROWS`` discipline (the renderer caps rows).
+
+        Stratification v1 = an honest head + fill rates — no hidden
+        ordering, no binning: the sample states exactly which rows it took.
+
+        Identity spine: a policy-covered table DELEGATES to the SQL path
+        (the masking view supplies the sample — masked columns never appear,
+        the row filter applies); hidden tables raise not-found. Uncovered
+        tables sample byte-identically.
+        """
+        effective_caller = caller if caller is not None else current_caller()
+        ext = self._match_external_table(table)
+        if ext is not None:
+            return self._sample_rows_external(*ext, limit=limit, columns=columns)
+        info = self._resolve(table)
+        rule = self._effective_rule(info, effective_caller)
+        if rule.hidden:
+            raise LakehouseError(f"Table '{table}' not found in data source")
+        if info.format == "virtual":
+            return self._sample_rows_virtual(info, table, limit=limit, columns=columns, caller=effective_caller)
+
+        cap = _profile_max_rows()
+        # D4 limit semantics, shared with scan_table: missing/negative ->
+        # SQLHANDLER_MAX_ROWS; an explicit positive limit is honored exactly;
+        # an explicit 0 stays an explicit empty sample.
+        resolved = _resolve_sample_limit(limit)
+        # The PROFILE cap bounds how much of the table a sample may read
+        # (when the MAX_ROWS cap is off/unlimited, the profile cap is the
+        # guardrail; when both apply, the smaller governs).
+        if resolved is None and cap > 0:
+            resolved = cap
+        elif resolved is not None and cap > 0:
+            resolved = min(resolved, cap)
+
+        if not rule.empty:
+            # Policy-covered: the SQL path (masking view) — sample rows MUST
+            # be the rows run_sql would return, not raw-head rows.
+            if columns:
+                masked = {c.lower() for c in rule.column_masks}
+                offending = [c for c in columns if c.lower() in masked]
+                if offending:
+                    raise LakehouseError(
+                        f"Column(s) {', '.join(offending)} on table '{table}' are masked for this "
+                        "caller and cannot be sampled."
+                    )
+            sample = self._sql_scan(info, columns, resolved, None, caller=effective_caller)
+            return self._shape_sample(
+                table=table,
+                uri=self.provider.table_uri(info),
+                n_rows=None,  # raw metadata count would leak unmasked cardinality
+                sample=sample,
+                requested_limit=limit,
+                resolved_limit=resolved,
+                cap=cap,
+                policy_applied=True,
+            )
+
+        dset = self._open_dataset(info)
+        scan = dset.scanner(
+            columns=list(columns) if columns else None,
+            batch_size=65536,
+        )
+        sample = scan.head(resolved) if resolved is not None and resolved >= 0 else scan.to_table()
+
+        return self._shape_sample(
+            table=table,
+            uri=self.provider.table_uri(info),
+            n_rows=self._metadata_row_count(dset),
+            sample=sample,
+            requested_limit=limit,
+            resolved_limit=resolved,
+            cap=cap,
+        )
+
+    def _sample_rows_virtual(
+        self,
+        info: TableInfo,
+        table: str,
+        limit: int | None,
+        columns: Sequence[str] | None,
+        *,
+        caller=None,
+    ) -> dict:
+        """sample_rows for a virtual table: the SQL path (it has no Dataset).
+
+        pyarrow filters/projections cannot push into a definition, so the
+        sample is ``SELECT ... LIMIT n`` — exactly how scan_arrow serves
+        virtual tables. The same D4/PROFILE cap resolution bounds the LIMIT.
+        ``caller`` passes into query_duckdb (transitive masking via the
+        registered base views).
+        """
+        cap = _profile_max_rows()
+        resolved = _resolve_sample_limit(limit)
+        if resolved is None and cap > 0:
+            resolved = cap
+        elif resolved is not None and cap > 0:
+            resolved = min(resolved, cap)
+        target = _safe_ident(info.name)
+        col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+        inner = f"SELECT {col_sel} FROM {target}"
+        if resolved is not None and resolved >= 0:
+            inner = f"SELECT * FROM ({inner}) LIMIT {int(resolved)}"
+        sample = self.query_duckdb(inner, caller=caller)
+        n_rows: int | None = None
+        try:
+            counted = self.query_duckdb(f"SELECT count(*) FROM {target}", caller=caller)
+            n_rows = int(counted.column(0)[0]) if counted.num_rows else None
+        except Exception:
+            n_rows = None  # the sample still stands on its own
+        return self._shape_sample(
+            table=table,
+            uri=f"virtual://{info.name}",
+            n_rows=n_rows,
+            sample=sample,
+            requested_limit=limit,
+            resolved_limit=resolved,
+            cap=cap,
+            virtual=True,
+        )
+
+    def _sample_rows_external(
+        self,
+        spec: AttachSpec,
+        qualified: str,
+        limit: int | None,
+        columns: Sequence[str] | None,
+    ) -> dict:
+        """sample_rows for an attached-database table: LIMIT runs server-side."""
+        cap = _profile_max_rows()
+        resolved = _resolve_sample_limit(limit)
+        if resolved is None and cap > 0:
+            resolved = cap
+        elif resolved is not None and cap > 0:
+            resolved = min(resolved, cap)
+        con = self._external_connection()
+        try:
+            col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
+            inner = f"SELECT {col_sel} FROM {qualified}"
+            if resolved is not None and resolved >= 0:
+                inner = f"SELECT * FROM ({inner}) LIMIT {int(resolved)}"
+            sample = con.sql(inner).arrow()
+            if isinstance(sample, pa.RecordBatchReader):
+                sample = sample.read_all()
+        except Exception as exc:
+            raise LakehouseError(f"Sampling attached table '{qualified}' failed: {exc}") from exc
+        finally:
+            con.close()
+        return self._shape_sample(
+            table=qualified,
+            uri=spec.display_uri,
+            n_rows=None,  # a live database has no cheap metadata count
+            sample=sample,
+            requested_limit=limit,
+            resolved_limit=resolved,
+            cap=cap,
+            source="external",
+        )
+
+    @staticmethod
+    def _metadata_row_count(dset) -> int | None:
+        """Full-table row count from Parquet/Delta metadata (best-effort)."""
+        try:
+            return int(dset.count_rows())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _shape_sample(
+        table: str,
+        uri: str,
+        n_rows: int | None,
+        sample: pa.Table,
+        requested_limit: int | None,
+        resolved_limit: int | None,
+        cap: int,
+        virtual: bool = False,
+        source: str | None = None,
+        policy_applied: bool = False,
+    ) -> dict:
+        """Shape one sample + per-column fill rates into the result dict.
+
+        Fill rates come from the SAME bounded sample the rows come from —
+        one honest posture, never mixed: a column's fill_pct is
+        ``(sampled_rows - null_count) / sampled_rows``.
+        """
+        sampled_rows = sample.num_rows
+        fill: list[dict] = []
+        for field in sample.schema:
+            col = sample.column(field.name)
+            null_count = col.null_count
+            fill_count = sampled_rows - null_count
+            fill_pct = round(fill_count * 100.0 / sampled_rows, 1) if sampled_rows else 0.0
+            fill.append(
+                {
+                    "name": field.name,
+                    "type": str(field.type),
+                    "fill_count": fill_count,
+                    "fill_pct": fill_pct,
+                    "null_count": null_count,
+                }
+            )
+        rows = sample.to_pylist()
+        result: dict = {
+            "table": table,
+            "uri": uri,
+            "n_rows": n_rows,
+            "sampled_rows": sampled_rows,
+            "sample_limit": resolved_limit,
+            "profile_max_rows": cap,
+            "columns": fill,
+            "rows": rows,
+        }
+        if requested_limit is not None and requested_limit < 0:
+            result["limit_resolved"] = True  # the D4 clamp applied (limit=-1 -> cap)
+        if virtual:
+            result["virtual"] = True
+        if source is not None:
+            result["source"] = source
+            result["read_only"] = True
+        if policy_applied:
+            result["policy_applied"] = True
+        return result
+
     def _scan_virtual(
         self,
         info: TableInfo,
@@ -2575,6 +3226,8 @@ class SqlEngine:
         filters: Sequence | None,
         limit: int | None,
         version_as_of: int | None,
+        *,
+        caller=None,
     ) -> pa.Table:
         """Scan a virtual table through the SQL path (it has no Dataset).
 
@@ -2583,6 +3236,12 @@ class SqlEngine:
         with a pointer to run_sql (whose predicates push down into the
         definition's base scans anyway). Time travel passes through: the
         definition's base tables are then read at the requested snapshot.
+
+        ``caller`` passes through to ``query_duckdb``: a virtual definition
+        composes over its base tables' registered views, so masking the
+        bases masks the virtual transitively (the verified composition path)
+        — but only when the enforcement rule actually applies (empty rule =
+        byte-identical path, including the materialization cache).
         """
         if filters:
             raise LakehouseError(
@@ -2595,6 +3254,7 @@ class SqlEngine:
             f"SELECT {col_sel} FROM {target}",
             limit=limit if (limit is not None and limit >= 0) else None,
             version_as_of=version_as_of,
+            caller=caller,
         )
 
     # ------------------------------------------------------------ duckdb
@@ -2605,6 +3265,8 @@ class SqlEngine:
         params: object | None = None,
         version_as_of: int | None = None,
         row_cap: int | None = None,
+        *,
+        caller=None,
     ) -> pa.Table:
         """Execute SQL via DuckDB over the provider Datasets.
 
@@ -2626,19 +3288,61 @@ class SqlEngine:
                 versionable table the query touches (Delta snapshot version
                 or Iceberg snapshot id). Plain-Parquet tables in the same
                 query are an error (they have no history).
+            caller: keyword-only (identity spine). The resolved Caller for
+                this query — thread-boundary rule: the query runs on a raw
+                ``threading.Thread`` where contextvars do NOT cross, so the
+                caller rides the job explicitly. None (default) = the async
+                context's caller (``current_caller()``), else anonymous:
+                audit lines stay field-absent and metrics stay byte-identical.
+                Also feeds policy enforcement (the masking views) and the
+                policy hash in the result-cache key.
         """
         if version_as_of is not None:
             _validate_snapshot_version(version_as_of, "Time travel")
+        # Keyword-only default: explicit caller wins; else the ambient
+        # request context; else None (anonymous — no attribution fields).
+        effective_caller = caller if caller is not None else current_caller()
         t0 = time.monotonic()
+        # WRITE-TIER INVARIANT (review §4, pinned by test_writes.py): a
+        # classified write NEVER touches the cache paths — classification
+        # happens BEFORE the cache check, and the write executes outside
+        # DuckDB entirely. With the tier flag OFF (default) this block is
+        # inert and every line below is exactly today's behavior; with it
+        # ON, run_sql hands classified writes here and the cache never sees
+        # a write's "result" (a cache hit serving a stale pre-write read
+        # would be the failure mode this ordering makes impossible).
+        if writes_mod.writes_enabled():
+            plan = writes_mod.classify_sql(sql)
+            if len(plan) == 1 and plan[0].kind == writes_mod.CLASS_WRITE_SCRATCH:
+                return self.execute_write(sql, params=params, caller=effective_caller)
         fast = self._metadata_count_fastpath(sql, version_as_of)
         if fast is not None:
-            self._record_outcome(sql, (time.monotonic() - t0) * 1000, 1, state="ok")
+            self._record_outcome(sql, (time.monotonic() - t0) * 1000, 1, state="ok", caller=effective_caller)
             return fast
-        cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of)
+        # Preview fast path (same choke-point posture as the count fast-path
+        # above): env-gated (SQLHANDLER_PREVIEW_FASTPATH, default ON), off
+        # switches and params/time-travel/row-cap mismatches fall straight
+        # through to the normal path — the flag loader reads with defaults
+        # and NEVER raises. The requested `limit` (an explicit arg, distinct
+        # from the statement's own LIMIT) and time travel both refuse the
+        # shortcut so every row-cap and snapshot contract stays on the full
+        # path; params would change the SQL identity mid-flight. The result
+        # IS identical in shape to the normal path's, so the cache and
+        # rendering below never see the difference.
+        if _preview_fastpath_enabled() and not params and version_as_of is None and limit is None:
+            fast = self._preview_fastpath(sql, version_as_of)
+            if fast is not None:
+                cap = _max_rows()
+                eff_cap = row_cap if row_cap is not None else cap
+                if fast.num_rows > eff_cap > 0:
+                    fast = fast.slice(0, eff_cap)
+                self._record_outcome(sql, (time.monotonic() - t0) * 1000, fast.num_rows, state="ok", caller=effective_caller)
+                return fast
+        cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of, caller=effective_caller)
         if cache_key is not None:
             cached = self._result_cache_lookup(cache_key)
             if cached is not None:
-                self._record_outcome(sql, 0.0, cached.num_rows, state="ok")
+                self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
                 return cached
         timeout = _query_timeout()
         job = QueryJob(
@@ -2648,6 +3352,7 @@ class SqlEngine:
             params=params,
             version_as_of=version_as_of,
             row_cap=row_cap,
+            caller=effective_caller,
         )
         if timeout > 0:
             job.wait(timeout)
@@ -2656,12 +3361,453 @@ class SqlEngine:
                 # the connection is closed instead of leaking.
                 job.cancel()
                 job.wait(_CANCEL_GRACE_SECONDS)
-                raise LakehouseError(f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
+                raise LakehouseError(
+                    _errors.enrich(f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
+                )
         else:
             job.wait()
         if job.state == "done" and cache_key is not None and job.result is not None:
-            self._result_cache_store(cache_key, job.result)
+            self._result_cache_store(cache_key, job.result, sql=sql)
         return job.result
+
+    # ------------------------------------------------------------- writes
+    def execute_write(
+        self,
+        sql: str,
+        params: object | None = None,
+        *,
+        caller=None,
+        mode: str | None = None,
+    ) -> pa.Table:
+        """Execute ONE classified write statement; return the write summary.
+
+        The write tier's executor (implementation review §4). The tier flag
+        (``SQLHANDLER_WRITES_ENABLED``, default FALSE) is checked HERE as
+        well as at the MCP surface — an engine-level caller cannot bypass
+        the gate. Flow:
+
+        1. **Classification FIRST** (``writes.classify_sql`` on the same
+           DuckDB-parser spans as the read guard) — before ANY cache lookup
+           would happen, and before any execution. Reads are NOT accepted
+           here: a read goes through :meth:`query_duckdb` (which classifies
+           first itself; the invariant is pinned by test_writes.py).
+        2. Target validation: ``<allowlisted-root>/<subject-slug>/...`` only
+           (no subject -> refused, always; anonymous gets NO write
+           capability) — and the target must not collide with a configured
+           source table (writes stay outside policy-covered tables).
+        3. The SELECT payload runs on a fresh locked-down DuckDB connection
+           with the caller's masking views registered (policy applies to
+           reads INSIDE the write too: what lands in scratch is exactly
+           what the caller could read).
+        4. The rows are written OUTSIDE DuckDB — delta-rs ``write_deltalake``
+           (default backend) or pyiceberg (``iceberg://``-named roots) — so
+           ``_duckdb_fs_lockdown`` and the READ_ONLY attach posture stay
+           untouched (the documented conflict; a dedicated writer
+           connection is the follow-up if DuckDB MERGE is demanded).
+        5. Single-writer discipline: in-process lock keyed
+           (backend, path) + advisory lease file (O_EXCL + TTL) on the
+           scratch PVC; contention is a RETRYABLE ``E_WRITE_CONFLICT``.
+
+        Returns a ONE-ROW summary Arrow table (target, backend, rows
+        written, mode) — the write SUMMARY returns in place of rows.
+        """
+        if not writes_mod.writes_enabled():
+            raise LakehouseError(
+                _errors.enrich(
+                    "Write refused: the write tier is disabled (SQLHANDLER_WRITES_ENABLED unset/0 — "
+                    "the deliberate default; writes are operator-gated)."
+                )
+            )
+        effective_caller = caller if caller is not None else current_caller()
+        # 1. classify BEFORE anything else — no cache, no dataset opens, no IO.
+        plan = writes_mod.classify_sql(sql)
+        if len(plan) != 1:
+            raise LakehouseError(
+                _errors.enrich(
+                    "Write refused: exactly one statement per call on the write tier "
+                    f"(got {len(plan)}). Run the read and the write separately."
+                )
+            )
+        cls = plan[0]
+        if cls.kind == writes_mod.CLASS_READ:
+            raise LakehouseError(
+                _errors.enrich(
+                    "Write refused: the statement is a read — run_sql handles reads "
+                    "(the write tier adds capability, it does not replace the read path)."
+                )
+            )
+        if cls.kind != writes_mod.CLASS_WRITE_SCRATCH:
+            detail = f" ({cls.reason})" if cls.reason else ""
+            raise LakehouseError(
+                _errors.enrich(f"Write refused: {cls.stmt_type} statements are not in the v1 write tier{detail}.")
+            )
+        # 2. resolve the target under the caller's subject namespace
+        #    (refuses: no subject, no roots, traversal, sibling aliases).
+        try:
+            if cls.target is None:  # a scratch class always parsed a target
+                raise writes_mod.WriteError(
+                    "Write refused: the statement's target could not be parsed.",
+                    code="E_WRITE_TARGET",
+                )
+            backend, canonical, _uri = writes_mod.resolve_write_target(cls.target, effective_caller)
+        except writes_mod.WriteError as exc:
+            raise LakehouseError(_errors.enrich(str(exc))) from exc
+        self._refuse_write_target_collision(cls.target, canonical)
+        # 3. run the SELECT payload on a fresh locked-down connection with
+        #    the caller's policy views — reads inside the write are governed
+        #    reads (the mask applies; hidden tables register empty).
+        select_sql = cls.source_sql or "SELECT 1"
+        t0 = time.monotonic()
+        rows = self._select_rows_for_write(select_sql, params, effective_caller)
+        # 4/5. write through the backend under the single-writer discipline.
+        # The parse (above) decides before the lease exists, so a refused
+        # write never creates lease litter. ``mode`` (optional) overrides
+        # the statement-shape default (append for INSERT, overwrite for
+        # CTAS/COPY): ``overwrite`` is the explicit replace semantics,
+        # ``append`` fails on a schema mismatch (fail closed — silently
+        # widening a target's schema is not v1 behavior).
+        write_mode = mode or ("append" if cls.stmt_type == "INSERT" else "overwrite")
+        if backend == "iceberg":
+            summary = self._write_iceberg_scratch(canonical, rows, write_mode)
+        else:
+            summary = self._write_delta_scratch(canonical, rows, write_mode)
+        # The write REPLACED files under a path the engine may hold a cached
+        # dataset handle for (a scratch root inside the provider root):
+        # evict it so the next read opens the NEW snapshot (the delta
+        # version check would catch an append; the CTAS drop-create changes
+        # the file set under the SAME version-0 log, so eviction is the
+        # correct invalidation).
+        self._evict_dataset_cache_for(canonical)
+        # AND the result cache: a read of the written table cached before
+        # the write must never be served after it (the never-stale rule).
+        # The CTAS drop-create RESETS the Delta log to version 0 — the
+        # version token REGRESSES, so the snapshot-token key comparison
+        # (which catches every normal ETL commit) cannot see this change;
+        # a write-keyed eviction is the only honest invalidation. L2 entries
+        # are keyed by the same key material on disk; evicting them keeps
+        # the other replicas honest too.
+        self._evict_result_cache_for_write(backend, canonical)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        self._record_write(cls, backend, canonical, rows.num_rows, elapsed_ms, state="ok", caller=effective_caller)
+        return pa.table(
+            {
+                "target": pa.array([summary["target"]], type=pa.string()),
+                "backend": pa.array([summary["backend"]], type=pa.string()),
+                "rows_written": pa.array([summary["rows"]], type=pa.int64()),
+                "mode": pa.array([summary["mode"]], type=pa.string()),
+                "duration_ms": pa.array([round(elapsed_ms, 1)], type=pa.float64()),
+            }
+        )
+
+    def _select_rows_for_write(self, select_sql: str, params: object | None, caller) -> pa.Table:
+        """Run the SELECT payload of a write on a fresh governed connection.
+
+        The exact QueryJob execution shape (locked-down connection + masking
+        views + row-cap NOTE: the cap does NOT apply to a write's SELECT —
+        the caller asked to write the query RESULT, not a truncated one; the
+        statement-shape guard already refused everything but single
+        SELECT-payload writes). Attach-touching payloads stay REFUSED:
+        attached catalogs are a source, never a sink, and the write tier
+        does not change that (the target is scratch; reads stay lake-only
+        here for the same exfiltration-shape reasons).
+        """
+        import duckdb
+
+        if self._sql_needs_external(select_sql):
+            raise LakehouseError(
+                _errors.enrich(
+                    "Write refused: the write tier reads lake tables only — attached external "
+                    "databases cannot feed a scratch write (source-never-sink holds for reads "
+                    "inside the write too)."
+                )
+            )
+        _validated = _validate_params(params)
+        con = duckdb.connect()
+        try:
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+            self._register_schema(con, select_sql, version=None, caller=caller)
+            rel = con.sql(select_sql, params=_validated)
+            arrow = rel.arrow()
+            if isinstance(arrow, pa.RecordBatchReader):
+                arrow = arrow.read_all()
+            return arrow
+        except Exception as exc:
+            hinted = _with_hints(self, select_sql, exc)
+            raise LakehouseError(_errors.enrich(f"Write failed (source query): {hinted}")) from exc
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    def _write_delta_scratch(self, canonical: str, rows: pa.Table, mode: str = "overwrite") -> dict:
+        """Delta-rs write of the query result into the subject's scratch.
+
+        ``mode`` is the delta-rs mode: ``overwrite`` (CTAS/COPY semantic —
+        the first write creates the table, a re-run replaces it) or
+        ``append`` (INSERT semantic — rows are added; a schema mismatch is
+        an ERROR, not an implicit schema evolution). All of it under the
+        single-writer lock + lease.
+        """
+        from deltalake import write_deltalake
+
+        if mode not in ("overwrite", "append"):
+            raise LakehouseError(f"Write refused: unsupported write mode {mode!r}.")
+        key = ("delta", canonical)
+        with writes_mod.single_writer_lock(key):
+            lease = writes_mod.WriteLease(canonical)
+            lease.acquire()
+            try:
+                exists = os.path.isdir(canonical) and os.path.isdir(os.path.join(canonical, "_delta_log"))
+                if not exists and mode == "append":
+                    # An INSERT creating its own target: still the overwrite
+                    # (create) form internally — nothing exists to append to.
+                    mode = "overwrite"
+                if exists and mode == "overwrite":
+                    # The CTAS semantic is REPLACE, schema included: a re-run
+                    # with different columns is a NEW table at the same path,
+                    # not a schema conflict. delta-rs' overwrite refuses a
+                    # narrower/different payload schema (verified 1.6.3), so
+                    # the honest replace is: drop the old directory under the
+                    # lease, then create fresh. The lease + lock make the
+                    # drop-create atomic against other writers.
+                    import shutil
+
+                    shutil.rmtree(canonical)
+                    exists = False
+                if not exists:
+                    os.makedirs(canonical, exist_ok=True)
+                try:
+                    write_deltalake(canonical, rows, mode="overwrite" if not exists else mode)
+                except Exception as exc:
+                    if mode == "append" and "Schema" in type(exc).__name__:
+                        # A schema mismatch on APPEND is refused, not evolved:
+                        # silently widening a scratch table's schema (the
+                        # schema_mode=merge behavior) hides drift between what
+                        # the caller thinks the target is and what it became.
+                        raise LakehouseError(
+                            _errors.enrich(
+                                f"Write refused: append to '{canonical}' does not match the target's "
+                                f"schema ({exc}). Use CREATE TABLE (overwrite) to replace it, or "
+                                "align the SELECT's columns/types with the target."
+                            )
+                        ) from exc
+                    raise
+            finally:
+                lease.release()
+        return {"target": canonical, "backend": "delta", "rows": rows.num_rows, "mode": mode}
+
+    def _write_iceberg_scratch(self, canonical: str, rows: pa.Table, mode: str = "overwrite") -> dict:
+        """pyiceberg write of the query result into a catalog-managed scratch.
+
+        The root's ``iceberg://`` marker declares a local SQL catalog for v1
+        (``ICEBERG_SCRATCH_URI``/``warehouse`` config); REST-catalog scratch
+        is the same code path with a different ``load_catalog`` — the
+        lockdown posture is untouched either way (pyiceberg writes over
+        pyarrow IO, never through DuckDB).
+        """
+        from pyiceberg.catalog.sql import SqlCatalog
+
+        key = ("iceberg", canonical)
+        with writes_mod.single_writer_lock(key):
+            lease = writes_mod.WriteLease(canonical)
+            lease.acquire()
+            try:
+                uri = os.environ.get("SQLHANDLER_WRITE_ICEBERG_CATALOG_URI", "").strip()
+                warehouse = os.environ.get("SQLHANDLER_WRITE_ICEBERG_WAREHOUSE", "").strip() or None
+                if not uri and warehouse:
+                    # pyiceberg's SQL catalog REQUIRES a connection URI; when
+                    # the operator configured only a warehouse, default the
+                    # catalog DB next to it (a sqlite file — local scratch).
+                    wh_fs = warehouse.removeprefix("file://")
+                    os.makedirs(wh_fs, exist_ok=True)
+                    uri = f"sqlite:///{wh_fs}/.sqlhandler-iceberg-catalog.db"
+                catalog = SqlCatalog("sqlhandler-scratch", uri=uri, warehouse=warehouse)
+                if warehouse:
+                    fs_location = warehouse.removeprefix("file://")
+                else:
+                    fs_location = os.path.dirname(canonical)
+                os.makedirs(fs_location, exist_ok=True)
+                namespace = os.path.basename(os.path.dirname(canonical)) or "scratch"
+                name = os.path.basename(canonical)
+                try:
+                    catalog.create_namespace(namespace)
+                except Exception:
+                    pass  # exists
+                full_name = (namespace, name)
+                created = False
+                try:
+                    table = catalog.load_table(full_name)
+                except Exception:
+                    table = catalog.create_table(full_name, rows.schema)
+                    created = True
+                if created or mode == "overwrite":
+                    table.overwrite(rows)
+                else:
+                    table.append(rows)
+                write_mode = "create" if created else mode
+            finally:
+                lease.release()
+        return {"target": canonical, "backend": "iceberg", "rows": rows.num_rows, "mode": write_mode}
+
+    def _refuse_write_target_collision(self, target: str | None, canonical: str) -> None:
+        """Writes are ALWAYS outside policy-covered tables (review §4).
+
+        A sloppy root could overlap a source root; refuse a target whose
+        canonical path resolves onto a CONFIGURED SOURCE table's location.
+        The discriminator is stable: the engine snapshots its source-table
+        locations the FIRST time the write tier resolves a target (before
+        any write of this process) — a table that was a source at snapshot
+        time is a source forever, and anything written since (the caller's
+        own prior CTAS re-listed under a scratch root) is not in the
+        snapshot and stays writable.
+        """
+        if self._write_tier_source_paths is None:
+            paths: set[str] = set()
+            for info in self.list_tables():
+                loc = info.location
+                if not loc:
+                    continue
+                if not os.path.isabs(loc):
+                    root = getattr(getattr(self.provider, "config", None), "root_dir", "") or ""
+                    loc = os.path.join(root, loc) if root else loc
+                try:
+                    paths.add(os.path.realpath(loc))
+                except OSError:
+                    paths.add(os.path.normpath(os.path.abspath(loc)))
+            self._write_tier_source_paths = paths
+        if not self._write_tier_source_paths:
+            return
+        try:
+            canonical_loc = os.path.realpath(canonical) if os.path.isabs(canonical) else canonical
+        except OSError:
+            canonical_loc = canonical
+        if canonical_loc in self._write_tier_source_paths:
+            raise LakehouseError(
+                _errors.enrich(
+                    f"Write refused: target '{canonical}' resolves onto a configured source "
+                    "table's location — write targets are always outside the covered source "
+                    "tables. Choose a target under your scratch namespace."
+                )
+            )
+
+    def _evict_result_cache_for_write(self, backend: str, canonical_path: str) -> None:
+        """Drop result-cache entries (L1 + L2) referencing a written table.
+
+        The write-tier complement of the snapshot-token invalidation: the
+        result-cache key embeds ``<source>/<path>=<version>`` per referenced
+        table, but a scratch CTAS drop-create RESETS the Delta log to
+        version 0 (the token regresses, so the token comparison that catches
+        normal ETL commits cannot see the change).
+
+        A stored key is the FINAL sha256 HEX (the parts are hashed away), so
+        path-matching stored keys is impossible; instead the key for a
+        candidate SQL is RECOMPUTED with the written table's NEW snapshot
+        token and checked for membership — a cached read of the written
+        table (whose old entry carried the old token) has a DIFFERENT key
+        only if the token changed, which is exactly the case the
+        drop-create defeats. So the honest eviction is: recompute the keys
+        of cached SQLs. The engine keeps a bounded key->sql side map
+        (populated at store time; entries dropped with their keys), scans
+        it for SQLs that REFERENCE the written table (the same
+        word-boundary name match ``_referenced_tables`` uses), and evicts
+        those keys from L1 and L2.
+
+        The written table's logical path is derived from the canonical
+        scratch path exactly as the provider lists it (the subject-slug
+        segment is the schema): ``.../<root>/<slug>/<name>`` lists as
+        ``<slug>/<name>``. Runs ONLY on the write path — a read-only
+        deployment pays nothing.
+        """
+        parts = [p for p in canonical_path.rstrip("/").split("/") if p]
+        table_path = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else canonical_path
+        table_name = parts[-1] if parts else canonical_path
+        # Every identifier the provider could list this table under: the
+        # bare name (how the write addressed it), the listed path, and the
+        # engine's QUALIFIED form (schema/name -> schema_name — DuckDB sees
+        # the subject-slug segment as a schema, so reads resolve
+        # ``alice/t`` as ``alice_t``).
+        idents = {table_name, table_path}
+        if len(parts) >= 2:
+            idents.add(f"{parts[-2]}_{parts[-1]}")
+        stale: list[str] = []
+        with self._lock:
+            for key, sql in list(self._result_cache_sql.items()):
+                try:
+                    # Same reference decision as _referenced_tables: a
+                    # word-boundary name match on the SQL text.
+                    if any(re.search(rf"\b{re.escape(i)}\b", sql) for i in idents):
+                        stale.append(key)
+                except Exception:
+                    continue
+            for k in stale:
+                entry = self._result_cache.pop(k, None)
+                self._result_cache_sql.pop(k, None)
+                if entry is not None:
+                    self._result_cache_bytes -= entry[1].nbytes
+        if self._l2_cache is not None:
+            try:
+                self._l2_cache.drop_for_table(table_path, table_name)
+            except Exception:
+                logger.debug("L2 write-eviction failed for %s", table_path, exc_info=True)
+
+    def _evict_dataset_cache_for(self, canonical_path: str) -> None:
+        """Drop cached dataset handles for the written table (any version).
+
+        The write tier's invalidation: a scratch write physically replaced
+        (or appended under) a path some cached handle points at. Every
+        matching entry is dropped — the next open re-reads the Delta log
+        fresh. Cheap (a dict scan over the bounded cache) and best-effort.
+        The match is on the cache KEY's table path (``<source>/<path>``):
+        the canonical scratch path ends ``.../<slug>/<name>`` and the
+        provider lists the written table as path ``<slug>/<name>``, so the
+        suffix test identifies exactly the written table — without
+        depending on whether the dataset lists full paths (pyarrow) or
+        bare names (delta-rs, verified).
+        """
+        parts = [p for p in canonical_path.rstrip("/").split("/") if p]
+        table_path = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else canonical_path
+        with self._lock:
+            for key in [k for k in self._dataset_cache]:
+                if key[1] and key[1].endswith(table_path) and key[0] == "default":
+                    del self._dataset_cache[key]
+                    self._version_checked_at.pop(key, None)
+
+    def _record_write(
+        self,
+        cls,
+        backend: str,
+        target: str,
+        rows: int,
+        duration_ms: float,
+        state: str,
+        error: str | None = None,
+        caller=None,
+    ) -> None:
+        """The write outcome choke point: audit event:"write" + additive metric.
+
+        Audit lines gain ``event:"write"`` with the target/backend/rows (the
+        review's additive line shape — existing query lines byte-identical).
+        The metric is ``sqlhandler_writes_total{backend,outcome}``.
+        """
+        try:
+            observability.audit_write(
+                sql=cls.statement,
+                state=state,
+                duration_ms=duration_ms,
+                target=target,
+                backend=backend,
+                n_rows=rows if state == "ok" else None,
+                error=error,
+                caller=caller,
+            )
+        except Exception:
+            logger.debug("write audit failed", exc_info=True)
+        try:
+            observability.metrics.record_write(backend, state)
+        except Exception:
+            logger.debug("write metric failed", exc_info=True)
 
     # ------------------------------------------------- fast path + results
     # Bare ``SELECT COUNT(*) FROM <table>`` — row counts live in the parquet
@@ -2673,6 +3819,131 @@ class SqlEngine:
         r"FROM\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*;?\s*$",
         re.IGNORECASE,
     )
+
+    # Bare-LIMIT preview detector (Task A). Same sqlglot-free philosophy as
+    # _referenced_tables / _COUNT_STAR_RE: a deliberately NARROW regex plus
+    # resolve-and-check — when in doubt, the normal query path. The regex
+    # anchors the head hard (SELECT + a projection list that cannot contain
+    # parens/semicolons) so FROM/JOIN/ON/WITH cannot hide inside the column
+    # text; the reject-word list then refuses aggregates and clause keywords.
+    _PREVIEW_RE = re.compile(
+        r"^\s*SELECT\s+(?P<cols>[^;()]+?)\s+FROM\s+"
+        r"(?P<table>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*"
+        r"(?:;\s*)?LIMIT\s+(?P<limit>\d+)\s*;?\s*$",
+        re.IGNORECASE,
+    )
+    # Words that never appear in a plain projection list: clause keywords
+    # (WHERE/GROUP/ORDER/... — belt-and-braces beside the regex anchoring),
+    # window constructs and aggregates. A bare `*` IS matched; only
+    # decorated lists are refused.
+    _PREVIEW_REJECT = re.compile(
+        r"\b(?:WHERE|GROUP|HAVING|ORDER|WINDOW|UNION|EXCEPT|INTERSECT|VALUES|OFFSET|AS|"
+        r"OVER|FILTER|SUM|COUNT|MIN|MAX|AVG|DISTINCT|CASE|CAST|COALESCE)\b",
+        re.IGNORECASE,
+    )
+
+    def _is_bare_preview(self, sql: str) -> tuple[str, int] | None:
+        """Match the bare-preview shape: ``(table, limit)`` — else None.
+
+        Steps, in order (each refusal = the normal path, never an error):
+
+        1. Regex shape — one SELECT, a projection list of plain identifiers
+           (``*`` allowed alone), FROM one table, a bare trailing LIMIT.
+        2. Column sanity — each comma-separated piece is a plain identifier
+           (dotted parts allowed, no aliases/expressions/quotes); the
+           reject-word list refuses aggregates and clause keywords.
+        3. Table resolve — `_safe_table_name` + `_resolve` must find a REAL
+           table (virtual / external-attach / raw-format fall through), the
+           same word-boundary + qualified-name discipline the registration
+           (`_register_schema`'s ``[source_]schema_name`` views) uses.
+        """
+        m = self._PREVIEW_RE.match(sql)
+        if not m or self._sql_needs_external(sql):
+            return None
+        cols = m.group("cols").strip()
+        if cols.lower() != "*" and self._PREVIEW_REJECT.search(cols):
+            return None
+        for piece in cols.split(","):
+            piece = piece.strip()
+            if piece == "*":
+                continue
+            if not piece or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", piece
+            ):
+                return None
+        try:
+            table = m.group("table")
+            _safe_table_name(table)
+            info = self._resolve(table)
+        except Exception:
+            return None
+        if info.format in ("virtual", "external") or is_raw_format(info.format):
+            return None
+        return table, int(m.group("limit"))
+
+    def _preview_fastpath(self, sql: str, version: int | None) -> pa.Table | None:
+        """Serve a bare ``SELECT cols FROM t LIMIT n`` from the first rows.
+
+        Reads the FIRST row group of the table's FIRST data file (Parquet:
+        one footer + one row group; Delta: the current snapshot's first
+        add-action file — the same enumeration skip that motivates the
+        count(*) fast-path, minus the full-scan semantics) and slices to
+        ``limit``.
+
+        SEMANTICS (stated honestly): for LIMIT without ORDER BY, any subset
+        of rows is a correct answer — the SQL contract fixes nothing about
+        WHICH rows. The fast path returns the first physical rows, which is
+        exactly that contract; the full path may hand back different rows
+        because DuckDB's read order/batch boundaries and pyarrow's row-group
+        selection are implementation details, not result guarantees. What
+        the fast path DOES guarantee: same column set/types, same row cap
+        and the same Arrow-table shape the normal path returns (rendering,
+        caps and audit/metrics all live above and are identical).
+
+        ANY snag (unresolvable fragment, a read error, a projected column
+        the fragment doesn't carry) returns None — the normal query path
+        takes over, never an error surfaces.
+
+        Structural split: :meth:`_is_bare_preview` decides the SHAPE (pure,
+        no IO), THIS method does the READ — tests and future callers can
+        monkeypatch the executor alone and assert it was (not) called.
+        """
+        parsed = self._is_bare_preview(sql)
+        if parsed is None:
+            return None
+        table, limit = parsed
+        try:
+            info = self._resolve(table)
+            if limit <= 0:
+                # LIMIT 0: no rows to read — shape-only answer, no IO.
+                dset = self._open_dataset(info, version)
+                return dset.schema.empty_table()
+            dset = self._open_dataset(info, version)
+            fragment = next(iter(dset.get_fragments()), None)
+            if fragment is None:
+                return None  # empty table (or unlisted backend): normal path
+            cols = self._preview_columns(sql)
+            # No explicit dataset schema is passed: parquet/delta fragments
+            # carry their physical schema (partition fields fold in at scan
+            # time) and iceberg/sharing datasets carry their own; passing an
+            # explicit `columns=` list to head() would REJECT names the
+            # fragment knows loudly instead of falling back — the plain
+            # projection keeps any mismatch on the fallback path.
+            rows = fragment.head(limit, columns=(cols or None))
+            if rows.num_rows > limit:
+                rows = rows.slice(0, limit)
+            return rows
+        except Exception:
+            logger.debug("preview fast-path failed for %r; using the query path", sql, exc_info=True)
+            return None
+
+    def _preview_columns(self, sql: str) -> list[str]:
+        """The preview's projected column names (``[]`` = star / all)."""
+        cols = self._PREVIEW_RE.match(sql).group("cols").strip()  # type: ignore[union-attr]
+        if cols.lower() == "*":
+            return []
+        # Dotted names: keep the last part (the column), as SQL does.
+        return [c.strip().split(".")[-1] for c in cols.split(",")]
 
     def _metadata_count_fastpath(self, sql: str, version: int | None) -> pa.Table | None:
         """Serve a bare ``SELECT COUNT(*) FROM <table>`` from metadata.
@@ -2693,6 +3964,12 @@ class SqlEngine:
             return None
         if info.format == "virtual":
             return None
+        if is_raw_format(info.format):
+            # Raw-text tables (csv/tsv/json/ndjson) carry no row-count
+            # metadata — no footers — so count_rows() here would SCAN the
+            # whole table while pretending to be the metadata fast path.
+            # Fall through to the query path (correct, just not free).
+            return None
         try:
             dset = self._open_dataset(info, version)
             n = int(dset.count_rows())
@@ -2701,6 +3978,46 @@ class SqlEngine:
             return None
         return pa.table({alias: pa.array([n], type=pa.int64())})
 
+    def _policy_hash(self, caller=None) -> str:
+        """The caller's effective-policy hash for cache keys (Stage 2 live).
+
+        Returns the sha256 of the caller's canonicalized effective rule set
+        (``policy.canonical_hash`` over the group specs that resolve for the
+        CURRENT caller), or ``""`` when enforcement is off / no caller is
+        bound / the caller's groups resolve to no rules. Every cache (result
+        L1/L2, virtual materialization, describe/profile) folds this value in
+        through :func:`_cache_policy_part` — the conditional-slot rule.
+
+        THE WIRING (identity spine Stage 1 + policy Stage 2): the caller
+        rides :func:`current_caller` — set by the server per request (MCP
+        tools/web UI) and passed EXPLICITLY into ``query_duckdb`` (keyword
+        ``caller``) where a raw ``threading.Thread`` (``QueryJob``) would
+        otherwise lose it (contextvars do not cross threads). With
+        enforcement OFF this returns ``""`` everywhere: keys stay
+        byte-identical, cross-caller sharing unchanged (the golden tests
+        pin it).
+        """
+        if not policy_mod.policy_enabled():
+            return ""
+        pol = policy_mod.policy_store().get()
+        if pol is None or not pol.groups:
+            return ""
+        effective = caller if caller is not None else current_caller()
+        if effective is None:
+            return ""
+        return pol.effective_hash(getattr(effective, "subject", None), getattr(effective, "key_fp", None))
+
+    @staticmethod
+    def _cache_policy_part(policy_hash: str) -> str:
+        """The ``policy=<hash>`` cache-key part, or "" when there is no policy.
+
+        Kept next to the key builders so the conditional is visible in one
+        place: a non-empty hash APPENDS the part; an empty hash contributes
+        nothing at all (not a placeholder, not a separator) — the parts join
+        byte-identically to today's.
+        """
+        return f"policy={policy_hash}" if policy_hash else ""
+
     def _result_cache_key(
         self,
         sql: str,
@@ -2708,6 +4025,7 @@ class SqlEngine:
         limit: int | None,
         row_cap: int | None,
         version_as_of: int | None,
+        caller=None,
     ) -> str | None:
         """Cache key for a query: full identity + base-snapshot version tokens.
 
@@ -2715,7 +4033,12 @@ class SqlEngine:
         literals — see :func:`_normalize_cache_sql`), so formatting-only
         re-runs hit the same entry; quoted content and comment-bearing
         queries keep byte-exact keys.
-        
+
+        A trailing ``policy=<hash>`` part is appended ONLY when the caller's
+        policy hash is non-empty (:meth:`_policy_hash` — empty everywhere in
+        this slice), so masked results can never share an entry with
+        unmasked ones; with no policy the key is byte-identical to the
+        historical format.
 
         None when the result must not be cached: caching disabled, no
         recognizable tables, any virtual table involved (its materialization
@@ -2729,48 +4052,119 @@ class SqlEngine:
                 return None
             if self._sql_needs_external(sql):
                 return None
-            parts = [_normalize_cache_sql(sql), repr(params), repr(limit), repr(row_cap), repr(version_as_of)]
+            parts = [
+                _normalize_cache_sql(sql),
+                repr(params),
+                repr(limit),
+                repr(row_cap),
+                repr(version_as_of),
+            ]
             for info in sorted(refs, key=lambda t: (t.source, t.path)):
                 parts.append(f"{info.source}/{info.path}={self._safe_version(info)}")
+            policy_part = self._cache_policy_part(self._policy_hash(caller))
+            if policy_part:
+                parts.append(policy_part)
             return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
         except Exception:
             return None
 
     def _result_cache_lookup(self, key: str) -> pa.Table | None:
-        """The cached result for ``key`` when fresh, else None (LRU-ordered)."""
+        """The cached result for ``key``: memory L1 first, then the shared L2.
+
+        An L1 hit is exactly today's path. On an L1 miss the shared-disk L2
+        (all replicas pointing at one directory — a PVC in k8s) is consulted;
+        an L2 hit warms L1, so the NEXT identical query on this replica is a
+        memory hit again. Every L2 step is best-effort: a missing, corrupt
+        or expired entry is an ordinary miss, and the L2 is disabled
+        entirely unless SQLHANDLER_L2_DIR is set.
+        """
         with self._lock:
             hit = self._result_cache.get(key)
-            if hit is None:
-                return None
-            ts, table = hit
-            if time.time() - ts >= self._result_cache_ttl:
-                del self._result_cache[key]
-                self._result_cache_bytes -= table.nbytes
-                return None
-            self._result_cache.move_to_end(key)
-            self._result_cache_hits += 1
-            return table
+            if hit is not None:
+                ts, table = hit
+                if time.time() - ts >= self._result_cache_ttl:
+                    del self._result_cache[key]
+                    self._result_cache_sql.pop(key, None)
+                    self._result_cache_bytes -= table.nbytes
+                else:
+                    self._result_cache.move_to_end(key)
+                    self._result_cache_hits += 1
+                    return table
+        if self._l2_cache is not None:
+            table = self._l2_cache.lookup(key)
+            if table is not None:
+                self._result_cache_store(key, table)
+                return table
+        return None
 
-    def _result_cache_store(self, key: str, table: pa.Table) -> None:
-        """Cache one query result (in-memory, byte-capped, LRU-evicted)."""
+    def _result_cache_store(self, key: str, table: pa.Table, sql: str | None = None) -> None:
+        """Cache one query result: memory L1 always, shared L2 when in band.
+
+        L2 gets only results in the byte band ``SQLHANDLER_L2_MIN_BYTES``
+        (smaller results round-trip the PVC slower than recomputing them) ≤
+        nbytes ≤ ``SQLHANDLER_L2_MAX_BYTES`` (a runaway result must not fill
+        the shared volume; default mirrors the virtual cache's 2 GiB). The
+        L1 cap logic is unchanged; L2 failures never raise.
+
+        The key -> referenced-table-paths mapping is remembered (write tier):
+        the stored key is the FINAL sha256 hex — the parts are hashed away —
+        so a write's post-write eviction cannot path-match stored keys
+        without this side map. Bounded with the cache itself (entries are
+        dropped when their key is).
+        """
         nbytes = table.nbytes
         if self._result_cache_max_bytes > 0 and nbytes > self._result_cache_max_bytes:
             return
         with self._lock:
             while self._result_cache and self._result_cache_bytes + nbytes > self._result_cache_max_bytes:
                 _, evicted = self._result_cache.popitem(last=False)
+                if self._result_cache_sql:
+                    self._result_cache_sql.popitem(last=False)
                 self._result_cache_bytes -= evicted[1].nbytes
             self._result_cache[key] = (time.time(), table)
             self._result_cache_bytes += nbytes
             self._result_cache_writes += 1
+            if sql is not None:
+                self._result_cache_sql[key] = sql
+        if (
+            self._l2_cache is not None
+            and self._l2_min_bytes <= nbytes
+            and (self._l2_max_bytes <= 0 or nbytes <= self._l2_max_bytes)
+        ):
+            self._l2_cache.store(key, table)
 
     def _referenced_tables(self, sql: str) -> list[TableInfo]:
         """Return the tables referenced by a SQL query.
 
         Matches table identifiers (bare or qualified) against the known
         tables, so we only open the datasets the query actually touches.
+
+        Policy-aware: hidden tables resolve TOO (the caller-visible list
+        excludes them, but a query naming one must reach the registration
+        path — which serves the EMPTY relation; dropping the reference here
+        would surface a catalog error naming a table that "doesn't exist",
+        which is both uglier and an existence oracle for probe loops). The
+        visibility contract lives in list_tables/describe/scan/query;
+        registration handles hidden tables deliberately.
         """
         known = self.list_tables()
+        if policy_mod.policy_enabled():
+            # Merge back any table the caller's policy HIDES: the empty-
+            # relation registration needs the TableInfo (schema) to build it.
+            pol = policy_store().get()
+            if pol.groups:
+                effective_caller = current_caller()
+                subject = getattr(effective_caller, "subject", None) if effective_caller is not None else None
+                key_fp = getattr(effective_caller, "key_fp", None) if effective_caller is not None else None
+                if effective_caller is not None:
+                    groups = pol.groups_for(subject, key_fp)
+                    hidden_known = {(t.source, t.path) for t in known}
+                    for t in self._provider_tables() + self._virtual_infos(self._provider_tables()):
+                        if (t.source, t.path) in hidden_known:
+                            continue
+                        if pol.rule_for_table(t.path, t.name, groups).hidden:
+                            known = known + [t]
+                            hidden_known.add((t.source, t.path))
         wanted: dict[tuple[str, str], TableInfo] = {}
         for info in known:
             for ident in (re.escape(info.name), re.escape(info.qualified_name)):
@@ -2779,7 +4173,9 @@ class SqlEngine:
                     break
         return list(wanted.values())
 
-    def _register_schema(self, con, sql: str, version: int | None = None, materialize: bool = True) -> None:
+    def _register_schema(
+        self, con, sql: str, version: int | None = None, materialize: bool = True, caller=None
+    ) -> None:
         """Register each referenced table as a DuckDB view over its Dataset.
 
         Each table gets its qualified view (``[source_]schema_name``) always,
@@ -2799,11 +4195,23 @@ class SqlEngine:
         ``version`` (time travel) opens every versionable table at that
         historical snapshot instead of the current one (virtual views then
         read their base tables at that same snapshot for free).
+
+        ``caller`` (keyword-friendly; identity spine): when policy
+        enforcement covers a physical table, the MASKING VIEW is registered
+        under the caller-visible names instead of the raw dataset — the
+        base dataset goes under a private name (``__sqlhandler_base_<n>``)
+        and the masking view (row filter + column masks, policy.py) reads
+        it. Virtual definitions compose over these views, so masking is
+        inherited TRANSITIVELY (the verified composition path). No caller /
+        enforcement off / empty rule → register exactly as before
+        (byte-identical behavior and materialization keys).
         """
         name_counts: dict[str, int] = {}
         for info in self.list_tables():
             name_counts[info.name] = name_counts.get(info.name, 0) + 1
+        effective_caller = caller if caller is not None else current_caller()
         physical, virtuals = self._expand_query_tables(self._referenced_tables(sql))
+        base_seq = 0
         for info in physical:
             views = {_safe_ident(info.qualified_name)}
             if name_counts.get(info.name, 0) <= 1:
@@ -2819,19 +4227,136 @@ class SqlEngine:
                     raise
                 logger.debug("Could not open dataset for %s", info.path)
                 continue
-            for view in views:
+            rule = self._effective_rule(info, effective_caller)
+            if rule.hidden:
+                # The table does not exist for this caller. Registering
+                # nothing would surface a confusing catalog error; registering
+                # an EMPTY relation keeps queries resolvable but yields zero
+                # rows and no columns... actually: an empty-typed relation
+                # from the real schema, so SELECT * still binds and returns
+                # nothing. The visibility layer (list/describe/search) hides
+                # it entirely; queries that name it explicitly get an empty
+                # result — information-theoretically the same as a table with
+                # a row_filter of FALSE, never an error message that leaks
+                # the table's existence to a tool that already knows the name.
                 try:
-                    con.register(view, dset)
+                    empty = self._empty_table_for(dset)
+                    for view in views:
+                        con.register(view, empty)
                 except Exception:
-                    logger.debug("Could not register view %s from %s", view, info.path)
+                    logger.debug("hidden-table empty registration failed for %s", info.path, exc_info=True)
+                continue
+            if rule.empty:
+                for view in views:
+                    try:
+                        con.register(view, dset)
+                    except Exception:
+                        logger.debug("Could not register view %s from %s", view, info.path)
+                continue
+            # POLICY-COVERED: raw dataset under a private base name, masking
+            # view under every caller-visible name.
+            base_seq += 1
+            base_name = f"__sqlhandler_base_{base_seq}"
+            try:
+                con.register(base_name, dset)
+                columns = [f.name for f in dset.schema]
+                mask_sql = policy_mod.build_mask_select(base_name, columns, rule.column_masks, rule.row_filter)
+                for view in views:
+                    con.execute(f"CREATE OR REPLACE VIEW {view} AS ({mask_sql})")
+                logger.debug(
+                    "policy view registered for %s (filter=%s, masks=%s)",
+                    info.path,
+                    bool(rule.row_filter),
+                    sorted(rule.column_masks),
+                )
+            except Exception as exc:
+                # Fail CLOSED: a masking view that cannot be built must never
+                # degrade to the raw dataset (that would be a silent leak).
+                raise LakehouseError(f"policy masking for table '{info.name}' could not be applied: {exc}") from exc
         if not virtuals:
             return
         self._apply_compat_macros(con)
         for info in virtuals:
-            self._register_virtual(con, info, version, materialize, name_counts)
+            self._register_virtual(con, info, version, materialize, name_counts, caller=effective_caller)
+
+    def _empty_table_for(self, dset) -> pa.Table:
+        """A zero-row arrow table with the dataset's REAL schema (hidden-table
+        registration: the shape is visible, the data is not — and only to a
+        caller who already names the hidden table explicitly)."""
+        schema = dset.schema
+        return pa.table([pa.array([], type=f.type) for f in schema], schema=schema)
+
+    def _effective_rule(self, info: TableInfo, caller=None, _validating: bool = False) -> TableRule:
+        """The policy rule for one table under ``caller`` (or the ambient
+        context's). Enforcement OFF / no policy file / no groups → the empty
+        rule (byte-identical behavior). A HIDDEN rule wins over everything.
+
+        Fail-closed on rule resolution errors: an exception inside policy
+        lookup refuses the scan path with LakehouseError rather than serving
+        the raw table (a resolution bug must never become a leak).
+
+        ``_validating`` breaks the describe→rule→describe recursion (the
+        first-use filter validation reads the SCHEMA, not the policy shape).
+        """
+        if not policy_mod.policy_enabled():
+            return TableRule()
+        try:
+            pol = policy_store().get()
+            if not pol.groups:
+                return TableRule()
+            if caller is None:
+                caller = current_caller()
+            if caller is None:
+                # NO caller context (engine internals/tests/pre-middleware):
+                # the empty rule. A real HTTP request always carries a Caller
+                # (anonymous at worst — which DOES get the default group);
+                # None is the internal trusted path, never a policy subject.
+                return TableRule()
+            subject = getattr(caller, "subject", None)
+            key_fp = getattr(caller, "key_fp", None)
+            groups = pol.groups_for(subject, key_fp)
+            if not groups:
+                # No group resolves (no default_group configured): the caller
+                # is unrestricted BY THE FILE — but only when the file
+                # deliberately has no default. groups_for already encodes it.
+                return TableRule()
+            rule = pol.rule_for_table(info.path, info.name, groups)
+            if rule.row_filter and not self._validated_filters.get(rule.row_filter) and not _validating:
+                # Validate the filter against THIS table's real columns at
+                # first use (load-time validation covers known tables; this
+                # catches tables described after the policy loaded). The
+                # schema read here must NOT re-enter rule resolution — the
+                # filter needs the RAW schema, which describe computes from
+                # the dataset directly; call the resolution-free path.
+                columns = self._raw_columns(info)
+                if columns:
+                    policy_mod.validate_row_filter(rule.row_filter, columns, info.path)
+                self._validated_filters[rule.row_filter] = True
+            return rule
+        except policy_mod.PolicyError as exc:
+            raise LakehouseError(f"policy for '{info.name}' is invalid: {exc}") from exc
+        except LakehouseError:
+            raise
+        except Exception as exc:
+            raise LakehouseError(f"policy enforcement failed for '{info.name}': {exc}") from exc
+
+    def _raw_columns(self, info: TableInfo) -> list[str]:
+        """The table's raw column names straight from the dataset (NO policy
+        resolution — the recursion-free schema read for filter validation)."""
+        try:
+            dset = self._open_dataset(info)
+            return [f.name for f in dset.schema]
+        except Exception:
+            return []
 
     def _register_virtual(
-        self, con, info: TableInfo, version: int | None, materialize: bool, name_counts: dict[str, int]
+        self,
+        con,
+        info: TableInfo,
+        version: int | None,
+        materialize: bool,
+        name_counts: dict[str, int],
+        caller=None,
     ) -> None:
         """Put virtual table ``info`` on the connection: from the
         materialization cache when valid, otherwise as a view built from the
@@ -2844,6 +4369,13 @@ class SqlEngine:
         LIMIT) reads a small parquet. Failures degrade to the live view —
         the cache is only an accelerator, never a dependency. Time-travel
         queries bypass the cache entirely (their base snapshots differ).
+
+        Policy (identity spine): the definition composes over the REGISTERED
+        views, so masking on its base tables is inherited transitively — the
+        same definition text serves masked and unmasked callers and the
+        materialization is keyed per policy hash (``_virtual_cache_base``
+        folds the caller's hash in when non-empty, producing SEPARATE
+        artifacts; unmasked callers keep today's exact filenames).
         """
         views = [_safe_ident(info.qualified_name)]
         if name_counts.get(info.name, 0) <= 1:
@@ -2851,9 +4383,9 @@ class SqlEngine:
         definition = self._definition_sql(info.name)
         dset = None
         if self._virtual_cache_ttl > 0 and version is None:
-            dset = self._virtual_cache_lookup(info, definition)
+            dset = self._virtual_cache_lookup(info, definition, caller=caller)
             if dset is None and materialize:
-                dset = self._virtual_cache_materialize(con, info, definition)
+                dset = self._virtual_cache_materialize(con, info, definition, caller=caller)
         if dset is not None:
             try:
                 for view in views:
@@ -2881,7 +4413,7 @@ class SqlEngine:
                     f"virtual table '{info.name}' could not be built from its catalog definition: {exc}"
                 ) from exc
 
-    def _virtual_cache_base(self, info: TableInfo, definition: str) -> dict:
+    def _virtual_cache_base(self, info: TableInfo, definition: str, caller=None) -> dict:
         """Identity of a virtual table's cache entry.
 
         The key covers the definition text (rewritten) of the table AND of
@@ -2890,6 +4422,12 @@ class SqlEngine:
         tables' snapshot-version tokens, so a new ETL commit on any base
         invalidates automatically. Returns the parquet path, the meta sidecar
         path, the key hash, and the current expected version tokens.
+
+        Policy (Stage 2): the CALLER's policy hash rides the digest walk
+        (after the definition texts, before the version tokens) when
+        non-empty — masked callers materialize to ``…-p<hash8>-<digest>.parquet``
+        and unmasked callers keep today's exact ``…-<digest>.parquet`` names
+        (the conditional infix rule; review §5).
         """
         physical, virtuals = self._expand_query_tables([info])
         h = hashlib.sha256()
@@ -2898,13 +4436,26 @@ class SqlEngine:
             h.update(b"\0")
             h.update(self._definition_sql(v.name).encode())
             h.update(b"\0")
+        # The caller's effective policy hash — the transitive definitions
+        # compose over masked base views, so the MATERIALIZED RESULT differs
+        # per policy and must not share an artifact across policies.
+        policy_hash = self._caller_policy_hash(caller)
+        if policy_hash:
+            h.update(b"policy\0")
+            h.update(policy_hash.encode())
+            h.update(b"\0")
         versions = {
             f"{i.source}/{i.path}": str(self._safe_version(i))
             for i in sorted(physical, key=lambda t: (t.source, t.path))
         }
         digest = h.hexdigest()
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", info.name)
-        path = Path(self._virtual_cache_dir) / f"{safe}-{digest[:16]}.parquet"
+        if policy_hash:
+            # Masked materialization: policy infix separates the artifacts
+            # (review §5: `…-p<hash8>-<digest16>.parquet`).
+            path = Path(self._virtual_cache_dir) / f"{safe}-p{policy_hash[:8]}-{digest[:16]}.parquet"
+        else:
+            path = Path(self._virtual_cache_dir) / f"{safe}-{digest[:16]}.parquet"
         return {
             "path": str(path),
             "meta": str(path) + ".json",
@@ -2912,12 +4463,35 @@ class SqlEngine:
             "versions": versions,
         }
 
-    def _virtual_cache_lookup(self, info: TableInfo, definition: str):
+    def _caller_policy_hash(self, caller=None) -> str:
+        """The caller's effective policy hash (empty = no policy for them).
+
+        One resolution point for the virtual-cache walk (``_virtual_cache_base``)
+        and any other place that needs the hash WITHOUT going through
+        ``_policy_hash()`` (which reads the ambient context). Explicit caller
+        wins, then the ambient context, then empty.
+        """
+        if not policy_mod.policy_enabled():
+            return ""
+        pol = policy_store().get()
+        if pol is None or not pol.groups:
+            return ""
+        effective = caller if caller is not None else current_caller()
+        if effective is None:
+            return ""
+        subject = getattr(effective, "subject", None)
+        key_fp = getattr(effective, "key_fp", None)
+        if not pol.groups_for(subject, key_fp):
+            return ""
+        return pol.effective_hash(subject, key_fp)
+
+    def _virtual_cache_lookup(self, info: TableInfo, definition: str, caller=None):
         """A pyarrow Dataset over the cached materialization when it is valid
-        for this definition + base snapshots + TTL, else None (never raises)."""
+        for this definition + base snapshots + TTL (+ this caller's policy),
+        else None (never raises)."""
         import pyarrow.dataset as pad
 
-        base = self._virtual_cache_base(info, definition)
+        base = self._virtual_cache_base(info, definition, caller=caller)
         try:
             meta = json.loads(Path(base["meta"]).read_text(encoding="utf-8"))
         except Exception:
@@ -2932,7 +4506,7 @@ class SqlEngine:
             logger.warning("virtual table %s: cache file unreadable; ignoring it", info.name, exc_info=True)
             return None
 
-    def _virtual_cache_materialize(self, con, info: TableInfo, definition: str):
+    def _virtual_cache_materialize(self, con, info: TableInfo, definition: str, caller=None):
         """Run the definition once and publish its full result to the cache.
 
         The result is CLUSTERED before writing (see ``_cluster_result``):
@@ -2945,11 +4519,15 @@ class SqlEngine:
         unique temp file + atomic rename, so concurrent queries may
         materialize simultaneously without corrupting anything (last writer
         wins; both results are valid).
+
+        ``caller`` rides into ``_virtual_cache_base`` so a masked caller's
+        materialization lands on its OWN artifact (policy infix) — never
+        into (or out of) an unmasked entry.
         """
         import pyarrow.dataset as pad
         import pyarrow.parquet as pq
 
-        base = self._virtual_cache_base(info, definition)
+        base = self._virtual_cache_base(info, definition, caller=caller)
         path = Path(base["path"])
         tmp_path: str | None = None
         try:
@@ -3254,13 +4832,379 @@ class SqlEngine:
             visit(name)
         return list(physical.values()), order
 
+    # -------------------------------------------------------- explain_query
+    # Operator extra_info text whose presence means "this scan is filtered
+    # in place" — the predicate was pushed INTO the scan rather than applied
+    # above it. Evaluated per scan node from its own extra_info
+    # ("Filters: amt>2.0"), which the JSON EXPLAIN exposes verbatim.
+    _PUSHDOWN_HINT_RE = re.compile(r"Filters", re.IGNORECASE)
+
+    @staticmethod
+    def _explain_scan_pushdown(node: dict) -> bool | None:
+        """Whether ONE scan node shows pushed-down filters, or None when unknown.
+
+        DuckDB prints the pushed-down predicates on the scan operator itself
+        (``Filters: amt>2.0`` in the scan's extra_info) — the whole point of
+        the view-registered pyarrow path. A scan with no ``Filters`` line is
+        NOT evidence of no pushdown (the query may genuinely have no
+        predicate over that table), so the verdict is reported per scan and
+        aggregated honestly: None = nothing observable either way.
+        """
+        extra = node.get("extra_info") or {}
+        return bool(extra.get("Filters")) if extra else None
+
+    @staticmethod
+    def _explain_plan_summary(tree: list[dict]) -> dict:
+        """Reduce one JSON EXPLAIN tree to {operators, scans, pushdown, est_rows}.
+
+        ``scan_nodes`` counts leaf scan operators (ARROW_SCAN / PARQUET_SCAN
+        / SQLITE_SCAN / ... — anything whose name ends in SCAN);
+        ``pushdown`` is True when at least one scan carries a Filters entry,
+        None when no scan exposes one (nothing observable — the query may
+        simply have no predicate). ``estimated_root_rows`` is the root's
+        Estimated Cardinality when it parses as a number (DuckDB's own
+        estimate, confidence "approx" by definition).
+        """
+        operators = 0
+        scans = 0
+        pushdown: bool | None = None
+        est_rows: float | None = None
+        found_root = False
+
+        def _walk(node: dict) -> None:
+            nonlocal operators, scans, pushdown, est_rows, found_root
+            operators += 1
+            if not found_root:
+                extra = node.get("extra_info") or {}
+                raw = str(extra.get("Estimated Cardinality", "")).replace(",", "").replace("~", "").strip()
+                if raw:
+                    try:
+                        est_rows = float(raw)
+                        found_root = True
+                    except ValueError:
+                        pass
+            name = str(node.get("name", "")).upper()
+            if name.endswith("SCAN"):
+                scans += 1
+                if pushdown is not True and SqlEngine._explain_scan_pushdown(node) is True:
+                    pushdown = True
+            for child in node.get("children") or []:
+                _walk(child)
+
+        for root in tree:
+            _walk(root)
+        return {
+            "operators": operators,
+            "scan_nodes": scans,
+            "pushdown": pushdown,
+            "estimated_root_rows": est_rows,
+        }
+
+    def _table_bytes_to_scan(self, info: TableInfo, dset, source: str) -> tuple[int | None, str]:
+        """Best-effort bytes-to-scan for one table, with its confidence label.
+
+        Backends in priority order (every failure degrades — the estimate is
+        the point, never a dependency):
+
+        * **Delta** (onelake / Delta-on-S3 / nfs) — the snapshot's add
+          actions already carry every data file's size in the delta log (the
+          same seed the block cache uses, ``onelake._delta_file_sizes``):
+          exact on-disk bytes, confidence ``"exact"``.
+        * **Iceberg** — ``plan_files`` reports per-file sizes from the
+          manifests (metadata only); confidence ``"exact"``.
+        * **Parquet over any provider** — the fragment metadata's
+          uncompressed row-group byte totals (one metadata read per file, no
+          column IO); confidence ``"approx"`` — compression makes on-disk
+          bytes smaller, typically several-fold.
+        * Anything else (or any failure) — None with confidence ``"none"``.
+        """
+        if source == "external":
+            return None, "none"
+        try:
+            if info.format == "delta":
+                dt = self._delta_handle(info)
+                if dt is None:
+                    return None, "none"
+                sizes = self._delta_file_sizes(dt)
+                if not sizes:
+                    return None, "none"
+                return sum(int(v) for v in sizes.values()), "exact"
+            if info.format == "iceberg":
+                file_sizes = self._iceberg_file_sizes(info)
+                if not file_sizes:
+                    return None, "none"
+                return sum(file_sizes), "exact"
+            total = 0
+            for frag in dset.get_fragments():
+                for rg in frag.row_groups:
+                    total += int(rg.total_byte_size)
+            return (total, "approx") if total else (None, "none")
+        except Exception:
+            return None, "none"
+
+    def _delta_handle(self, info: TableInfo, version: int | None = None):
+        """The provider's DeltaTable handle when it exposes one (else None).
+
+        Providers open Delta handles internally (``_open_delta``); asking
+        for one generically would couple the engine to every backend, so a
+        bounded ``getattr`` probe REUSES the provider's existing opener (and
+        therefore its auth plumbing) instead of duplicating it. Providers
+        without delta handles — or which fail to open — answer None and the
+        size estimate degrades honestly.
+        """
+        opener = getattr(self.provider, "_open_delta", None)
+        if not callable(opener):
+            return None
+        try:
+            return opener(info, version) if version is not None else opener(info)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _delta_file_sizes(dt) -> dict[str, int] | None:
+        """Relative data-file path -> size, from the snapshot's add actions.
+
+        Read here from the ALREADY-OPEN handle (no second metadata round
+        trip): the same shape the block cache seeds from (the providers'
+        ``_delta_file_sizes``), duplicated as a static helper because the
+        engine must not import from the provider modules (they import from
+        ``provider.py``; the reverse edge would be a cycle).
+        """
+        try:
+            adds = dt.get_add_actions(flatten=True)
+            table = adds if isinstance(adds, pa.Table) else pa.table(adds)
+            return dict(zip(table.column("path").to_pylist(), table.column("size_bytes").to_pylist()))
+        except Exception:
+            return None
+
+    def _iceberg_file_sizes(self, info: TableInfo) -> list[int] | None:
+        """Data-file byte sizes for an Iceberg table, from its manifests.
+
+        Mirrors IcebergProvider.open_dataset's plan (catalog load + scan
+        planning — metadata only, no data files read); None on any failure,
+        including the optional pyiceberg dependency being absent.
+        """
+        loader = getattr(self.provider, "_load_table", None)
+        if not callable(loader):
+            return None
+        try:
+            table = loader(info)
+            return [int(t.file.file_size_in_bytes) for t in table.scan().plan_files()]
+        except Exception:
+            return None
+
+    def _warm_cold_state(
+        self, sql: str, params: object, limit: int | None, row_cap: int | None, version, caller=None
+    ) -> dict:
+        """Where the query's result would come from right now (no execution).
+
+        ``l1`` = the in-memory result cache holds this exact query identity;
+        ``l2`` = the shared-disk layer does (when configured — the probe
+        reads one JSON sidecar, metadata, never the result). The cache-key
+        identity is EXACTLY ``_result_cache_key``'s, so a reported-warm
+        result would be served by ``query_duckdb`` itself. When the key
+        can't be computed (virtual table, attached catalog, caching off) the
+        band reports a plain false — for virtual tables the virtual
+        materialization cache is the warm path and is out of this band's
+        scope (named as such in the tool's output).
+        """
+        state = {"l1": False, "l2": False, "block_cache": None}
+        key = None
+        if self._result_cache_ttl > 0:
+            try:
+                key = self._result_cache_key(sql, params, limit, row_cap, version, caller=caller)
+            except Exception:
+                key = None
+        if key is not None:
+            with self._lock:
+                hit = self._result_cache.get(key)
+                if hit is not None and time.time() - hit[0] < self._result_cache_ttl:
+                    state["l1"] = True
+            if not state["l1"] and self._l2_cache is not None:
+                try:
+                    state["l2"] = self._l2_cache.has_entry(key)
+                except Exception:
+                    state["l2"] = False
+        state["block_cache"] = self._block_cache_warm()
+        return state
+
+    @staticmethod
+    def _block_cache_warm() -> bool | None:
+        """Block-cache warm state for this query (None = the cache is off).
+
+        ``None`` when the disk block cache is not enabled (honest N/A — most
+        deployments). With the cache ON the answer is the mixed/unknown
+        False: per-file block presence needs the scan node → file mapping
+        (the JSON plan's scan nodes carry no file lists in this DuckDB
+        version), and a claimed-warm signal that could be wrong is worse
+        than an honest "cache on, warmth unknown". The one provable warm
+        case — the OneLake Delta data-file handler seeded from the delta
+        log — is per-table and is reported in ``bytes_confidence``
+        (``"exact"`` = the same log the block cache seeds from).
+        """
+        from .blockcache import block_cache_enabled
+
+        return False if block_cache_enabled() else None
+
+    def explain_query(
+        self,
+        sql: str,
+        params: object | None = None,
+        version_as_of: int | None = None,
+        include_plan: bool = False,
+        *,
+        caller=None,
+    ) -> dict:
+        """Cost estimate for one read-only query WITHOUT running it.
+
+        The explain_query agent tool's engine method (agent productivity
+        pack; implementation review §2c). Composed of existing pieces, none
+        of which executes the query's data path:
+
+        * **Parse** — sqlguard's ``extract_statement_spans`` through
+          ``assert_attached_readonly``, with the ``_explain_inner_sql``
+          unwrap, so EXPLAIN-of-SELECT arrives normalized and anything else
+          (INSERT, multi-statement, EXPLAIN-of-a-write) is refused by the
+          SAME parser rule run_sql applies (this tool is an estimator, not a
+          new guard to dodge).
+        * **Table refs** — ``_referenced_tables`` (the same cheap identifier
+          matching the cache keys use).
+        * **Row counts** — dataset metadata (``count_rows()``, the exact
+          number the count(*) fast-path serves for free).
+        * **Bytes-to-scan** — Delta add-action file sizes (the block cache's
+          seed), Iceberg manifest file sizes, or Parquet row-group
+          uncompressed totals; each with its own confidence label.
+        * **Plan tree** — ``EXPLAIN (FORMAT JSON)`` on a fresh locked-down
+          connection after ``_register_schema``; DuckDB plans and binds
+          only (no row is read), so virtual-table definitions are safe to
+          bind. Computed only when ``include_plan`` is set — the review's
+          first slice is rows + bytes + warm/cold; the tree is the
+          enricher, and its absence must never fail the tool.
+        * **Warm/cold** — the exact result-cache key identity, probed
+          against L1 and L2 (see :meth:`_warm_cold_state`).
+
+        Every number carries a confidence label (``exact`` | ``approx`` |
+        ``none``), and per-table estimates carry the snapshot-version token
+        they were keyed to, so an agent can see when an estimate describes
+        a different ETL snapshot than the one a fresh ``run_sql`` would
+        read.
+
+        Attached-database queries have no lake metadata at all: every count
+        reports confidence ``"none"`` (degrade honestly — the review's
+        verified gotcha), the plan is skipped (their catalogs attach on
+        execution connections only), and the rest of the shape stands.
+        """
+        sql = assert_attached_readonly(sql)
+        touches_external = bool(self.attaches) and bool(sql_references_attach(sql, self.attaches))
+        tables: list[dict] = []
+        if not touches_external:
+            for info in self._referenced_tables(sql):
+                entry: dict = {
+                    "table": info.qualified_name,
+                    "path": info.path,
+                    "source": info.source,
+                    "format": info.format,
+                    "rows": None,
+                    "rows_confidence": "none",
+                    "bytes_to_scan": None,
+                    "bytes_confidence": "none",
+                    "snapshot_version": None,
+                }
+                if info.format == "virtual":
+                    entry["virtual"] = True
+                else:
+                    try:
+                        dset = self._open_dataset(info)
+                        n = self._metadata_row_count(dset)
+                        if n is not None:
+                            entry["rows"] = n
+                            entry["rows_confidence"] = "exact"
+                        nbytes, nbytes_conf = self._table_bytes_to_scan(info, dset, info.source)
+                        entry["bytes_to_scan"] = nbytes
+                        entry["bytes_confidence"] = nbytes_conf
+                        entry["snapshot_version"] = self._safe_version(info)
+                    except Exception:
+                        pass  # unreachable source: the ref is still listed, unnumbered
+                tables.append(entry)
+
+        inner = _explain_inner_sql(sql)
+        result: dict = {
+            "sql": sql,
+            "read_only": True,
+            "touches_external": touches_external,
+            "tables": tables,
+            "n_tables": len(tables),
+            # Param validation is free and fails loudly here rather than
+            # surprising the follow-up run_sql call.
+            "params_ok": True,
+        }
+        try:
+            _validate_params(params)
+        except Exception as exc:
+            result["params_ok"] = False
+            result["params_error"] = str(exc)
+
+        effective_caller = caller if caller is not None else current_caller()
+        result["warm_cold"] = self._warm_cold_state(inner, params, None, None, version_as_of, caller=effective_caller)
+
+        if include_plan and not touches_external:
+            result["plan"] = self._explain_plan(inner, params, version_as_of, caller=effective_caller)
+        return result
+
+    def _explain_plan(self, sql: str, params: object | None, version: int | None, caller=None) -> dict:
+        """One JSON EXPLAIN of the (SELECT) query on a fresh locked connection.
+
+        DuckDB's ``EXPLAIN (FORMAT JSON)`` plans and binds only — the
+        referenced tables (virtual views included) are resolved, no row is
+        read. The connection applies the standard posture (fs lockdown +
+        memory budget + registered schema views — the QueryJob sequence), so
+        the plan reflects exactly what a ``run_sql`` of this text would
+        execute. Failures degrade to an error entry; the rows/bytes/warm
+        fields stand on their own.
+        """
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            _duckdb_fs_lockdown(con)
+            _apply_memory_budget(con)
+            # materialize=False (the _describe_virtual posture): EXPLAIN must
+            # stay a cheap schema bind — an explain must never trigger the
+            # (potentially expensive) first materialization of a virtual
+            # table. The plan of the UNMATERIALIZED definition is exactly
+            # what a run_sql would execute when no materialization exists;
+            # when one does, its scan is a plain parquet read (the filter is
+            # pre-applied, so the plan shows less pushdown — a harmless
+            # under-estimate of an already-cheaper path).
+            self._register_schema(con, sql, version=version, materialize=False, caller=caller)
+            raw = con.execute("EXPLAIN (FORMAT JSON) " + sql, params).fetchall()
+            tree = json.loads(raw[0][1])
+            return {"tree": tree, "summary": self._explain_plan_summary(tree)}
+        except Exception as exc:
+            return {"tree": None, "summary": None, "error": str(exc)}
+        finally:
+            con.close()
+
     # -------------------------------------------------------------- help
     def prewarm(self, tables: Sequence[str]) -> dict[str, str]:
         """Fill the describe cache for tables; return per-table outcome.
 
         Failures are recorded per table and never raised (a table may be
         temporarily unavailable or renamed).
+
+        Data prewarm (Task B, opt-in via row groups > 0): when the disk
+        block cache is ENABLED, each table's first
+        ``SQLHANDLER_PREWARM_ROWGROUPS`` (default 1, 0 = off) row groups are
+        ALSO read through the table's wrapped dataset — the cache fills
+        naturally on the read (the same wrapped-filesystem path every later
+        scan takes), so a cold block cache stops charging the first query
+        of the day. Local/NFS backends are skipped explicitly (the OS page
+        cache does this job for free — the same includeLocal semantics the
+        block cache itself applies). The block cache is OFF by default, so
+        with no operator opt-in this loop is exactly the historical
+        describe-only prewarm and the outcome stays ``"ok"``.
         """
+        rowgroups = _prewarm_rowgroups()
         outcomes: dict[str, str] = {}
         for name in tables:
             try:
@@ -3269,7 +5213,96 @@ class SqlEngine:
             except Exception as exc:
                 outcomes[name] = f"error: {exc}"
                 logger.warning("prewarm describe %s failed: %s", name, exc)
+                continue  # the data warm would just fail the same way
+            if rowgroups <= 0:
+                continue  # 0 = data prewarm off (describe-only prewarm)
+            try:
+                outcomes[name] = self._prewarm_data(name, rowgroups, outcomes[name])
+            except Exception as exc:  # never fail startup over a warm read
+                outcomes[name] = "data-error"
+                logger.warning("prewarm data %s failed: %s", name, exc)
         return outcomes
+
+    def _prewarm_data(self, name: str, rowgroups: int, describe_status: str) -> str:
+        """Read a table's first row groups through the block cache; status.
+
+        Returns ``"data-ok"`` when row groups were read, ``"ok"`` when the
+        table was skipped (block cache off / a pure-local backend the cache
+        intentionally does not cover), ``"data-skipped-no-cache"`` when the
+        cache is on but the table's format has no wrapped read path, and
+        ``"data-error"`` when the read failed (the describe cache keeps
+        whatever it got). Called from :meth:`prewarm`'s try/except — never
+        on the startup critical path, bounded by the small row-group count.
+        """
+        from .blockcache import block_cache_enabled
+
+        if not block_cache_enabled():
+            # Cache off: the read would land nowhere durable and local disk
+            # is the page cache's job anyway — skip explicitly.
+            return describe_status
+        try:
+            info = self._resolve(name)
+        except Exception:
+            return describe_status  # describe warmed; nothing more to do
+        if info.format in ("virtual", "external", "sharing"):
+            return "data-skipped-no-cache"
+        # includeLocal semantics (blockcache.maybe_block_cache): pure-local
+        # filesystems are NOT wrapped by default — the OS page cache already
+        # serves them, so a prewarm read of local data buys nothing. NFS
+        # mounts ARE LocalFileSystem to pyarrow; sites that opted them into
+        # the block cache (SQLHANDLER_BLOCK_CACHE_INCLUDE_LOCAL=1) prewarm
+        # them like any other remote source.
+        provider = self._prewarm_provider(info)
+        if provider is None:
+            return "data-skipped-no-cache"
+        if getattr(provider, "kind", "") == "nfs" and not self._block_cache_includes_local():
+            return "data-skipped-no-cache"
+        dset = self._open_dataset(info)
+        fragment = next(iter(dset.get_fragments()), None)
+        if fragment is None:
+            return describe_status  # empty table: nothing to warm
+        # fragment.head() rides the dataset's WRAPPED filesystem, so the
+        # parquet footer + column chunks land in the block cache on this
+        # read — the identical read path (and cache keys) a later query
+        # takes. The row-group count bounds the bytes: head(n) stops at the
+        # first batch covering n rows, so head over one row group's worth of
+        # rows reads ~one row group. No try here: a failed warm read
+        # propagates to prewarm()'s per-table handler ("data-error") —
+        # startup never sees it.
+        rg_rows = self._first_row_group_rows(fragment)
+        fragment.head(max(rg_rows, 1) * rowgroups)
+        return "data-ok"
+
+    @staticmethod
+    def _first_row_group_rows(fragment) -> int:
+        """Rows in the fragment's first row group (0 when unknown)."""
+        try:
+            rg = fragment.row_groups[0]
+            return int(getattr(rg, "num_rows", 0) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _block_cache_includes_local() -> bool:
+        """Whether the block cache was opted into local/NFS paths."""
+        from .blockcache import _cfg
+
+        return bool(_cfg()["include_local"])
+
+    def _prewarm_provider(self, info: TableInfo):
+        """The provider that owns ``info`` (MultiProvider dispatch), or None.
+
+        Mirrors MultiProvider._owner's tag dispatch without importing it —
+        a single-provider engine returns ``self.provider`` directly.
+        """
+        provider = self.provider
+        owner = getattr(provider, "_owner", None)
+        if callable(owner):
+            try:
+                return owner(info)
+            except Exception:
+                return None
+        return provider
 
     def cache_stats(self) -> dict:
         """Small in-memory snapshot of the metadata caches (for observability)."""
@@ -3297,6 +5330,16 @@ class SqlEngine:
                     "hits": self._result_cache_hits,
                     "writes": self._result_cache_writes,
                 },
+                # Shared-disk L2 behind the memory LRU (l2cache.py). Top-level
+                # l2_hits/l2_misses feed the `cache="l2"` metric series (the
+                # same flat shape describe/profile/dataset already use);
+                # "l2" carries the full config + counters for humans, and is
+                # None when the layer is disabled so dashboards can
+                # distinguish "off" from "on with zero hits". Additive — with
+                # the L2 off every pre-existing key renders byte-identically.
+                "l2_hits": self._l2_cache.stats()["hits"] if self._l2_cache is not None else 0,
+                "l2_writes": self._l2_cache.stats()["writes"] if self._l2_cache is not None else 0,
+                "l2": self._l2_cache.stats() if self._l2_cache is not None else None,
                 "tables_cached": self._tables is not None,
                 "tables_cached_age_s": round((time.monotonic() - self._tables_ts), 1)
                 if self._tables is not None

@@ -35,7 +35,10 @@ curl -s https://<endpoint>/mcp \
 
 Expect a result with `serverInfo.name = "sqlhandler"` (plus protocolVersion and
 capabilities). Follow with `tools/list` — expect `list_tables`,
-`search_tables`, `describe_table`, `profile_table`, `run_sql`, `scan_table`.
+`search_tables`, `describe_table`, `profile_table`, `column_stats`, `run_sql`,
+`scan_table`, the async/saved query sets (`query_submit`/`query_status`/
+`query_result`/`query_cancel`, `query_save`/`query_list`/`query_delete`/
+`query_saved`), plus `explain_query` and `ask_data`.
 
 ## 3. Sample query
 
@@ -81,6 +84,11 @@ kubectl -n <namespace> port-forward svc/<release>-sqlhandler 9097:9097    # then
 kubectl -n <namespace> get hpa <release>-sqlhandler -w                    # replica count under load
 kubectl -n <namespace> top pods -l app.kubernetes.io/instance=<release>   # CPU/memory vs requests
 ```
+
+Concurrency-gate + audit smoke checks (chart values `query.*`):
+
+- **Gate wired** — `kubectl -n <namespace> exec deploy/<release>-sqlhandler -- printenv SQLHANDLER_MAX_CONCURRENT_QUERIES SQLHANDLER_QUEUE_TIMEOUT` prints the values you set (`8` / `30` by default). A burst beyond the cap returns the queue-timeout error instead of piling up threads.
+- **Audit wired** — set `query.auditLog: /var/lib/sqlhandler-audit/audit.jsonl`, apply, then run one query and check `kubectl -n <namespace> exec deploy/<release>-sqlhandler -- tail -1 /var/lib/sqlhandler-audit/audit.jsonl` shows a JSON line with `ts`/`sql`/`state`. Remove the value to switch audit back off (default).
 
 ## 6. Troubleshooting
 

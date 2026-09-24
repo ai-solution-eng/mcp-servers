@@ -130,7 +130,7 @@ Users never run `helm install` or `kubectl apply` to deploy on PCAI: the package
 | `helm/` (k8s-mcp) | HPE / trusted operators | Every knob below is values-configurable |
 | `helm-customer/` (k8s-mcp-customer) | Customer PCAI catalogs | Structurally locked: exec/policy/clients/RBAC keys don't exist in values; pasting them is inert |
 
-**Required values** (both charts):
+### Required values (both charts)
 
 ```yaml
 apiKey:
@@ -141,7 +141,54 @@ ezua:
     endpoint: "k8s-mcp.${DOMAIN_NAME}"   # unique per release on the gateway
 ```
 
-**Optional values** (trusted chart) — `console.enabled`, `rbac.scope` + `rbac.extraResourceGroups`, `namespaces.allowed`/`blocked`, `exec.*`, `clients.*`, `listing.*`, `metrics.*`, `imagePullSecrets`, `resources`, `ezua.authorizationPolicy.*`. Full walkthrough: [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md); paste-ready examples: [`helm/values-examples/`](helm/values-examples/README.md) and [`helm-customer/values-examples/`](helm-customer/values-examples/README.md).
+**Pre-deploy the key Secret before the first apply** — the Deployment fails
+loud (`CreateContainerConfigError`) until it exists, and the chart never
+creates or inlines the key:
+
+```bash
+kubectl -n <namespace> create secret generic k8s-mcp-apikey \
+  --from-literal="api-key=$(openssl rand -hex 32)"
+# apiKey.existingSecret: ""  → the chart looks for <deployment.name>-apikey;
+# point existingSecret at another name if you prefer.
+```
+
+`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**:
+both templates call Helm's `required` on it, so an empty endpoint aborts the
+render before anything is created — `Valid .Values.ezua.virtualService.endpoint
+is required !` (the VirtualService template) and `… is required when ezua is
+enabled !` (the AuthorizationPolicy template). It is not just a route: the
+Deployment injects it as `MCP_HOSTNAME`, pinning the Host header for the SDK's
+DNS-rebinding protection — it **must be unique per release** on the shared
+ezaf-gateway (two VirtualServices claiming one host split traffic between
+their backends). It is empty in neither chart's defaults (`k8s-mcp.${DOMAIN_NAME}`
+/ `k8s-mcp-customer.${DOMAIN_NAME}`); the failure above only bites an operator
+who blanks it. With `ezua.enabled: false` no VirtualService or AuthorizationPolicy
+is rendered and the endpoint is never read (in-cluster Service access only).
+
+### Optional values (trusted chart)
+
+`console.enabled`, `rbac.scope` + `rbac.extraResourceGroups`,
+`namespaces.allowed`/`blocked`, `exec.*`, `clients.*`, `listing.*`,
+`metrics.*`, `imagePullSecrets`, `resources`, `ezua.authorizationPolicy.*`.
+Full walkthrough: [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md); paste-ready examples: [`helm/values-examples/`](helm/values-examples/README.md) and [`helm-customer/values-examples/`](helm-customer/values-examples/README.md).
+
+### Connectivity & pod-wiring knobs (both charts)
+
+Standard Kubernetes knobs — defaults fit the fleet baseline; overridable per
+deployment. The security-sensitive plumbing (non-root 10001, read-only rootfs,
+dropped capabilities, RuntimeDefault seccomp, `/tmp` emptyDir) is **baked into
+the templates and deliberately NOT values-overridable** — the audited baseline.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `deployment.appName` | `k8s-mcp` / `k8s-mcp-customer` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is). Leave at the default; mismatched selectors break the Service/VS wiring. |
+| `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request; scale up freely if needed. |
+| `image.pullPolicy` | `IfNotPresent` | Standard. Tags are immutable per release convention (unlike prometheus-mcp). |
+| `service.targetPort` | `9090` | Container port (also drives `containerPort` and both probes). Move it only with the server's listen port. |
+| `resources.requests.cpu` / `resources.limits.cpu` | `100m` / `500m` | CPU requests/limits (memory: `128Mi` / `512Mi`). |
+| `podAnnotations.sidecar.istio.io/inject` | `"false"` | String form is deliberate. Keep `false`: the server already enforces auth + namespace policy itself, a mesh sidecar adds mTLS between pods but would also add a second auth hop for MCP clients. Flip only with a deliberate mesh-identity design. |
+| `extraAllowedHosts` | `[]` | **Meaningful.** Extra `Host` header values the MCP SDK's DNS-rebinding protection accepts for **in-cluster callers** addressing the server by service DNS (`http://<name>-service.<ns>.svc.cluster.local:9090/mcp` — e.g. Open WebUI). Rendered as `MCP_EXTRA_ALLOWED_HOSTS` (comma-joined) only when non-empty; entries match verbatim or as `host:*` (any port). The pinned public FQDN (`ezua.virtualService.endpoint`) and loopback are always allowed; empty = behavior unchanged. Never bypasses the API-key gate. |
+| `ezua.authorizationPolicy.providerName` | `oauth2-proxy` | Extension provider the rendered Istio AuthorizationPolicy delegates to (with `ezua.authorizationPolicy.enabled: true`, `namespace: istio-system`). Only meaningful when the gate is on. |
 
 ## Built-in ops console (`/ui/`)
 
@@ -173,7 +220,7 @@ A static, HPE-branded single-page console served by the server itself (`/` redir
 | Document | Contents |
 |---|---|
 | [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), out-of-band API key, namespace policy/exec/per-user keys day-2 ops, ezua/Istio, customer chart, upgrading, MCP fleet context, troubleshooting |
-| [documentation/FEATURES.md](documentation/FEATURES.md) | Hardening & capability changelog (v0.0.1 → v0.2.12) — what was fixed and why |
+| [documentation/FEATURES.md](documentation/FEATURES.md) | Hardening & capability changelog (v0.0.1 → v0.2.13) — what was fixed and why |
 | [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | Auth gate check, MCP 2.0 handshake, one-tool test, optional operator kubectl, troubleshooting |
 | [helm/values-examples/](helm/values-examples/README.md) | Paste-ready, secret-free full-values examples (trusted chart) |
 | [helm-customer/values-examples/](helm-customer/values-examples/README.md) | Paste-ready, secret-free examples (locked customer chart) |

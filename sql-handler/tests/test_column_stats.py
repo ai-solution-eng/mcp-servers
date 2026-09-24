@@ -14,7 +14,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from sqlhandler import server
-from sqlhandler.engine import LakehouseError, SqlEngine, _column_stats_queries, _profile_max_rows, _validate_column
+from sqlhandler.engine import (
+    LakehouseError,
+    SqlEngine,
+    _column_stats_queries,
+    _profile_max_rows,
+    _validate_column,
+)
 from sqlhandler.provider import TableInfo
 
 
@@ -124,8 +130,12 @@ def test_sample_cap_zero_means_full_column(tmp_path, monkeypatch):
 
 
 def test_top_n_clamped(eng):
-    assert eng.column_stats("work_order", "kind", top_n=0)["top_values"] == [{"value": "a", "count": 3}]  # clamp to 1
-    assert len(eng.column_stats("work_order", "kind", top_n=99)["top_values"]) == 2  # clamp to 20, table has 2
+    assert eng.column_stats("work_order", "kind", top_n=0)["top_values"] == [
+        {"value": "a", "count": 3}
+    ]  # clamp to 1
+    assert (
+        len(eng.column_stats("work_order", "kind", top_n=99)["top_values"]) == 2
+    )  # clamp to 20, table has 2
 
 
 # ------------------------------------------------------------ validation
@@ -217,18 +227,24 @@ def test_column_stats_queries_against_raw_duckdb():
 
 def test_mcp_column_stats_markdown(eng, monkeypatch):
     monkeypatch.setattr(server, "_handler", lambda: eng)
-    text, is_error = server._dispatch_tool("column_stats", {"table": "work_order", "column": "amount"})
+    text, is_error = server._dispatch_tool(
+        "column_stats", {"table": "work_order", "column": "amount"}
+    )
     assert is_error is False
     assert "Column stats: work_order.amount (double)" in text
     assert "distinct_count" in text and "null_count" in text
     assert "Top values" in text
 
     # same error convention as profile_table: the message carries the reason
-    text, _is_error = server._dispatch_tool("column_stats", {"table": "work_order", "column": "nope"})
+    text, _is_error = server._dispatch_tool(
+        "column_stats", {"table": "work_order", "column": "nope"}
+    )
     assert "does not exist" in text and "Available columns" in text
 
     # top_n passes through the tool boundary (check the Top values section only)
-    text, is_error = server._dispatch_tool("column_stats", {"table": "work_order", "column": "kind", "top_n": 1})
+    text, is_error = server._dispatch_tool(
+        "column_stats", {"table": "work_order", "column": "kind", "top_n": 1}
+    )
     assert is_error is False
     top_section = text.split("Top values")[1]
     assert "| a | 3 |" in top_section and "| b |" not in top_section

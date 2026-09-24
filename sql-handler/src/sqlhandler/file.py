@@ -7,6 +7,18 @@ The "nfs" backend reads tables from a directory mounted into the container
 Discovery mirrors the S3 backend for Parquet and adds Delta-log detection;
 reading is backed by pyarrow's LocalFileSystem and deltalake, so no
 credentials or endpoint are needed.
+
+Raw-text landing zone (``SQLHANDLER_RAW_FORMATS=on``, the default): the same
+conventions discover small csv/tsv/json/ndjson/jsonl files (``.gz`` variants
+included) as raw tables — see :mod:`sqlhandler.rawfiles` for the exact rules
+(raw suffixes, the per-file size cap — applied to the compressed size for
+``.gz``, same as S3 so the feature semantics stay uniform across backends —
+raw-vs-parquet precedence, and the collision policy). Partition folders fold
+into the raw table by directory like Parquet's do, but partition-COLUMN
+extraction stays Parquet-only — no ``key=value`` columns are derived for raw
+tables (pyarrow hive partitioning is deliberately out of scope for the
+landing zone). NFS reads are fast, but the cap applies here too so a landing
+zone means the same thing on every backend.
 """
 
 from __future__ import annotations
@@ -19,6 +31,15 @@ import pyarrow.fs as pafs
 
 from .config import FileConfig
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
+from .rawfiles import (
+    build_raw_dataset,
+    classify_raw_file,
+    is_raw_format,
+    log_skipped,
+    raw_discovery_enabled,
+    raw_size_cap_mb,
+    raw_table_within_cap,
+)
 
 logger = logging.getLogger("sqlhandler.file")
 
@@ -76,10 +97,18 @@ class FileProvider(DataProvider):
     def _hidden(path_parts) -> bool:
         return any(p.startswith(".") for p in path_parts)
 
-    def _derive(self, rel: str) -> TableInfo | None:
-        """Map a relative Parquet path to a TableInfo (mirrors S3)."""
+    def _derive(self, rel: str, fmt: str = "parquet") -> TableInfo | None:
+        """Map a relative data-file path to a TableInfo (mirrors S3).
+
+        ``fmt`` is the file's format string (``"parquet"`` or a raw-text
+        suffix name from :func:`classify_raw_file`); raw single files at the
+        root drop the whole raw suffix (``orders.csv.gz`` -> table
+        ``orders``), matching the Parquet stem rule.
+        """
         parts = [p for p in rel.split("/") if p]
-        if not parts or not self._is_parquet(parts[-1]):
+        if not parts:
+            return None
+        if fmt == "parquet" and not self._is_parquet(parts[-1]):
             return None
         if self._hidden(parts[:-1]):
             return None
@@ -87,15 +116,34 @@ class FileProvider(DataProvider):
         while dirs and "=" in dirs[-1]:
             dirs.pop()
         if not dirs:
-            name = parts[-1][: -len(_PARQUET_SUFFIX)]
-            return TableInfo(name=name, schema="default", format="parquet", location=parts[-1])
+            stem = parts[-1]
+            if fmt == "parquet":
+                name = stem[: -len(_PARQUET_SUFFIX)]
+            else:
+                # raw single file: strip the FULL raw suffix (incl. .gz),
+                # so orders.csv.gz -> orders and events.jsonl -> events
+                raw_suffix = "." + (classify_raw_file(stem) or "")
+                name = stem[: -len(raw_suffix)] if stem.lower().endswith(raw_suffix) else stem.rsplit(".", 1)[0]
+            return TableInfo(name=name, schema="default", format=fmt, location=stem)
         name = dirs[-1]
         schema = dirs[-2] if len(dirs) >= 2 else "default"
         location = "/".join(dirs)
-        return TableInfo(name=name, schema=schema, format="parquet", location=location)
+        return TableInfo(name=name, schema=schema, format=fmt, location=location)
 
     def list_tables(self) -> list[TableInfo]:
-        """Enumerate Delta Lake tables and Parquet tables under the root."""
+        """Enumerate Delta Lake tables, Parquet tables and raw-text tables
+        under the root.
+
+        Delta/Parquet discovery is exactly as before (byte-identical for
+        parquet-only directories). Raw-text landing-zone discovery — when
+        ``SQLHANDLER_RAW_FORMATS=on`` (default) — folds in small csv/tsv/
+        json/ndjson/jsonl tables with the same folder conventions and the
+        shared rules of :mod:`sqlhandler.rawfiles`: Delta > Parquet > raw
+        precedence per table path, alphabetical-by-suffix collision
+        resolution with a warning, and the ``SQLHANDLER_RAW_MAX_FILE_MB``
+        per-file cap (compressed size for ``.gz``) skipping whole tables
+        with a log line.
+        """
         fs = self._fs()
         root = self._root()
         try:
@@ -125,21 +173,80 @@ class FileProvider(DataProvider):
             ti = TableInfo(name=name, schema=schema, format="delta", location=location)
             seen.setdefault(ti.path, ti)
 
+        want_raw = raw_discovery_enabled()
+        cap_mb = raw_size_cap_mb() if want_raw else 0
+        # Raw candidate collection mirrors the S3 provider exactly: gather
+        # first (the listing is already in hand), then apply the cap and
+        # precedence rules, so both backends share one decision path.
+        raw_candidates: dict[str, dict[str, list[tuple[str, int]]]] = {}
         for fi in files:
             rel = fi.path[len(root) :].strip("/")
-            if not rel or not self._is_parquet(rel):
+            if not rel:
                 continue
             if any(fi.path.startswith(dr + "/") for dr in delta_roots):
                 continue  # data files inside a Delta table, not their own table
-            info = self._derive(rel)
+            if _DELTA_LOG in rel.split("/"):
+                # A Delta log JSON (t/_delta_log/00….json) is table METADATA,
+                # not a raw landing-zone file — same exclusion as s3.py.
+                continue
+            if self._is_parquet(rel):
+                info = self._derive(rel)
+                if info is not None:
+                    seen.setdefault(info.path, info)
+            elif want_raw:
+                raw_fmt = classify_raw_file(rel)
+                if raw_fmt is None:
+                    continue
+                info = self._derive(rel, fmt=raw_fmt)
+                if info is not None:
+                    raw_candidates.setdefault(info.path, {}).setdefault(raw_fmt, []).append(
+                        (fi.path, int(fi.size or 0))
+                    )
+
+        for path in sorted(raw_candidates):
+            by_fmt = raw_candidates[path]
+            if path in seen:  # parquet (or delta) already owns this table path
+                log_skipped(
+                    path,
+                    "ignored raw file(s) — the table folder is "
+                    f"{'delta' if seen[path].format == 'delta' else 'parquet'}",
+                )
+                continue
+            fmts = sorted(by_fmt)
+            fmt = fmts[0]
+            if len(fmts) > 1:
+                logger.warning(
+                    "raw-format collision on table %s: %s — using %s (first alphabetically)",
+                    path,
+                    ", ".join("." + f for f in fmts),
+                    "." + fmt,
+                )
+            entries = by_fmt[fmt]
+            sizes = [size for _, size in entries]
+            if not raw_table_within_cap(sizes, cap_mb):
+                log_skipped(
+                    path,
+                    f"raw file(s) exceed SQLHANDLER_RAW_MAX_FILE_MB={cap_mb} (cap applies to compressed size for .gz)",
+                )
+                continue
+            info = self._derive(entries[0][0][len(root) :].strip("/"), fmt=fmt)
             if info is not None:
-                seen.setdefault(info.path, info)
+                # Raw tables open over their EXACT file list (absolute paths
+                # on the local fs), never a folder scan — see rawfiles.py.
+                object.__setattr__(info, "raw_files", [path_ for path_, _ in entries])
+                seen[info.path] = info
         return sorted(seen.values(), key=lambda ti: ti.path)
 
     def open_dataset(self, info: TableInfo, version: int | None = None):
-        """Open a Delta table or Parquet folder/file as a pyarrow Dataset.
+        """Open a Delta table, Parquet folder/file or raw-text table as a
+        pyarrow Dataset.
 
-        ``version`` (Delta only) pins a historical snapshot for time travel.
+        ``version`` (Delta only) pins a historical snapshot for time travel;
+        raw tables and plain Parquet have no version history and refuse one.
+        Raw tables open over their discovered file list with the matching
+        pyarrow format (csv / tab-delimited csv / newline-delimited json);
+        schema inference happens at open and a failure surfaces as the
+        standard LakehouseError.
         """
         root = self._contained_path(info)
         try:
@@ -150,6 +257,14 @@ class FileProvider(DataProvider):
                     return DeltaTable(root).to_pyarrow_dataset()
                 _validate_snapshot_version(version, "Delta")
                 return DeltaTable(root, version=int(version)).to_pyarrow_dataset()
+            if is_raw_format(info.format):
+                if version is not None:
+                    raise LakehouseError(
+                        f"Time travel is not supported for raw-format table '{info.path}' "
+                        "(only Delta and Iceberg tables have version history)."
+                    )
+                files = getattr(info, "raw_files", None) or [root]
+                return build_raw_dataset(info.location or info.path, info.format, list(files), self._fs())
             if version is not None:
                 raise LakehouseError(
                     f"Time travel is not supported for plain Parquet table '{info.path}' "

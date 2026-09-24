@@ -20,7 +20,7 @@ deployment:
 # pullPolicy stays Always on purpose (see helm/values.yaml).
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.4.1
+  tag: v0.5.2
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -61,6 +61,19 @@ service:
   port: 9095
   targetPort: 9095
 
+# -- Saved-query persistence (Wave-5 F4 — chart default OFF) ------------------------
+# SITE: flip to true so user-saved queries survive pod updates; the chart
+# default (in-memory store) forgets them on every reschedule. replicaCount > 1
+# with a RWO class strands extra replicas Pending — RWX class or 1 replica.
+persistence:
+  enabled: false
+  mountPath: /data
+  size: 1Gi
+  storageClass: ""          # "" = cluster default StorageClass
+  accessModes:
+    - ReadWriteOnce
+  savedQueriesFile: saved-queries.json
+
 # -- Resources --------------------------------------------------------------------------------
 resources:
   requests:
@@ -89,4 +102,8 @@ ezua:
 
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
-  enabled: true
+  # SITE: flip to true where the trial wants per-tool counters (requires the
+  # prometheus-operator ServiceMonitor CRD); off = no /metrics route.
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval

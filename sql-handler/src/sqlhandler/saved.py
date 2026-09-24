@@ -82,7 +82,9 @@ def validate_query_name(name: object) -> str:
         raise ValueError("Saved-query name must be a string.")  # noqa: TRY004
     cleaned = name.strip()
     if not cleaned or not _NAME_RE.fullmatch(cleaned):
-        raise ValueError("Saved-query name must be 1-128 characters with no path separators or control characters.")
+        raise ValueError(
+            "Saved-query name must be 1-128 characters with no path separators or control characters."
+        )
     return cleaned
 
 
@@ -143,7 +145,10 @@ def credential_ok(provided: str) -> bool:
     creds = _configured_credentials()
     if not creds or not provided:
         return False
-    return any(hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in creds)
+    return any(
+        hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8"))
+        for candidate in creds
+    )
 
 
 class NotAuthorized(Exception):
@@ -210,7 +215,9 @@ class SavedQueryStore:
         except FileNotFoundError:
             return {"version": _STORE_VERSION, "queries": {}}
         except (OSError, json.JSONDecodeError):
-            logger.warning("saved-query store %s unreadable; starting from an empty store", self._path)
+            logger.warning(
+                "saved-query store %s unreadable; starting from an empty store", self._path
+            )
             return {"version": _STORE_VERSION, "queries": {}}
         if not isinstance(data, dict) or not isinstance(data.get("queries"), dict):
             logger.warning("saved-query store %s has an unexpected shape; ignoring it", self._path)
@@ -248,13 +255,27 @@ class SavedQueryStore:
         return out
 
     # ---- operations
-    def save(self, name: object, sql: str, params: object | None = None, description: object | None = None) -> dict:
+    def save(
+        self,
+        name: object,
+        sql: str,
+        params: object | None = None,
+        description: object | None = None,
+        caller=None,
+    ) -> dict:
         """Validate + upsert one saved query; returns the stored entry summary.
 
         The SQL must PARSE (DuckDB's own parser) and, while the MCP read-only
         mode is on (decision D2, default), must be SELECT-only — the same
         guard ``query_saved`` re-applies at run time, so a poisoned store
         still cannot make another agent execute DDL.
+
+        Identity spine: when policy enforcement is on AND a caller is known,
+        the entry records its ``owner`` (subject slug or key fingerprint —
+        never the raw key); reads/lists are then owner-scoped (another
+        caller's SQL text can name tables a policy hides) and a cross-owner
+        delete/run is refused like an unknown name. Enforcement off keeps
+        the shared store byte-identical (no owner field).
         """
         clean = validate_query_name(name)
         if not isinstance(sql, str) or not sql.strip():
@@ -272,6 +293,9 @@ class SavedQueryStore:
             if len(description) > _DESCRIPTION_MAX_CHARS:
                 raise ValueError(f"description too long (cap {_DESCRIPTION_MAX_CHARS} chars).")
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        from . import policy as policy_mod
+
+        owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
         with self._lock:
             data = self._load()
             queries = data["queries"]
@@ -285,32 +309,64 @@ class SavedQueryStore:
                 "created_at": created,
                 "updated_at": now,
             }
+            if owner is not None:
+                entry["owner"] = owner
             entry = {
-                k: v for k, v in entry.items() if v is not None or k in ("sql", "params", "created_at", "updated_at")
+                k: v
+                for k, v in entry.items()
+                if v is not None or k in ("sql", "params", "created_at", "updated_at")
             }
             queries[clean] = entry
             self._write(data)
         return self._entry_summary(clean, entry)
 
-    def list(self) -> list[dict]:
-        """Every saved query (bounded by the store itself — a curated set)."""
+    def list(self, caller=None) -> list[dict]:
+        """Every visible saved query (owner-scoped under enforcement).
+
+        Enforcement ON + a caller → only that caller's own entries (a saved
+        SQL template names tables — running or even READING another caller's
+        can reveal policy-hidden names). Enforcement off / no caller →
+        everything, byte-identical to the shared store.
+        """
+        from . import policy as policy_mod
+
+        owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
         with self._lock:
             data = self._load()
-            return [self._entry_summary(n, e) for n, e in sorted(data["queries"].items())]
+            items = sorted(data["queries"].items())
+        if owner is None:
+            return [self._entry_summary(n, e) for n, e in items]
+        return [self._entry_summary(n, e) for n, e in items if isinstance(e, dict) and e.get("owner") == owner]
 
-    def get(self, name: object) -> dict | None:
+    def get(self, name: object, caller=None) -> dict | None:
         clean = validate_query_name(name)
         with self._lock:
             data = self._load()
             entry = data["queries"].get(clean)
-        return self._entry_summary(clean, entry) if entry else None
+        if entry is None:
+            return None
+        from . import policy as policy_mod
 
-    def delete(self, name: object) -> bool:
+        if caller is not None and policy_mod.policy_enabled():
+            owner = policy_mod.owner_key(caller)
+            if isinstance(entry, dict) and entry.get("owner") is not None and entry.get("owner") != owner:
+                # Another caller's private query: invisible, not readable.
+                return None
+        return self._entry_summary(clean, entry)
+
+    def delete(self, name: object, caller=None) -> bool:
         clean = validate_query_name(name)
+        from . import policy as policy_mod
+
         with self._lock:
             data = self._load()
             if clean not in data["queries"]:
                 return False
+            if caller is not None and policy_mod.policy_enabled():
+                entry = data["queries"][clean]
+                owner = policy_mod.owner_key(caller)
+                if isinstance(entry, dict) and entry.get("owner") is not None and entry.get("owner") != owner:
+                    raise NotAuthorized("saved query belongs to another caller")
             del data["queries"][clean]
             self._write(data)
         return True
@@ -353,7 +409,7 @@ def reset_saved_query_store() -> None:
         _store = None
 
 
-def api_saved_save(body: dict, request=None) -> dict:
+def api_saved_save(body: dict, request=None, *, caller=None) -> dict:
     """POST /api/saved-queries + MCP query_save."""
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
@@ -363,35 +419,39 @@ def api_saved_save(body: dict, request=None) -> dict:
         body.get("sql", ""),
         body.get("params"),
         body.get("description"),
+        caller=caller,
     )
 
 
-def api_saved_list() -> list[dict]:
-    """GET /api/saved-queries + MCP query_list (read posture: ungated here)."""
-    return saved_query_store().list()
+def api_saved_list(caller=None) -> list[dict]:
+    """GET /api/saved-queries + MCP query_list (owner-scoped under enforcement)."""
+    return saved_query_store().list(caller=caller)
 
 
-def api_saved_delete(name: str, request=None) -> dict:
+def api_saved_delete(name: str, request=None, *, caller=None) -> dict:
     """DELETE /api/saved-queries/{name} + MCP query_delete."""
     assert_write_allowed(request)
-    deleted = saved_query_store().delete(name)
+    deleted = saved_query_store().delete(name, caller=caller)
     if not deleted:
         raise UnknownSavedQuery(f"Unknown saved query: {name}")
     return {"deleted": name}
 
 
-def api_saved_run(name: str, body: dict | None = None) -> tuple[str, object | None, dict]:
+def api_saved_run(name: str, body: dict | None = None, *, caller=None) -> tuple[str, object | None, dict]:
     """Resolve a saved query for running; returns (sql, merged_params, entry).
 
     Call-time params OVERRIDE stored params (dict merge — per-key override;
     a positional list replaces the stored list entirely). The D2 guard is
     RE-applied to the stored SQL at run time: a hand-edited store file
     cannot smuggle DDL past the read-only mode.
+
+    Identity spine: another caller's owner-scoped entry resolves as unknown
+    (invisible) when policy enforcement is on.
     """
     body = body or {}
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
-    entry = saved_query_store().get(name)
+    entry = saved_query_store().get(name, caller=caller)
     if entry is None:
         raise UnknownSavedQuery(f"Unknown saved query: {name}")
     sql = entry.get("sql", "")

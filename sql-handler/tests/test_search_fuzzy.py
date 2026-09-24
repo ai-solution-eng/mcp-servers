@@ -27,7 +27,7 @@ def _make_engine(tmp_path, catalog=None, monkeypatch=None):
     class P:
         kind = "fake"
 
-        def list_tables(self):
+        def list_tables(self, **kw):
             return [
                 TableInfo(name="work_order", schema="workorder", format="parquet"),
                 TableInfo(name="orders_archive", schema="sales", format="parquet"),
@@ -85,7 +85,8 @@ def test_matched_on_records_the_reasons(tmp_path):
     assert hits[0]["matched_on"][0] == "exact-name"
     assert hits[0]["matched_on"] == list(dict.fromkeys(hits[0]["matched_on"]))  # deduped
     assert all(
-        reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token") for reason in hits[0]["matched_on"]
+        reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token")
+        for reason in hits[0]["matched_on"]
     )
 
 

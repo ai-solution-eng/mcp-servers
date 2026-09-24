@@ -89,6 +89,42 @@ service. The vendor-label Kyverno ClusterPolicy ships ungated in this chart
   provider; external MCP callers must then present a valid PCAI SSO/bearer
   token (the rotating-token trade is documented above).
 
+## Deployment targets
+
+Behavior that differs by target, and the paste-ready values for each
+(`helm/values-examples/` — sanitized; real per-site values live in
+`helm/local/`). This server has no API-key Secret to provision — the auth
+posture is entirely the `ezua.authorizationPolicy` gate above.
+
+### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+
+- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
+  write the literal domain into `ezua.virtualService.endpoint` (the G2
+  example ships it already; `ezua.domainName` is informational).
+- GPU wiring: `gpuNvlinkDomains` pinned to the operator-confirmed two
+  4-GPU islands, `nvlinkAutodetect.enabled: false` (no resident detector
+  pods); `persistence.enabled: true` (RWX `gl4f-filesystem`) so saved
+  queries survive pod updates; metrics + ServiceMonitor on.
+- Sanitized example:
+  [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
+
+### Hosted trial (customer-hosted PCAI)
+
+- **`${DOMAIN_NAME}` placeholders stay as-is** (PCAI resolves them before
+  rendering on current builds; substitute the literal domain only on a build
+  that does not — an unresolved placeholder registers a gateway host that
+  matches nothing).
+- `nvlinkAutodetect.enabled: false` on CPU-only trial clusters (`true` where
+  GPU nodes exist); `persistence.enabled: false` keeps the chart's default
+  in-memory saved-query store unless the trial wants durability.
+- Decide the auth posture explicitly: `ezua.authorizationPolicy.enabled`
+  (`false` = anonymous reads through the gateway — acceptable for a
+  read-only surface where the trial posture allows; `true` = PCAI SSO/bearer
+  enforced at the gateway).
+- Metrics off keeps the render minimal.
+- Sanitized example:
+  [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
+
 ## Upgrading
 
 Upgrades are a values edit + re-apply, not a redeploy:

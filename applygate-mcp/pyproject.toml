@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "applygate-mcp"
-version = "0.2.2"
+version = "0.3.0"
 description = "applygate-mcp — governed Kubernetes write-path MCP: allowlisted server-side apply with plan/confirm semantics, default-deny namespaces, kind allowlist and a JSONL audit trail"
 requires-python = ">=3.10"
 keywords = ["mcp", "kubernetes", "server-side-apply", "gitops", "hpe", "pcai"]

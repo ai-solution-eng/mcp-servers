@@ -1,0 +1,4 @@
+export DEMO_S3_ENDPOINT=https://minio-api.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+export DEMO_S3_ACCESS_KEY=admin-io
+export DEMO_S3_SECRET_KEY='MinIO$2K'
+export DEMO_S3_BUCKET=test-parquet

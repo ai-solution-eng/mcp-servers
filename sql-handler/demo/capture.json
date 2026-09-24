@@ -1,0 +1,444 @@
+{
+ "captured_at": "2026-09-23 09:33:41",
+ "sqlhandler_host": "sqlhandler.pcai-se-ai-application.hst.rdlabs.hpecorp.net",
+ "ezpresto_host": "mcp-ezpresto-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net",
+ "sqlhandler": [
+  {
+   "id": "status",
+   "ms": 375.7,
+   "ok": true,
+   "note": "sqlhandler v2.3.2 backend=s3"
+  },
+  {
+   "id": "list_tables",
+   "ms": 129.1,
+   "ok": true,
+   "lines": [
+    "13 tables (auto-discovered from s3://test-parquet):",
+    "  c                     ",
+    "  customers             ",
+    "  employees             ",
+    "  orders                ",
+    "  testdata_50col        ",
+    "  top_orders            ",
+    "  dept_payroll [VIRTUAL]",
+    "  orders_eu [VIRTUAL]   ",
+    "  orders_eu_premium [VIRTUAL]",
+    "  \u2026 +4 more"
+   ],
+   "n_tables": 13,
+   "virtual": [
+    "dept_payroll",
+    "orders_eu",
+    "orders_eu_premium",
+    "orders_line_totals",
+    "orders_union_eu_apac",
+    "revenue_by_region",
+    "vip_revenue"
+   ]
+  },
+  {
+   "id": "describe_orders",
+   "ms": 215.4,
+   "ok": true,
+   "lines": [
+    "orders \u2014 the orders fact table \u2014 one row per fictional sale",
+    "URI: s3://test-parquet/sales/orders",
+    "  order_id     Order identifier (bench range-filters on it)",
+    "  customer_id  FK to customers.customer_id \u2014 the who-bought-what join key",
+    "  region       Sales region \u2014 bench groups/aggregates by it",
+    "  product      Product key \u2014 bench groups by it",
+    "  qty          Quantity sold \u2014 bench sums it",
+    "  unit_price   Unit price \u2014 bench filters > 250 / averages it",
+    "  order_ts     Order timestamp \u2014 the time axis for trend queries"
+   ]
+  },
+  {
+   "id": "q1",
+   "ms": 758.0,
+   "ok": true,
+   "n_rows": 4,
+   "sql": "SELECT region, COUNT(*) AS orders, SUM(unit_price * qty) AS revenue FROM orders GROUP BY region ORDER BY revenue DESC",
+   "lines": [
+    "| region | orders | revenue |",
+    "| NA | 50246 | 635002371.51 |",
+    "| EU | 50009 | 625125793.42 |",
+    "| LATAM | 49839 | 623569014.31 |",
+    "| APAC | 49906 | 623456819.73 |"
+   ],
+   "cols": [
+    "region",
+    "orders",
+    "revenue"
+   ],
+   "rows": [
+    [
+     "NA",
+     50246,
+     635002371.5100077
+    ],
+    [
+     "EU",
+     50009,
+     625125793.4200008
+    ],
+    [
+     "LATAM",
+     49839,
+     623569014.3100063
+    ],
+    [
+     "APAC",
+     49906,
+     623456819.7300029
+    ]
+   ]
+  },
+  {
+   "id": "q2",
+   "ms": 957.4,
+   "ok": true,
+   "n_rows": 5,
+   "sql": "SELECT c.customer_name, c.country, COUNT(*) AS orders, SUM(o.unit_price * o.qty) AS revenue FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.is_vip GROUP BY 1, 2 ORDER BY revenue DESC LIMIT 5",
+   "lines": [
+    "| customer_name | country | orders | revenue |",
+    "| cust-3100908 | IND | 2 | 61372.8 |",
+    "| cust-5506886 | BRA | 2 | 52301.82 |",
+    "| cust-7873760 | BRA | 2 | 47405.54 |",
+    "| cust-9960800 | DEU | 1 | 46771.2 |",
+    "| cust-2010968 | IND | 1 | 46512.76 |"
+   ],
+   "cols": [
+    "customer_name",
+    "country",
+    "orders",
+    "revenue"
+   ],
+   "rows": [
+    [
+     "cust-3100908",
+     "IND",
+     2,
+     61372.8
+    ],
+    [
+     "cust-5506886",
+     "BRA",
+     2,
+     52301.82
+    ],
+    [
+     "cust-7873760",
+     "BRA",
+     2,
+     47405.54
+    ],
+    [
+     "cust-9960800",
+     "DEU",
+     1,
+     46771.2
+    ],
+    [
+     "cust-2010968",
+     "IND",
+     1,
+     46512.76
+    ]
+   ]
+  },
+  {
+   "id": "q3",
+   "ms": 273.0,
+   "ok": true,
+   "n_rows": 5,
+   "sql": "SELECT dept, COUNT(*) AS headcount, ROUND(AVG(salary), 0) AS avg_salary FROM employees GROUP BY dept ORDER BY headcount DESC",
+   "lines": [
+    "| dept | headcount | avg_salary |",
+    "| FIN | 10124 | 129858 |",
+    "| SALES | 10107 | 129496 |",
+    "| ENG | 9981 | 129400 |",
+    "| OPS | 9941 | 129641 |",
+    "| HR | 9847 | 130456 |"
+   ],
+   "cols": [
+    "dept",
+    "headcount",
+    "avg_salary"
+   ],
+   "rows": [
+    [
+     "FIN",
+     10124,
+     129858.0
+    ],
+    [
+     "SALES",
+     10107,
+     129496.0
+    ],
+    [
+     "ENG",
+     9981,
+     129400.0
+    ],
+    [
+     "OPS",
+     9941,
+     129641.0
+    ],
+    [
+     "HR",
+     9847,
+     130456.0
+    ]
+   ]
+  },
+  {
+   "id": "q4",
+   "ms": 4092.2,
+   "ok": true,
+   "n_rows": 1,
+   "sql": "SELECT COUNT(*) AS n, SUM(quantity) AS total_qty, MAX(supplier_id) AS max_supplier, MIN(brand_id) AS min_brand FROM testdata_50col",
+   "lines": [
+    "| n | total_qty | max_supplier | min_brand |",
+    "| 3000000 | 749894896 | 4999 | 1 |"
+   ],
+   "cols": [
+    "n",
+    "total_qty",
+    "max_supplier",
+    "min_brand"
+   ],
+   "rows": [
+    [
+     3000000,
+     749894896.0,
+     4999,
+     1
+    ]
+   ]
+  },
+  {
+   "id": "q4_repeat",
+   "ms": 4635.7,
+   "ok": true,
+   "n_rows": 1,
+   "lines": [
+    "(identical query repeated \u2014 served from the result cache)"
+   ]
+  },
+  {
+   "id": "burst",
+   "level": 7,
+   "wall_ms": 4473.9,
+   "ok": 7,
+   "qps": 1.56,
+   "p50_ms": 399.1,
+   "per_call_ms": [
+    391.9,
+    394.0,
+    396.2,
+    399.1,
+    401.4,
+    609.0,
+    4467.6
+   ]
+  }
+ ],
+ "ezpresto": [
+  {
+   "id": "status",
+   "ms": 0,
+   "ok": true,
+   "note": "MCP server: Presto MCP Server vdev"
+  },
+  {
+   "id": "list_tables",
+   "ms": 877.3,
+   "ok": true,
+   "lines": [
+    "list_catalogs \u2192 list_schemas \u2192 list_tables   (3 calls, no docs,",
+    "no descriptions, no aliases \u2014 bare names only)",
+    "  c",
+    "  customers",
+    "  employees",
+    "  orders",
+    "  testdata_50col",
+    "  top_orders"
+   ],
+   "n_tables": 6,
+   "calls": 3
+  },
+  {
+   "id": "describe_orders",
+   "ms": 285.6,
+   "ok": true,
+   "lines": [
+    "get_table_schema(minio.default.orders)",
+    "  ?            ",
+    "  ?            ",
+    "  ?            ",
+    "  ?            ",
+    "  ?            ",
+    "  ?            ",
+    "  ?            "
+   ]
+  },
+  {
+   "id": "q1",
+   "ms": 542.0,
+   "ok": true,
+   "n_rows": 4,
+   "sql": "SELECT region, COUNT(*) AS orders, SUM(unit_price * qty) AS revenue FROM minio.default.orders GROUP BY region ORDER BY revenue DESC",
+   "lines": [
+    "| orders | region | revenue |",
+    "| 50246 | NA | 635002371.51 |",
+    "| 50009 | EU | 625125793.42 |",
+    "| 49839 | LATAM | 623569014.31 |",
+    "| 49906 | APAC | 623456819.73 |"
+   ],
+   "cols": [
+    "orders",
+    "region",
+    "revenue"
+   ],
+   "rows": [
+    {
+     "orders": 50246,
+     "region": "NA",
+     "revenue": 635002371.5100077
+    },
+    {
+     "orders": 50009,
+     "region": "EU",
+     "revenue": 625125793.4200008
+    },
+    {
+     "orders": 49839,
+     "region": "LATAM",
+     "revenue": 623569014.3100063
+    },
+    {
+     "orders": 49906,
+     "region": "APAC",
+     "revenue": 623456819.7300029
+    }
+   ]
+  },
+  {
+   "id": "q2",
+   "ms": 837.2,
+   "ok": true,
+   "n_rows": 5,
+   "sql": "SELECT c.customer_name, c.country, COUNT(*) AS orders, SUM(o.unit_price * o.qty) AS revenue FROM minio.default.orders o JOIN minio.default.customers c ON o.customer_id = c.customer_id WHERE c.is_vip GROUP BY 1, 2 ORDER BY revenue DESC LIMIT 5",
+   "lines": [
+    "| country | customer_name | orders | revenue |",
+    "| IND | cust-3100908 | 2 | 61372.8 |",
+    "| BRA | cust-5506886 | 2 | 52301.82 |",
+    "| BRA | cust-7873760 | 2 | 47405.54 |",
+    "| DEU | cust-9960800 | 1 | 46771.2 |",
+    "| IND | cust-2010968 | 1 | 46512.76 |"
+   ],
+   "cols": [
+    "country",
+    "customer_name",
+    "orders",
+    "revenue"
+   ],
+   "rows": [
+    {
+     "country": "IND",
+     "customer_name": "cust-3100908",
+     "orders": 2,
+     "revenue": 61372.8
+    },
+    {
+     "country": "BRA",
+     "customer_name": "cust-5506886",
+     "orders": 2,
+     "revenue": 52301.82
+    },
+    {
+     "country": "BRA",
+     "customer_name": "cust-7873760",
+     "orders": 2,
+     "revenue": 47405.54
+    },
+    {
+     "country": "DEU",
+     "customer_name": "cust-9960800",
+     "orders": 1,
+     "revenue": 46771.2
+    },
+    {
+     "country": "IND",
+     "customer_name": "cust-2010968",
+     "orders": 1,
+     "revenue": 46512.76
+    }
+   ]
+  },
+  {
+   "id": "q3",
+   "ms": 320.6,
+   "ok": true,
+   "n_rows": 0,
+   "sql": "SELECT dept, COUNT(*) AS headcount, ROUND(AVG(salary), 0) AS avg_salary FROM minio.default.employees GROUP BY dept ORDER BY headcount DESC",
+   "lines": [],
+   "cols": [],
+   "rows": []
+  },
+  {
+   "id": "q4",
+   "ms": 826.1,
+   "ok": true,
+   "n_rows": 1,
+   "sql": "SELECT COUNT(*) AS n, SUM(quantity) AS total_qty, MAX(supplier_id) AS max_supplier, MIN(brand_id) AS min_brand FROM minio.default.testdata_50col",
+   "lines": [
+    "| max_supplier | min_brand | n | total_qty |",
+    "| 4999 | 1 | 3000000 | 749894896 |"
+   ],
+   "cols": [
+    "max_supplier",
+    "min_brand",
+    "n",
+    "total_qty"
+   ],
+   "rows": [
+    {
+     "max_supplier": 4999,
+     "min_brand": 1,
+     "n": 3000000,
+     "total_qty": 749894896
+    }
+   ]
+  },
+  {
+   "id": "q3_retry",
+   "ms": 227.9,
+   "ok": true,
+   "n_rows": 0,
+   "lines": [
+    "SELECT * FROM minio.default.employees LIMIT 5 \u2192 0 rows"
+   ]
+  },
+  {
+   "id": "burst",
+   "level": 7,
+   "wall_ms": 2939.0,
+   "ok": 7,
+   "qps": 2.38,
+   "p50_ms": 2412.7,
+   "per_call_ms": [
+    2102.6,
+    2104.0,
+    2167.2,
+    2412.7,
+    2892.2,
+    2907.7,
+    2938.3
+   ]
+  }
+ ]
+}

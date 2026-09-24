@@ -15,6 +15,8 @@ Endpoints (all JSON unless noted):
   GET  /api/tables    -> {"tables": [{"name", "path", "format"}]}
   POST /api/describe  -> {"table", "uri", "columns": [{"name", "type"}]}
   POST /api/query     -> {"columns": [...], "rows": [[...]], "n_rows", "duration_ms"}
+                         ({"format": "arrow"} returns a base64 Arrow IPC
+                         stream text payload instead of the JSON shape)
   POST /api/query/async -> {"query_id", "state"} (long queries; poll /rows)
   GET  /api/query/{id}          -> job status (state, columns, n_rows)
   GET  /api/query/{id}/rows     -> paginated result rows (offset/limit)
@@ -31,7 +33,7 @@ Endpoints (all JSON unless noted):
   POST   /api/saved-queries/{name}/run -> run one (bind params, read-only)
   POST /api/preview   -> {"columns": [...], "rows": [[...]], "n_rows", "duration_ms"}
   POST /api/profile   -> column-level statistics (min/max, null %, distinct, quantiles)
-  POST /api/export    -> CSV/Parquet file download of a query or table (attachment)
+  POST /api/export    -> CSV/Parquet/Arrow file download of a query or table (attachment)
 
   Semantic catalog — documentation for agents and humans (the one mutating
   corner: it writes to the engine's catalog store, never data):
@@ -42,6 +44,8 @@ Endpoints (all JSON unless noted):
   GET    /api/semantic-catalog/table   -> one table's entry (?table=, ?format=)
   POST   /api/semantic-catalog/table   -> upsert one table's entry {table, content}
   DELETE /api/semantic-catalog/table   -> drop one table's entry (?table=)
+  POST   /api/semantic-catalog/import-dbt         -> dbt manifest.json -> PROPOSED catalog (no write)
+  POST   /api/semantic-catalog/import-dbt/apply   -> same body + writes the merged catalog to the store
   POST   /api/highlight                -> pygments-guessed HTML (rcat-style -g) for editors
 
 The HTML page is served at ``/`` and ``/ui``.
@@ -50,6 +54,7 @@ The HTML page is served at ``/`` and ``/ui``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
 import os
 import time as _time
@@ -61,7 +66,17 @@ from pathlib import Path
 
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from .engine import LakehouseError, QueryJob, SqlEngine, _max_rows, _validate_params, _validate_snapshot_version
+from . import identity as _identity
+from .dbt_import import apply_import as _dbt_apply_import
+from .dbt_import import import_dbt_manifest as _dbt_import_dbt_manifest
+from .engine import (
+    LakehouseError,
+    QueryJob,
+    SqlEngine,
+    _max_rows,
+    _validate_params,
+    _validate_snapshot_version,
+)
 from .jobs import JobError, api_job_cancel, api_job_result, api_job_status, api_job_submit
 from .saved import (
     NotAuthorized,
@@ -161,6 +176,43 @@ def _json_safe(value):
         return repr(value)
 
 
+# ---------------------------------------------------------------------------
+# Arrow IPC (format="arrow")
+# ---------------------------------------------------------------------------
+
+_ARROW_MEDIA_TYPE = "application/vnd.apache.arrow.stream"
+
+
+def arrow_to_ipc_stream_bytes(arrow) -> bytes:
+    """Serialize one Arrow Table as IPC stream bytes (the "arrow" format).
+
+    ``pa.ipc.new_stream`` writes the schema + batches to the sink; a
+    ``pa.ipc.open_stream`` reader reconstructs the table byte-faithfully —
+    decimals, timestamps and nulls survive (markdown/csv re-render them as
+    text, which is exactly the fidelity loss the format exists to avoid).
+    """
+    import io
+
+    import pyarrow as pa
+
+    sink = io.BytesIO()
+    with pa.ipc.new_stream(sink, arrow.schema) as writer:
+        writer.write_table(arrow)
+    return sink.getvalue()
+
+
+def arrow_to_ipc_text(arrow) -> str:
+    """Render one Arrow Table as a base64 IPC-stream text payload.
+
+    The first line is a human/machine-readable header (the same additive
+    posture as the JSON payload's meta keys); the base64 body follows and
+    decodes straight into ``pa.ipc.open_stream``.
+    """
+    raw = arrow_to_ipc_stream_bytes(arrow)
+    header = f"# arrow: {arrow.num_rows} rows x {arrow.num_columns} cols, {len(raw)} bytes ipc-stream base64"
+    return header + "\n" + base64.b64encode(raw).decode("ascii")
+
+
 def arrow_to_payload(arrow, limit: int | None = None) -> dict:
     """Convert a pyarrow Table into a JSON payload dict (columns + rows).
 
@@ -201,7 +253,7 @@ def api_status(engine: SqlEngine) -> dict:
     }
 
 
-def api_tables(engine: SqlEngine) -> dict:
+def api_tables(engine: SqlEngine, caller=None) -> dict:
     return {
         "tables": [
             {
@@ -212,13 +264,13 @@ def api_tables(engine: SqlEngine) -> dict:
                 "format": t.format,
                 "source": t.source,
             }
-            for t in engine.list_tables()
+            for t in engine.list_tables(caller=caller)
         ]
     }
 
 
-def api_describe(engine: SqlEngine, table: str) -> dict:
-    info = engine.describe_table(table)
+def api_describe(engine: SqlEngine, table: str, caller=None) -> dict:
+    info = engine.describe_table(table, caller=caller)
     out = {
         "table": table,
         "uri": info["uri"],
@@ -232,29 +284,46 @@ def api_describe(engine: SqlEngine, table: str) -> dict:
         out["description"] = info["description"]
     if info.get("aliases"):
         out["aliases"] = info["aliases"]
+    # Raw-format marker (mirrors the virtual-table flag): the UI badges raw
+    # landing-zone tables so their no-statistics nature is visible.
+    if info.get("raw"):
+        out["raw"] = True
+        out["format"] = info.get("format", "")
     return out
 
 
-def api_query(engine: SqlEngine, sql: str, limit: int | None = None, params: object | None = None) -> dict:
+def api_query(
+    engine: SqlEngine,
+    sql: str,
+    limit: int | None = None,
+    params: object | None = None,
+    caller=None,
+    output_format: str = "json",
+) -> dict | str:
     import time
 
     safe = assert_readonly(sql)
     params = _validate_params(params)  # raises ValueError-like LakehouseError early
     limit = _clamp_limit(limit)
     t0 = time.monotonic()
-    arrow = engine.query_duckdb(safe, limit=limit, params=params)
+    arrow = engine.query_duckdb(safe, limit=limit, params=params, caller=caller)
     duration_ms = round((time.monotonic() - t0) * 1000, 1)
+    if str(output_format or "json").strip().lower() == "arrow":
+        # Arrow IPC text payload: the duration meta rides as a second header
+        # line (the base64 body has no meta keys to merge into).
+        text = arrow_to_ipc_text(arrow)
+        return text + f"\n# duration_ms: {duration_ms}\n# sql: {safe}"
     payload = arrow_to_payload(arrow, limit=limit)
     payload.update({"sql": safe, "duration_ms": duration_ms})
     return payload
 
 
-def api_preview(engine: SqlEngine, table: str, limit: int | None = None) -> dict:
+def api_preview(engine: SqlEngine, table: str, limit: int | None = None, caller=None) -> dict:
     import time
 
     limit = _clamp_limit(limit)
     t0 = time.monotonic()
-    arrow = engine.scan_arrow(table, limit=limit)
+    arrow = engine.scan_arrow(table, limit=limit, caller=caller)
     duration_ms = round((time.monotonic() - t0) * 1000, 1)
     payload = arrow_to_payload(arrow, limit=limit)
     payload.update({"table": table, "duration_ms": duration_ms})
@@ -274,12 +343,12 @@ def _json_safe_deep(value):
     return _json_safe(value)
 
 
-def api_profile(engine: SqlEngine, table: str, columns: list[str] | None = None) -> dict:
+def api_profile(engine: SqlEngine, table: str, columns: list[str] | None = None, caller=None) -> dict:
     """Column-level statistics (shares the engine's profile cache with MCP)."""
     import time
 
     t0 = time.monotonic()
-    profile = _json_safe_deep(engine.profile_table(table, columns=columns))
+    profile = _json_safe_deep(engine.profile_table(table, columns=columns, caller=caller))
     profile["duration_ms"] = round((time.monotonic() - t0) * 1000, 1)
     return profile
 
@@ -482,21 +551,21 @@ def _export_max_rows() -> int:
 
 
 def api_export(engine: SqlEngine, body: dict) -> dict:
-    """POST /api/export — download a query or table result as CSV/Parquet.
+    """POST /api/export — download a query or table result as CSV/Parquet/Arrow.
 
     Accepts {"sql": ...} (read-only guard applies) or {"table": ...}
     (preview-style scan), optional "limit" (clamped to
-    SQLHANDLER_EXPORT_MAX_ROWS) and "format" ("csv" | "parquet"). Returns
-    {content: bytes, media_type, filename} for the route to send as an
-    attachment.
+    SQLHANDLER_EXPORT_MAX_ROWS) and "format" ("csv" | "parquet" | "arrow").
+    Returns {content: bytes, media_type, filename} for the route to send as
+    an attachment.
     """
     import io
 
     import pyarrow.parquet as pq
 
     fmt = str(body.get("format", "csv")).strip().lower()
-    if fmt not in ("csv", "parquet"):
-        raise ValueError(f"Unsupported export format {fmt!r}; use 'csv' or 'parquet'.")
+    if fmt not in ("csv", "parquet", "arrow"):
+        raise ValueError(f"Unsupported export format {fmt!r}; use 'csv', 'parquet' or 'arrow'.")
     try:
         raw_limit = body.get("limit")
         limit = _EXPORT_DEFAULT_ROWS if raw_limit is None else max(int(raw_limit), 0)
@@ -519,6 +588,9 @@ def api_export(engine: SqlEngine, body: dict) -> dict:
     if fmt == "csv":
         content = arrow.to_pandas().to_csv(index=False).encode("utf-8")
         media_type = "text/csv"
+    elif fmt == "arrow":
+        content = arrow_to_ipc_stream_bytes(arrow)
+        media_type = _ARROW_MEDIA_TYPE
     else:
         sink = io.BytesIO()
         pq.write_table(arrow, sink)
@@ -570,6 +642,74 @@ def api_catalog_clear(engine: SqlEngine) -> dict:
     """
     removed = engine.clear_catalog()
     return {"removed": removed, **engine.catalog_status()}
+
+
+# ---- dbt manifest import (semantic catalog) ----------------------------------
+# A dbt compile artifact (target/manifest.json) already carries what the
+# semantic catalog wants — model/column descriptions, dbt meta, compiled SQL.
+# This importer turns one into catalog content: parse-only by default
+# (import → preview → explicit Apply), writing through the SAME validated
+# upload store as POST /api/semantic-catalog so validation, the PVC store and
+# hot reload ride along. The parsing lives in sqlhandler.dbt_import (pure,
+# stdlib-json, no dbt dependency); these wrappers only bind the HTTP shapes
+# to the engine.
+
+
+def api_dbt_import(engine: SqlEngine, body: object) -> dict:
+    """POST /api/semantic-catalog/import-dbt — manifest → PROPOSED catalog.
+
+    Body JSON::
+
+        {"manifest": {...full manifest.json...}}
+        {"manifest_b64": "<base64 of manifest.json>"}
+        {"manifest": "...", "allow_virtual": true,             # default false
+         "source_filter": "jaffle",                             # null = all
+         "alias_map": {"dbt_node_name": "catalog_table_key"}}
+
+    Virtual tables are double-gated: a node generates a ``definition`` only
+    when it carries ``meta.sqlhandler.virtual: true`` AND the request passes
+    ``allow_virtual: true`` — the global flag alone never turns on virtual
+    tables. ``meta.sqlhandler.hide: true`` omits a node entirely. Nothing is
+    written: the response returns the proposed tables mapping plus
+    ``imported`` / ``virtuals`` / ``skipped`` / ``warnings`` counts, and the
+    caller decides whether to POST the same body to the /apply route.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
+    manifest = body["manifest"] if body.get("manifest") is not None else body.get("manifest_b64")
+    if manifest is None:
+        raise ValueError("Provide 'manifest' (the manifest.json content) or 'manifest_b64' (base64 of it).")
+    alias_map = body.get("alias_map")
+    if alias_map is not None and not isinstance(alias_map, dict):
+        raise ValueError("alias_map must map dbt node names to catalog table keys.")
+    return _dbt_import_dbt_manifest(
+        manifest,
+        allow_virtual=bool(body.get("allow_virtual", False)),
+        source_filter=body.get("source_filter") or None,
+        alias_map=alias_map,
+    )
+
+
+def api_dbt_import_apply(engine: SqlEngine, body: object) -> dict:
+    """POST /api/semantic-catalog/import-dbt/apply — preview + write to the store.
+
+    Takes the exact same body as the import (preview) route and additionally:
+
+        {"force_overwrite": true}   # replace non-dbt entries too (default false)
+
+    Merge rule: the importer output is merged node-by-node into the effective
+    catalog; an existing key is overwritten ONLY when it was itself produced
+    by a previous dbt import (the entry's ``meta.imported_from == "dbt"``
+    marker — the importer tracks provenance in entry meta, which the schema
+    preserves) or ``force_overwrite`` is true. Hand-written entries always
+    survive and stay listed in ``warnings`` so the operator can see what the
+    import did not touch. The merged catalog is written through
+    ``engine.set_catalog_text`` (validation, canonical-JSON store, atomic
+    replace, hot reload, "most recent intentional action wins" precedence).
+    """
+    result = api_dbt_import(engine, body)
+    force = bool(body.get("force_overwrite", False)) if isinstance(body, dict) else False
+    return {"proposed": result, **_dbt_apply_import(engine, result, force_overwrite=force)}
 
 
 # ---- semantic catalog editor (global + per-table) ----------------------------
@@ -730,9 +870,16 @@ def register_ui(app, engine_getter) -> None:
     async def status(_request) -> JSONResponse:
         return JSONResponse(await asyncio.to_thread(api_status, engine_getter()))
 
+    def _caller_for(request):
+        """The request's resolved Caller (identity spine); None-safe."""
+        try:
+            return _identity.caller_from_request_state(request)
+        except Exception:
+            return None
+
     async def tables(_request) -> JSONResponse:
         try:
-            return JSONResponse(await asyncio.to_thread(api_tables, engine_getter()))
+            return JSONResponse(await asyncio.to_thread(api_tables, engine_getter(), _caller_for(_request)))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -742,7 +889,9 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            return JSONResponse(await asyncio.to_thread(api_describe, engine_getter(), str(body.get("table", ""))))
+            return JSONResponse(
+                await asyncio.to_thread(api_describe, engine_getter(), str(body.get("table", "")), _caller_for(request))
+            )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -751,20 +900,25 @@ def register_ui(app, engine_getter) -> None:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        caller = _caller_for(request)
         try:
-            return JSONResponse(
-                await asyncio.to_thread(
-                    api_query,
-                    engine_getter(),
-                    str(body.get("sql", "")),
-                    body.get("limit"),
-                    body.get("params"),
-                )
+            result = await asyncio.to_thread(
+                api_query,
+                engine_getter(),
+                str(body.get("sql", "")),
+                body.get("limit"),
+                body.get("params"),
+                caller,
+                body.get("format", "json"),
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
+        # format="arrow" renders to a plain-text IPC payload, not a dict.
+        if isinstance(result, str):
+            return Response(content=result, media_type="text/plain; charset=utf-8")
+        return JSONResponse(result)
 
     async def preview(request) -> JSONResponse:
         try:
@@ -773,7 +927,9 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(
-                await asyncio.to_thread(api_preview, engine_getter(), str(body.get("table", "")), body.get("limit"))
+                await asyncio.to_thread(
+                    api_preview, engine_getter(), str(body.get("table", "")), body.get("limit"), _caller_for(request)
+                )
             )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
@@ -787,7 +943,9 @@ def register_ui(app, engine_getter) -> None:
             cols = body.get("columns")
             col_list = [str(c) for c in cols if str(c).strip()] if isinstance(cols, list) else None
             return JSONResponse(
-                await asyncio.to_thread(api_profile, engine_getter(), str(body.get("table", "")), col_list)
+                await asyncio.to_thread(
+                    api_profile, engine_getter(), str(body.get("table", "")), col_list, _caller_for(request)
+                )
             )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
@@ -888,7 +1046,13 @@ def register_ui(app, engine_getter) -> None:
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
         payload = arrow_to_payload(arrow)  # the job's rows are already MAX_ROWS-bounded
-        payload.update({"job_id": request.path_params["job_id"], "total_rows": arrow.num_rows, "result_fetched": True})
+        payload.update(
+            {
+                "job_id": request.path_params["job_id"],
+                "total_rows": arrow.num_rows,
+                "result_fetched": True,
+            }
+        )
         return JSONResponse(payload)
 
     async def jobs_cancel(request) -> JSONResponse:
@@ -1121,4 +1285,112 @@ def register_ui(app, engine_getter) -> None:
     app.add_route("/api/semantic-catalog/table", semantic_catalog_table_get, methods=["GET"])
     app.add_route("/api/semantic-catalog/table", semantic_catalog_table_update, methods=["POST"])
     app.add_route("/api/semantic-catalog/table", semantic_catalog_table_delete, methods=["DELETE"])
+
+    # ---- dbt manifest import: preview (parse-only) + apply (writes through
+    # the same upload store as POST /api/semantic-catalog). Two routes, one
+    # body shape — the UI previews first, then the operator clicks Apply.
+    async def semantic_catalog_dbt_import(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        try:
+            return JSONResponse({"ok": True, **await asyncio.to_thread(api_dbt_import, engine_getter(), body)})
+        except ValueError as exc:  # manifest / option validation
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def semantic_catalog_dbt_import_apply(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not engine_getter().catalog_uploads_enabled:
+            # Fail BEFORE parsing when the whole surface is switched off —
+            # same message the plain upload route gives.
+            return JSONResponse(
+                {"error": "Semantic-catalog upload is disabled (SQLHANDLER_CATALOG_UPLOAD=0)."}, status_code=400
+            )
+        try:
+            return JSONResponse({"ok": True, **await asyncio.to_thread(api_dbt_import_apply, engine_getter(), body)})
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse(
+                {
+                    "error": f"Cannot write the catalog store "
+                    f"({engine_getter().catalog_status().get('store_path')}): {exc}. "
+                    "Set SQLHANDLER_CATALOG_STORE to a writable path."
+                },
+                status_code=500,
+            )
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    app.add_route("/api/semantic-catalog/import-dbt", semantic_catalog_dbt_import, methods=["POST"])
+    app.add_route("/api/semantic-catalog/import-dbt/apply", semantic_catalog_dbt_import_apply, methods=["POST"])
     app.add_route("/api/highlight", highlight, methods=["POST"])
+
+    # ---- MCP Inspector tab (/api/inspector/*): a web bridge to the SAME tool
+    # surface an MCP client sees. /tools serves the tools/list payload (name,
+    # description, inputSchema — from server.mcp_tool_specs, one source of
+    # truth); /call dispatches through the server's OWN tools/call dispatcher
+    # so identity, policy, caching, the audit trail and the saved-query write
+    # gate ride along byte-identically — the browser is just another MCP
+    # client that happens to speak JSON instead of JSON-RPC. Tool errors come
+    # back MCP-shaped (isError:true content, HTTP 200 — an inspector shows
+    # tool errors); only BRIDGE validation (bad JSON body, non-dict
+    # arguments) is an HTTP 4xx. Auth is the shared /api posture
+    # (SQLHANDLER_API_TOKEN middleware / gateway) — never the /mcp keys.
+    #
+    # _tool_dispatcher is injected by server._build_http_app (the same
+    # engine_getter injection pattern); the default keeps register_ui's
+    # existing call sites and tests working by importing the dispatcher
+    # lazily (no import cycle at module load).
+    def _tool_dispatcher() -> object:
+        try:
+            from .server import _dispatch_tool  # lazy: avoids the import cycle
+
+            return _dispatch_tool
+        except Exception:  # pragma: no cover - server always present in prod
+            return None
+
+    async def inspector_tools(_request) -> JSONResponse:
+        try:
+            from .server import mcp_tool_specs  # lazy: avoids the import cycle
+
+            return JSONResponse({"tools": await asyncio.to_thread(mcp_tool_specs)})
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def inspector_call(request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "Provide the tool 'name' to call."}, status_code=400)
+        args = body.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return JSONResponse({"error": "'arguments' must be a JSON object."}, status_code=400)
+        dispatch = _tool_dispatcher()
+        if dispatch is None:  # pragma: no cover - defensive
+            return JSONResponse({"error": "Tool dispatcher unavailable."}, status_code=500)
+        # The request rides along EXACTLY as the /mcp transport hands it to
+        # tools/call: the dispatcher reads the caller identity off its scope
+        # state (audit + policy) and query_save/query_delete verify the
+        # presented credential per call (the mutation gate).
+        try:
+            text, is_error = await asyncio.to_thread(dispatch, name.strip(), args, request)
+        except Exception as exc:  # dispatcher-level failure → MCP-shaped error
+            text, is_error = f"Tool dispatch failed: {exc}", True
+        return JSONResponse({"content": [{"type": "text", "text": text}], "isError": is_error})
+
+    app.add_route("/api/inspector/tools", inspector_tools, methods=["GET"])
+    app.add_route("/api/inspector/call", inspector_call, methods=["POST"])

@@ -3,6 +3,17 @@
 Persistent, per-agent **scratch workspaces** for baseline agent harnesses
 (opencode, DSH): the durable layer a stateless shell does not give the model.
 
+**Deploy on PCAI:** import the packaged chart once, then edit the chart's
+values in the PCAI **Helm Values** editor and apply — you never run
+`helm install`/`kubectl apply` for the deployment (PCAI resolves
+`${DOMAIN_NAME}` in ezua values before rendering). The values walkthrough —
+required vs optional keys, the API-key Secret, exec governance, proxy/CA,
+deployment targets (internal SE-G2 / hosted trial) — lives in
+[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md); verification in
+[documentation/VERIFICATION.md](documentation/VERIFICATION.md); sanitized
+paste-ready per-target values in
+[helm/values-examples/](helm/values-examples/README.md).
+
 ## Why
 
 Harness shells are stateless between calls — platform temp areas may not
@@ -186,6 +197,23 @@ specific argv tools instead. Operators re-add interpreters explicitly via
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | passed through to `run_command` children (chart: `hpe_proxies`) so `pip` works behind the corporate proxy |
 | `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`PIP_CERT` | — | corporate MITM CA for pip/requests (chart: `caCert` → `ezaf-root-ca`) |
 
+### Helm chart — standard Kubernetes knobs
+
+Boilerplate workload values in `helm/values.yaml` — every path is settable in
+the PCAI **Helm Values** editor; defaults are sensible, so none normally need
+touching. (Behavior-bearing chart keys — `workbench.*`, `persistence.*`,
+`apiKey.*`, `webui.enabled`, `metrics.*`, `caCert.*`, `ezua.*` — are covered
+above and in `documentation/DEPLOYMENT.md`.)
+
+| Key | Default | Effect |
+|---|---|---|
+| `deployment.appName` | `workbench-mcp` | Kubernetes object + pod/container name and label. |
+| `image.tag` | `v0.2.1` | Image tag — kept in lockstep with `Chart.yaml` `appVersion`; a stale tag in a site values file is how an "old MCP server" pod happens. |
+| `resources.requests.cpu` / `resources.limits.cpu` | `250m` / `1` | Container CPU requests/limits (memory: `256Mi` / `512Mi`). |
+| `securityContext.runAsNonRoot` / `securityContext.runAsUser` | `true` / `10001` | Pod-level non-root posture; uid 10001 matches the image user, and `fsGroup: 10001` keeps the mounted PVC writable. |
+| `containerSecurityContext.readOnlyRootFilesystem` | `true` | Root filesystem is read-only — `run_command` children can write only the PVC and `/tmp` (fleet-audit P0). |
+| `containerSecurityContext.allowPrivilegeEscalation` | `false` | Privilege escalation disabled; all capabilities dropped (fleet-audit P0). |
+
 ## Web UI
 
 With `WORKBENCH_UI_ENABLED` (chart `webui.enabled`, default true) the same
@@ -195,8 +223,12 @@ viewer/saver, per-workspace env table editor, a run-command console
 (argv input with the allowlist hint, stdout/stderr/exit/duration), and an
 audit tail. The `/api/*` endpoints call the **same core functions the MCP
 tools use** — path confinement, caps, the argv allowlist and the JSONL
-audit all still apply; the UI gets no new powers. It is unauthenticated at
-the pod: the endpoint must sit behind gateway authn (PCAI Istio gateway).
+audit all still apply; the UI gets no new powers. Auth posture (fleet
+K8S-MCP-console pattern): the console HTML at `/` and `/ui` is
+**public-but-inert** — an unlock bar in the page collects the key, because
+the browser cannot load the page behind a 401 — while every `/api/*` data
+route (and `/mcp`) stays API-key-gated at the pod; the endpoint must also
+sit behind gateway authn (PCAI Istio gateway).
 
 ## Run
 

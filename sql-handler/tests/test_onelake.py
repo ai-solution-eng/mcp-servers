@@ -55,14 +55,18 @@ def test_cached_token_reused_until_expiry():
     p = _provider()
     with mock.patch(
         "urllib.request.urlopen",
-        side_effect=lambda req, timeout=None: _FakeResp({"access_token": "tok-1", "expires_in": 3600}),
+        side_effect=lambda req, timeout=None: _FakeResp(
+            {"access_token": "tok-1", "expires_in": 3600}
+        ),
     ):
         assert p._dfs_access_token() == "tok-1"
         assert p._dfs_access_token() == "tok-1"
     p._token_expires_at = 0
     with mock.patch(
         "urllib.request.urlopen",
-        side_effect=lambda req, timeout=None: _FakeResp({"access_token": "tok-2", "expires_in": 3600}),
+        side_effect=lambda req, timeout=None: _FakeResp(
+            {"access_token": "tok-2", "expires_in": 3600}
+        ),
     ):
         assert p._dfs_access_token() == "tok-2"
 

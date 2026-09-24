@@ -38,17 +38,17 @@ ezua:
 | Key | Default | Meaning |
 |---|---|---|
 | `deployment.*` | `searxng-mcp`, 1 replica | Workload naming and scale. The MCP server is stateless — scale replicas freely. |
-| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/searxng-mcp` / `v1.2.2` | Keep `tag` in lockstep with the chart's `appVersion` — a stale default is how an "old MCP + new chart" pod happens. |
+| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/searxng-mcp` / `v1.4.0` | Keep `tag` in lockstep with the chart's `appVersion` — a stale default is how an "old MCP + new chart" pod happens. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package stays private (public packages pull anonymously). |
 | `searxng.image.*` | `docker.io/searxng/searxng`, dated pin | SearXNG sidecar image; pinned to the dated tag `latest` resolved to at chart update time. Refresh the pin by editing the tag and re-applying. |
 | `searxng.baseUrl` | `""` | Public base URL rendered into `settings.yml` (`server.base_url`). The JSON API works without it; set `https://<endpoint>/` for correct UI links. |
 | `searxng.language` | `en-US` | Default language/region for the MCP server (`SEARXNG_LANGUAGE`). |
-| `searxng.disabledEngines` | `[]` | Engines to disable via `settings.yml`. Leave empty — SearXNG auto-suspends flaky engines and the search tool reports it; only hard-disable a consistently dead one (e.g. startpage behind the HPE proxy). |
+| `searxng.disabledEngines` | `[]` (chart default: the corporate-proxy dead-engine list) | Engines to disable via `settings.yml`. The chart's default list drops engines with a track record of dying behind corporate egress proxies (ddg/brave/startpage variants + `wikidata` — CAPTCHA walls / SPARQL timeouts on a shared egress IP); on a shared egress IP dead engines still burn the per-IP rate budget on every search, so keeping the list is a quota save, not a latency nicety. Set `[]` only on open-internet (non-proxied) installs. Names must match engine names exactly (`GET /config`); a wrong name is silently ignored. |
 | `searxng.resources` | 100m/256Mi → 1 CPU/1Gi | SearXNG sidecar sizing. |
 | `service.port` / `searxngPort` | 9090 / 8080 | MCP (`/mcp`) and SearXNG web UI ports. |
 | `resources` | 200m/200Mi → 1 CPU/512Mi | MCP container sizing. |
 | `browser.enabled` | `false` | Adds the headless-browser sidecar (Playwright Chromium) so `fetch_content` can render JS-only pages and take screenshots. Costs ~512Mi and a second image; plain HTTP + curl_cffi already covers most sites. |
-| `browser.image.*` | `ghcr.io/ai-solution-eng/searxng-mcp-browser` / `v1.2.1` | Sidecar image; build/push first if you maintain your own (see `browser/Dockerfile`). |
+| `browser.image.*` | `ghcr.io/ai-solution-eng/searxng-mcp-browser` / `v1.4.0` | Sidecar image; build/push first if you maintain your own (see `browser/Dockerfile`). |
 | `browser.caCert.enabled` / `.configMap` | `false` / `ezaf-root-ca` | Installs a corporate MITM CA into the Chromium trust store at startup (Chromium ignores `SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS`). The ConfigMap must exist in the release namespace — copy the cluster-wide one if needed. |
 | `browser.extraArgs` | `""` | Extra Chromium command-line flags. |
 | `env` | `SEARXNG_URL=http://localhost:8080` | MCP container env. `SEARXNG_URL` points at the sidecar — leave it. Other server knobs (`SEARXNG_TIMEOUT`, `FETCH_REQUESTS_PER_MINUTE`, …) can be added here. |

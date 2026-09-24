@@ -27,10 +27,54 @@ data:
   # (default) = same-origin only — browsers are refused, MCP clients are not.
   SQLHANDLER_ALLOWED_ORIGINS: {{ . | quote }}
   {{- end }}
+  {{- /* Response compression (mcp.compression): gzip on markdown/JSON-heavy
+         responses (5-10x on the wire). Defaults mirror the server code —
+         gzip from 1024 bytes up; SSE/streaming responses are excluded by
+         the middleware (it compresses each streamed chunk after the SSE
+         content-type guard). */}}
+  SQLHANDLER_COMPRESSION: {{ ternary "gzip" "off" .Values.mcp.compression.enabled | quote }}
+  SQLHANDLER_COMPRESSION_MIN_SIZE: {{ .Values.mcp.compression.minSize | quote }}
   # Optional auth gate on /metrics + /ready (default off = unauthenticated).
   # When true, scrapers must present SQLHANDLER_API_TOKEN or an /mcp API key
   # (X-API-Key / X-API-Token / Bearer); /health stays open for probes.
   SQLHANDLER_METRICS_AUTH: {{ ternary "1" "0" .Values.security.metricsAuth | quote }}
+  {{- /* Identity spine + policy-as-code (security.identity / security.policy).
+         The trust flag is the operator's AuthorizationPolicy assertion —
+         comment rendered so the posture is auditable in the ConfigMap. */}}
+  SQLHANDLER_TRUST_BROWSER_HEADERS: {{ ternary "1" "0" .Values.security.identity.trustBrowserHeaders | quote }}
+  {{- if .Values.security.policy.enabled }}
+  SQLHANDLER_POLICY_ENABLED: "1"
+  {{- if .Values.security.policy.existingConfigMap }}
+  SQLHANDLER_POLICY_FILE: {{ printf "%s/%s" .Values.security.policy.mountPath .Values.security.policy.existingConfigMapKey | quote }}
+  {{- end }}
+  {{- else }}
+  SQLHANDLER_POLICY_ENABLED: "0"
+  {{- end }}
+  {{- /* Write tier (review §4 — GLOBAL FLAG, DEFAULT FALSE). Disabled
+         renders only the master switch "0" (byte-identical default
+         render); enabled requires scratch roots to render the rest.
+         mcp.readonly above keeps governing multi-statement/DDL exactly
+         as before — this flag gates ONLY the new scratch-write
+         capability. */}}
+  SQLHANDLER_WRITES_ENABLED: {{ ternary "1" "0" .Values.writes.enabled | quote }}
+  {{- /* DuckDB fs-layer opt-in (values: duckdbFileAccess, default false):
+         locked down by default — read_csv('/etc/passwd'), COPY TO and
+         extension URL fetches fail closed. Required ONLY for attached
+         sources that read through DuckDB's fs (ducklake row reads);
+         attached-catalog writes stay refused by the SQL guard either way. */}}
+  SQLHANDLER_DUCKDB_FILE_ACCESS: {{ ternary "1" "0" .Values.duckdbFileAccess | quote }}
+  {{- if .Values.writes.enabled }}
+  {{- with .Values.writes.scratch.roots }}
+  SQLHANDLER_WRITE_SCRATCH_ROOTS: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_WRITE_LEASE_TTL: {{ .Values.writes.scratch.leaseTtl | quote }}
+  {{- with .Values.writes.scratch.icebergCatalogUri }}
+  SQLHANDLER_WRITE_ICEBERG_CATALOG_URI: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.writes.scratch.icebergWarehouse }}
+  SQLHANDLER_WRITE_ICEBERG_WAREHOUSE: {{ . | quote }}
+  {{- end }}
+  {{- end }}
   # Backend: onelake (default), s3/minio, or iceberg.
   SQLHANDLER_BACKEND: {{ .Values.backend | default "onelake" | quote }}
   {{- if not .Values.sources }}
@@ -64,8 +108,13 @@ data:
   {{- end }}
   {{- else if eq .Values.backend "iceberg" }}
   # Iceberg catalog connection details (non-secret). Token/keys -> Secret.
+  # Values-first: iceberg.catalogType -> ICEBERG_CATALOG_TYPE (rest | sql |
+  # glue | hive | nessie). glue reads the standard AWS_* environment (IRSA) —
+  # the chart never renders AWS credential values.
   ICEBERG_CATALOG_TYPE: {{ .Values.iceberg.catalogType | default "rest" | quote }}
+  {{- if .Values.iceberg.catalogUri }}
   ICEBERG_CATALOG_URI: {{ .Values.iceberg.catalogUri | quote }}
+  {{- end }}
   {{- if .Values.iceberg.catalogName }}
   ICEBERG_CATALOG_NAME: {{ .Values.iceberg.catalogName | quote }}
   {{- end }}
@@ -74,6 +123,11 @@ data:
   {{- end }}
   {{- if .Values.iceberg.namespace }}
   ICEBERG_NAMESPACE: {{ .Values.iceberg.namespace | quote }}
+  {{- end }}
+  {{- /* Nessie branch/tag (catalogType: nessie): values-first via
+         iceberg.nessieRef; empty renders nothing = catalog default branch. */}}
+  {{- with .Values.iceberg.nessieRef }}
+  ICEBERG_NESSIE_REF: {{ . | quote }}
   {{- end }}
   # S3 storage for the Iceberg data files (optional; same vars as s3 backend).
   {{- if .Values.iceberg.storage.endpointUrl }}
@@ -88,6 +142,77 @@ data:
   {{- else if eq .Values.backend "nfs" }}
   # NFS / local filesystem backend: read-only directory of Parquet files.
   NFS_ROOT: {{ .Values.nfs.rootDir | default "/data" | quote }}
+  {{- else if eq .Values.backend "sharing" }}
+  # Delta Sharing backend (README: Delta Sharing). The bearer token NEVER
+  # renders here: profile-file deployments get DELTA_SHARING_PROFILE (the
+  # mounted ConfigMap file below); secret deployments get endpoint/token
+  # via secretKeyRef in the deployment (sharing.existingSecret). Render
+  # guard: sharing.enabled must accompany backend "sharing".
+  {{- if not .Values.sharing.enabled }}
+  {{- fail "backend: sharing requires sharing.enabled: true (see values.yaml)" }}
+  {{- end }}
+  {{- if .Values.sharing.existingConfigMap }}
+  SQLHANDLER_SHARING_PROFILE: {{ printf "%s/%s" "/etc/sqlhandler-sharing" .Values.sharing.existingConfigMapKey | quote }}
+  {{- else if .Values.sharing.existingSecret }}
+  # env-only mode: endpoint + bearer token arrive via secretKeyRef
+  {{- else }}
+  {{- fail "backend: sharing requires sharing.existingConfigMap (profile ConfigMap) or sharing.existingSecret (endpoint+token Secret)" }}
+  {{- end }}
+  {{- else if eq .Values.backend "adls" }}
+  # ADLS Gen2 backend (values: adls.*). The client secret NEVER renders
+  # here — ADLS_CLIENT_SECRET_ENV carries the NAME of the env var and the
+  # deployment wires that var from the operator's Secret via secretKeyRef.
+  # Render guard: adls.enabled must accompany backend "adls" (same shape as
+  # the sharing guard above).
+  {{- if not .Values.adls.enabled }}
+  {{- fail "backend: adls requires adls.enabled: true (see values.yaml)" }}
+  {{- end }}
+  {{- if not (or .Values.adls.filesystem .Values.adls.container) }}
+  {{- fail "backend: adls requires adls.filesystem (or adls.container)" }}
+  {{- end }}
+  ADLS_ACCOUNT: {{ required "backend: adls requires adls.account" .Values.adls.account | quote }}
+  {{- $adlsContainer := .Values.adls.filesystem | default .Values.adls.container }}
+  ADLS_CONTAINER: {{ $adlsContainer | quote }}
+  {{- with .Values.adls.prefix }}
+  ADLS_PREFIX: {{ . | quote }}
+  {{- end }}
+  ADLS_AUTH: {{ .Values.adls.auth | default "anon" | quote }}
+  {{- if eq (.Values.adls.auth | default "anon") "client-secret" }}
+  {{- /* client-secret mode: ids are non-secret (ConfigMap is fine); the
+         secret itself arrives via secretKeyRef (deployment.yaml) and only
+         its ENV-VAR NAME renders here. Both names must be present or the
+         pod would boot half-configured and 401 at first query. */}}
+  ADLS_TENANT_ID: {{ required "adls.auth: client-secret requires adls.tenantId" .Values.adls.tenantId | quote }}
+  ADLS_CLIENT_ID: {{ required "adls.auth: client-secret requires adls.clientId" .Values.adls.clientId | quote }}
+  {{- if not .Values.adls.existingSecret }}
+  {{- fail "adls.auth: client-secret requires adls.existingSecret (a Secret carrying the client secret — never a value in helm)" }}
+  {{- end }}
+  ADLS_CLIENT_SECRET_ENV: {{ printf "ADLS_CLIENT_SECRET" | quote }}
+  {{- end }}
+  {{- with .Values.adls.endpointSuffix }}
+  ADLS_ENDPOINT_SUFFIX: {{ . | quote }}
+  {{- end }}
+  {{- else if eq .Values.backend "gcs" }}
+  # GCS backend (values: gcs.*). The service-account key file is MOUNTED
+  # (operator's volume; gcs.credentialsFile is the mounted path) — key
+  # CONTENTS never render into any manifest. Render guard: gcs.enabled must
+  # accompany backend "gcs".
+  {{- if not .Values.gcs.enabled }}
+  {{- fail "backend: gcs requires gcs.enabled: true (see values.yaml)" }}
+  {{- end }}
+  GCS_BUCKET: {{ required "backend: gcs requires gcs.bucket" .Values.gcs.bucket | quote }}
+  {{- with .Values.gcs.prefix }}
+  GCS_PREFIX: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gcs.projectId }}
+  GCS_PROJECT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gcs.credentialsFile }}
+  GCS_CREDENTIALS_FILE: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.gcs.anonymous }}
+  GCS_ANONYMOUS: "true"
+  {{- end }}
   {{- end }}
   {{- end }}
   {{- if .Values.sources }}
@@ -98,12 +223,11 @@ data:
   {{- /* External read-only databases: the JSON carries env-var NAMES only
          (password_env = SQLHANDLER_DB_PW_<NAME>); the password VALUES are
          wired via secretKeyRef from the db-credentials Secret (see
-         secret.yaml / deployment.yaml) and never enter the ConfigMap. */}}
-  {{- $attach := list }}
-  {{- /* External read-only databases: the JSON carries env-var NAMES only
-         (password_env = SQLHANDLER_DB_PW_<NAME>); the password VALUES are
-         wired via secretKeyRef from the db-credentials Secret (see
          secret.yaml / deployment.yaml) and never enter the ConfigMap.
+         The wiring is TYPE-AGNOSTIC — every entry's password rides the same
+         SQLHANDLER_DB_PW_<NAME> path, so adding a type never touches these
+         templates (mongodb/bigquery need their community extension baked in
+         at build time; see the Dockerfile note — README: External databases).
          sqlite entries carry a file path (no host/port/user/password_env),
          and every entry forwards an optional `params` object (TLS / driver
          options — README: External databases). Impossible entries fail the
@@ -112,23 +236,57 @@ data:
   {{- range .Values.databases }}
   {{- $t := .type | default "postgres" }}
   {{- if not .name }}{{- fail "databases: every entry needs a name" }}{{- end }}
-  {{- if not .database }}{{- fail (printf "databases: entry %s is missing database" .name) }}{{- end }}
+  {{- if and (eq $t "ducklake") (not .catalog) }}{{- fail (printf "databases: ducklake entry %s is missing catalog (the connect string without the ducklake: prefix)" .name) }}{{- end }}
+  {{- if and (eq $t "ducklake") (or .host .port .user .database) }}{{- fail (printf "databases: ducklake entry %s must not set host/port/user/database (the endpoint is the catalog connect string)" .name) }}{{- end }}
+  {{- if and (ne $t "ducklake") (not .database) }}{{- fail (printf "databases: entry %s is missing database" .name) }}{{- end }}
   {{- if and (eq $t "sqlite") (or .host .port .user) }}
   {{- fail (printf "databases: sqlite entry %s must not set host/port/user (database is the file path)" .name) }}
   {{- end }}
+  {{- if and (eq $t "bigquery") (or .host .port .user .user_env .params) }}
+  {{- fail (printf "databases: bigquery entry %s must not set host/port/user/user_env/params (the scope is `database` = project or project.dataset; auth is ADC or a temporary access_token via `password`)" .name) }}
+  {{- end }}
+  {{- if and (ne $t "bigquery") .billing_project }}{{- fail (printf "databases: entry %s sets billing_project but that field is bigquery-only" .name) }}{{- end }}
+  {{- if eq $t "ducklake" }}
+  {{- /* ducklake: the operator-authored catalog connect string (+ optional
+          data_path) ride verbatim; `password` is consumed by the deployment's
+          secretKeyRef wiring (SQLHANDLER_DB_PW_<NAME>) and referenced from the
+          JSON via password_env — it NEVER lands in the ConfigMap. */}}
+  {{- $dbName := .name }}
+  {{- $entry := dict "name" .name "type" $t "catalog" .catalog }}
+  {{- with .data_path }}{{- $_ := set $entry "data_path" . }}{{- end }}
+  {{- with .password }}{{- $_ := set $entry "password_env" (printf "SQLHANDLER_DB_PW_%s" (upper $dbName)) }}{{- end }}
+  {{- $attach = append $attach $entry }}
+  {{- else }}
   {{- $entry := dict "name" .name "type" $t "database" .database }}
   {{- if ne $t "sqlite" }}
   {{- with .host }}{{- $_ := set $entry "host" . }}{{- end }}
+  {{- /* bigquery's password_env is OPTIONAL (ADC is the default auth) — the
+          env-name is only emitted when the operator actually set a password
+          (a temporary access token); the other server types always carry it
+          (empty = trust-auth). */}}
+  {{- if or (ne $t "bigquery") .password }}
   {{- $_ := set $entry "password_env" (printf "SQLHANDLER_DB_PW_%s" (upper .name)) }}
+  {{- end }}
   {{- with .port }}{{- $_ := set $entry "port" (. | int) }}{{- end }}
   {{- with .user }}{{- $_ := set $entry "user" . }}{{- end }}
+  {{- with .billing_project }}{{- $_ := set $entry "billing_project" . }}{{- end }}
   {{- end }}
   {{- with .params }}{{- $_ := set $entry "params" . }}{{- end }}
   {{- $attach = append $attach $entry }}
   {{- end }}
+  {{- end }}
   # Attached external databases (read-only; see README: External databases).
   SQLHANDLER_ATTACH: {{ $attach | toJson | quote }}
   {{- end }}
+  {{- /* Raw-format landing zone (rawFiles): CSV/TSV/JSON/NDJSON/JSONL (+ .gz)
+         files under the s3/nfs backends discover as queryable tables,
+         mirroring Parquet discovery semantics. Size-gated on purpose — raw
+         text has no row-group statistics, so this is a landing-zone feature,
+         not a scan path (tables carry a RAW badge; the count(*) metadata
+         fast path refuses them). maxFileMB applies to the COMPRESSED size
+         for .gz files (approximate — see values.yaml for the honesty note). */}}
+  SQLHANDLER_RAW_FORMATS: {{ ternary "1" "0" .Values.rawFiles.enabled | quote }}
+  SQLHANDLER_RAW_MAX_FILE_MB: {{ .Values.rawFiles.maxFileMB | quote }}
   # In-process metadata cache (list_tables / describe_table). NOTE: no sprig
   # `default` here — `0` (disable caching / check every query) and `false`
   # are meaningful values that `default` treats as empty and would override.
@@ -138,6 +296,9 @@ data:
   {{- if .Values.cache.prewarmTables }}
   SQLHANDLER_PREWARM_TABLES: {{ .Values.cache.prewarmTables | quote }}
   {{- end }}
+  # Data prewarm depth: first N row groups of each prewarm table are read
+  # through the disk block cache at startup (0 = off; describe-only).
+  SQLHANDLER_PREWARM_ROWGROUPS: {{ .Values.cache.prewarmRowgroups | quote }}
   # DuckDB query-engine budget, derived from the container's own cgroup
   # limits (see src/sqlhandler/resources.py): memory_limit = fraction x the
   # pod's memory limit, threads = the pod's CPU limit, and a spill directory
@@ -179,10 +340,37 @@ data:
   {{- with .Values.cache.virtualCacheDir }}
   SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
   {{- end }}
+  {{- /* Shared L2 result cache (cross-replica): opt-in like the block
+         cache. Disabled renders only the master switch "false"; nothing
+         else leaks. Even when enabled, SQLHANDLER_L2_DIR is rendered ONLY
+         when cache.l2.dir is set — the engine refuses to default the dir
+         to pod-local /tmp, which would look like sharing while sharing
+         nothing. When replicas can exceed 1 the dir must sit on an RWX
+         volume (see values.yaml cache.l2 note; the RWO/stranded-replica
+         discipline is semanticCatalog.store's render-guard precedent). */}}
+  SQLHANDLER_L2_ENABLED: {{ ternary "1" "0" .Values.cache.l2.enabled | quote }}
+  {{- if .Values.cache.l2.enabled }}
+  {{- with .Values.cache.l2.dir }}
+  SQLHANDLER_L2_DIR: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_L2_TTL: {{ .Values.cache.l2.ttl | quote }}
+  SQLHANDLER_L2_MIN_BYTES: {{ .Values.cache.l2.minBytes | quote }}
+  SQLHANDLER_L2_MAX_BYTES: {{ .Values.cache.l2.maxBytes | quote }}
+  {{- end }}
   # D5: per-query wall-clock timeout (seconds; 0 = no timeout). A runaway
   # query used to hold one of the concurrency-gate slots forever; >10-minute
   # queries must opt in by raising this.
   SQLHANDLER_QUERY_TIMEOUT: {{ .Values.query.timeoutSeconds | quote }}
+  # Query execution bounds (query.* values): default row cap, profiling
+  # sample cap, async-job registry cap, query-memory resource depth. The
+  # env names are the server's; operators set the values.
+  SQLHANDLER_MAX_ROWS: {{ .Values.query.maxRows | quote }}
+  SQLHANDLER_PROFILE_MAX_ROWS: {{ .Values.query.profileMaxRows | quote }}
+  SQLHANDLER_MAX_JOBS: {{ .Values.query.maxJobs | quote }}
+  SQLHANDLER_QUERY_MEMORY_SIZE: {{ .Values.query.queryMemorySize | quote }}
+  # Bare-LIMIT preview fast path: first-row-group read instead of the full
+  # fragment enumeration (query.previewFastpath; engine default is ON).
+  SQLHANDLER_PREVIEW_FASTPATH: {{ ternary "1" "0" .Values.query.previewFastpath | quote }}
   {{- /* Disk block cache: opt-in (s3/iceberg parquet IO; delta-rs IO on
          onelake is not wrappable). Empty strings mean "engine default". */}}
   SQLHANDLER_BLOCK_CACHE: {{ .Values.cache.blockCache.enabled | quote }}

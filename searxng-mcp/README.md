@@ -85,6 +85,7 @@ so. `render="always"` skips plain HTTP entirely; `render="never"` keeps the old 
 | `SEARXNG_TIMEOUT` | `10` | Search request timeout (s) |
 | `SEARXNG_VERIFY_TLS` | `true` | TLS verification for https:// SearXNG URLs |
 | `SEARXNG_REQUESTS_PER_MINUTE` | `30` | Search rate limit |
+| `SEARXNG_SEARCH_CACHE_TTL` | `120` | Search result cache TTL seconds (`0` disables) |
 | `FETCH_REQUESTS_PER_MINUTE` | `20` | Fetch rate limit |
 | `FETCH_VERIFY_TLS` | `true` | TLS verification for fetched pages |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | Corporate proxy for `fetch_content` |
@@ -145,7 +146,11 @@ returns a policy error naming `SEARXNG_FETCH_ALLOW_HOSTS`.
 
 Quick wins in the same area: successful fetches are memoized for
 `SEARXNG_FETCH_CACHE_TTL` seconds with single-flight coalescing (concurrent
-identical requests share one upstream run); the plain-path response body is
+identical requests share one upstream run); **searches are memoized for
+`SEARXNG_SEARCH_CACHE_TTL` seconds (default 120, `0` disables) with the
+same single-flight semantics** — on a shared multi-tenant instance this
+dedupes the duplicate queries several agent sessions produce, which is a
+direct saving of the upstream per-IP engine budget; the plain-path response body is
 capped (`SEARXNG_FETCH_MAX_BODY_BYTES`) with a truncation notice in the
 output; the screenshot data URL is size-capped
 (`SEARXNG_FETCH_MAX_SCREENSHOT_KB`) and ships with the first page
@@ -215,6 +220,46 @@ docker run --rm -p 8080:8080 \
 ```
 
 ## Deployment
+
+Deployment on PCAI (HPE Private Cloud AI / Ezmeral Unified Analytics) is values-driven: users never run `helm install` or `kubectl apply` — the packaged chart is imported into the PCAI catalog once, the deployment is created from it, and every knob below is set in the chart's **Helm Values** editor (or via the PCAI API). PCAI resolves `${DOMAIN_NAME}` in the `ezua` values before rendering. The paste-ready full-values examples in [`helm/values-examples/`](helm/values-examples/README.md) are written for that editor.
+
+### Required values
+
+The chart **fails to render** unless these are set:
+
+| Key | Why it is required |
+|---|---|
+| `searxng.secretKey` | **REQUIRED** — the deployment template errors (`searxng.secretKey is required (SEARXNG_SECRET) — or set searxng.existingSecret`) when it is empty. It seeds SearXNG's `SEARXNG_SECRET` (session/crypto); the chart default is a placeholder, so change it for any real deployment. |
+| `searxng.existingSecret` (+ `existingSecretKey`, default `secret`) | **Alternative wiring, preferred**: point at a pre-created Secret and `SEARXNG_SECRET` comes from `secretKeyRef` instead — when set, the literal `secretKey` above is ignored and the empty-value render failure cannot happen. `kubectl create secret generic <name> --from-literal=secret=$(openssl rand -hex 32)`. |
+| `ezua.virtualService.endpoint` | **REQUIRED when `ezua.enabled`** (default `true`): the VirtualService host — e.g. `searxng-mcp.${DOMAIN_NAME}` (PCAI resolves `${DOMAIN_NAME}`). Empty endpoint aborts the render. |
+
+```yaml
+searxng:
+  # Preferred — the secret never passes through values files or git:
+  existingSecret: "searxng-secret"
+  # … or a literal (lab only): secretKey: "<SECRET_KEY>"   # openssl rand -hex 32
+ezua:
+  virtualService:
+    endpoint: "searxng-mcp.${DOMAIN_NAME}"
+```
+
+### Standard Kubernetes knobs
+
+Boilerplate sizing/identity/probe values — every path is settable in the PCAI **Helm Values** editor; defaults are sensible, so none normally need touching:
+
+| Key | Default | Effect |
+|---|---|---|
+| `deployment.appName` | `searxng-mcp` | Kubernetes object + pod label for the MCP container. |
+| `deployment.replicaCount` | `1` | Pod replicas (stateless MCP server — scale freely). |
+| `image.pullPolicy` | `IfNotPresent` | Pull policy of the MCP container image. |
+| `resources.requests.cpu` / `resources.limits.cpu` | `200m` / `1` | MCP container CPU requests/limits. |
+| `searxng.image.pullPolicy` | `IfNotPresent` | Pull policy of the SearXNG sidecar image. |
+| `searxng.resources.requests.cpu` / `searxng.resources.limits.cpu` | `100m` / `1` | SearXNG sidecar CPU requests/limits. |
+| `browser.image.tag` / `browser.image.pullPolicy` | `v1.4.0` / `IfNotPresent` | Optional headless-browser sidecar image pin and pull policy (used when `browser.enabled`). |
+| `browser.resources.requests.cpu` | `250m` | Headless-browser sidecar CPU request (memory limit 1Gi). |
+| `service.targetPort` | `9090` | Container port the Service's `mcp` port forwards to (also the `/mcp` VirtualService backend). |
+| `metrics.serviceMonitor` | `true` | Render the ServiceMonitor when `metrics.enabled: true`. |
+| `metrics.interval` | `30s` | ServiceMonitor scrape interval. |
 
 ```bash
 # Build & push the MCP image (playwright client included via the browser extra)
@@ -293,10 +338,16 @@ Or through the gateway (oauth2-proxy protected):
 - **Sidecar image pinning.** The chart pins SearXNG to the dated tag that Docker Hub's `latest` resolved to when the chart was last touched (never the mutable `latest` tag itself — pods rescheduled later would silently get different engines/settings). To refresh the pin: look up the newest dated tag on Docker Hub, bump `searxng.image.tag` in values, and upgrade. For a fully immutable reference,
   use the digest form (`image: searxng/searxng@sha256:…`). The MCP server side is decoupled from SearXNG releases — it speaks the JSON API, whose schema has been stable for years — so sidecar upgrades are low-risk; validate with `GET /config` and one search call after upgrading.
 - `server.limiter: false` keeps the limiter off for internal API use — no valkey/redis required. Add valkey only if you ever expose this publicly.
-- **Default: no engines are disabled.** All default SearXNG engines stay on, including ddg/brave/startpage. SearXNG auto-suspends engines that fail repeatedly (transient, self-recovers) and the search tool reports `some engines did not respond: …` per query — so an engine being flaky costs a little latency, never correctness. If one proves *consistently* dead on a given network (startpage showed a
-  hard CAPTCHA wall on the HPE proxy during testing), add it to `searxng.disabledEngines` in values and `helm upgrade`; verify with `GET /config` afterwards.
+- **The default disable-list targets engines that die behind corporate egress proxies** (ddg/brave/startpage variants + `wikidata`; SE-G2 evidence: CAPTCHA walls for datacenter IPs, SPARQL timeouts through the proxy). On a *shared* egress IP this is not a latency nicety — every search pays the dead engines' request/timeout budget, the cluster's instances share one upstream rate-limit budget, and SearXNG auto-suspension merely reports `some engines did not respond: …` per query without conserving quota. Set `searxng.disabledEngines: []` only on open-internet (non-proxied) installs. Names must match engine names exactly (see the `engines:` array in `GET /config`); a wrong name is silently ignored.
 
 ## Files
+
+| Document | Contents |
+|---|---|
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), ezua/Istio wiring, upgrading |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | Two-path liveness, MCP handshake check, one-tool test, optional operator kubectl, troubleshooting |
+| [helm/values-examples/](helm/values-examples/README.md) | Paste-ready, secret-free full-values examples (G2 lab, hosted trial) |
+| [helm/values.yaml](helm/values.yaml) | Chart defaults — the authoritative list of every knob |
 
 ```
 searxng_mcp/

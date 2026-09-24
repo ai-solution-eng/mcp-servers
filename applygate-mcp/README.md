@@ -158,13 +158,37 @@ is a subset check, so old readers keep parsing new entries):
   audit surfaces and joinable across the fleet) and the client `host:port`.
   Resolved at the auth layer (`_CallerAuditMiddleware` → contextvar → the
   tool bodies via `asyncio.to_thread`, which copies the request context —
-  the fleet pattern of K8S-MCP's `_Caller`). The shared `mcp_auth`
-  middleware authenticates but does not expose the matched identity, so
-  applygate re-resolves it from the same inputs; entries from the read-only
-  console path and stdio use are anonymous (`null`s) by design. Per-client
-  key *names* (K8S-MCP's `K8S_MCP_CLIENTS` registry) have no applygate
-  equivalent yet — the fingerprint is the identity until that lands
-  (candidate for the Wave-6 `mcp-fleet-common` extraction).
+  the fleet pattern of K8S-MCP's `_Caller`). Entries from the read-only
+  console path and stdio use are anonymous (`null`s) by design.
+- **`caller` may carry up to two MORE keys — `name` and `via` (Wave 6,
+  fleet Item A1/A2) — and each appears ONLY when set**, so a deployment
+  that configures neither serializes the exact pre-attribution 2-key shape:
+  - **`name`** — the per-request registry name (`APPLYGATE_CLIENTS`,
+    `name:key;name:key;...`, chart `clients.existingSecret` → secret key;
+    re-read every request, so rotation needs no restart). The registry only
+    NAMES keys the API-key middleware already matched — it can never
+    authenticate anything; a malformed entry is skipped loudly and
+    attribution degrades to fingerprint-only.
+  - **`via`** — the caller claim relayed by a TRUSTED proxy peer in
+    `X-MCP-Caller` (chart `callerPassthrough.trustedCidrs` →
+    `MCP_CALLER_TRUSTED_CIDRS`; e.g. a gateway emits `X-MCP-Caller:
+    <subject>@gateway`). The header is honored ONLY when the direct peer
+    IP is inside the configured CIDRs — unset/empty means the header is
+    ignored from EVERY peer (fail-closed; the default render). Behind an
+    Istio sidecar the scope client is the sidecar's address, so tune the
+    CIDR list per deployment. Values are sanitized before they enter the
+    audit JSON (CR/LF and control characters stripped, capped at 200
+    chars).
+  - **Privacy note (deliberate):** when the gateway relays a subject
+    (A3), `via` puts a HUMAN identifier into this audit PVC. That is the
+    point — audit-grade attribution — and the convention keeps the value a
+    non-secret account name (`project-user-*` style), never an email or
+    token.
+  - **Attribution-never-authorization (hard invariant, enforced by
+    tests):** `name` and `via` never unlock anything — not namespaces, not
+    kinds, not the D11 plan binding, not `confirm_apply`. `key_fp` remains
+    the credential truth; `via` is trusted-peer metadata about who a
+    trusted intermediary says is on the other end.
 
 ### Verifying the chain (the procedure)
 
@@ -233,6 +257,8 @@ CRDs in-cluster.
 | `APPLYGATE_AUDIT_FILE` | `/data/audit.jsonl` | JSONL audit sink (hash-chained; mounted volume in the Helm chart). |
 | `APPLYGATE_UNPLANNED_APPLY` | `deny` | D11 plan-binding transition knob: `deny` (apply without a matching plan refuses) / `warn` (applies + logs loudly) / `allow` (pre-D11 behavior). Unknown values fail closed. |
 | `APPLYGATE_METRICS_ENABLED` | *(off)* | Serve `/metrics` (prometheus-client when installed, honest fallback otherwise). Chart key: `metrics.enabled`. |
+| `APPLYGATE_CLIENTS` | *(unset)* | Optional per-request caller-name registry, `name:key;name:key;...` — NAMES keys the auth middleware already matched (audit `caller.name`). Never authenticates anything. Chart key: `clients.existingSecret` (secret material — existingSecret-only). |
+| `MCP_CALLER_TRUSTED_CIDRS` | *(empty)* | Comma-separated CIDRs of trusted direct peers whose `X-MCP-Caller` claim is recorded (audit `caller.via`, sanitized, ≤200 chars). **Empty = fail-closed: the header is ignored from every peer.** Chart key: `callerPassthrough.trustedCidrs`. Attribution-never-authorization: never unlocks anything. |
 
 ## RBAC requirements
 
@@ -388,13 +414,52 @@ wire, `/api/audit` and the 400 on a path-traversal attempt.
 helm lint helm/
 helm template test helm/
 helm template site helm/ -f helm/local/values.example.yaml   # after filling it in
+# Or render with the sanitized paste-ready examples (values-examples/README.md):
+helm template g2 helm/ -f helm/values-examples/values.g2.yaml
+helm template trial helm/ -f helm/values-examples/values.hosted-trial.yaml
 ```
 
 `values.yaml` ships **default-deny** (`namespaces.allowed: ""`). Site
 overrides go in `helm/local/values.<site>.yaml` (never committed, never
-packaged). The audit PVC (`persistence.enabled=true`, 1Gi) keeps the trail
+packaged); sanitized paste-ready per-target examples live in
+[helm/values-examples/](helm/values-examples/README.md) (values walkthrough:
+[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md), verification:
+[documentation/VERIFICATION.md](documentation/VERIFICATION.md)). The audit
+PVC (`persistence.enabled=true`, 1Gi) keeps the trail
 across restarts; with persistence disabled an `emptyDir` is mounted instead
 so `readOnlyRootFilesystem` still works (trail lost on restart — labs only).
+
+### Required values
+
+`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**:
+`templates/virtualservice.yaml` calls Helm's `required` on it, so an empty
+endpoint aborts the render before anything is created — `Valid
+.Values.ezua.virtualService.endpoint is required !` (applygate ships
+`ezua.enabled: false` by default; the check only bites an operator who enables
+the gateway exposure and then blanks the endpoint, or the `${DOMAIN_NAME}`
+placeholder fails to resolve). With `ezua.enabled: false` no VirtualService is
+rendered and the endpoint is never read — in-cluster Service access only.
+
+```yaml
+ezua:
+  enabled: true                        # SITE: expose /mcp (and the webui) through the gateway
+  domainName: ${DOMAIN_NAME}
+  virtualService:
+    endpoint: applygate-mcp.${DOMAIN_NAME}   # unique per release on the gateway
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 120s
+```
+
+### Standard Kubernetes knobs
+
+Defaults fit the fleet baseline; overridable per deployment.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `deployment.appName` | `applygate-mcp` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is, and names the PVC/Secrets). Leave at the default; mismatched selectors break the Service wiring. |
+| `resources.requests.cpu` / `resources.limits.cpu` | `100m` / `1` | CPU requests/limits (memory: `256Mi` / `512Mi`). |
+| `securityContext.runAsNonRoot` / `.runAsUser` / `.runAsGroup` / `.fsGroup` | `true` / `10001` / `10001` / `10001` | **Present in values but NOT consumed by any template** — pod/container security actually renders from `podSecurityContext` (RuntimeDefault seccomp) and `containerSecurityContext` (below); the image itself runs `USER 10001`. Kept for values-shape consistency; editing it is inert. |
+| `containerSecurityContext.allowPrivilegeEscalation` | `false` | Container securityContext (with `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault` via `podSecurityContext`). Keep false — part of the audited baseline; the k8s client needs only the `/tmp` emptyDir. |
 
 Wave-3 additive keys — **both default OFF/empty, so the default render is
 byte-identical to the Wave-0 baseline** (verified by render-diff):
@@ -404,6 +469,15 @@ byte-identical to the Wave-0 baseline** (verified by render-diff):
   unset = the server's built-in default deny applies).
 - `metrics.enabled: false` (+ `metrics.interval: 30s`) — renders
   `APPLYGATE_METRICS_ENABLED` and the `ServiceMonitor` only when true.
+- `clients.existingSecret: ''` (Wave-6 attribution) — renders
+  `APPLYGATE_CLIENTS` (from the named Secret's `clients.existingSecretKey`,
+  default `clients`) only when set: the per-request caller-name registry
+  (`name:key;name:key;...`) → audit `caller.name`. Omitted ⇒ fp-only
+  caller audit, behavior unchanged.
+- `callerPassthrough.trustedCidrs: ''` (Wave-6 attribution) — renders
+  `MCP_CALLER_TRUSTED_CIDRS` only when set: CIDRs of trusted direct peers
+  whose `X-MCP-Caller` claim is recorded → audit `caller.via`. Omitted ⇒
+  the header is ignored from every peer (fail-closed).
 - `audit.file` carries the audit-path comment block: **the audit.path is
   documented for ops mount/expose** — the fleet convention is to mount the
   same path/PVC into the logsearch pod so the trail is searchable.

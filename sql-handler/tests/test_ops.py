@@ -18,7 +18,9 @@ from sqlhandler.server import _ApiTokenMiddleware
 def _make_engine(tmp_path, **kw):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
+    pq.write_table(
+        pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}), d / "part.parquet"
+    )
 
     class P:
         kind = "fake"
@@ -132,7 +134,7 @@ def test_audit_bad_path_never_raises(tmp_path):
 def _patch_register(monkeypatch, sleep=None):
     import sqlhandler.engine as eng_mod
 
-    def register(self, con, sql, version=None):
+    def register(self, con, sql, version=None, **kw):
         if sleep is not None:
             time.sleep(sleep)
         con.register("work_order", pa.table({"id": [1, 2, 3, 4, 5]}))

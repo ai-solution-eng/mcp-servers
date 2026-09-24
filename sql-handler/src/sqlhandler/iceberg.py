@@ -11,6 +11,17 @@ caches, scans) works unchanged:
   * open_dataset                  -> manifest-listed Parquet files as a
                                      pyarrow Dataset
 
+Catalog types (``ICEBERG_CATALOG_TYPE``):
+  * ``rest``    - Iceberg REST catalog (Dremio, Nessie's REST endpoint,
+                  Databricks Unity Catalog, S3 Tables, ...)
+  * ``sql``     - SQL catalog (SQLite/Postgres) for local dev/tests
+  * ``glue``    - AWS Glue Data Catalog (needs the ``pyiceberg[glue]``
+                    extras; AWS credentials/region come from the standard
+                    AWS_* environment / instance role / IRSA — never values)
+  * ``hive``    - Hive metastore over thrift (needs ``pyiceberg[hive]``)
+  * ``nessie``  - Project Nessie via the REST catalog with the branch/tag
+                    pinned in the URI (no native nessie type in pyiceberg)
+
 Requires the optional dependency ``pyiceberg``:
     pip install 'sqlhandler[iceberg]'
 """
@@ -19,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.dataset as pad
@@ -30,15 +42,26 @@ from .s3 import build_s3fs
 
 logger = logging.getLogger("sqlhandler.iceberg")
 
-_MISSING_MSG = (
-    "Iceberg support requires the optional 'pyiceberg' package. Install with:  pip install 'sqlhandler[iceberg]'"
+_MISSING_MSG = "Iceberg support requires the optional 'pyiceberg' package. Install with:  pip install 'sqlhandler[iceberg]'"
+
+# The glue/hive catalog classes import boto3/thrift at module load — pyiceberg
+# raises its own NotInstalledError when the extra is missing; we translate it
+# into a LakehouseError with the right pip target.
+_GLUE_MISSING_MSG = (
+    "Iceberg catalog type 'glue' requires the pyiceberg AWS extras (boto3/botocore). "
+    "Install with:  pip install 'pyiceberg[glue]'  (AWS credentials come from the "
+    "standard AWS_* environment variables / instance role / IRSA — never config values)"
+)
+_HIVE_MISSING_MSG = (
+    "Iceberg catalog type 'hive' requires the pyiceberg thrift extra. "
+    "Install with:  pip install 'pyiceberg[hive]'"
 )
 
 _SCHEMES = ("s3://", "file://", "gs://", "abfs://", "abfss://")
 
 
 class IcebergProvider(DataProvider):
-    """Apache Iceberg catalog backend (REST or local SQL), read-only."""
+    """Apache Iceberg catalog backend (REST/SQL/glue/hive/nessie), read-only."""
 
     kind = "iceberg"
 
@@ -46,7 +69,9 @@ class IcebergProvider(DataProvider):
         """Wrap a pyiceberg catalog + its storage credentials."""
         if not config.is_configured:
             raise LakehouseError(
-                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI (and ICEBERG_CATALOG_TYPE=rest|sql)."
+                "Iceberg connection is not configured. Set ICEBERG_CATALOG_URI "
+                "(the REST/Nessie/thrift endpoint) or ICEBERG_CATALOG_TYPE=glue "
+                "with the AWS_* environment set."
             )
         self.config = config
         self._cat = None
@@ -61,23 +86,77 @@ class IcebergProvider(DataProvider):
             except ImportError as exc:
                 raise LakehouseError(_MISSING_MSG) from exc
             try:
-                if self.config.catalog_type == "sql":
+                from pyiceberg.exceptions import NotInstalledError
+            except ImportError:  # pragma: no cover - ancient pyiceberg
+                NotInstalledError = ()
+            cfg = self.config
+            try:
+                if cfg.catalog_type == "sql":
                     self._cat = SqlCatalog(
-                        self.config.catalog_name,
-                        uri=self.config.catalog_uri,
-                        warehouse=self.config.warehouse or None,
+                        cfg.catalog_name,
+                        uri=cfg.catalog_uri,
+                        warehouse=cfg.warehouse or None,
+                    )
+                elif cfg.catalog_type == "glue":
+                    # boto3 resolves credentials/region from the standard AWS
+                    # environment (env vars, instance role, IRSA) — NO
+                    # credential values ever travel through this config.
+                    self._cat = load_catalog(
+                        "default",
+                        type="glue",
+                        warehouse=cfg.warehouse or None,
+                    )
+                elif cfg.catalog_type == "hive":
+                    self._cat = load_catalog(
+                        "default",
+                        type="hive",
+                        uri=cfg.catalog_uri,
+                        warehouse=cfg.warehouse or None,
+                    )
+                elif cfg.catalog_type == "nessie":
+                    # No native "nessie" type in pyiceberg's registry: Nessie's
+                    # Iceberg REST endpoint is a plain REST catalog whose
+                    # branch/tag rides the URI path (the REST `prefix`
+                    # property does NOT work for pyiceberg — projectnessie.org).
+                    self._cat = load_catalog(
+                        "default",
+                        type="rest",
+                        uri=self._nessie_uri(),
+                        token=cfg.catalog_token or None,
+                        warehouse=cfg.warehouse or None,
                     )
                 else:
                     self._cat = load_catalog(
                         "default",
                         type="rest",
-                        uri=self.config.catalog_uri,
-                        token=self.config.catalog_token or None,
-                        warehouse=self.config.warehouse or None,
+                        uri=cfg.catalog_uri,
+                        token=cfg.catalog_token or None,
+                        warehouse=cfg.warehouse or None,
                     )
+            except NotInstalledError as exc:
+                msg = _GLUE_MISSING_MSG if cfg.catalog_type == "glue" else _HIVE_MISSING_MSG
+                raise LakehouseError(f"{msg} ({exc})") from exc
             except Exception as exc:
                 raise LakehouseError(f"Iceberg catalog init failed: {exc}") from exc
         return self._cat
+
+    def _nessie_uri(self) -> str:
+        """The Nessie Iceberg REST URI with the pinned branch/tag appended.
+
+        Per projectnessie.org's Iceberg-REST guide the ref travels in the URI
+        (``http://host:19120/iceberg/<branch>``); a URI that already carries a
+        branch/warehouse segment (``.../iceberg/<ref>`` or
+        ``.../iceberg/<ref>|<warehouse>``) wins — the env ref is then ignored.
+        """
+        uri = (self.config.catalog_uri or "").rstrip("/")
+        ref = (self.config.nessie_ref or "").strip().strip("/")
+        if not ref:
+            return uri
+        path = urlparse(uri).path
+        _, _, rest = path.partition("/iceberg")
+        if rest and rest != "/":
+            return uri
+        return f"{uri}/{ref}"
 
     def _namespaces(self) -> list[str]:
         """Namespaces (schemas) to list, after the optional namespace filter."""
@@ -148,7 +227,9 @@ class IcebergProvider(DataProvider):
         """
         table = self._load_table(info)
         scan = (
-            table.scan() if version is None else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
+            table.scan()
+            if version is None
+            else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
         )
         try:
             files = [f.file.file_path for f in scan.plan_files()]

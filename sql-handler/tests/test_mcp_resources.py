@@ -28,13 +28,13 @@ class CatalogStubEngine:
     def __init__(self, descriptions=None):
         self.descriptions = descriptions or {}
 
-    def list_tables(self):
+    def list_tables(self, **kw):
         return TABLES
 
     def table_description(self, info):
         return self.descriptions.get(info.path, "")
 
-    def describe_table(self, table):
+    def describe_table(self, table, **kw):
         if table in ("workorder/work_order", "work_order"):
             return {
                 "table": table,
@@ -48,7 +48,7 @@ class CatalogStubEngine:
             }
         raise LakehouseError(f"Table '{table}' not found")
 
-    def query_memory(self):
+    def query_memory(self, caller=None):
         return [
             {"ts": "t", "sql": "SELECT 1", "duration_ms": 1.0, "n_rows": 1, "error": None},
         ]
@@ -92,9 +92,13 @@ def test_read_resource_table_schema(stub_engine):
 
 
 def test_read_resource_catalog_and_query_memory(stub_engine):
-    cat = asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://catalog"})()))
+    cat = asyncio.run(
+        mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://catalog"})())
+    )
     assert "Work order headers" in cat.contents[0].text
-    mem = asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://query-memory"})()))
+    mem = asyncio.run(
+        mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://query-memory"})())
+    )
     assert "SELECT 1" in mem.contents[0].text
 
 
@@ -104,7 +108,11 @@ def test_read_resource_unknown_raises_mcp_error(stub_engine):
     with pytest.raises(MCPError):
         asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://nope"})()))
     with pytest.raises(MCPError):
-        asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://table/missing/schema"})()))
+        asyncio.run(
+            mr.handle_read_resource(
+                None, type("P", (), {"uri": "sqlhandler://table/missing/schema"})()
+            )
+        )
 
 
 def test_catalog_resource_mentions_missing_catalog(stub_engine):
@@ -130,7 +138,9 @@ def test_get_prompt_explore_data(stub_engine):
 
 
 def test_get_prompt_analyze_table(stub_engine):
-    params = type("P", (), {"name": "analyze-table", "arguments": {"table": "workorder/work_order"}})()
+    params = type(
+        "P", (), {"name": "analyze-table", "arguments": {"table": "workorder/work_order"}}
+    )()
     result = asyncio.run(mr.handle_get_prompt(None, params))
     assert "workorder/work_order" in result.messages[0].content.text
 
@@ -139,7 +149,9 @@ def test_get_prompt_errors(stub_engine):
     from mcp.shared.exceptions import MCPError
 
     with pytest.raises(MCPError):
-        asyncio.run(mr.handle_get_prompt(None, type("P", (), {"name": "analyze-table", "arguments": {}})()))
+        asyncio.run(
+            mr.handle_get_prompt(None, type("P", (), {"name": "analyze-table", "arguments": {}})())
+        )
     with pytest.raises(MCPError):
         asyncio.run(mr.handle_get_prompt(None, type("P", (), {"name": "nope", "arguments": {}})()))
 
@@ -158,7 +170,7 @@ def _make_engine(tmp_path, **kw):
     class P:
         kind = "fake"
 
-        def list_tables(self):
+        def list_tables(self, **kw):
             return [TableInfo(name="work_order", schema="workorder", format="parquet")]
 
         def table_uri(self, info):

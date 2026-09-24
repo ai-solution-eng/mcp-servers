@@ -18,7 +18,7 @@ deployment:
 # Chart.yaml by the release tooling) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  tag: v0.1.2
+  tag: v0.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -28,8 +28,10 @@ imagePullSecrets: []
 # -- Web UI -------------------------------------------------------------------------------
 # HPE-branded browser console at / — read/write, calls the SAME core functions
 # the MCP tools use (path confinement, caps, argv allowlist, audit all still
-# apply). Unauthenticated at the pod: the endpoint must sit behind gateway
-# authn (the ezaf-gateway VirtualService below).
+# apply). The console HTML (/ and /ui) is public-but-inert (an in-page unlock
+# bar collects the key); every /api/* data route stays key-gated — and the
+# endpoint must sit behind gateway authn (the ezaf-gateway VirtualService
+# below).
 webui:
   enabled: true
 
@@ -38,6 +40,10 @@ workbench:
   # Root directory holding all workspaces — MUST match persistence.mountPath.
   root: /data
   # argv[0] allowlist for run_command (comma-separated); no shells by design.
+  # Fleet decision D18: NO interpreters (python3) and no package managers
+  # (pip/pip3) in the default — an allow-listed interpreter can sidestep the
+  # argv-level workspace confinement. Re-add deliberately if the threat model
+  # accepts the documented residual (README "Honest limits").
   execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
   # Hard deny (WINS over the allowlist): network/escalation binaries.
   execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
@@ -51,6 +57,10 @@ workbench:
   # Max entries per list_files response.
   maxListEntries: 500
   logLevel: INFO
+  # Workspace templates (Wave-5 F3) — SITE: chart default ({} = the
+  # workspace_create tool's template parameter is refused; nothing renders).
+  # See the helm/values.yaml comment block for a worked example.
+  templates: {}
 
 # -- HPE corporate proxy --------------------------------------------------------------------------
 # SITE: this cluster sits behind the HPE corporate proxy — wiring it is what
@@ -94,10 +104,25 @@ resources:
     memory: 512Mi
 
 # -- Security context -----------------------------------------------------------------
+# Non-root uid + fsGroup 10001 (PVC writable by the server user), RuntimeDefault
+# seccomp at the pod level.
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level hardening (fleet-audit P0): read-only rootfs (run_command
+# children can write only the PVC + /tmp), no privilege escalation, caps
+# dropped. The pod also mounts NO service-account token (automount
+# explicitly off in the chart — the server makes zero k8s calls).
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
 
 # -- Persistence ---------------------------------------------------------------------
 # THE point of the workbench: workspaces survive pod restarts. RWX so every
@@ -132,3 +157,5 @@ apiKey:
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval

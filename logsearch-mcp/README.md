@@ -224,6 +224,8 @@ surface is exercised without a cluster.
 ```bash
 helm lint helm/
 helm template test helm/ -f helm/local/values.example.yaml   # example render
+helm template g2 helm/ -f helm/values-examples/values.g2.yaml     # sanitized examples
+helm template trial helm/ -f helm/values-examples/values.hosted-trial.yaml
 helm upgrade --install logsearch-mcp helm/ -n <namespace> -f helm/local/values.<site>.yaml
 ```
 
@@ -234,7 +236,46 @@ cluster-local entries); no `caCert` wiring (the in-cluster API uses the
 service-account CA — there is no MITM egress to trust); a vendor-label
 Kyverno policy gated on `ezua.enabled`.
 
-Per-site values live in `helm/local/` (never committed, never packaged).
+Per-site values live in `helm/local/` (never committed, never packaged);
+sanitized paste-ready per-target examples (SE-G2 / hosted trial) live in
+[helm/values-examples/](helm/values-examples/README.md) — walkthrough:
+[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md), verification:
+[documentation/VERIFICATION.md](documentation/VERIFICATION.md).
+
+### Required values
+
+`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**:
+`templates/virtualservice.yaml` calls Helm's `required` on it, so an empty
+endpoint aborts the render before anything is created — `Valid
+.Values.ezua.virtualService.endpoint is required !` (logsearch ships
+`ezua.enabled: false` by default; the check only bites an operator who enables
+the gateway exposure and then blanks the endpoint, or the `${DOMAIN_NAME}`
+placeholder fails to resolve). With `ezua.enabled: false` no VirtualService is
+rendered and the endpoint is never read — in-cluster Service access only.
+
+```yaml
+ezua:
+  enabled: true                        # SITE: expose /mcp (+ web console) through the gateway
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    endpoint: "logsearch-mcp.${DOMAIN_NAME}"   # unique per release on the gateway
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+```
+
+### Standard Kubernetes knobs
+
+Defaults fit the fleet baseline; overridable per deployment. The read-only
+RBAC posture (`rbac.create`/`rbac.clusterWide`) is covered in
+[RBAC requirements](#rbac-requirements).
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `deployment.appName` | `logsearch-mcp` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is, and names the ServiceAccount). Leave at the default; mismatched selectors break the Service/VS wiring. |
+| `service.type` | `ClusterIP` | Cluster-internal ClusterIP; the only external path is the ezaf-gateway VirtualService (set `ezua.enabled: true`). Don't switch to NodePort/LB without replacing that exposure path. |
+| `service.targetPort` | `9101` | Container port (also drives `containerPort` and the probes). Move it only with the server's listen port. |
+| `resources.requests.cpu` | `100m` | CPU request (limits: memory `512Mi`; requests.memory `256Mi`, no CPU limit). |
+| `securityContext.runAsNonRoot` / `securityContext.runAsUser` | `true` / `10001` | Enforce the image's own `USER 10001` at the pod level. Keep both — part of the audited baseline; no values-defined `fsGroup` (the server needs no writable group volumes). |
 
 ## Release / chores
 

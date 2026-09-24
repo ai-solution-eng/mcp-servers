@@ -129,7 +129,9 @@ class OneLakeProvider(DataProvider):
                 # Deterministic auth errors (4xx, except 429) are not retried;
                 # throttling (429) and server errors (>=500) are transient.
                 if exc.code < 500 and exc.code != 429:
-                    raise LakehouseError(f"OneLake token acquisition failed: HTTP {exc.code}") from exc
+                    raise LakehouseError(
+                        f"OneLake token acquisition failed: HTTP {exc.code}"
+                    ) from exc
                 last_err = exc
             except Exception as exc:
                 last_err = exc
@@ -271,7 +273,9 @@ class OneLakeProvider(DataProvider):
             ]
 
         infos: list[TableInfo] = []
-        with ThreadPoolExecutor(max_workers=min(_SCHEMA_LIST_WORKERS, max(len(schemas), 1))) as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(_SCHEMA_LIST_WORKERS, max(len(schemas), 1))
+        ) as pool:
             for batch in pool.map(_list_schema, schemas):
                 infos.extend(batch)
 
@@ -316,7 +320,9 @@ class OneLakeProvider(DataProvider):
                     raise ValueError("must be a JSON object")  # noqa: TRY004
                 options.update(extra)
             except Exception as exc:
-                raise LakehouseError(f"SQLHANDLER_ONELAKE_STORAGE_OPTIONS is not valid JSON options: {exc}") from exc
+                raise LakehouseError(
+                    f"SQLHANDLER_ONELAKE_STORAGE_OPTIONS is not valid JSON options: {exc}"
+                ) from exc
         return options
 
     def open_dataset(self, info: TableInfo, version: int | None = None):

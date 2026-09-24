@@ -160,6 +160,64 @@ spec:
             - name: SQLHANDLER_CATALOG_STORE
               value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog") | quote }}
             {{- end }}
+            {{- if hasKey .Values.query "concurrency" }}
+            {{- /* Legacy nesting guard (never shipped): reject a query.concurrency
+                   map so a mis-merged values file cannot silently drop the gate. */}}
+            {{- fail "query.concurrency: use the flat keys query.maxConcurrentQueries / query.queueTimeoutSeconds" }}
+            {{- end }}
+            # Per-pod query-concurrency gate (engine.py; values: query.*).
+            # Both vars are rendered unconditionally: the app's defaults (8 / 30s)
+            # match these values.yaml defaults, so explicit == default renders the
+            # same behavior while keeping the gate visible and adjustable in the
+            # PCAI Helm Values editor.
+            - name: SQLHANDLER_MAX_CONCURRENT_QUERIES
+              value: {{ .Values.query.maxConcurrentQueries | quote }}
+            - name: SQLHANDLER_QUEUE_TIMEOUT
+              value: {{ .Values.query.queueTimeoutSeconds | quote }}
+            {{- if .Values.query.auditLog }}
+            {{- /* JSONL query-audit log (values: query.auditLog). The value is a
+                   PATH; the chart only renders the env var and (below) a writable
+                   emptyDir for the path's directory — the file is pod-local by
+                   design (durable audit = point the path at your own PVC mount).
+                   Render guard: absolute path required so the mount math below
+                   cannot produce a relative nonsense mountPath. */}}
+            {{- if not (regexMatch "^/" .Values.query.auditLog) }}
+            {{- fail "query.auditLog must be an absolute path (e.g. /var/lib/sqlhandler-audit/audit.jsonl)" }}
+            {{- end }}
+            - name: SQLHANDLER_AUDIT_LOG
+              value: {{ .Values.query.auditLog | quote }}
+            {{- end }}
+            {{- if and (eq .Values.backend "sharing") .Values.sharing.enabled }}
+            {{- /* Delta Sharing (values: sharing.*): the profile FILE comes
+                   from the mounted ConfigMap (configmap.yaml renders
+                   DELTA_SHARING_PROFILE); the Secret path wires endpoint +
+                   bearer token directly via secretKeyRef. Either way the
+                   token never renders into the ConfigMap. */}}
+            {{- if .Values.sharing.existingSecret }}
+            - name: DELTA_SHARING_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sharing.existingSecret }}
+                  key: {{ .Values.sharing.existingSecretEndpointKey }}
+            - name: DELTA_SHARING_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sharing.existingSecret }}
+                  key: {{ .Values.sharing.existingSecretBearerTokenKey }}
+            {{- end }}
+            {{- end }}
+            {{- if and (eq .Values.backend "adls") .Values.adls.enabled (eq (.Values.adls.auth | default "anon") "client-secret") .Values.adls.existingSecret }}
+            {{- /* ADLS Gen2 (values: adls.*): the client secret NEVER renders
+                   into the ConfigMap — ADLS_CLIENT_SECRET_ENV (rendered there)
+                   names THIS env var, whose VALUE arrives from the operator's
+                   Secret via secretKeyRef. Identical posture to the FABRIC_
+                   credential block above. */}}
+            - name: ADLS_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adls.existingSecret }}
+                  key: {{ .Values.adls.existingSecretClientSecretKey | default "client-secret" }}
+            {{- end }}
           {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
                  backend additionally mounts its PVC; the semantic catalog
                  mounts its ConfigMap read-only; the upload store mounts its
@@ -169,7 +227,10 @@ spec:
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
           {{- $needCatalog := .Values.semanticCatalog.enabled }}
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
-          {{- if or $needTmp $needData $needCatalog $needStore }}
+          {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
+          {{- $needSharing := and (eq .Values.backend "sharing") .Values.sharing.enabled .Values.sharing.existingConfigMap }}
+          {{- $needAudit := and (.Values.query.auditLog) (ne (dir .Values.query.auditLog) "/") }}
+          {{- if or $needTmp $needData $needCatalog $needStore $needScratch $needSharing $needAudit }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
@@ -195,6 +256,31 @@ spec:
                    hot-reloads. */}}
             - name: catalog-store
               mountPath: {{ .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
+            {{- end }}
+            {{- if $needScratch }}
+            {{- /* Read-write on purpose: the write tier writes scratch tables
+                   (and the single-writer lease files) here. RWX discipline:
+                   see values.yaml writes.scratch.pvc + the scratch-pvc.yaml
+                   render guard. */}}
+            - name: scratch
+              mountPath: {{ .Values.writes.scratch.pvc.mountPath | default "/scratch" }}
+            {{- end }}
+            {{- if $needAudit }}
+            {{- /* Read-write on purpose: the audit JSONL writer appends here.
+                   Pod-local emptyDir keyed to the path's DIRECTORY (e.g.
+                   /var/lib/sqlhandler-audit for .../sqlhandler-audit/a.jsonl);
+                   a root-level path ("/a.jsonl") skips the mount entirely —
+                   only a hardened (read-only-rootfs) pod needs the dir. */}}
+            - name: audit-log
+              mountPath: {{ dir .Values.query.auditLog }}
+            {{- end }}
+            {{- if $needSharing }}
+            {{- /* Directory mount, NOT subPath — same mtime-hot-reload
+                   reasoning as the semantic catalog (though the sharing
+                   profile is read once at startup today). */}}
+            - name: sharing-profile
+              mountPath: /etc/sqlhandler-sharing
+              readOnly: true
             {{- end }}
           {{- end }}
           # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
@@ -241,7 +327,8 @@ spec:
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
-      {{- if or $needTmp $needData $needCatalog $needStore }}
+      {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
+      {{- if or $needTmp $needData $needCatalog $needStore $needScratch $needAudit }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
@@ -266,6 +353,30 @@ spec:
         - name: catalog-store
           persistentVolumeClaim:
             claimName: {{ .Values.semanticCatalog.store.existingClaim | default (printf "%s-catalog" (include "sqlhandler.fullname" .)) }}
+        {{- end }}
+        {{- if $needScratch }}
+        {{- /* The chart-created <release>-scratch PVC (RWX render-guarded),
+               or an existing claim via writes.scratch.pvc.existingClaim. */}}
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: {{ .Values.writes.scratch.pvc.existingClaim | default (printf "%s-scratch" (include "sqlhandler.fullname" .)) }}
+        {{- end }}
+        {{- if $needSharing }}
+        {{- /* Operator-owned profile ConfigMap (sharing.existingConfigMap);
+               the key must carry the Delta Sharing profile YAML/JSON. Never
+               a values-rendered credential — profiles carry the token. */}}
+        - name: sharing-profile
+          configMap:
+            name: {{ required "sharing.existingConfigMap is required for the profile-file path" .Values.sharing.existingConfigMap }}
+        {{- end }}
+        {{- if $needAudit }}
+        {{- /* Pod-local writable dir for the audit JSONL (values: query.auditLog).
+               emptyDir is the deliberate choice: audit is a diagnostic stream,
+               not a system of record — the append-only file survives container
+               restarts but not rescheduling. Durable audit = target a path on
+               your own PVC-backed mount. */}}
+        - name: audit-log
+          emptyDir: {}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

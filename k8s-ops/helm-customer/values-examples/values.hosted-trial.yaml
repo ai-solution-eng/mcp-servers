@@ -34,8 +34,9 @@ deployment:
 image:
   # SITE: keep in lockstep with Chart.yaml appVersion (same image as the
   # internal chart — the locking lives in this chart, not the binary).
+  # SITE: pinned at chart 1.1.0.
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v0.3.1
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -78,6 +79,18 @@ apiKey:
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
 
+# -- In-cluster host allowlist (benign connectivity wiring) -----------------
+# Extra Host header values the MCP SDK's DNS-rebinding protection accepts for
+# in-cluster callers (never bypasses the API-key gate). SITE: chart default.
+extraAllowedHosts: []
+
+# -- Cluster-wide listing guardrails (benign wiring) -------------------------
+# Performance guardrails only — NOT security knobs. "" = the server's own
+# default. SITE: kept at the chart default.
+listing:
+  maxItems: ""
+  concurrency: ""
+
 # -- RBAC: BAKED, NOT VALUES-DRIVEN ---------------------------------------------------------------------
 # templates/rbac-readonly.yaml carries a $scope chart constant ("cluster") —
 # read-only, cluster-wide, the same posture validated on the internal cluster.
@@ -119,3 +132,4 @@ ezua:
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
+  interval: 30s

@@ -27,7 +27,7 @@ deployment:
 # the registry, and IfNotPresent would serve a stale cached digest.
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.4.1
+  tag: v0.5.2
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -118,3 +118,5 @@ ezua:
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval

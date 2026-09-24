@@ -254,7 +254,9 @@ def test_dataset_not_cached_when_disabled(tmp_path):
 
 
 def test_dataset_lru_eviction(tmp_path):
-    eng, provider = _make_engine(tmp_path, cache_ttl=3600, dataset_cache_ttl=3600, dataset_cache_tables=2)
+    eng, provider = _make_engine(
+        tmp_path, cache_ttl=3600, dataset_cache_ttl=3600, dataset_cache_tables=2
+    )
     for name in ("a", "b", "c"):
         eng._open_dataset(TableInfo(name, "s"))
     assert len(eng._dataset_cache) == 2  # capped
@@ -318,7 +320,9 @@ def test_query_duckdb(tmp_path):
 
 def test_query_duckdb_join_across_tables(tmp_path):
     eng, _ = _make_engine(tmp_path)
-    arrow = eng.query_duckdb("SELECT w.kind, n.note_id FROM work_order w JOIN work_order_note n ON 1=1 LIMIT 3")
+    arrow = eng.query_duckdb(
+        "SELECT w.kind, n.note_id FROM work_order w JOIN work_order_note n ON 1=1 LIMIT 3"
+    )
     assert arrow.num_rows == 3
 
 
@@ -452,7 +456,8 @@ def test_catalog_hot_reload_on_mtime_change(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path)
     # path-keyed entry wins (lookup order: path, qualified, bare name)
     assert (
-        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"]
+        == "Work order headers, one row per maintenance order"
     )
     # Rewrite with a new description and bump the mtime.
     _write_catalog(tmp_path, {"tables": {"workorder/work_order": {"description": "updated"}}})
@@ -500,7 +505,8 @@ def test_catalog_store_upload_overrides_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
     eng, _ = _make_engine(tmp_path)
     assert (
-        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"]
+        == "Work order headers, one row per maintenance order"
     )
     # Upload as YAML text — the friendlier format must work end to end.
     res = eng.set_catalog_text("tables:\n  workorder/work_order:\n    description: uploaded\n")
@@ -525,7 +531,8 @@ def test_catalog_clear_falls_back_to_configured(tmp_path, monkeypatch):
     status = eng.catalog_status()
     assert status["active_source"] == "configured"
     assert (
-        eng.describe_table("workorder/work_order")["description"] == "Work order headers, one row per maintenance order"
+        eng.describe_table("workorder/work_order")["description"]
+        == "Work order headers, one row per maintenance order"
     )
     assert eng.clear_catalog() is False  # nothing left to remove
 
@@ -635,12 +642,18 @@ def test_catalog_update_table_creates_and_roundtrips(tmp_path, monkeypatch):
     monkeypatch.delenv("SQLHANDLER_CATALOG", raising=False)
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
     eng, _ = _make_engine(tmp_path)
-    eng.catalog_update_table("workorder/work_order", '{"description": "from json", "aliases": ["wo"]}')
+    eng.catalog_update_table(
+        "workorder/work_order", '{"description": "from json", "aliases": ["wo"]}'
+    )
     d = eng.catalog_table_entry("workorder/work_order")
     assert d["found"] is True and "from json" in d["text"]
     # a single-entry `tables:` wrapper is forgiven and unwrapped
-    eng.catalog_update_table("workorder/work_order", "tables:\n  whatever:\n    description: wrapped\n")
-    assert eng.catalog_table_entry("workorder/work_order")["text"].startswith("description: wrapped")
+    eng.catalog_update_table(
+        "workorder/work_order", "tables:\n  whatever:\n    description: wrapped\n"
+    )
+    assert eng.catalog_table_entry("workorder/work_order")["text"].startswith(
+        "description: wrapped"
+    )
 
 
 def test_catalog_update_table_rejects_bad_fragments(tmp_path, monkeypatch):

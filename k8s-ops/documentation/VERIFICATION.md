@@ -28,7 +28,7 @@ curl -sS "https://<endpoint>/mcp" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
-Expect 18 tool definitions (19 with exec enabled). `tools/list` carries `ttlMs=300000, cacheScope=public` — clients may cache it. Legacy 2025-era clients are served by the same process via the `initialize` handshake; nothing to configure.
+Expect 19 tool definitions (20 with exec enabled). `tools/list` carries `ttlMs=300000, cacheScope=public` — clients may cache it. Legacy 2025-era clients are served by the same process via the `initialize` handshake; nothing to configure.
 
 ## 3. One tool test
 

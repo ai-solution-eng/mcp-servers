@@ -307,7 +307,9 @@ def test_export_limit_clamped_to_env_cap(tmp_path, monkeypatch):
 def _engine(tmp_path):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
+    pq.write_table(
+        pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet"
+    )
     return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
 
 
@@ -316,9 +318,7 @@ def _engine(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-_YAML_CATALOG = (
-    b"tables:\n  orders:\n    description: Order headers (uploaded)\n    columns:\n      qty: Quantity in units\n"
-)
+_YAML_CATALOG = b"tables:\n  orders:\n    description: Order headers (uploaded)\n    columns:\n      qty: Quantity in units\n"
 
 
 def test_catalog_upload_yaml_then_json_roundtrip(engine, tmp_path):
@@ -401,21 +401,35 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
     assert client.post("/api/semantic-catalog", content=b"tables: {}").status_code == 401
 
     yaml_catalog = b"tables:\n  orders:\n    description: over HTTP\n"
-    assert client.post("/api/semantic-catalog", content=yaml_catalog, headers=auth).json()["tables"] == 1
-    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "over HTTP"
+    assert (
+        client.post("/api/semantic-catalog", content=yaml_catalog, headers=auth).json()["tables"]
+        == 1
+    )
+    assert (
+        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
+        == "over HTTP"
+    )
     assert client.get("/api/semantic-catalog", headers=auth).json()["active_source"] == "upload"
 
     assert (
         client.post(
-            "/api/semantic-catalog", content=b'{"tables": {"orders": {"description": "v2"}}}', headers=auth
+            "/api/semantic-catalog",
+            content=b'{"tables": {"orders": {"description": "v2"}}}',
+            headers=auth,
         ).status_code
         == 200
     )
-    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "v2"
+    assert (
+        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
+        == "v2"
+    )
 
     assert client.post("/api/semantic-catalog", content=b"{broken", headers=auth).status_code == 400
     assert client.delete("/api/semantic-catalog", headers=auth).json()["removed"] is True
-    assert "description" not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
+    assert (
+        "description"
+        not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +440,9 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
 def _catalog_engine(tmp_path, monkeypatch):
     """A file-backend engine with an isolated catalog store."""
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
-    pq.write_table(pa.table({"id": [1, 2, 3], "qty": [1.0, 2.0, 3.0]}), str(tmp_path / "orders.parquet"))
+    pq.write_table(
+        pa.table({"id": [1, 2, 3], "qty": [1.0, 2.0, 3.0]}), str(tmp_path / "orders.parquet")
+    )
     return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
 
 
@@ -531,12 +547,20 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
         headers=auth,
     )
     assert r.status_code == 200 and r.json()["ok"] is True
-    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "via http"
     assert (
-        client.post("/api/semantic-catalog/table", json={"table": "orders"}, headers=auth).status_code == 400
+        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
+        == "via http"
+    )
+    assert (
+        client.post(
+            "/api/semantic-catalog/table", json={"table": "orders"}, headers=auth
+        ).status_code
+        == 400
     )  # missing content
 
-    r = client.post("/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth)
+    r = client.post(
+        "/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth
+    )
     assert r.status_code == 200
     body = r.json()
     assert body["highlighted"] in (True, False)  # pygments is optional by design
@@ -545,4 +569,7 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
 
     r = client.delete("/api/semantic-catalog/table?table=orders", headers=auth)
     assert r.status_code == 200 and r.json()["removed"] is True
-    assert client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"] is False
+    assert (
+        client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"]
+        is False
+    )

@@ -28,7 +28,9 @@ def _reset_warning_flag():
 def _mock_reads(monkeypatch, files: dict[str, str]):
     """Point _read_cgroup_value at an in-memory 'filesystem'."""
     monkeypatch.setattr(
-        resources, "_read_cgroup_value", lambda *paths: next((files[p] for p in paths if p in files), None)
+        resources,
+        "_read_cgroup_value",
+        lambda *paths: next((files[p] for p in paths if p in files), None),
     )
 
 

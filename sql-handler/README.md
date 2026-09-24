@@ -2,14 +2,19 @@
 
 Fast, direct SQL access to columnar data, exposed as an **MCP server** — a drop-in **EzPresto / PrestoDB replacement**. It reads tabular data **directly** from the source with pyarrow and queries it with **DuckDB** over the exposed pyarrow datasets, pushing predicates / column projection into the scan.
 
-Four backends are supported (selected by `SQLHANDLER_BACKEND`):
+Seven backends are supported (selected by `SQLHANDLER_BACKEND`):
 
 - **onelake** (default) — Microsoft Fabric OneLake (Delta Lake over ABFS)
 - **s3 / minio** — S3-compatible object storage (Parquet files)
+- **adls** — Azure Data Lake Storage Gen2 (`ADLS_ACCOUNT` + `ADLS_CONTAINER`; Parquet **and** Delta, Entra client-secret or anonymous)
+- **gcs** — Google Cloud Storage (`GCS_BUCKET`; Parquet **and** Delta, service-account key file or anonymous)
 - **iceberg** — Apache Iceberg tables through a catalog (REST or SQL), Parquet data files
 - **nfs** — a mounted directory (NFS / PVC / hostPath): Delta Lake **and** Parquet
+- **sharing** — a Delta Sharing server (Databricks / OSCAR, open protocol, read-only)
 
 They all share the same SQL engine, caches, MCP tools, and backend-aware readiness probe; only the `DataProvider` behind them differs. See [Backend comparison](#backend-comparison-onelake-fabric-vs-s3-minio).
+
+Here is a [video link](https://storage.googleapis.com/ai-solution-engineering-videos/public/SqlHandler.mkv) showing the performance improvements and LLM centric features enabled through this app, and comparing it to EzPresto.
 
 ## Backend comparison: OneLake (Fabric) vs S3 (MinIO)
 
@@ -235,7 +240,7 @@ The federated engine shares the same caches as single-source mode, keyed per sou
 
 ## External databases (read-only attach)
 
-The engine is a *lake* engine — but some questions need the **system of record** behind the lake. Configure one or more external database servers — Postgres, MySQL/MariaDB, SQLite files, or SQL Server — and their tables become queryable (and join-able with lake tables in the SAME query) as `<db-alias>.<schema>.<table>`:
+The engine is a *lake* engine — but some questions need the **system of record** behind the lake. Configure one or more external database servers — Postgres, MySQL/MariaDB, SQLite files, SQL Server, MongoDB, or BigQuery — and their tables become queryable (and join-able with lake tables in the SAME query) as `<db-alias>.<schema>.<table>`:
 
 ```bash
 export SQLHANDLER_ATTACH='[
@@ -243,10 +248,26 @@ export SQLHANDLER_ATTACH='[
    "database":"opsdb", "user":"ro_user", "password_env":"OPS_PG_PASSWORD",
    "params": {"sslmode": "verify-full", "sslrootcert": "/etc/sqlhandler/certs/ca.crt"}},
   {"name":"crm", "type":"sqlserver", "host":"sql.crm.internal", "port":1433,
-   "database":"crmdb", "user":"ro_user", "password_env":"CRM_SQL_PASSWORD"}
+   "database":"crmdb", "user":"ro_user", "password_env":"CRM_SQL_PASSWORD"},
+  {"name":"mdb", "type":"mongodb", "host":"mongo.internal", "port":27017,
+   "database":"opsdb", "user":"ro_user", "password_env":"MONGO_PASSWORD",
+   "params": {"srv": "false", "tls": "true"}},
+  {"name":"bq", "type":"bigquery", "database":"my-gcp-project.analytics",
+   "password_env":"BQ_ACCESS_TOKEN"}
 ]'
 # or: export SQLHANDLER_ATTACH_FILE=/etc/sqlhandler/attach.json
 ```
+
+(MongoDB: host + a REQUIRED `database` scope; the community `mongo` extension
+is opt-in at build time — see the Dockerfile note. BigQuery: `database` is the
+GCP `project` or `project.dataset`, optional `billing_project` for public /
+cross-project data; auth is Google ADC in-container by default, and
+`password_env` carries a temporary OAuth2 access token that SQLhandler applies
+as a DuckDB Secret scoped to the attached project — the token never appears in
+the ATTACH statement or any tool output. The community `bigquery` extension is
+opt-in at build time too. Configuring either type without the baked extension
+fails with a clear "extension not baked into this image" error naming the
+`INSTALL <ext> FROM community` line to add.)
 
 ```sql
 SELECT o.status, count(*) AS n
@@ -258,10 +279,10 @@ GROUP BY 1
 - `list_tables` gains an "Attached databases" section with the qualified table names; `describe_table` / `profile_table` accept `<db-alias>.<schema>.<table>` directly (profile runs `SUMMARIZE` on the server, bounded by `SQLHANDLER_PROFILE_MAX_ROWS`).
 - **Read-only is enforced by DuckDB itself** — every `ATTACH` carries `READ_ONLY`, so writes against the attached catalog fail at the engine level, not by convention.
 - **Secrets hygiene**: the config carries env-var *names* (`password_env`); a literal `password` key is rejected at startup, and resolved passwords are scrubbed from every error message. (Trust-auth over a unix socket: `"password_env": ""`.)
-- **The filesystem lockdown stays on**: attaching a database does not re-open DuckDB file reads — `read_parquet('/etc/passwd')` still fails on attached-DB connections. The scanner extensions (`postgres_scanner`, `mysql_scanner`, `sqlite_scanner`, plus the community `mssql` for SQL Server) are baked into the image at build time (two egress endpoints: `extensions.duckdb.org` + `community-extensions.duckdb.org`) and loaded explicitly; runtime extension downloads stay disabled.
+- **The filesystem lockdown stays on**: attaching a database does not re-open DuckDB file reads — `read_parquet('/etc/passwd')` still fails on attached-DB connections. The scanner extensions (`postgres_scanner`, `mysql_scanner`, `sqlite_scanner`, plus the community `mssql` for SQL Server) are baked into the image at build time (two egress endpoints: `extensions.duckdb.org` + `community-extensions.duckdb.org`) and loaded explicitly; runtime extension downloads stay disabled. The community `mongo` and `bigquery` extensions are **opt-in at build time** — they are not in the default bake list, so a deployment that configures `mongodb`/`bigquery` entries without extending the bake gets a clear "Extension … not found" error; the Dockerfile carries a commented one-line bake example showing exactly how to add them.
 - A database that is down does not fail the lake: `list_tables` reports it as unavailable, and queries touching only the lake never attach anything.
 - The catalog alias must be DuckDB-identifier-safe and unique; malformed config fails loudly at startup by design.
-- **`params` — driver options per entry (the TLS story)**: many production endpoints REQUIRE TLS, and a `params` object per entry carries driver options — `{key: value}` pairs merged over each type's built-in DSN keys (an existing key is overridden in place, new keys are appended; no duplicate key is ever emitted). Keys are lowercased `[a-z][a-z0-9_]*`; values are ≤256 chars from `[A-Za-z0-9_./:@=+ -]` — quotes, backslashes, semicolons and braces are refused, so no DSN/conn-string injection is possible. One per-type exception: the mysql/mariadb scanner parses its DSN as whitespace-split bare values (no quote handling), so for those two types the entry fields (`host`/`database`/`user`) and every `params` value must not contain whitespace — a resolved password containing whitespace is rejected at attach time; postgres (libpq-quoted) and sqlserver (semicolon-delimited) accept spaces. Keys that would carry secrets or duplicate the entry's own fields (`password`, `user`, `host`, `port`, `database`, `server`, …) are rejected loudly, and the literal-secret scan covers `params` too.
+- **`params` — driver options per entry (the TLS story)**: many production endpoints REQUIRE TLS, and a `params` object per entry carries driver options — `{key: value}` pairs merged over each type's built-in DSN keys (an existing key is overridden in place, new keys are appended; no duplicate key is ever emitted). Keys are lowercased `[a-z][a-z0-9_]*`; values are ≤256 chars from `[A-Za-z0-9_./:@=+ -]` — quotes, backslashes, semicolons and braces are refused, so no DSN/conn-string injection is possible. One per-type exception: the mysql/mariadb/mongodb DSNs are parsed as whitespace-split bare values (no quote handling), so for those types the entry fields (`host`/`database`/`user`) and every `params` value must not contain whitespace — a resolved password containing whitespace is rejected at attach time; postgres (libpq-quoted), sqlserver (semicolon-delimited) and bigquery (no DSN values from params at all) accept spaces. Keys that would carry secrets or duplicate the entry's own fields (`password`, `user`, `host`, `port`, `database`, `server`, …) are rejected loudly, and the literal-secret scan covers `params` too.
 - **Connection lifecycle**: every query that references an attached catalog runs on a fresh connection — `LOAD` extension → `ATTACH … READ_ONLY` → filesystem lockdown, per query; there is no pooling, so busy production servers see per-query connection churn (postgres DSNs carry `connect_timeout=10`).
 - **Managed IAM auth is not expressible**: `password_env` names a static environment variable, so rotating IAM database auth (GCP Cloud SQL IAM auth, AWS IAM DB auth) cannot be configured — put the Cloud SQL Auth Proxy sidecar (or equivalent) in front of the database and connect with `password_env: ""` (trust-auth) to the proxy where applicable.
 
@@ -274,10 +295,42 @@ GROUP BY 1
 | `mariadb` | `mysql_scanner` → `TYPE mysql` | 3306 | Alias served by the mysql scanner (same wire protocol) — the ATTACH says `mysql` while the config keeps the operator's `mariadb` spelling. |
 | `sqlite` | `sqlite_scanner` → `TYPE sqlite` | — | `database` is the sqlite FILE PATH; no host/port/user, `password_env` may be omitted, `params` are not accepted. The file is read at query time through the extension's own bundled sqlite3 library — outside DuckDB's filesystem lockdown — but the path is operator-configured in `SQLHANDLER_ATTACH` (never model-chosen), the same trust model as the nfs backend. READ_ONLY still enforced. |
 | `sqlserver` | `mssql` (community) → `TYPE mssql` | 1433 | Native TDS 7.4 — needs no unixODBC and no Microsoft ODBC driver in the image. Requires an explicit `user`/`user_env` (no `sa` default). TLS is ON by default: `Encrypt=yes;TrustServerCertificate=yes` are lenient defaults `params` can override — in the mssql extension the two keys are synonyms, so a conflicting pair fails the ATTACH loudly; do not mix ODBC-style tightenings, see the [mssql extension docs](https://duckdb.org/community_extensions/extensions/mssql) for TLS options. |
+| `mongodb` | `mongo` (community) → `TYPE mongo` | 27017 | Full ATTACH on DuckDB 1.5.5. `database` is REQUIRED — it scopes the attach to one MongoDB database (the extension's `dbname` key; omitting it would expose every database on the server as a schema). `user` optional (no default — omit for unauthenticated dev servers). Atlas/SRV and TLS ride `params`: `srv: "true"`, `tls: "true"`, `tls_ca_file: "/certs/ca.pem"`. **Extension opt-in at build time** (see the Dockerfile note). |
+| `bigquery` | `bigquery` (community) → `TYPE bigquery` | — | Full ATTACH on DuckDB 1.5.5. `database` IS the scope: a GCP project ID or `project.dataset` (datasets become schemas); there is no host/port/user and `params` are not accepted (the `bq_*` knobs are DuckDB settings, not ATTACH keys). Optional `billing_project` for public/cross-project data (the extension's billing/quota-project ATTACH option). Auth is NOT a DSN password: Google Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, workload identity, gcloud ADC) by default; `password_env` carries a **temporary OAuth2 access token** applied as a DuckDB Secret scoped to the attached project (`CREATE OR REPLACE SECRET … (TYPE bigquery, SCOPE 'bq://<project>', ACCESS_TOKEN '…')` — the ATTACH DSN never carries the token). **Extension opt-in at build time** (see the Dockerfile note). |
 
-`"postgresql"` is not a valid type — the config key is spelled `postgres`.
+`"postgresql"` is not a valid type — the config key is spelled `postgres`. Two more names are deliberately NOT types: `clickhouse` (DuckDB 1.5.5 has no ClickHouse extension with ATTACH support — the community repo for 1.5.5 carries only `chsql_native`, scan functions without a catalog) and `motherduck` (a bare `ATTACH 'md:'` auto-installs a signed extension from MotherDuck's own repository and, without a token, hangs the pod in an interactive OAuth login — outside the bake-and-LOAD trust boundary every type here shares). MotherDuck remains reachable as a **ducklake** catalog (`type: ducklake`, `catalog: "md:<database>"`, token via `password_env`).
 
 The postgres adapter also covers postgres wire-compatible servers — Amazon Redshift, AlloyDB, YugabyteDB, CockroachDB, TimescaleDB — with TLS where required via `params` (Redshift: `sslmode: require`, port 5439).
+
+### DuckLake (`type: ducklake`)
+
+**DuckLake** is DuckDB's own lakehouse format: instead of a folder of Parquet files plus a sidecar log, the metadata (schemas, tables, snapshots, stats) lives in a **SQL catalog database** — SQLite, Postgres, or MotherDuck — whose entries point at the Parquet data files on disk or object storage. Attach one as an external catalog with `type: ducklake`:
+
+```bash
+export SQLHANDLER_ATTACH='[
+  {"name":"lakehouse", "type":"ducklake",
+   "catalog":"postgres:dbname=ducklake host=pg.internal user=ro password=…"},
+  {"name":"dev_dl", "type":"ducklake",
+   "catalog":"sqlite:/data/ducklake/catalog.db", "data_path":"/data/ducklake/files"},
+  {"name":"md_dl", "type":"ducklake", "catalog":"md:mydb",
+   "password_env":"MDL_TOKEN"}
+]'
+```
+
+Helm (`databases:` in values — the entry rides the same render path and the `<fullname>-db-credentials` Secret as every other attach type):
+
+```yaml
+databases:
+  - name: lakehouse
+    type: ducklake
+    catalog: "postgres:dbname=ducklake host=pg.internal user=ro"
+    password: ""            # -> db-credentials Secret (catalogs that authenticate)
+    data_path: /data/ducklake/files   # optional; only used when the catalog is CREATED
+```
+
+- The `catalog` value is the connect string **without** the `ducklake:` prefix — `sqlite:<path>` (single-node/dev), `postgres:<libpq key=value …>` (production; credentials may be embedded or given via `password_env`), or `md:<database>` (MotherDuck; token via `password_env`). It is operator-authored, never model-chosen — the same trust model as the sqlite file path and the server `host`.
+- The ATTACH carries **no `TYPE` keyword**: the `ducklake:` URL scheme is what makes DuckDB dispatch to the ducklake extension (an explicit `TYPE ducklake` makes DuckDB 1.5.5 refuse the existing catalog — verified empirically). Optional `DATA_PATH` applies only when the attach **creates** a new DuckLake; an existing catalog ignores it.
+- **Read-only is enforced by DuckDB itself** (`READ_ONLY` attach: INSERT/UPDATE/DELETE/CREATE/ALTER all refused) **and** by the unconditional attached-catalog SQL guard — independent of `SQLHANDLER_DUCKDB_FILE_ACCESS`. DuckDB 1.5.5 behavior inherited here: ducklake reads its **data** (inlined catalog rows and local Parquet files under `data_path`) through DuckDB's own filesystem layer, so under the default fs lockdown only metadata answers (count(*)/min/max from catalog stats) are served and row reads fail closed. Set `SQLHANDLER_DUCKDB_FILE_ACCESS=1` (the existing documented opt-out) when operators want row reads — writes stay refused with the flag on or off.
 
 ## Iceberg (catalog) backend
 
@@ -297,8 +350,39 @@ sqlhandler --transport streamable-http --port 9097
 
 Two catalog types are supported:
 
-- **`rest`** (default) — an Iceberg REST catalog (Dremio, Nessie, Amazon S3 Tables). `ICEBERG_CATALOG_URI` is the REST endpoint.
+- **`rest`** (default) — an Iceberg REST catalog (Dremio, Amazon S3 Tables, Databricks Unity Catalog). `ICEBERG_CATALOG_URI` is the REST endpoint.
 - **`sql`** — a SQL catalog (SQLite/Postgres) for local dev/tests: `ICEBERG_CATALOG_TYPE=sql` and `ICEBERG_CATALOG_URI=sqlite:///path/catalog.db`. Writers and readers must use the same `ICEBERG_CATALOG_NAME`.
+
+Three more catalog types (verified against the installed pyiceberg's catalog registry):
+
+- **`glue`** — AWS Glue Data Catalog: `ICEBERG_CATALOG_TYPE=glue`, no URI. Region and credentials resolve through boto3's standard chain — the `AWS_REGION`/`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` env vars, an instance role, or IRSA on EKS. **AWS credentials are never config values** (there are deliberately no SQLhandler AWS knobs); needs the `pyiceberg[glue]` extras (boto3/botocore) — when they are missing the server raises an actionable `LakehouseError` naming the pip target.
+- **`hive`** — Hive metastore over thrift: `ICEBERG_CATALOG_TYPE=hive` and `ICEBERG_CATALOG_URI=thrift://hms-host:9083`. Needs the `pyiceberg[hive]` extras (thrift).
+- **`nessie`** — Project Nessie: `ICEBERG_CATALOG_TYPE=nessie` with `ICEBERG_CATALOG_URI=http://nessie:19120/api/iceberg` (the ref rides the URI — pyiceberg has no native `nessie` type, and its REST `prefix` property does not work for pyiceberg, per projectnessie.org). `ICEBERG_NESSIE_REF` pins a branch/tag (empty = the catalog default); a URI that already carries `/iceberg/<ref>` wins over the env ref.
+
+**Databricks Unity Catalog preset** (UC exposes a standard Iceberg REST API — pure config, no extra code):
+
+```bash
+export SQLHANDLER_BACKEND=iceberg
+export ICEBERG_CATALOG_TYPE=rest
+export ICEBERG_CATALOG_URI=https://<workspace-host>/api/2.1/unity-catalog/iceberg
+export ICEBERG_WAREHOUSE=<uc-catalog-name>          # sent as the REST `warehouse` parameter
+export ICEBERG_CATALOG_TOKEN=<PAT-or-OAuth-token>   # keep in .env / a Secret, never commit
+```
+
+```yaml
+# Helm (values-first) — the chart renders exactly the env above:
+backend: iceberg
+iceberg:
+  catalogType: rest
+  catalogUri: "https://<workspace-host>/api/2.1/unity-catalog/iceberg"
+  warehouse: "<uc-catalog-name>"
+  credentialsSecret:
+    create: false
+    values:
+      token: "<PAT-or-OAuth-token>"
+```
+
+UC's endpoint covers the standard Iceberg REST namespace/table endpoints the server uses (`list`/`load`); the token flows through the existing `ICEBERG_CATALOG_TOKEN` (pyiceberg sends it as the `Authorization: Bearer` header — no header tweaking needed).
 
 Tables are addressed as `<namespace>/<name>` and read as Parquet; `run_sql` / `scan_table` push predicates/projections into the Parquet scan as with the other backends. Install the optional dependency first:
 
@@ -398,12 +482,14 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `S3_ANONYMOUS` | `true` to read a public bucket without keys |
 | `S3_USE_SSL` | Force `https` when `S3_ENDPOINT_URL` has no scheme |
 | `S3_PATH_STYLE` | Path-style addressing (default `true`; what MinIO uses) |
-| `ICEBERG_CATALOG_TYPE` | `rest` (default) or `sql` |
-| `ICEBERG_CATALOG_URI` | REST endpoint or `sqlite:///path` (sql) |
-| `ICEBERG_CATALOG_TOKEN` | Optional REST bearer token |
+| `ICEBERG_CATALOG_TYPE` | `rest` (default), `sql`, `glue`, `hive`, or `nessie` (unknown values fall back to `rest`) |
+| `ICEBERG_CATALOG_URI` | REST/Nessie endpoint, `thrift://host:9083` (hive), or `sqlite:///path` (sql); unused for glue |
+| `ICEBERG_CATALOG_TOKEN` | Optional REST bearer token (rest / nessie / Databricks Unity Catalog) |
 | `ICEBERG_CATALOG_NAME` | Catalog name (SQL catalogs partition by it; default `sqlhandler`) |
 | `ICEBERG_WAREHOUSE` | Optional table location root |
 | `ICEBERG_NAMESPACE` | Optional namespace filter for `list_tables` |
+| `ICEBERG_NESSIE_REF` | Optional Nessie branch/tag pinned for reads (`nessie` type; empty = catalog default) |
+| `AWS_*` (glue only) | Read **directly by boto3** — `AWS_REGION`/`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, `AWS_PROFILE`, or instance role/IRSA. No SQLhandler AWS env vars exist, by design |
 | `NFS_ROOT` | Mounted directory with tables (nfs backend; required) |
 | `SQLHANDLER_TRANSPORT` | Default MCP transport for the CLI (`stdio` default; `streamable-http`) |
 | `SQLHANDLER_ENV_FILE` | Path to a `.env` file (default: auto-discovered `config/.env`) |
@@ -429,6 +515,13 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_VIRTUAL_CACHE_MAX_BYTES` | Skip caching virtual results larger than this — they are served live instead (default 2GiB; `0` = unlimited) |
 | `SQLHANDLER_RESULT_CACHE_TTL` | Seconds an identical query's result is served from memory (keyed by sql/params/limits + base-snapshot versions; repeated agent queries become ~0 ms). The key's SQL is whitespace-normalized outside quoted literals, so formatting-only re-runs hit; case is NOT folded and comment-bearing/dollar-quoted SQL keeps byte-exact keys. `0` disables (default 3600) |
 | `SQLHANDLER_RESULT_CACHE_MAX_BYTES` | In-memory cap for cached query results, LRU-evicted (default 256MiB) |
+| `SQLHANDLER_L2_DIR` | Directory for the **shared L2 result cache** — results published as zstd parquet + `.json` sidecar on a path every replica can read (k8s: an RWX PVC), so a warm query on one replica serves the others. Unset (default) = L2 off, byte-identical to the memory-only behavior. Entries expire via `SQLHANDLER_L2_TTL` (lazy delete on lookup + a daemon sweep) and are never served past a base-snapshot change (the key carries the versions) |
+| `SQLHANDLER_L2_ENABLED` | `0` disables the shared L2 layer entirely (default on — but inert until `SQLHANDLER_L2_DIR` is set; no default dir on purpose, pod-local `/tmp` would look like sharing while sharing nothing) |
+| `SQLHANDLER_L2_MIN_BYTES` / `SQLHANDLER_L2_MAX_BYTES` | Publish only results in this byte band: smaller results round-trip the shared volume slower than recomputing (default floor 256KiB); larger ones must not fill it (default ceiling 2GiB, mirroring the virtual cache; `0` = unlimited ceiling) |
+| `SQLHANDLER_L2_TTL` | Seconds a published L2 result stays valid (default 3600; `0` = no expiry — keys still invalidate on snapshot change) |
+| `SQLHANDLER_TRUST_BROWSER_HEADERS` | Trust gate for the identity spine's **browser rung**: when truthy, oauth2-proxy identity headers (`X-Auth-Request-User`, `X-Forwarded-Groups`) resolve the request's Caller on keyless requests (the UI/API path). Set it ONLY when the workload AuthorizationPolicy pins ingress to the gateway — the headers are forgeable on any pod reachable without that pin (default off) |
+| `SQLHANDLER_POLICY_FILE` | Path to the **policy-as-code** document (JSON or YAML): `groups → {tables glob → {row_filter, column_masks{col: redact | hash | const}}, hidden_tables}` + `subjects`/`key_fps` → groups + `default_group`. Hot-reloaded on mtime; a broken edit keeps the previous policy enforcing (fail-closed). Enforcement per caller: masking views in DuckDB, hidden-table invisibility, per-policy cache keys — see FEATURES.md "Policy-as-code" |
+| `SQLHANDLER_POLICY_ENABLED` | `1` turns policy enforcement ON (default `0` — with the flag off, everything is byte-identical to the pre-policy behavior: no masking views, no policy hash in any cache key, shared query memory/saved queries). When ON, identities with no binding fall to the policy file's `default_group` (the restricted default for legacy keys) |
 | `SQLHANDLER_VIRTUAL_CACHE_SORT` | `0` disables clustering (auto-sorting) of materialized virtual results by their lowest-cardinality columns (default on) |
 | `SQLHANDLER_BLOCK_CACHE` | `1` enables the disk block cache for object-store reads (parquet footers/column chunks cached pod-local; opt-in — cold big sequential scans pay a small Python-layer cost, repeated/filtered reads win big) (default off). Backends: S3/Iceberg filesystems and the OneLake/Delta **data files** (delta-log IO stays inside delta-rs; cached bytes are scoped by Delta snapshot version, so a new ETL commit or a time-travel read never serves another snapshot's blocks) |
 | `SQLHANDLER_BLOCK_CACHE_DIR` / `_BLOCK_SIZE` / `_MAX_BYTES` / `_INCLUDE_LOCAL` | Cache location (default `<tmp>/sqlhandler-block-cache`), block size (default 8MiB), total-size cap (reset on overflow, default 4GiB), and `1` to also cache `LocalFileSystem` paths (NFS mounts — real-local disk is already covered by the page cache) |
@@ -437,13 +530,13 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
 | `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
 | `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (**default 600** — decision D5; a runaway query used to hold a concurrency slot forever; `0` = no timeout) |
-| `SQLHANDLER_MAX_CONCURRENT_QUERIES` | Max simultaneous DuckDB queries (default 8; 0 = unlimited); excess queue |
-| `SQLHANDLER_QUEUE_TIMEOUT` | Seconds a query may wait for a concurrency slot (default 30) |
+| `SQLHANDLER_MAX_CONCURRENT_QUERIES` | Max simultaneous DuckDB queries (default 8; 0 = unlimited); excess queue — chart value: `query.maxConcurrentQueries` |
+| `SQLHANDLER_QUEUE_TIMEOUT` | Seconds a query may wait for a concurrency slot (default 30) — chart value: `query.queueTimeoutSeconds` |
 | `SQLHANDLER_ASYNC_JOB_TTL` | Seconds a finished async-query job stays fetchable (default 900; shared by the web `/api/query/async` registry and the MCP jobs registry) |
 | `SQLHANDLER_MAX_JOBS` | Max jobs tracked by the MCP/`/api/jobs` async-query registry (default **8**; garbage/non-positive values fall back to the default — the registry is bounded by design). Beyond the cap a submit is refused with a clear message until jobs are cancelled/fetched; the registry is in-memory and a restart clears it |
 | `SQLHANDLER_SAVED_QUERIES_PATH` | JSON file for the saved-parameterized-queries store (default: next to the disk-warm cache / platform temp dir, like the catalog store). Each entry maps a name to a SQL template + default bind params; writes are atomic (temp+rename, chmod 600) and the store degrades to empty on a corrupt file rather than erroring |
 | `SQLHANDLER_EXPORT_MAX_ROWS` | Row cap for CSV/Parquet exports (default 100000; 0 = hard 1M ceiling) |
-| `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off) |
+| `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off). Chart value: `query.auditLog` (the chart also mounts a pod-local writable dir for the path; durable audit = point it at your own PVC-backed mount) |
 | `SQLHANDLER_API_TOKEN` | Require this bearer token on `/api/*` (unset = no token check) |
 | `SQLHANDLER_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | OPTIONAL `/mcp` API-key gate: comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). Unset → `/mcp` runs open exactly as before (loud startup warning; gateway remains the outer layer). Rotation: append the new key, move clients, drop the old — env re-read per request, no restart. Chart wiring: `security.apiKey.existingSecret` (empty default = not wired). | unset → `/mcp` open |
 | `S3_FORMAT` | `auto` (detect Delta by `_delta_log`), `parquet`, or `delta` |
@@ -534,9 +627,9 @@ cache:
 > callers not on that list. See [Security notes](#security-notes) for the
 > full model.
 
-> **Toromont:** a ready-made values file with the real service principal +
-> OneLake coordinates is provided (`helm/deploy-toromont-values.yaml`, local
-> only — it is gitignored). Paste its values into the PCAI *Helm Values*
+> **Toromont:** the site's real service principal + OneLake coordinates live
+> in a per-site values file under `helm/local/` (gitignored + hardlink-excluded
+> — see `helm/local/README.md`). Paste its values into the PCAI *Helm Values*
 > editor — **do NOT commit the file itself**. Note it must set
 > `backend: onelake` explicitly (the chart default is `s3`, and the fabric
 > credential wiring is gated on the backend). With it, the chart creates the
@@ -636,7 +729,38 @@ iceberg:
       secretKey: "<s3-secret-key>"
 ```
 
-The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars, injecting the REST token and S3 storage keys from the `iceberg-credentials` Secret. `ICEBERG_CATALOG_TYPE=sql` (a local SQL catalog) needs no Secret at all when the warehouse is local. The OneLake/Fabric Secret wiring is only rendered when `backend: onelake`, so an S3-only deployment needs no Fabric credential at all. The
+The chart wires `SQLHANDLER_BACKEND=iceberg` and the `ICEBERG_*` env vars, injecting the REST token and S3 storage keys from the `iceberg-credentials` Secret. `ICEBERG_CATALOG_TYPE=sql` (a local SQL catalog) needs no Secret at all when the warehouse is local. The other catalog types are values-first too:
+
+```yaml
+# Hive metastore (iceberg.catalogType: hive → ICEBERG_CATALOG_URI is the thrift URI)
+iceberg:
+  catalogType: hive
+  catalogUri: "thrift://hms.hive.svc:9083"
+
+# AWS Glue (iceberg.catalogType: glue → no URI; AWS_REGION/AWS_ACCESS_KEY_ID/...
+# come from the pod environment / IRSA — the chart never renders AWS credentials)
+iceberg:
+  catalogType: glue
+  warehouse: "s3://my-warehouse"
+
+# Nessie (iceberg.catalogType: nessie → REST URI; nessieRef pins the branch)
+iceberg:
+  catalogType: nessie
+  catalogUri: "http://nessie.nessie.svc:19120/api/iceberg"
+  nessieRef: "main"          # renders ICEBERG_NESSIE_REF; empty = catalog default
+
+# Databricks Unity Catalog (standard Iceberg REST; token via the credentials Secret)
+iceberg:
+  catalogType: rest
+  catalogUri: "https://<workspace-host>/api/2.1/unity-catalog/iceberg"
+  warehouse: "<uc-catalog-name>"
+  credentialsSecret:
+    create: false
+    values:
+      token: "<PAT-or-OAuth-token>"
+```
+
+The OneLake/Fabric Secret wiring is only rendered when `backend: onelake`, so an S3-only deployment needs no Fabric credential at all. The
 chart renders, when `ezua.enabled=true` (default):
 
 - `Deployment` + `Service` (port `9097`, MCP at `/mcp`)
@@ -716,11 +840,11 @@ In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is 
 - **Credentials**: create Kubernetes Secrets out-of-band (never in values files); see `helm/local/README.md` for create/read/rotate commands. `SQLHANDLER_SOURCES` with embedded keys is for development only.
 - **In-cluster callers** need nothing while the NetworkPolicy is off (default). Once it is enabled, direct calls from another namespace require that namespace in `security.networkPolicy.allowedNamespaces` — no client-side change.
 
-## Observability & ops (0.9.0)
+## Observability & ops
 
 ### Prometheus metrics
 
-`GET /metrics` renders the Prometheus text exposition (no extra dependency): query counters by outcome (`ok`/`error`/`cancelled`), a query-duration histogram, rows returned, cache hit/miss counters per cache type, and gauges for the table count, process RSS and the container memory limit. Set `SQLHANDLER_METRICS_AUTH=1` to require a token on `/metrics` + `/ready` (see the env table; default off = open, today's behavior).
+`GET /metrics` renders the Prometheus text exposition (no extra dependency): query counters by outcome (`ok`/`error`/`cancelled`), a query-duration histogram, rows returned, cache hit/miss counters per cache type, and gauges for the table count, process RSS and the container memory limit. Set `SQLHANDLER_METRICS_AUTH=1` to require a token on `/metrics` (see the env table; default off = open, today's behavior — `/ready` is never gated, kubelet probes cannot authenticate).
 
 ### Audit log
 
@@ -728,7 +852,7 @@ Set `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` and every query outcome is appended
 
 ### API token (non-gateway deployments)
 
-When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it (`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time compared) — for deployments where the JSON API is not already behind the PCAI oauth2-proxy gateway. `/mcp`, `/ui` and `/health` are unaffected (and `/metrics` + `/ready` too, unless `SQLHANDLER_METRICS_AUTH=1`); note the in-browser UI does not send the token, so leave it unset when the UI must work without
+When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it (`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time compared) — for deployments where the JSON API is not already behind the PCAI oauth2-proxy gateway. `/mcp`, `/ui`, `/health` and `/ready` are unaffected (`/metrics` too, unless `SQLHANDLER_METRICS_AUTH=1`); note the in-browser UI does not send the token, so leave it unset when the UI must work without
 gateway auth.
 
 ## MCP tools
@@ -738,14 +862,16 @@ gateway auth.
 - `describe_table`    — columns/types/URI for a table (+ catalog docs)
 - `profile_table`     — column statistics: min/max, distinct≈, null %, avg/std, q25/q50/q75, row count (cached like describe)
 - `column_stats`      — statistics for ONE column: distinct count, null count/%, min/max, q25/q50/q75 and the top-5 values with counts, over the same bounded sample profile_table uses (`SQLHANDLER_PROFILE_MAX_ROWS`)
-- `run_sql`           — run SELECT-only SQL via DuckDB (aggregations/joins); markdown (default), JSON or CSV output; optional bind `params` and time travel. DDL/DML is refused by default (`SQLHANDLER_MCP_READONLY`, decision D2)
+- `run_sql`           — run SELECT-only SQL via DuckDB (aggregations/joins); markdown (default), JSON, CSV or Arrow IPC output; optional bind `params` and time travel. DDL/DML is refused by default (`SQLHANDLER_MCP_READONLY`, decision D2)
 - `scan_table`        — pull columns/rows via pyarrow with a row limit; same output formats and time travel
 - `query_submit` / `query_status` / `query_result` / `query_cancel` — **async query jobs**: start a long query and get a `job_id` immediately, poll its status, fetch the result once (then it is freed from memory), cancel mid-flight. Same engine path as `run_sql`: the read-only guard applies at **submit** time, the `SQLHANDLER_QUERY_TIMEOUT` (600s default) is watchdog-enforced even when nobody polls, `SQLHANDLER_MAX_ROWS` bounds results. The registry is in-memory (a restart clears it — resubmit) and capped at `SQLHANDLER_MAX_JOBS` (default 8; beyond that the submit is refused with a clear message). REST twins under `/api/jobs/*`
 - `query_save` / `query_list` / `query_delete` / `query_saved` — **saved parameterized queries**: name → SQL + default bind params (`$name` / `?` placeholders — never string-interpolated), stored in a JSON file (`SQLHANDLER_SAVED_QUERIES_PATH`). Save-time validation parses the SQL and applies the read-only guard (re-applied at run time, so a hand-edited store cannot smuggle DDL). **Writes are auth-gated**: when `SQLHANDLER_API_TOKEN` or `MCP_API_KEYS`/`SQLHANDLER_API_KEYS` is configured, an unauthenticated `query_save`/`query_delete` is refused; with no credential configured (single-user-local mode) writes are allowed and the posture is logged at startup. REST twins under `/api/saved-queries/*`
+- `explain_query`    — estimate one read-only query's cost WITHOUT running it: per-table metadata row counts and bytes-to-scan (each labeled exact / approx / none), the warm/cold band (is this exact query already in the L1/L2 result cache), and with `include_plan` a DuckDB EXPLAIN (FORMAT JSON) summary — planning only, the data path never executes
+- `ask_data`         — plan a natural-language question without executing: search tables (top 5), describe the best hit (20 columns + catalog docs), profile up to 6 of them, then draft one candidate SELECT + a suggested follow-up; the output ends in a "run this with run_sql" footer — execution stays a separate, explicit `run_sql` call
 
 In federated multi-source mode, tables are source-qualified: `list_tables` returns all sources, and `describe_table` / `run_sql` take names like `sales_orders` or `inventory_raw_customers` (bare names only when unique).
 
-## Agent ergonomics (0.9.0)
+## Agent ergonomics
 
 Features that make LLM agents effective against the lake on the first try:
 
@@ -806,6 +932,7 @@ The web UI's **Semantic catalog** panel uploads a `.json`/`.yaml` file (or accep
 | `GET /api/semantic-catalog/table?table=…&format=yaml\|json` | one table's entry (or `found: false`) |
 | `POST /api/semantic-catalog/table` | `{"table", "content"}` — upsert ONE table's entry (merged + stored) |
 | `DELETE /api/semantic-catalog/table?table=…` | drop one table's entry |
+| `POST /api/semantic-catalog/import-dbt` (+ `/apply`) | import dbt's `target/manifest.json` → catalog docs (preview first; Apply merges; see ["Importing from dbt"](docs/semantic-catalog.md#importing-from-dbt)) |
 | `POST /api/highlight` | pygments-guessed inline-styled HTML for the editors (`pygmentize -g` semantics) |
 
 #### Editing in the browser (global + per-dataset)
@@ -842,7 +969,7 @@ Prompts: `explore-data` (list → catalog → profile → SQL workflow) and `ana
 - **Did-you-mean errors** — a bad table name in SQL comes back with the nearest real table names attached ("Did you mean one of: workorder_work_order, …"), so the agent self-corrects in one round-trip.
 - **Usage-driven prewarm** — when `SQLHANDLER_PREWARM_TABLES` is unset, the busiest tables of the previous run (usage counts persisted with the disk-warm cache) are prewarmed on restart. The server teaches itself what to warm.
 
-## Query engine capabilities (0.9.0)
+## Query engine capabilities
 
 ### Parameterized queries
 
@@ -875,7 +1002,7 @@ Finished jobs are kept for `SQLHANDLER_ASYNC_JOB_TTL` seconds (default 900), up 
 
 ### Concurrency cap
 
-`SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8; 0 = unlimited) bounds the simultaneous DuckDB queries per pod; excess queries queue up to `SQLHANDLER_QUEUE_TIMEOUT` seconds (default 30) and then fail with a clear error instead of piling up on the container.
+`SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8; 0 = unlimited) bounds the simultaneous DuckDB queries per pod; excess queries queue up to `SQLHANDLER_QUEUE_TIMEOUT` seconds (default 30) and then fail with a clear error instead of piling up on the container. On PCAI deployments both are chart values — `query.maxConcurrentQueries` and `query.queueTimeoutSeconds` — set them in the Helm Values editor; the chart wires the env vars for you.
 
 ## Other data sources / roadmap
 

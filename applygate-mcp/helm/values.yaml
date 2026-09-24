@@ -4,7 +4,7 @@ deployment:
   replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.2.2
+  tag: v0.3.0
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 # API keys for the /mcp endpoint (fleet pattern: K8S-MCP). The chart NEVER
@@ -19,6 +19,30 @@ imagePullSecrets: []
 apiKey:
   existingSecret: applygate-mcp-apikey
   existingSecretKey: api-keys
+clients:
+  # Per-request caller-name registry (fleet Item A4): APPLYGATE_CLIENTS =
+  # "name:key;name:key;..." — it NAMES keys the API-key middleware already
+  # matched (audit attribution: caller.name). The registry can NEVER
+  # authenticate anything: an unregistered key behaves exactly as today.
+  # Keys are Secret material — existingSecret-only (the K8S-MCP invariant,
+  # the chart never creates or inlines a key):
+  #   kubectl -n <ns> create secret generic applygate-mcp-clients \
+  #     --from-literal=clients='pipeline-bot:key-1;deploy-bot:key-2'
+  # Omitted (default) → the env is not rendered → fp-only caller audit,
+  # byte-identical behavior to the pre-attribution baseline.
+  existingSecret: ''
+  existingSecretKey: clients
+callerPassthrough:
+  # X-MCP-Caller honoring (fleet Item A2): the header is accepted ONLY from
+  # direct peers inside these CIDRs (comma-separated, e.g. the gateway/sidecar
+  # pod CIDR) and lands in the audit as caller.via. UNSET/EMPTY = fail-closed:
+  # the header is IGNORED from every peer (the default render — a deployment
+  # without an explicitly trusted relay never trusts the header). Behind an
+  # Istio sidecar scope["client"] is the sidecar's address, so tune the list
+  # per deployment. Attribution-never-authorization: via and name NEVER
+  # unlock anything (not namespaces, not kinds, not the D11 plan binding,
+  # not confirm_apply) — key_fp remains the credential truth.
+  trustedCidrs: ''
 webui:
   enabled: true
 namespaces:

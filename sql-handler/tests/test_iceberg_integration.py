@@ -53,7 +53,11 @@ def test_iceberg_end_to_end():
     writer.close()
 
     eng = SqlEngine(
-        IcebergProvider(IcebergConfig(catalog_type="sql", catalog_uri=uri, warehouse=wh, catalog_name=_catalog_name()))
+        IcebergProvider(
+            IcebergConfig(
+                catalog_type="sql", catalog_uri=uri, warehouse=wh, catalog_name=_catalog_name()
+            )
+        )
     )
 
     tables = eng.list_tables()

@@ -1,6 +1,6 @@
 # FEATURES — Hardening & Capability changelog (v0.0.1 → v0.2.13)
 
-This file summarizes everything that changed across the hardening session that took `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl, `cluster-admin`, unauthenticated endpoint) to v0.2.12 — deployed, verified live, and in daily use from DSH. The chart line has since moved on (current: `helm/` 0.3.1 + `helm-customer/` 0.3.1-customer, see `helm/Chart.yaml`); the invariants below still hold.
+This file summarizes everything that changed across the hardening session that took `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl, `cluster-admin`, unauthenticated endpoint) to v0.2.13 — deployed, verified live, and in daily use from DSH. The chart line has since moved on (current: `helm/` 1.1.0 + `helm-customer/` 1.1.0-customer, see `helm/Chart.yaml`); the invariants below still hold.
 
 ---
 

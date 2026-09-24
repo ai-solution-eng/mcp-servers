@@ -9,8 +9,9 @@ suggestions, corrections and unresponsive engines.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import httpx2
 
@@ -39,6 +40,7 @@ class SearXNGResponse:
     infoboxes: list[dict] = field(default_factory=list)
     unresponsive_engines: list[tuple[str, str]] = field(default_factory=list)
     number_of_results: int = 0
+    cache_hit: bool = False
 
 
 class RateLimiter:
@@ -56,6 +58,97 @@ class RateLimiter:
             now = time.monotonic()
             self._timestamps = [t for t in self._timestamps if now - t < 60.0]
         self._timestamps.append(now)
+
+
+class SearchResultCache:
+    """Tiny TTL cache + single-flight coalescer for search outcomes.
+
+    Mirrors fetcher.FetchResultCache. Shared multi-tenant instances get many
+    identical/duplicate queries (several agent sessions on the same cluster);
+    each miss fans out to every enabled engine through ONE corporate-egress
+    IP, so every avoided duplicate search is a meaningful chunk of the
+    upstream rate-limit budget.
+
+    * TTL: entries expire after ``ttl_seconds`` (0 disables caching entirely).
+    * Single flight: concurrent calls with the same key share ONE upstream
+      run — later callers await the same task instead of racing the engines.
+    * Failures are coalesced but never memoized: an exception propagates to
+      every waiter, but the next call after the failure retries upstream.
+    * Bounded to ``max_entries`` (oldest evicted).
+    """
+
+    def __init__(self, ttl_seconds: float, max_entries: int = 64):
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self.max_entries = max(1, int(max_entries))
+        self._store: dict[tuple, tuple[float, SearXNGResponse]] = {}
+        self._inflight: dict[tuple, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def _peek(self, key) -> SearXNGResponse | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        expiry, resp = entry
+        if expiry <= time.monotonic():
+            self._store.pop(key, None)
+            return None
+        # Copy on read: callers mutate their response (cache_hit flag), and
+        # one shared instance must never alias between callers.
+        return replace(resp)
+
+    async def run(self, key, factory, cacheable=None) -> tuple[SearXNGResponse, bool]:
+        """Run ``factory()`` once per key within the TTL window; returns
+        ``(response, cache_hit)``."""
+        hit = self._peek(key)
+        if hit is not None:
+            self.hits += 1
+            return hit, True
+        loop = asyncio.get_running_loop()
+        # Coalesce: one shared task per key. All logic (publish + cleanup +
+        # memoize) lives in the task's done-callback so it happens even if
+        # the owner caller is cancelled mid-flight; asyncio.shield lets
+        # individual waiters go away without killing the upstream run.
+        async with self._lock:
+            hit = self._peek(key)
+            if hit is not None:
+                self.hits += 1
+                return hit, True
+            task = self._inflight.get(key)
+            if task is None:
+                task = loop.create_task(_run_factory(factory))
+                self._inflight[key] = task
+
+                def _publish(done: asyncio.Task, key=key) -> None:
+                    self._inflight.pop(key, None)
+                    if done.cancelled():
+                        return
+                    exc = done.exception()
+                    if exc is not None:
+                        return  # failures are coalesced but never memoized
+                    resp = done.result()
+                    if cacheable is None or cacheable(resp):
+                        self._store[key] = (
+                            time.monotonic() + self.ttl_seconds,
+                            resp,
+                        )
+                        while len(self._store) > self.max_entries:
+                            self._store.pop(next(iter(self._store)))
+
+                task.add_done_callback(_publish)
+        self.misses += 1
+        resp = await asyncio.shield(task)
+        # Copy per caller (same aliasing concern as _peek): waiters share the
+        # one task result otherwise.
+        return replace(resp), False
+
+
+async def _run_factory(factory):
+    result = factory()
+    if asyncio.iscoroutine(result):
+        result = await result
+    return result
 
 
 # Minimal ISO-639-1 language code set, used to disambiguate ddgs-style
@@ -198,11 +291,20 @@ class SearXNGClient:
         timeout: float = 10.0,
         verify_tls: bool = True,
         requests_per_minute: int = 30,
+        cache_ttl_seconds: float | None = None,
         transport: httpx2.AsyncBaseTransport | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.default_language = default_language
         self.rate_limiter = RateLimiter(requests_per_minute)
+        if cache_ttl_seconds is not None:
+            ttl = float(cache_ttl_seconds)
+        else:
+            try:
+                ttl = float(os.getenv("SEARXNG_SEARCH_CACHE_TTL", "120"))
+            except ValueError:
+                ttl = 120.0
+        self.result_cache = SearchResultCache(ttl_seconds=ttl)
         self._client = httpx2.AsyncClient(
             timeout=httpx2.Timeout(timeout),
             verify=verify_tls,
@@ -231,9 +333,12 @@ class SearXNGClient:
         time_range: str = "",
         pageno: int = 1,
     ) -> SearXNGResponse:
-        """Run one search. Raises SearXNGError on transport/HTTP/parse errors."""
-        await self.rate_limiter.acquire()
+        """Run one search. Raises SearXNGError on transport/HTTP/parse errors.
 
+        Cached per exact request params for ``SEARXNG_SEARCH_CACHE_TTL``
+        seconds (default 120, 0 disables). Concurrent identical searches
+        share one upstream fan-out; errors are coalesced but never memoized.
+        """
         params: dict[str, str] = {
             "q": query,
             "format": "json",
@@ -250,16 +355,29 @@ class SearXNGClient:
         if time_range:
             params["time_range"] = time_range
 
-        data = await self._request(params)
-        if data is None:
-            # Some SearXNG builds reject unknown language codes with a 400 —
-            # retry once without the language filter rather than failing.
-            params.pop("language", None)
+        key = tuple(sorted(params.items()))
+
+        async def _run() -> SearXNGResponse:
+            await self.rate_limiter.acquire()
             data = await self._request(params)
             if data is None:
-                raise SearXNGError(f"SearXNG request failed for query: {query!r}")
+                # Some SearXNG builds reject unknown language codes with a
+                # 400 — retry once without the language filter rather than
+                # failing. (Re-run with the mutated params; the cache key is
+                # already fixed and only successful parses are memoized.)
+                params.pop("language", None)
+                data = await self._request(params)
+                if data is None:
+                    raise SearXNGError(f"SearXNG request failed for query: {query!r}")
+            return self._parse(data, query)
 
-        return self._parse(data, query)
+        resp, cache_hit = await self.result_cache.run(
+            key,
+            _run,
+            cacheable=lambda r: True,  # errors raise; only successes arrive
+        )
+        resp.cache_hit = cache_hit
+        return resp
 
     async def _request(self, params: dict[str, str]) -> dict | None:
         """GET /search; returns parsed JSON, or None on HTTP 4xx (caller may

@@ -59,6 +59,7 @@ from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 # Initialize MCP server (MCP SDK v2 / protocol 2026-07-28).
 # Transport options (host, port, stateless_http, ...) are passed to run(),
@@ -666,7 +667,9 @@ def _cap_suffix(marker) -> str:
 # ─── Generic K8s API Tools ───────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_resource(
     resource_type: str,
     name: str = "",
@@ -699,7 +702,9 @@ async def get_resource(
     return await _kubectl_plan_execute(argv)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def describe_resource(
     resource_type: str,
     name: str,
@@ -721,7 +726,9 @@ async def describe_resource(
     return await _kubectl_plan_execute(argv)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_api_resources() -> str:
     """List all available API resource types in the cluster, including CRDs.
     Use this to discover what resource types exist before querying them."""
@@ -731,7 +738,9 @@ async def list_api_resources() -> str:
 # ─── Cluster Health ──────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def cluster_health() -> str:
     """Get overall cluster health: node status, component status, resource usage.
     Use this as the first tool to understand the cluster state."""
@@ -810,7 +819,9 @@ async def cluster_health() -> str:
 # ─── Namespaces ──────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_namespaces() -> str:
     """List all namespaces with status and age. Namespace policy applies:
     only policy-allowed namespaces are shown."""
@@ -831,7 +842,9 @@ async def list_namespaces() -> str:
 # ─── Pods ────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_pods(namespace: str = "", label_selector: str = "") -> str:
     """List pods with health status, restarts, and age.
     If namespace is empty, lists across all namespaces (namespace policy
@@ -867,7 +880,9 @@ async def list_pods(namespace: str = "", label_selector: str = "") -> str:
         return f"K8s API Error: {e.reason} ({e.status})"
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_pod_logs(
     pod_name: str,
     namespace: str = "default",
@@ -923,7 +938,9 @@ async def get_pod_logs(
 # ─── Events ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_events(
     namespace: str = "",
     resource_name: str = "",
@@ -973,7 +990,9 @@ async def get_events(
 # ─── Deployments / StatefulSets / DaemonSets ─────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_workloads(namespace: str = "") -> str:
     """List all workloads (Deployments, StatefulSets, DaemonSets, Jobs) in a
     namespace or cluster-wide (namespace policy filters the results)."""
@@ -1054,7 +1073,9 @@ async def list_workloads(namespace: str = "") -> str:
 # ─── Services & Networking ───────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_services(namespace: str = "") -> str:
     """List services with type, cluster IP, and ports.
     If namespace is empty, lists across all namespaces (namespace policy
@@ -1086,7 +1107,9 @@ async def list_services(namespace: str = "") -> str:
 # ─── ConfigMaps & Secrets ────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_configmap(name: str, namespace: str = "default") -> str:
     """Read a ConfigMap's data keys and values."""
     violation = namespace_violation(namespace)
@@ -1101,7 +1124,9 @@ async def get_configmap(name: str, namespace: str = "default") -> str:
         return f"Error: {e.reason}"
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_secrets(namespace: str = "default") -> str:
     """List secret names and types in a namespace (values are NOT shown).
     Requires the server's RBAC to grant secret read — the shipped read-only
@@ -1124,7 +1149,9 @@ async def list_secrets(namespace: str = "default") -> str:
 # ─── PVCs & Storage ─────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_pvcs(namespace: str = "") -> str:
     """List PersistentVolumeClaims with status, capacity, and storage class.
     If namespace is empty, lists across all namespaces (namespace policy
@@ -1269,7 +1296,9 @@ def _triage_exc_message(exc) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def triage(namespace: str, app: str = "") -> str:
     """One-call namespace triage: an attention list (restarts, not-Ready,
     OOMKilled/CrashLoopBackOff, failing probes) followed by the pods,
@@ -1439,7 +1468,9 @@ async def triage(namespace: str, app: str = "") -> str:
 # ─── Custom Resources (CRDs) ────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_crds() -> str:
     """List all Custom Resource Definitions (CRDs) installed in the cluster."""
     return await _kubectl_plan_execute(
@@ -1452,7 +1483,9 @@ async def list_crds() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_custom_resource(
     group: str,
     version: str,
@@ -1620,7 +1653,9 @@ def _vs_summary(item: dict) -> list:
     return lines
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def list_virtual_services(namespace: str = "", name: str = "") -> str:
     """List Istio VirtualServices with hosts, gateways, and route targets.
     Fully read-only.
@@ -1696,7 +1731,9 @@ async def list_virtual_services(namespace: str = "", name: str = "") -> str:
 # ─── RBAC ────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def check_rbac(
     verb: str,
     resource: str,
@@ -2118,7 +2155,23 @@ def _exec_argv(namespace: str, pod_name: str, command: list, container: str) -> 
 
 if _exec_enabled():
 
-    @mcp.tool()
+    # ToolAnnotations honesty note: exec_in_pod is NOT read-only at the protocol
+    # layer — it runs an attacker-influenced argv inside a peer container and
+    # every attempt is audit-logged, so clients must not prefetch it or treat
+    # calls as side-effect-free. But it is also NOT destructive by design: the
+    # binary allowlist admits only inspection binaries (ps, ls, cat, tail, ...)
+    # and hard-denies shells/interpreters/privilege escalation, and the command
+    # never mutates the Kubernetes API (kubectl is invoked strictly read-verb).
+    # readOnlyHint=False signals the container-touching caution;
+    # destructiveHint=False preserves callability in read-only client modes;
+    # openWorldHint=True because kubectl reaches the live cluster.
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            open_world_hint=True,
+        ),
+    )
     async def exec_in_pod(pod_name: str, namespace: str, command: list[str], container: str = "") -> str:
         """Run ONE read-only debugging command inside a container (opt-in tool).
 
@@ -2190,7 +2243,9 @@ if _exec_enabled():
 # ─── kubectl (generic escape hatch) ─────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def run_kubectl(command: str) -> str:
     """Run a read-only kubectl command. This is the most flexible tool.
     Examples:

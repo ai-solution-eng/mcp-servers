@@ -123,7 +123,9 @@ class _FakeDeltaTable:
     calls: list = []  # noqa: RUF012 - test double, list reset per test
 
     def __init__(self, uri, version=None, storage_options=None):
-        _FakeDeltaTable.calls.append({"uri": uri, "version": version, "storage_options": storage_options})
+        _FakeDeltaTable.calls.append(
+            {"uri": uri, "version": version, "storage_options": storage_options}
+        )
         self._dataset = f"dataset-for-{uri}-v{version}"
 
     def to_pyarrow_dataset(self):

@@ -5,6 +5,7 @@ Live end-to-end check (needs a reachable SearXNG): see tests/live_check.py
 """
 
 import asyncio
+import time
 from typing import Any
 
 import httpx2
@@ -357,6 +358,111 @@ def test_fetch_curl_backend_skips_plain(monkeypatch):
 
 def test_clean_markdown_cruft():
     assert clean_markdown_cruft("a\n\n\n\n\nb") == "a\n\nb"
+
+
+# ---------------------------------------------------------------------------
+# Search result cache (TTL + single-flight)
+# ---------------------------------------------------------------------------
+
+
+def test_search_cache_hit_within_ttl():
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=120)
+    r1 = asyncio.run(client.search("python mcp"))
+    r2 = asyncio.run(client.search("python mcp"))
+    assert calls["n"] == 1  # second search served from cache
+    assert r2.cache_hit is True and r1.cache_hit is False
+    assert r2.results == r1.results
+    assert client.result_cache.hits == 1 and client.result_cache.misses == 1
+
+
+def test_search_cache_key_includes_params():
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=120)
+    asyncio.run(client.search("python mcp"))
+    asyncio.run(client.search("python mcp", categories="it"))
+    asyncio.run(client.search("python mcp", pageno=2))
+    asyncio.run(client.search("different query"))
+    assert calls["n"] == 4  # every param/query variation is a distinct entry
+
+
+def test_search_cache_disabled_with_zero_ttl():
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=0)
+    asyncio.run(client.search("python mcp"))
+    asyncio.run(client.search("python mcp"))
+    assert calls["n"] == 2
+
+
+def test_search_cache_expires(monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=120)
+    asyncio.run(client.search("python mcp"))
+    # Age every entry past the TTL (fake clock keeps this fast).
+    real_monotonic = time.monotonic
+    clock = {"offset": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + clock["offset"])
+    clock["offset"] = 121.0
+    asyncio.run(client.search("python mcp"))
+    assert calls["n"] == 2
+
+
+def test_search_cache_errors_not_memoized():
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx2.Response(500)
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=120)
+    with pytest.raises(SearXNGError):
+        asyncio.run(client.search("python mcp"))
+    resp = asyncio.run(client.search("python mcp"))
+    assert calls["n"] == 2  # the failure was coalesced but NOT cached
+    assert resp.cache_hit is False
+
+
+def test_search_cache_single_flight():
+    """Concurrent identical searches share ONE upstream fan-out."""
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        time.sleep(0.05)  # widen the race window
+        return httpx2.Response(200, json=SAMPLE_RESPONSE)
+
+    client = make_client(handler, cache_ttl_seconds=120)
+
+    async def burst():
+        return await asyncio.gather(*(client.search("python mcp") for _ in range(5)))
+
+    results = asyncio.run(burst())
+    assert calls["n"] == 1  # all five callers shared one upstream run
+    assert all(r.results for r in results)
+    # Coalesced waiters count as misses (same convention as the fetch cache);
+    # the point is the single upstream fan-out, verified above.
 
 
 # ---------------------------------------------------------------------------

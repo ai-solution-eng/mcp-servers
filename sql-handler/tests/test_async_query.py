@@ -46,10 +46,12 @@ def _patch_register(monkeypatch, sleep=None):
     """Replace schema registration (optionally with a slow one)."""
     import sqlhandler.engine as eng_mod
 
-    def register(self, con, sql, version=None):
+    def register(self, con, sql, version=None, **kw):
         if sleep is not None:
             time.sleep(sleep)
-        con.register("work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}))
+        con.register(
+            "work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]})
+        )
 
     monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", register)
 

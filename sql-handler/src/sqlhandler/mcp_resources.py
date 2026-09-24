@@ -61,9 +61,11 @@ _MARKDOWN = "text/markdown"
 # ---------------------------------------------------------------------------
 
 
-def _schema_text(engine: SqlEngine, table: str) -> str:
-    """Markdown schema (+ catalog docs) for one table."""
-    d = engine.describe_table(table)
+def _schema_text(engine: SqlEngine, table: str, caller=None) -> str:
+    """Markdown schema (+ catalog docs) for one table (policy-aware: hidden
+    tables raise; masked columns are omitted — the describe result the
+    caller's policy produces)."""
+    d = engine.describe_table(table, caller=caller)
     lines = [f"# Table: {d['table']}", "", f"URI: `{d['uri']}`", ""]
     if d.get("description"):
         lines += [d["description"], ""]
@@ -75,9 +77,10 @@ def _schema_text(engine: SqlEngine, table: str) -> str:
     return "\n".join(lines)
 
 
-def _catalog_text(engine: SqlEngine) -> str:
-    """Markdown overview of every table + its semantic-catalog description."""
-    tables = engine.list_tables()
+def _catalog_text(engine: SqlEngine, caller=None) -> str:
+    """Markdown overview of every table + its semantic-catalog description
+    (policy-aware: hidden tables are omitted for the reading caller)."""
+    tables = engine.list_tables(caller=caller)
     lines = ["# Table catalog", ""]
     if not tables:
         lines.append("No tables found in the configured data source.")
@@ -98,9 +101,15 @@ def _catalog_text(engine: SqlEngine) -> str:
     return "\n".join(lines)
 
 
-def _query_memory_text(engine: SqlEngine) -> str:
-    """Markdown of recent query outcomes (the agent's own query history)."""
-    memory = engine.query_memory()
+def _query_memory_text(engine: SqlEngine, caller=None) -> str:
+    """Markdown of recent query outcomes (the agent's own query history).
+
+    ``caller`` (identity spine): owner-scoped when policy enforcement is on —
+    another caller's recorded SQL can name tables this caller's policy hides,
+    so the memory serves ONLY the reading caller's own entries. Enforcement
+    off keeps the shared history byte-identical.
+    """
+    memory = engine.query_memory(caller=caller)
     lines = [
         "# Query memory",
         "",
@@ -142,7 +151,10 @@ def _parse_table_uri(uri: str) -> str | None:
 
 async def handle_list_resources(ctx, params) -> ListResourcesResult:
     """resources/list: static per-table schemas + the catalog + query memory."""
+    from . import identity as _identity
     from .server import _handler  # local import: avoids a server<->module cycle
+
+    caller = _identity.caller_from_request_state(getattr(ctx, "request", None))
 
     def _build():
         engine = _handler()
@@ -160,7 +172,7 @@ async def handle_list_resources(ctx, params) -> ListResourcesResult:
                 mime_type=_MARKDOWN,
             ),
         ]
-        for t in engine.list_tables():
+        for t in engine.list_tables(caller=caller):
             desc = engine.table_description(t) or None
             resources.append(
                 Resource(
@@ -193,19 +205,21 @@ async def handle_list_resource_templates(ctx, params) -> ListResourceTemplatesRe
 
 async def handle_read_resource(ctx, params) -> ReadResourceResult:
     """resources/read for the sqlhandler:// scheme."""
+    from . import identity as _identity
     from .server import _handler
 
     uri = str(params.uri)
     table = _parse_table_uri(uri)
+    caller = _identity.caller_from_request_state(getattr(ctx, "request", None))
 
     def _render() -> str:
         engine = _handler()
         if table is not None:
-            return _schema_text(engine, table)
+            return _schema_text(engine, table, caller=caller)
         if uri == _CATALOG_URI:
-            return _catalog_text(engine)
+            return _catalog_text(engine, caller=caller)
         if uri == _QUERY_MEMORY_URI:
-            return _query_memory_text(engine)
+            return _query_memory_text(engine, caller=caller)
         raise LookupError(f"Unknown resource: {uri}")
 
     try:
@@ -218,7 +232,9 @@ async def handle_read_resource(ctx, params) -> ReadResourceResult:
 
         code = INVALID_PARAMS if isinstance(exc, LookupError) else INTERNAL_ERROR
         raise MCPError(code=code, message=str(exc)) from exc
-    return ReadResourceResult(contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)])
+    return ReadResourceResult(
+        contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +258,9 @@ _PROMPTS = [
         description="Deep-dive one table: schema, profile statistics, then targeted queries.",
         arguments=[
             PromptArgument(
-                name="table", description="Table name (schema/name when the source uses schemas)", required=True
+                name="table",
+                description="Table name (schema/name when the source uses schemas)",
+                required=True,
             )
         ],
     ),
@@ -298,4 +316,6 @@ async def handle_get_prompt(ctx, params) -> GetPromptResult:
         )
     else:
         raise _bad(f"Unknown prompt: {name}")
-    return GetPromptResult(messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))])
+    return GetPromptResult(
+        messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))]
+    )

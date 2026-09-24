@@ -75,7 +75,9 @@ class FakeRequest:
 
 def test_save_list_get_delete_roundtrip():
     store = SavedQueryStore()
-    entry = store.save("kind-a", "SELECT * FROM work_order WHERE kind = $k", {"k": "a"}, "kind A orders")
+    entry = store.save(
+        "kind-a", "SELECT * FROM work_order WHERE kind = $k", {"k": "a"}, "kind A orders"
+    )
     assert entry["name"] == "kind-a"
     assert entry["sql"] == "SELECT * FROM work_order WHERE kind = $k"
     assert entry["params"] == {"k": "a"}
@@ -181,14 +183,18 @@ def test_run_uses_bind_params_injection_is_inert(tmp_path, monkeypatch):
 
     # the injection attempt: stored SQL must keep its placeholder
     assert "$k" in store.get("by-kind")["sql"]
-    payload = json.loads(server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json"))
+    payload = json.loads(
+        server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json")
+    )
     assert payload["rows"] == [], "injection must not leak other rows (bind, not interpolate)"
 
     # positional-? variant too
     store.save("positional", "SELECT id FROM work_order WHERE kind = ?", ["b"])
     payload = json.loads(server.query_saved("positional", output_format="json"))
     assert payload["rows"] == [[2], [4]]
-    payload = json.loads(server.query_saved("positional", params=["x' OR '1'='1"], output_format="json"))
+    payload = json.loads(
+        server.query_saved("positional", params=["x' OR '1'='1"], output_format="json")
+    )
     assert payload["rows"] == []
 
 
@@ -231,7 +237,12 @@ def test_mcp_query_save_list_delete_roundtrip(monkeypatch):
     monkeypatch.setattr(server, "_handler", lambda: None)
     text, is_error = server._dispatch_tool(
         "query_save",
-        {"name": "orders", "sql": "SELECT * FROM work_order WHERE kind = $k", "params": {"k": "a"}, "description": "d"},
+        {
+            "name": "orders",
+            "sql": "SELECT * FROM work_order WHERE kind = $k",
+            "params": {"k": "a"},
+            "description": "d",
+        },
     )
     assert is_error is False
     entry = json.loads(text)
@@ -252,7 +263,12 @@ def test_mcp_query_saved_run(tmp_path, monkeypatch):
     eng = _make_engine(tmp_path)
     monkeypatch.setattr(server, "_handler", lambda: eng)
     server._dispatch_tool(
-        "query_save", {"name": "b-kind", "sql": "SELECT id FROM work_order WHERE kind = $k", "params": {"k": "b"}}
+        "query_save",
+        {
+            "name": "b-kind",
+            "sql": "SELECT id FROM work_order WHERE kind = $k",
+            "params": {"k": "b"},
+        },
     )
     text, is_error = server._dispatch_tool("query_saved", {"name": "b-kind"})
     assert is_error is False
@@ -350,11 +366,16 @@ def test_rest_saved_queries_auth_matrix(tmp_path, monkeypatch):
     # middleware and (for any caller that reaches it) the saved-write gate.
     # Either refusing is the contract; the gate's own message is asserted in
     # the unit tests + the MCP-keys-only REST test below.
-    assert client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1"}).status_code == 401
+    assert (
+        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1"}).status_code == 401
+    )
     assert client.delete("/api/saved-queries/whatever").status_code == 401
     auth = {"X-API-Token": "tok-1"}
     assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth).status_code == 200
+        client.post(
+            "/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth
+        ).status_code
+        == 200
     )
     assert client.delete("/api/saved-queries/q", headers=auth).status_code == 200
     # reads follow the /api posture (token middleware), not the write gate
@@ -387,7 +408,10 @@ def test_rest_saved_queries_with_mcp_keys_only(tmp_path, monkeypatch):
     assert "MCP_API_KEYS" in r.json()["error"]
     ok = {"X-API-Key": "key-9"}
     assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok).status_code == 200
+        client.post(
+            "/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok
+        ).status_code
+        == 200
     )
     # reads stay open (same posture as /mcp without its own gate here)
     assert client.get("/api/saved-queries").status_code == 200
@@ -411,11 +435,19 @@ def test_rest_saved_validation_and_run_errors(tmp_path, monkeypatch):
     register_ui(app, lambda: eng)
     client = TestClient(app)
 
-    assert client.post("/api/saved-queries", json={"name": "q", "sql": "DROP TABLE x"}).status_code == 400
-    assert client.post("/api/saved-queries", json={"name": "a/b", "sql": "SELECT 1"}).status_code == 400
+    assert (
+        client.post("/api/saved-queries", json={"name": "q", "sql": "DROP TABLE x"}).status_code
+        == 400
+    )
+    assert (
+        client.post("/api/saved-queries", json={"name": "a/b", "sql": "SELECT 1"}).status_code
+        == 400
+    )
     assert client.post("/api/saved-queries", json={"sql": "SELECT 1"}).status_code == 400
     assert client.post("/api/saved-queries/nope/run", json={}).status_code == 404
-    bad = client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT $x", "params": {"x": [1]}})
+    bad = client.post(
+        "/api/saved-queries", json={"name": "q", "sql": "SELECT $x", "params": {"x": [1]}}
+    )
     assert bad.status_code == 400
 
 
@@ -436,7 +468,10 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_API_TOKEN", "tok-e2e")
     app = _build_http_app()
     with TestClient(app) as client:
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
 
         def rpc(method, params, rid=1, extra=None):
             h = dict(headers)
@@ -450,7 +485,11 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
 
         init = rpc(
             "initialize",
-            {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
             rid=0,
         )
         assert init.status_code == 200

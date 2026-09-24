@@ -143,7 +143,9 @@ def test_virtual_definition_pulls_in_base_tables(engine):
 
 
 def test_virtual_joins_physical_in_one_query(engine):
-    out = engine.query_duckdb("SELECT s.id FROM shop_sales p JOIN vw_big_sales s USING (id) ORDER BY s.id")
+    out = engine.query_duckdb(
+        "SELECT s.id FROM shop_sales p JOIN vw_big_sales s USING (id) ORDER BY s.id"
+    )
     assert out.column("id").to_pylist() == [2, 3]
 
 
@@ -307,7 +309,9 @@ def test_snowflake_array_construct_compact_runs_verbatim(tmp_path, monkeypatch):
 def test_compact_rewrite_is_string_literal_safe(tmp_path, monkeypatch):
     doc = _catalog_doc(
         name="vw_literal",
-        definition=("SELECT id FROM sales WHERE 'call array_construct_compact(x, y)' <> '' ORDER BY id LIMIT 1"),
+        definition=(
+            "SELECT id FROM sales WHERE 'call array_construct_compact(x, y)' <> '' ORDER BY id LIMIT 1"
+        ),
     )
     eng, _ = _make_engine(tmp_path, monkeypatch, doc=doc)
     out = eng.query_duckdb("SELECT id FROM vw_literal")
@@ -465,6 +469,7 @@ def test_result_cache_bails_on_comments_and_dollar_quotes(engine):
 
 def test_normalize_cache_sql_edges():
     from sqlhandler.engine import _normalize_cache_sql as nz
+
     assert nz("SELECT  1") == nz("SELECT 1") == "SELECT 1"
     assert nz(" SELECT 1 ; ") == "SELECT 1"
     assert nz("SELECT 'a  b'") == "SELECT 'a  b'"  # literal spacing preserved

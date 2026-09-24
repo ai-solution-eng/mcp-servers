@@ -50,10 +50,12 @@ def _patch_register(monkeypatch, sleep=None):
     """Replace schema registration (optionally with a slow one)."""
     import sqlhandler.engine as eng_mod
 
-    def register(self, con, sql, version=None):
+    def register(self, con, sql, version=None, **kw):
         if sleep is not None:
             time.sleep(sleep)
-        con.register("work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}))
+        con.register(
+            "work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]})
+        )
 
     monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", register)
 
@@ -222,10 +224,14 @@ def test_job_timeout_message_matches_sync_path(tmp_path, monkeypatch):
     _wait_done(mgr, job_id, timeout=5.0)
     with pytest.raises(JobError) as exc:
         mgr.take_result(job_id)
-    assert "Query timed out after 0.2s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled." in str(exc.value)
+    assert "Query timed out after 0.2s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled." in str(
+        exc.value
+    )
     # ...the exact text the synchronous path raises:
     eng2 = _make_engine(tmp_path)
-    with pytest.raises(LakehouseError, match="Query timed out after 0.2s \\(SQLHANDLER_QUERY_TIMEOUT\\)"):
+    with pytest.raises(
+        LakehouseError, match="Query timed out after 0.2s \\(SQLHANDLER_QUERY_TIMEOUT\\)"
+    ):
         eng2.query_duckdb("SELECT * FROM work_order")
 
 
@@ -319,7 +325,9 @@ def test_mcp_query_tools_roundtrip(tmp_path, monkeypatch):
     assert status["state"] == "done"
     assert status["n_rows"] == 2
 
-    text, is_error = server._dispatch_tool("query_result", {"job_id": job_id, "output_format": "json"})
+    text, is_error = server._dispatch_tool(
+        "query_result", {"job_id": job_id, "output_format": "json"}
+    )
     assert is_error is False
     rows = json.loads(text)
     assert rows["rows"] == [[2, "b"], [4, "b"]]
@@ -382,7 +390,9 @@ def rest_client(tmp_path, monkeypatch):
 
 def test_rest_jobs_flow(rest_client):
     client, auth = rest_client
-    r = client.post("/api/jobs", json={"sql": "SELECT * FROM work_order WHERE kind = 'a'"}, headers=auth)
+    r = client.post(
+        "/api/jobs", json={"sql": "SELECT * FROM work_order WHERE kind = 'a'"}, headers=auth
+    )
     assert r.status_code == 200
     body = r.json()
     job_id = body["job_id"]
@@ -419,7 +429,9 @@ def test_rest_jobs_ddl_refused_at_submit(rest_client):
 def test_rest_jobs_cancel_and_unknown(rest_client, monkeypatch):
     client, auth = rest_client
     _patch_register(monkeypatch, sleep=1.0)
-    job_id = client.post("/api/jobs", json={"sql": "SELECT * FROM work_order"}, headers=auth).json()["job_id"]
+    job_id = client.post(
+        "/api/jobs", json={"sql": "SELECT * FROM work_order"}, headers=auth
+    ).json()["job_id"]
     time.sleep(0.1)
     r = client.delete(f"/api/jobs/{job_id}", headers=auth)
     assert r.status_code == 200

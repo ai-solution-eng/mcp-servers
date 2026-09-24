@@ -66,7 +66,7 @@ def _registered_engine(monkeypatch) -> SqlEngine:
     """Engine whose schema registration registers a real in-memory view."""
     eng = _engine()
 
-    def fake_register(self, con, sql, version=None):
+    def fake_register(self, con, sql, version=None, **kw):
         con.register("stub_tbl", pa.table({"a": [1, 2, 3], "s": ["x", "y", "z"]}))
 
     monkeypatch.setattr(SqlEngine, "_register_schema", fake_register)
@@ -76,7 +76,7 @@ def _registered_engine(monkeypatch) -> SqlEngine:
 def _registered_schema_of(table: pa.Table):
     """Return a _register_schema replacement registering ``table`` as 'big'."""
 
-    def fake_register(self, con, sql, version=None):
+    def fake_register(self, con, sql, version=None, **kw):
         con.register("big", table)
 
     return fake_register
@@ -297,7 +297,7 @@ def _run_sql_engine(calls: list[str]):
     """Stub engine for server.run_sql: records the SQL it is handed."""
 
     class _Recording:
-        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None):
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
             calls.append(sql)
             return pa.table({"ok": [1]})
 
@@ -393,7 +393,9 @@ def _attach_engine(monkeypatch) -> SqlEngine:
     applied: list = []
     monkeypatch.setattr(eng_mod, "apply_external", lambda con, specs: applied.append(list(specs)))
     monkeypatch.setattr(
-        eng_mod.SqlEngine, "_register_schema", lambda self, con, sql, version=None, materialize=True: None
+        eng_mod.SqlEngine,
+        "_register_schema",
+        lambda self, con, sql, version=None, materialize=True, **kw: None,
     )
     eng._applied_attaches = applied  # type: ignore[attr-defined]
     return eng
@@ -449,7 +451,9 @@ def test_plain_lake_connection_never_sees_attaches(monkeypatch):
     applied: list = []
     monkeypatch.setattr(eng_mod, "apply_external", lambda con, specs: applied.append(list(specs)))
     monkeypatch.setattr(
-        eng_mod.SqlEngine, "_register_schema", lambda self, con, sql, version=None, materialize=True: None
+        eng_mod.SqlEngine,
+        "_register_schema",
+        lambda self, con, sql, version=None, materialize=True, **kw: None,
     )
     # No attached alias referenced -> plain path, no attach, no SELECT-only
     # guard: with the MCP opt-out a caller regains multi-statement DDL on
@@ -457,9 +461,7 @@ def test_plain_lake_connection_never_sees_attaches(monkeypatch):
     # catalog and no scanner extension to build a sink with — nothing to
     # exfiltrate INTO.
     monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
-    script = (
-        "CREATE TEMP TABLE scratch (a int); INSERT INTO scratch VALUES (41), (1); SELECT sum(a) AS total FROM scratch"
-    )
+    script = "CREATE TEMP TABLE scratch (a int); INSERT INTO scratch VALUES (41), (1); SELECT sum(a) AS total FROM scratch"
     out = eng.query_duckdb(script)  # must not raise
     assert out.column("total")[0].as_py() == 42
     assert applied == []
@@ -506,7 +508,9 @@ def _five_row_engine(tmp_path) -> SqlEngine:
     d = tmp_path / "t"
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"i": [0, 1, 2, 3, 4]}), d / "p.parquet")
-    return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0, dataset_cache_ttl=0)
+    return SqlEngine(
+        FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0, dataset_cache_ttl=0
+    )
 
 
 def test_scan_arrow_default_limit_clamped_to_max_rows(monkeypatch, tmp_path):
@@ -545,7 +549,9 @@ def _fifty_row_engine(tmp_path) -> SqlEngine:
     d = tmp_path / "big"
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"i": list(range(50))}), d / "p.parquet")
-    return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0, dataset_cache_ttl=0)
+    return SqlEngine(
+        FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0, dataset_cache_ttl=0
+    )
 
 
 def test_resolve_scan_limit_semantics(monkeypatch):
@@ -645,7 +651,7 @@ def test_query_timeout_error_names_env(monkeypatch, tmp_path):
 
     from sqlhandler.engine import _query_timeout
 
-    def slow_register(self, con, sql, version=None):
+    def slow_register(self, con, sql, version=None, **kw):
         _time.sleep(1.0)
 
     monkeypatch.setattr(SqlEngine, "_register_schema", slow_register)
@@ -670,7 +676,7 @@ class _StubProvider:
 class _StubEngine:
     provider = _StubProvider()
 
-    def query_duckdb(self, sql, limit=None, params=None, version_as_of=None):
+    def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
         return pa.table({"a": [1]})
 
     def scan_arrow(self, table, columns=None, limit=None, version_as_of=None):
@@ -745,7 +751,9 @@ def test_mcp_transport_guard_missing_host(monkeypatch):
     """A Host-less request is refused (unit: ASGI scope without a host)."""
     from sqlhandler.server import _McpTransportGuard
 
-    verdict = _McpTransportGuard._reject({"type": "http", "path": "/mcp", "method": "POST", "headers": []})
+    verdict = _McpTransportGuard._reject(
+        {"type": "http", "path": "/mcp", "method": "POST", "headers": []}
+    )
     assert verdict == (421, "Missing Host header")
 
 
@@ -781,7 +789,9 @@ def test_metrics_and_ready_open_by_default(monkeypatch):
 
 def test_metrics_auth_gate(monkeypatch):
     """SQLHANDLER_METRICS_AUTH=1 gates /metrics only; /ready stays open (kubelet probes cannot authenticate)."""
-    with _client(monkeypatch, SQLHANDLER_METRICS_AUTH="1", SQLHANDLER_API_TOKEN="probe-token") as client:
+    with _client(
+        monkeypatch, SQLHANDLER_METRICS_AUTH="1", SQLHANDLER_API_TOKEN="probe-token"
+    ) as client:
         assert client.get("/metrics").status_code == 401
         assert client.get("/metrics", headers={"X-API-Token": "probe-token"}).status_code == 200
         # /ready + /health stay open for kubelet probes either way.

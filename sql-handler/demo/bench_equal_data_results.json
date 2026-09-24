@@ -1,0 +1,130 @@
+{
+ "run": "in-cluster equal-data head-to-head",
+ "date": "2026-09-23T14:44Z",
+ "mode": "sqlhandler=REST twin ClusterIP (v2.3.2 API-key gate on /mcp in-cluster); ezpresto=MCP execute_query ClusterIP",
+ "parity_at_bench_time": {
+  "employees": [
+   50000,
+   50000
+  ],
+  "orders": [
+   200000,
+   200000
+  ],
+  "customers": [
+   150000,
+   150000
+  ],
+  "testdata_50col": [
+   3000000,
+   3000000
+  ],
+  "verdict": "EQUAL"
+ },
+ "reps": "5 warm + 5 cold per query per leg; all 5/5 ok both legs",
+ "concurrency_L4": {
+  "sqlhandler": {
+   "qps": 37.61,
+   "p50": 24.0,
+   "p95": 31.1
+  },
+  "ezpresto": {
+   "qps": 6.18,
+   "p50": 781.5,
+   "p95": 1241.5
+  },
+  "ratio": 6.1
+ },
+ "rows": [
+  {
+   "q": "count_small",
+   "sh_warm": 13.5,
+   "sh_cold": 151.4,
+   "ez_warm": 138.6,
+   "ez_cold": 126.0,
+   "warm_ratio": 10.27,
+   "cold_ratio": 0.83
+  },
+  {
+   "q": "range_filter",
+   "sh_warm": 98.1,
+   "sh_cold": 132.5,
+   "ez_warm": 219.6,
+   "ez_cold": 210.7,
+   "warm_ratio": 2.24,
+   "cold_ratio": 1.59
+  },
+  {
+   "q": "filtered_agg",
+   "sh_warm": 154.3,
+   "sh_cold": 165.6,
+   "ez_warm": 482.5,
+   "ez_cold": 449.7,
+   "warm_ratio": 3.13,
+   "cold_ratio": 2.72
+  },
+  {
+   "q": "groupby_agg",
+   "sh_warm": 112.4,
+   "sh_cold": 200.0,
+   "ez_warm": 394.1,
+   "ez_cold": 416.2,
+   "warm_ratio": 3.51,
+   "cold_ratio": 2.08
+  },
+  {
+   "q": "join_count",
+   "sh_warm": 189.5,
+   "sh_cold": 196.9,
+   "ez_warm": 372.9,
+   "ez_cold": 327.6,
+   "warm_ratio": 1.97,
+   "cold_ratio": 1.66
+  },
+  {
+   "q": "join_agg",
+   "sh_warm": 344.6,
+   "sh_cold": 482.8,
+   "ez_warm": 428.2,
+   "ez_cold": 388.0,
+   "warm_ratio": 1.24,
+   "cold_ratio": 0.8
+  },
+  {
+   "q": "count_big_3m",
+   "sh_warm": 15.3,
+   "sh_cold": 350.4,
+   "ez_warm": 237.4,
+   "ez_cold": 215.7,
+   "warm_ratio": 15.52,
+   "cold_ratio": 0.62
+  },
+  {
+   "q": "col_proj_agg_2cols",
+   "sh_warm": 296.1,
+   "sh_cold": 375.1,
+   "ez_warm": 575.5,
+   "ez_cold": 545.5,
+   "warm_ratio": 1.94,
+   "cold_ratio": 1.45
+  },
+  {
+   "q": "filtered_group_3m",
+   "sh_warm": 470.6,
+   "sh_cold": 493.7,
+   "ez_warm": 539.2,
+   "ez_cold": 548.2,
+   "warm_ratio": 1.15,
+   "cold_ratio": 1.11
+  },
+  {
+   "q": "wide_agg_4cols",
+   "sh_warm": 361.0,
+   "sh_cold": 478.6,
+   "ez_warm": 551.2,
+   "ez_cold": 480.6,
+   "warm_ratio": 1.53,
+   "cold_ratio": 1.0
+  }
+ ]
+}

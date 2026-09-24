@@ -12,8 +12,20 @@ Real per-site values — the actual `searxng.secretKey` and any site-specific tu
 ## Using on PCAI
 
 1. Import the packaged chart into the PCAI catalog (once per chart version).
-2. Pick the closest example, adjust every `# SITE:` line (endpoint host, secretKey, proxy need, browser sidecar).
-3. Paste the **whole document** into the chart's *Helm Values* editor and apply — it is a complete values document, not an overlay, because the PCAI values editor replaces the chart's bundled `values.yaml` entirely.
+2. **Two secrets are in play:**
+   - `searxng.secretKey` (**required** — the render fails without it or
+     `searxng.existingSecret`): the examples use a `<SECRET_KEY>` placeholder;
+     replace it, or pre-deploy a Secret and point `searxng.existingSecret` at
+     it (preferred — the value then never passes through values):
+     `kubectl -n <ns> create secret generic searxng-secret --from-literal=secret=$(openssl rand -hex 32)`
+   - the **optional** MCP API key: both examples point `apiKey.existingSecret`
+     at the fleet convention `mcp-fleet-apikeys` (key `api-keys`) — create it
+     the same way to switch the key gate on
+     (`kubectl -n <ns> create secret generic mcp-fleet-apikeys --from-literal='api-keys=<key1>,<key2>'`),
+     or clear `apiKey.existingSecret` to run `/mcp` open with a loud startup
+     warning.
+3. Pick the closest example, adjust every `# SITE:` line (endpoint host, secretKey, proxy need, browser sidecar).
+4. Paste the **whole document** into the chart's *Helm Values* editor and apply — it is a complete values document, not an overlay, because the PCAI values editor replaces the chart's bundled `values.yaml` entirely.
 
 ## Using with helm (operators)
 

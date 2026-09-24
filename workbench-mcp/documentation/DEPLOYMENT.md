@@ -39,7 +39,7 @@ ezua:
 | `workbench.templates` | `{}` | Workspace templates for `workspace_create(name, template=<name>)` — **default OFF: an empty object renders no env at all and the tool's `template` parameter is refused**, exactly the pre-templates behavior. Each named template may only (a) **widen** that workspace's exec allowlist with operator-supplied *bare binary names* (`extra_allowed` — the denylist still wins, so a template can never re-enable a denied binary) and (b) pre-run `canned_setup` argv commands **inside the new workspace through the exact `run_command` machinery** (confinement, server-PATH allowlist resolution, timeouts, output caps, audit — each setup run is audited as a `workspace_template_setup` event carrying the template name). Only the template *name* persists in the workspace; the widened allowlist is re-derived from the current values on every call, so removing a template shrinks its workspaces back to the base allowlist. See the `helm/values.yaml` comment block for a worked example. |
 | `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (per-tool request counters, nothing else). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is key-free like the probes. |
 | `apiKey.existingSecret` / `existingSecretKey` | `workbench-mcp-apikey` / `api-keys` | **Mandatory wiring, never created by the chart**: every route except `/health`/`/healthz` requires an API key, so the Secret must exist in the target namespace before `helm install` or the pod sits in `CreateContainerConfigError`. Comma-separated keys (`api-keys=new,old`) are the zero-downtime rotation mechanism (env re-read per request). |
-| `webui.enabled` | `true` | The HPE-branded console at `/` — workspace switcher, file tree + viewer/saver, env editor, run-command console, audit tail. The UI is read/write and calls the SAME core functions (confinement, caps, allowlist, audit all still apply) but is unauthenticated at the pod: keep it behind gateway authn. |
+| `webui.enabled` | `true` | The HPE-branded console at `/` — workspace switcher, file tree + viewer/saver, env editor, run-command console, audit tail. The UI is read/write and calls the SAME core functions (confinement, caps, allowlist, audit all still apply). Auth posture: the console HTML (`/`, `/ui`) is public-but-inert (an in-page unlock bar collects the key — the browser cannot load the page behind a 401); every `/api/*` data route stays API-key-gated, and the endpoint sits behind gateway authn. |
 | `deployment.replicaCount` | `1` | Stateless MCP — any replica serves any request (needs the RWX volume to share state). |
 | `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml` by release tooling — leave at the chart default; a stale tag in a site file is how an "old MCP server" pod happens. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
@@ -78,14 +78,58 @@ server parses them defensively.
 When `ezua.enabled=true` the chart renders one VirtualService on
 `istio-system/ezaf-gateway`: `/mcp` routes to the MCP server (port 9103,
 `timeout: 660s`), and the root route sends `/`, `/ui`, `/api/*` and the
-health endpoints to the same service. Trust note, verbatim from the chart:
-the web UI is read/write and unauthenticated at the pod — gateway authn (this
-ezaf-gateway VirtualService) is the only thing between it and a browser. The
+health endpoints to the same service. Trust note: the console HTML at `/`
+and `/ui` is public-but-inert (an in-page unlock bar collects the API key —
+the browser cannot load the page behind a 401), while every `/api/*` data
+route and `/mcp` stay API-key-gated at the pod — gateway authn (this
+ezaf-gateway VirtualService) is the additional layer between it and a
+browser. The
 MCP tools carry their own confirm gates and audit trail; the browser surface
 adds convenience, not guardrails. PCAI resolves `${DOMAIN_NAME}` in ezua
 values before rendering on current builds; if your build does not, write the
 literal domain — an unresolved placeholder registers a gateway host that
 matches nothing.
+
+## Deployment targets
+
+Behavior that differs by target, and the paste-ready values for each
+(`helm/values-examples/` — sanitized; real per-site values live in
+`helm/local/`):
+
+### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+
+- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
+  write the literal domain into `ezua.domainName` and
+  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Proxy + MITM CA on** — `hpe_proxies: true` and `caCert.enabled: true`
+  (the `ezaf-root-ca` ConfigMap present in the release namespace): this is
+  what lets `pip install ...` inside `run_command` reach PyPI through the
+  HPE proxy. Note the interplay with fleet decision D18: `pip` must also be
+  allow-listed (`workbench.execAllowlist`) for it to run at all — the G2
+  site chooses its allowlist deliberately.
+- Fleet API key (Secret `mcp-fleet-apikeys`, key `api-keys`), Kyverno
+  vendor-label policy on, metrics + ServiceMonitor on.
+- Sanitized example:
+  [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
+
+### Hosted trial (customer-hosted PCAI)
+
+- **`${DOMAIN_NAME}` placeholders stay as-is** (PCAI resolves them before
+  rendering on current builds; substitute the literal domain only on a build
+  that does not).
+- **Keep the D18 narrow allowlist** (`ls,cat,...,uniq` — no interpreters, no
+  package managers) unless the trial explicitly needs them; the trial posture
+  leans on the documented defense-in-depth (no SA token, read-only rootfs,
+  argv screening).
+- `hpe_proxies: false` / `caCert.enabled: false` unless the trial cluster
+  egresses via the HPE proxy; `kyverno.enabled: false` unless the platform
+  enforces vendor labels; metrics off keeps the render minimal.
+- API-key Secret provisioned out of band per the customer's key process
+  (`mcp-fleet-apikeys` convention or the customer's own Secret name) — every
+  route except `/health`/`/healthz` is keyed, so the read/write web UI also
+  sits behind the key plus the gateway authn.
+- Sanitized example:
+  [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
 
 ## Upgrading
 

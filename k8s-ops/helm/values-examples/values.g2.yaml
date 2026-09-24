@@ -23,9 +23,11 @@ deployment:
 
 # -- Image ------------------------------------------------------------------------
 image:
-  # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image tags).
+  # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
+  # tags) — a stale default is how an "old MCP + new chart" pod happens.
+  # SITE: pinned at chart 1.1.0.
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v0.3.1
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 
 # SITE: private-GHCR pull secret — omit ([]) when the package is public.
@@ -140,6 +142,14 @@ ezua:
     namespace: "istio-system"
     providerName: "oauth2-proxy"
 
+# -- Cluster-wide listing guardrails (performance; 1.1.0) ----------------------
+# Performance guardrails only. "" = the server's own default (500 items /
+# concurrency 8) and renders NO env var. SITE: kept at the server defaults.
+listing:
+  maxItems: ""
+  concurrency: ""
+
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
+  interval: 30s

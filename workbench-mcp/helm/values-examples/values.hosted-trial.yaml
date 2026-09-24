@@ -18,7 +18,7 @@ deployment:
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  tag: v0.1.2
+  tag: v0.2.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -26,8 +26,10 @@ image:
 imagePullSecrets: []
 
 # -- Web UI -------------------------------------------------------------------------------
-# Read/write, unauthenticated at the pod — keep on only where the gateway
-# enforces authn (the ezaf-gateway VirtualService below).
+# Read/write console; the HTML (/ and /ui) is public-but-inert (in-page
+# unlock bar collects the key), the /api/* data routes stay key-gated — keep
+# on only where the gateway ALSO enforces authn (the ezaf-gateway
+# VirtualService below).
 webui:
   enabled: true
 
@@ -36,6 +38,9 @@ workbench:
   # Root directory holding all workspaces — MUST match persistence.mountPath.
   root: /data
   # argv[0] allowlist for run_command (comma-separated); no shells by design.
+  # NOTE (fleet decision D18): pip/python3 are NOT here — re-add only if the
+  # trial genuinely needs them (an allow-listed interpreter can sidestep the
+  # argv-level workspace confinement; see README "Honest limits").
   execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
   # Hard deny (WINS over the allowlist): network/escalation binaries.
   execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
@@ -49,11 +54,14 @@ workbench:
   # Max entries per list_files response.
   maxListEntries: 500
   logLevel: INFO
+  # Workspace templates (Wave-5 F3) — SITE: chart default ({} = the
+  # workspace_create tool's template parameter is refused; nothing renders).
+  templates: {}
 
 # -- HPE corporate proxy --------------------------------------------------------------------------
 # SITE: off unless the trial cluster sits behind the HPE corporate proxy —
 # when true, proxy env passes through to run_command children so `pip` works.
-hpe_proxies: true
+hpe_proxies: false
 
 proxy:
   http: http://hpeproxy.its.hpecorp.net:8080
@@ -71,7 +79,7 @@ caCert:
 # -- Kyverno vendor-label policy -------------------------------------------------------------------
 # Enable only where the trial platform enforces the hpe-ezua/* vendor labels.
 kyverno:
-  enabled: true
+  enabled: false
 
 # -- Service exposure -------------------------------------------------------------------
 service:
@@ -89,10 +97,25 @@ resources:
     memory: 512Mi
 
 # -- Security context -----------------------------------------------------------------
+# Non-root uid + fsGroup 10001 (PVC writable by the server user), RuntimeDefault
+# seccomp at the pod level.
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level hardening (fleet-audit P0): read-only rootfs (run_command
+# children can write only the PVC + /tmp), no privilege escalation, caps
+# dropped. The pod also mounts NO service-account token (automount
+# explicitly off in the chart — the server makes zero k8s calls).
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
 
 # -- Persistence ---------------------------------------------------------------------
 # Workspaces survive pod restarts. RWX so every replica sees the same state;
@@ -126,4 +149,8 @@ apiKey:
 
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:
-  enabled: true
+  # SITE: flip to true where the trial wants per-tool counters (requires the
+  # prometheus-operator ServiceMonitor CRD).
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval

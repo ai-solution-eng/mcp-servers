@@ -58,7 +58,7 @@ ezua:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `deployment.*` | `k8s-mcp`, 1 replica | Naming and scale; the server is stateless. |
-| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/k8s-mcp` / `v0.3.1` | Keep `tag` in lockstep with the chart's `appVersion`. |
+| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/k8s-mcp` / `v1.1.0` | Keep `tag` in lockstep with the chart's `appVersion`. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package stays private. |
 | `service.port` | 9090 | MCP (`/mcp`) + console (`/ui/`). |
 | `resources` | 100m/128Mi → 500m/512Mi | Small; raise the limit if large `--all-namespaces` YAML dumps are common (they buffer in memory before the 50k truncation). |

@@ -109,7 +109,17 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
         )
 
     def __hash__(self) -> int:  # keep the wrapper usable as a dict key
-        return hash((type(self).__name__, str(self._base), self._cfg["dir"], self._scope))
+        # NEVER str(self._base): pyarrow's reprs embed the inner filesystem
+        # wrapper's OBJECT ADDRESS (``...LocalFileSystem object at 0x...``),
+        # and a SubTreeFileSystem does not keep that wrapper alive — after a
+        # GC re-materializes it, the same handler's str() prints a different
+        # address, so a str-based hash changes under a LIVE object (violating
+        # the eq/hash contract: dataset-cache identity lookups randomly miss,
+        # defeating the cache — caught live as a flaky test assertion).
+        # type_name + (for subtree fs) base_path is the stable value identity
+        # that __eq__'s ``self._base == other._base`` compares equal on.
+        base_path = getattr(self._base, "base_path", "")
+        return hash((type(self).__name__, self._base.type_name, base_path, self._cfg["dir"], self._scope))
 
     # -- the two hot paths ----------------------------------------------------
 
@@ -309,7 +319,12 @@ class _CachedStream:
                 f.write(data)
             os.replace(tmp, bp)
         except Exception:
-            logger.debug("block %s/%d not cached (disk issue?); serving from stream", self._path, i, exc_info=True)
+            logger.debug(
+                "block %s/%d not cached (disk issue?); serving from stream",
+                self._path,
+                i,
+                exc_info=True,
+            )
         return data
 
     # -- the file-like contract pyarrow needs ---------------------------------
@@ -410,5 +425,9 @@ def maybe_block_cache(
         logger.debug("block cache enabled for %s", purpose or type(fs).__name__)
         return wrapped
     except Exception:
-        logger.warning("could not enable block cache for %s; using the plain filesystem", purpose, exc_info=True)
+        logger.warning(
+            "could not enable block cache for %s; using the plain filesystem",
+            purpose,
+            exc_info=True,
+        )
         return fs

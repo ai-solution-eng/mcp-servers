@@ -51,6 +51,7 @@ import time
 import uuid
 from collections import OrderedDict
 
+from . import errors as _errors
 from .engine import (
     LakehouseError,
     QueryJob,
@@ -156,6 +157,7 @@ class McpJobManager:
         limit: int | None = None,
         params: object | None = None,
         version_as_of: int | None = None,
+        caller=None,
     ) -> dict:
         """Validate + start a job; returns ``{"job_id", "state"}``.
 
@@ -165,6 +167,10 @@ class McpJobManager:
         version) is synchronous too: a bad payload is an immediate error, not
         a job that instantly fails. Over-cap submits are refused with
         ``{"error": ..., "status": 429}``.
+
+        ``caller`` (identity spine) rides the QueryJob (keyword-only) so the
+        worker thread — where contextvars do NOT cross — records the outcome
+        against the submitter.
         """
         if mcp_readonly_enabled():
             # Decision D2 at SUBMIT time: the same parser guard, the same
@@ -189,7 +195,7 @@ class McpJobManager:
             self._cleanup()
             if len(self._records) >= self._max_jobs:
                 return {
-                    "error": (
+                    "error": _errors.enrich(
                         f"Too many active query jobs ({len(self._records)} of "
                         f"{self._max_jobs}, SQLHANDLER_MAX_JOBS); cancel or fetch "
                         "results and retry later."
@@ -201,7 +207,7 @@ class McpJobManager:
         # its LakehouseError surfaces as a submit-time refusal) and starts
         # the worker thread. Done OUTSIDE the manager lock so submits never
         # serialize behind each other's queue waits.
-        job = QueryJob(engine, sql, limit=limit, params=params, version_as_of=version_as_of)
+        job = QueryJob(engine, sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller)
         job_id = uuid.uuid4().hex
         with self._lock:
             if len(self._records) >= self._max_jobs:
@@ -209,7 +215,7 @@ class McpJobManager:
                 # (the losing job releases its gate slot when it unwinds).
                 job.cancel()
                 return {
-                    "error": (
+                    "error": _errors.enrich(
                         f"Too many active query jobs ({self._max_jobs}, "
                         f"SQLHANDLER_MAX_JOBS); cancel or fetch results and retry later."
                     ),
@@ -240,7 +246,7 @@ class McpJobManager:
                 return
             record.job.cancel()
             record.timed_out = True
-            record.timeout_message = (
+            record.timeout_message = _errors.enrich(
                 f"Query timed out after {_query_timeout()}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled."
             )
             logger.warning("async query job %s timed out and was cancelled", job_id)
@@ -312,7 +318,10 @@ class McpJobManager:
         if state == "cancelled":
             raise JobError("Query was cancelled.", status=400)
         if state != "done":
-            raise JobError(record.job.error or f"Job did not complete (state: {state}).", status=400)
+            raise JobError(
+                _errors.enrich(record.job.error or f"Job did not complete (state: {state})."),
+                status=400,
+            )
         arrow = record.job.result
         with self._lock:
             if record.fetched:  # a racing fetch won; honor once-only
@@ -414,8 +423,12 @@ def reset_job_manager() -> None:
 # ---------------------------------------------------------------------------
 
 
-def api_job_submit(engine: SqlEngine, body: dict) -> dict:
-    """POST /api/jobs + MCP query_submit — start a read-only query job."""
+def api_job_submit(engine: SqlEngine, body: dict, *, caller=None) -> dict:
+    """POST /api/jobs + MCP query_submit — start a read-only query job.
+
+    ``caller`` (identity spine) rides the QueryJob across the thread
+    boundary so the outcome record attributes to the submitter.
+    """
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
     result = job_manager().submit(
@@ -424,6 +437,7 @@ def api_job_submit(engine: SqlEngine, body: dict) -> dict:
         limit=body.get("limit"),
         params=body.get("params"),
         version_as_of=body.get("version_as_of"),
+        caller=caller,
     )
     if result.get("error"):
         return result  # carries its own "status" for the route wrapper

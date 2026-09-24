@@ -102,6 +102,41 @@ Rules of the road:
   SQL path but its pyarrow `filters` argument is refused (use `run_sql`). Time-travel queries bypass the cache.
 - `virtual: true` **without** a `definition` is just a documentation marker — no table appears.
 
+### Importing from dbt
+
+If your models are documented in dbt, the compile artifact already carries everything the catalog wants —
+no second place to write descriptions. Run `dbt compile` and feed the generated `target/manifest.json`
+to the importer: model + column descriptions become catalog docs, dbt `meta` opts into the extra
+behavior, and the whole output is a **proposed** catalog until you apply it.
+
+| dbt manifest field | Becomes |
+|---|---|
+| `nodes` with `resource_type` `model` / `seed` / `snapshot` | catalog table entries (tests/analyses/exposures ignored; `materialized: ephemeral` skipped — unless an imported model depends on it) |
+| `node.description` | entry `description` |
+| `node.columns.<col>.description` | `columns` mapping, column name → doc |
+| `node.columns.<col>.dtype` (when no description) | one-line `"<dtype> column"` placeholder |
+| `schema` + `name` | catalog key `<schema>/<name>` (bare `name` fallback; the engine also matches source-qualified and bare keys) |
+| `alias` / `relation_name` | key fallbacks; an explicit `alias_map` (`dbt name → catalog key`) wins over every generated form |
+| `meta.sqlhandler.description` | fallback table description when `description` is empty |
+| `meta.sqlhandler.aliases` | entry `aliases` (search terms for `search_tables`) |
+| `meta.sqlhandler.virtual: true` | virtual table — **only** with `compiled_sql` that is a single read-only `SELECT`/`WITH` **and** the request's `allow_virtual: true` (both gates, never either alone) |
+| `meta.sqlhandler.hide: true` | node omitted from the import entirely |
+
+Two API routes (same token gating and `SQLHANDLER_CATALOG_UPLOAD=0` switch as every catalog write):
+
+- `POST /api/semantic-catalog/import-dbt` — body `{"manifest": {...manifest.json...}}` (or
+  `{"manifest_b64": …}`; options `allow_virtual`, `source_filter`, `alias_map`) → returns
+  `{imported, virtuals, skipped, warnings, catalog}` **without writing anything**: the catalog is a
+  preview you (or the UI) inspect first.
+- `POST /api/semantic-catalog/import-dbt/apply` — the same body (plus `force_overwrite`) merges the
+  import into the live catalog through the validated upload store (hot reload included). **Merge
+  rule:** an existing entry is overwritten only when it was itself produced by a previous dbt import
+  (the importer tags entries `meta.imported_from: "dbt"`, which the schema preserves) or
+  `force_overwrite: true`; hand-written entries always survive and are listed in `warnings`.
+
+In the Data Explorer, the *Semantic catalog* panel's **Import dbt…** button does the same loop:
+pick `target/manifest.json`, review the preview, Apply.
+
 ### Authoring tips
 
 - Describe the **grain** ("one row per order", "one row per order-line") — the single biggest accuracy win for aggregations.

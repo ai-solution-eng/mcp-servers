@@ -83,8 +83,7 @@ kubectl get authorizationpolicy -n istio-system   # when the auth gate is enable
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Every tool returns `Error: ... connection refused` / timeout | `prometheusUrl` points at a service that does not exist on this cluster | Set the real in-cluster Prometheus URL in the Helm Values editor, re-apply |
-| Render fails: `ezua.domainName still contains the literal placeholder` | `${DOMAIN_NAME}` left unsubstituted — this chart fails loudly on purpose | Write the literal cluster domain in `ezua.domainName` and `ezua.virtualService.endpoint` |
-| Route silently vanishes from the gateway (404 at the edge) | Endpoint/domain mismatch, or `ezua.enabled=false` | Re-check the literal host matches your PCAI domain; enable ezua |
+| Route silently vanishes from the gateway (404 at the edge); blank endpoint aborts the render (`Valid .Values.ezua.virtualService.endpoint is required !`) | `${DOMAIN_NAME}` left unsubstituted by the PCAI build (the placeholder registers a host that matches nothing), endpoint blanked, or `ezua.enabled=false` | Write the literal cluster domain in `ezua.virtualService.endpoint` (and, informationally, `ezua.domainName`); enable ezua. PCAI resolves the placeholder on current builds — keep it there when pasting the hosted-trial example |
 | Tools return data, console 404s at `/` | Console is always served — a 404 means the root route is missing | Confirm the VirtualService root route exists (`/` → service 9095) |
 | 403 at the gateway on `/mcp` | `ezua.authorizationPolicy.enabled=true` | Present a valid PCAI token (`Authorization: Bearer ...`), or disable the gate |
 | GPU tab empty or "no GPU data" | No DCGM exporter on the cluster, or no GPU nodes | Expected on CPU-only clusters; the rest of the console keeps working |

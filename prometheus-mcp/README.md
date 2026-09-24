@@ -105,6 +105,44 @@ default). Complete paste-ready documents:
 and
 [helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
 
+### Mandatory endpoint when the gateway is on
+
+`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**
+(this chart's default): `templates/virtualservice.yaml` and — when the
+authorization gate is on — `templates/authorizationpolicy.yaml` call Helm's
+`required` on it, so an empty endpoint aborts the render before anything is
+created — `Valid .Values.ezua.virtualService.endpoint is required !` /
+`… is required when ezua is enabled !`. It must be unique per release on the
+shared ezaf-gateway, and it is the *only* gateway host: `ezua.domainName` is
+informational (no template reads it). With `ezua.enabled: false` nothing is
+rendered from it — in-cluster Service access only.
+
+### Saved-query persistence (`persistence.*` — default OFF)
+
+`query_save`/`query_list`/`query_delete`/`query_saved` keep their JSON store
+in memory unless `persistence.enabled: true` wires `PROMETHEUS_SAVED_QUERIES_PATH`
+to `<mountPath>/<savedQueriesFile>` on a dedicated PVC
+(`<deployment.name>-data`) — every pod update/reschedule otherwise silently
+forgets every saved query. Sub-keys:
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `persistence.mountPath` | `/data` | Where the store volume mounts in the container. |
+| `persistence.savedQueriesFile` | `saved-queries.json` | Store file **inside** the mount, pinned explicitly so a moved `mountPath` cannot silently orphan an existing store. |
+| `persistence.size` | `1Gi` | PVC storage request. |
+| `persistence.storageClass` | `""` | Empty = cluster default StorageClass. |
+| `persistence.accessModes` | `[ReadWriteOnce]` | `replicaCount > 1` with a RWO class strands extra replicas Pending — flip to a RWX class (gl4f-filesystem RWX on G2) or keep 1 replica (the fleet default). |
+
+### Standard Kubernetes knobs
+
+Defaults fit the fleet baseline; overridable per deployment.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `deployment.appName` | `prometheus-mcp` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is, and names the PVC). Leave at the default; mismatched selectors break the Service/VS wiring. |
+| `image.tag` | `v0.5.2` | Kept in lockstep with the pushed image tags; the release tooling bumps it. Pin a site override only deliberately — a stale tag is how "old MCP" pods happen. |
+| `resources.requests.cpu` | `100m` | CPU request (limits: memory `512Mi`; requests.memory `128Mi`, no CPU limit). |
+
 ## Connect an MCP client
 
 Any MCP client that speaks streamable-HTTP connects to `/mcp` (stateless —

@@ -36,7 +36,9 @@ def _validate_snapshot_version(version: object, backend: str) -> int:
     are ints in Python but are never a legitimate snapshot id).
     """
     if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-        raise LakehouseError(f"{backend} time travel needs a non-negative integer snapshot version, got {version!r}.")
+        raise LakehouseError(
+            f"{backend} time travel needs a non-negative integer snapshot version, got {version!r}."
+        )
     return version
 
 
@@ -207,12 +209,20 @@ def make_provider(config: object) -> DataProvider:
 
     Dispatch is by config type so new backends only add a branch here.
     """
-    from .config import FabricConfig, FileConfig, IcebergConfig, S3Config
+    from .config import AdlsConfig, FabricConfig, FileConfig, GcsConfig, IcebergConfig, S3Config, SharingConfig
 
     if isinstance(config, S3Config):
         from .s3 import S3Provider
 
         return S3Provider(config)
+    if isinstance(config, AdlsConfig):
+        from .adls import AdlsProvider
+
+        return AdlsProvider(config)
+    if isinstance(config, GcsConfig):
+        from .gcs import GcsProvider
+
+        return GcsProvider(config)
     if isinstance(config, IcebergConfig):
         from .iceberg import IcebergProvider
 
@@ -225,6 +235,10 @@ def make_provider(config: object) -> DataProvider:
         from .onelake import OneLakeProvider
 
         return OneLakeProvider(config)
+    if isinstance(config, SharingConfig):
+        from .sharing import SharingProvider
+
+        return SharingProvider(config)
     raise LakehouseError(
         f"Unsupported backend config type: {type(config).__name__!r}. Use load_backend_config() to build a known one."
     )

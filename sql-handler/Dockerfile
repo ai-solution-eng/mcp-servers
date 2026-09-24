@@ -45,7 +45,21 @@ RUN uv pip install --system \
 # EULA'd driver is installed here — dead weight in a network-facing image.
 # The external.py "sqlserver" adapter name refers to this extension; its ATTACH
 # must pass (TYPE mssql) — the casing DuckDB's ATTACH accepts for the type.
-RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community')]" \
+# ducklake: baked here since 2.4 (vendored locally too — duckdb-ext/). The
+# community attach types mongo + bigquery are OPT-IN: append
+# 'INSTALL mongo FROM community', 'INSTALL bigquery FROM community' to the
+# statement list below when a deployment needs them (they are NOT in the
+# default image — external.py fails with a clear "extension not baked"
+# message until the build is extended). There is NO clickhouse ATTACH
+# extension for DuckDB 1.5.5 (only chsql_native scan functions) — do not add
+# one, and never add motherduck (a bare md: ATTACH without a token hangs the
+# pod in an interactive OAuth flow; use a ducklake md: catalog with
+# motherduck_token instead).
+# OPT-IN example (uncomment the whole RUN block and remove the default one
+# above to bake the two community attach extensions):
+# RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community', 'INSTALL ducklake', 'INSTALL mongo FROM community', 'INSTALL bigquery FROM community')]" \
+#     && chmod -R a+rX /opt/duckdb-ext
+RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community', 'INSTALL ducklake')]" \
     && chmod -R a+rX /opt/duckdb-ext
 ENV SQLHANDLER_DUCKDB_EXTENSION_DIR=/opt/duckdb-ext
 

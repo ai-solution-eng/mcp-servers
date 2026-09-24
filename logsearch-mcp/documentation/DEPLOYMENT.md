@@ -131,6 +131,47 @@ Two conventions, both documentation-only in this chart (no `audit.*` /
   `WORKBENCH_SHARED_PATHS=/data/exports`) rather than at a server-local
   path only this pod can see.
 
+## Deployment targets
+
+Behavior that differs by target, and the paste-ready values for each
+(`helm/values-examples/` — sanitized; real per-site values live in
+`helm/local/`):
+
+### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+
+- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
+  write the literal domain into `ezua.domainName` and
+  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Lab posture, set EXPLICITLY.** `emptyAllowsAll: true` keeps this lab's
+  pre-D8 open default (with an empty `allowedNamespaces`) — that is a
+  deliberate escape-hatch choice, never a default; flip it off (and set an
+  allowlist) the moment the cluster stops being a lab.
+- `rbac.clusterWide: true` — cluster-wide pod/log READS via the chart's
+  opt-in knob (same two read-only rules); `logsearch.blockedNamespaces` stays
+  the agent-side counterweight for system namespaces.
+- Fleet API key (Secret `mcp-fleet-apikeys`, key `api-keys`), metrics +
+  ServiceMonitor on.
+- Sanitized example:
+  [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
+
+### Hosted trial (customer-hosted PCAI)
+
+- **`${DOMAIN_NAME}` placeholders stay as-is** (PCAI resolves them before
+  rendering on current builds; substitute the literal domain only on a build
+  that does not).
+- **Production posture: DEFAULT-DENY.** An explicit
+  `logsearch.allowedNamespaces` is REQUIRED; `emptyAllowsAll` stays `false`
+  (never restore the pre-D8 open default on a trial); keep
+  `rbac.clusterWide: false` — blast radius exactly one namespace, plus the
+  one-time read-only bootstrap per namespace the trial needs to search.
+- API-key Secret provisioned out of band per the customer's key process
+  (`mcp-fleet-apikeys` convention or the customer's own Secret name); pod
+  logs are sensitive — the key gate and the namespace policy are the two
+  controls that matter.
+- `hpe_proxies: false`; metrics off keeps the render minimal.
+- Sanitized example:
+  [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
+
 ## Upgrading
 
 Upgrades are a values edit + re-apply, not a redeploy:

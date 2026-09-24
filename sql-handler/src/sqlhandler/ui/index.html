@@ -171,6 +171,7 @@
     text-transform: uppercase;
   }
   .table-item .fmt.virtual { color: var(--accent); border-color: var(--accent); }
+  .table-item .fmt.raw { color: var(--yellow); border-color: var(--yellow); }
   .table-item .tname { flex: 1; font-family: var(--mono); font-size: 13px; word-break: break-all; }
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .tabs {
@@ -407,6 +408,54 @@
   .sv-dialog-foot { display: flex; align-items: center; gap: 10px; }
   .sv-dialog-foot .spacer { flex: 1; }
   .sv-err { color: var(--red); font-size: 12px; font-family: var(--mono); white-space: pre-wrap; }
+
+  /* ---- Inspector tab (MCP tool bridge) ---- */
+  #insp-error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #insp-error.show { display: block; }
+  .insp-field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
+  .insp-field label { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .insp-field label b { color: var(--text); font-weight: 600; }
+  .insp-field .req { color: var(--yellow); font-weight: 700; margin-left: 4px; }
+  .insp-field input, .insp-field select {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  .insp-field input:focus, .insp-field select:focus { border-color: var(--accent); }
+  .insp-field input[type="checkbox"] { width: auto; align-self: flex-start; }
+  .insp-out {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    max-height: 60vh;
+  }
+  .insp-out.is-error { background: var(--err-bg); border-color: var(--err-border); color: var(--err-text); }
+  .insp-out table { border-collapse: collapse; margin: 6px 0; }
+  .insp-out th, .insp-out td { border: 1px solid var(--border); padding: 2px 8px; text-align: left; }
 </style>
 </head>
 <body>
@@ -445,6 +494,10 @@
       <div style="display:flex;gap:8px;margin-top:8px">
         <button id="catalog-upload" class="ghost" style="flex:1" title="Upload a catalog file — JSON or YAML are both accepted">Upload JSON/YAML…</button>
       </div>
+      <input type="file" id="catalog-dbt-file" accept=".json,.txt" style="display:none" />
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="catalog-dbt" class="ghost" style="flex:1" title="Import dbt's target/manifest.json into the catalog: model + column descriptions become docs; virtual tables only for nodes meta-tagged sqlhandler.virtual AND when you tick the preview option">Import dbt…</button>
+      </div>
       <div class="hint" style="margin-top:8px">Per-dataset docs: select a table → <b>Semantic</b> tab.</div>
     </div>
   </aside>
@@ -454,6 +507,7 @@
       <button class="tab active" data-tab="query">Query</button>
       <button class="tab" data-tab="schema">Schema</button>
       <button class="tab" data-tab="semantic">Semantic</button>
+      <button class="tab" data-tab="inspector">Inspector</button>
     </div>
 
     <div id="pane-query" class="pane">
@@ -517,6 +571,22 @@
         </div>
       </div>
     </div>
+
+    <div id="pane-inspector" class="pane hidden">
+      <div class="hint" style="margin-bottom:10px">MCP inspector — the same tools an MCP client sees (documentation/MCP.md). Calls ride the web API auth.</div>
+      <div class="panel">
+        <h2>MCP tool</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="insp-tool" style="flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 10px;font-family:var(--mono);font-size:12px;outline:none"></select>
+          <button id="insp-run" title="Call the tool (Ctrl+Enter)">Run</button>
+          <button id="insp-raw" class="ghost" title="Show the exact {content, isError} JSON the bridge returned">Raw</button>
+        </div>
+        <div class="hint" id="insp-tool-desc" style="margin-top:8px"></div>
+        <div id="insp-form" style="margin-top:10px"></div>
+      </div>
+      <div id="insp-error"></div>
+      <div id="insp-result"></div>
+    </div>
   </main>
 </div>
 
@@ -545,6 +615,34 @@
       <span class="spacer"></span>
       <span id="sv-modal-err" class="sv-err"></span>
       <button id="sv-modal-apply">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- dbt manifest import: preview → explicit Apply. Same .sv-modal styling. -->
+<div id="dbt-modal" class="sv-modal hidden" role="dialog" aria-modal="true" aria-label="dbt manifest import">
+  <div class="sv-backdrop" id="dbt-modal-backdrop"></div>
+  <div class="sv-dialog">
+    <div class="sv-dialog-head">
+      <div>
+        <h2>Import dbt manifest</h2>
+        <div class="hint" id="dbt-modal-info">target/manifest.json → semantic catalog</div>
+      </div>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Only nodes meta-tagged sqlhandler.virtual AND this checkbox produce virtual tables — both gates are required">
+        <input type="checkbox" id="dbt-allow-virtual" /> allow virtual tables
+      </label>
+      <button type="button" class="sv-close" id="dbt-modal-close" title="Close (Esc)">✕</button>
+    </div>
+    <div style="flex:1;min-height:0;overflow:auto;padding:4px 2px">
+      <div id="dbt-modal-summary" class="empty" style="margin:4px 0 10px">Pick a target/manifest.json and click Preview.</div>
+      <div id="dbt-modal-warnings"></div>
+      <pre id="dbt-modal-catalog" style="display:none;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto;border:1px solid var(--border,#333);border-radius:6px;padding:8px;margin:8px 0 0"></pre>
+    </div>
+    <div class="sv-dialog-foot">
+      <span class="hint">Preview writes nothing. Apply merges: hand-written entries are kept; previous dbt imports are refreshed.</span>
+      <span class="spacer"></span>
+      <span id="dbt-modal-err" class="sv-err"></span>
+      <button id="dbt-modal-apply" disabled>Apply</button>
     </div>
   </div>
 </div>
@@ -585,6 +683,14 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
+}
+
+// Raw landing-zone formats (csv/tsv/json/ndjson/jsonl, + .gz) — mirrors
+// sqlhandler.rawfiles.RAW_FORMATS. The badge reads "raw csv" etc. so an
+// agent/user can see at a glance that the table has no statistics.
+function isRawFormat(fmt) {
+  return ["csv", "tsv", "json", "ndjson", "jsonl",
+          "csv.gz", "tsv.gz", "json.gz", "ndjson.gz", "jsonl.gz"].includes(fmt);
 }
 
 // ---- header status -------------------------------------------------------
@@ -628,8 +734,10 @@ function renderTables() {
     const el = document.createElement("div");
     el.className = "table-item" + (state.selected && state.selected.path === t.path ? " active" : "");
     const fmt = document.createElement("span");
-    fmt.className = "fmt" + (t.format === "virtual" ? " virtual" : "");
-    fmt.textContent = t.format || "?";
+    // RAW badge: same mechanism as VIRTUAL — raw landing-zone tables
+    // (csv/tsv/json, scanned whole) deserve a visible kind marker.
+    fmt.className = "fmt" + (t.format === "virtual" ? " virtual" : isRawFormat(t.format) ? " raw" : "");
+    fmt.textContent = t.format === "virtual" ? "virtual" : isRawFormat(t.format) ? "raw " + t.format : t.format || "?";
     const name = document.createElement("span");
     name.className = "tname";
     // show `<source>/schema/name`, e.g. sales/orders or warehouse/sales/orders
@@ -645,6 +753,7 @@ function selectTable(t) {
   state.selected = t;
   renderTables();
   $("sql").value = "SELECT * FROM " + (t.qualified_name || t.path) + " LIMIT 100";
+  inspRefillTable(t); // Inspector pane: keep the `table` argument on the selected table
   showSchema(t);
   switchTab("schema");
 }
@@ -659,7 +768,10 @@ async function showSchema(t) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ table: t.path }),
     });
-    $("schema-desc").textContent = "uri: " + (d.uri || "");
+    // RAW tables announce themselves (landing zone: whole-file scans, no
+    // statistics) — same posture as the /api/describe `raw` marker.
+    $("schema-desc").textContent =
+      "uri: " + (d.uri || "") + (d.raw ? " — RAW " + (d.format || "") + " (landing zone; no row-group statistics)" : "");
     const cols = d.columns || [];
     let html = '<table class="grid"><thead><tr><th>#</th><th>column</th><th>type</th></tr></thead><tbody>';
     cols.forEach((c, i) => {
@@ -688,6 +800,7 @@ function renderResult(payload) {
     '<button class="copy" id="copy-csv">copy CSV</button>' +
     '<button class="copy" id="export-csv">export CSV</button>' +
     '<button class="copy" id="export-parquet">export Parquet</button>' +
+    '<button class="copy" id="export-arrow">export Arrow</button>' +
     (numericColIndex(cols, rows) >= 0 ? '<button class="copy" id="toggle-chart">📊 chart</button>' : "") +
     '</div><div id="chart"></div>';
   html += '<div style="overflow:auto;max-height:60vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr>';
@@ -712,6 +825,8 @@ function renderResult(payload) {
   if (ec) ec.onclick = () => exportResult("csv");
   const ep = $("export-parquet");
   if (ep) ep.onclick = () => exportResult("parquet");
+  const ea = $("export-arrow");
+  if (ea) ea.onclick = () => exportResult("arrow");
   const tc = $("toggle-chart");
   if (tc) tc.onclick = () => drawChart(cols, rows, tc);
 }
@@ -928,7 +1043,9 @@ function switchTab(tab) {
   $("pane-query").classList.toggle("hidden", tab !== "query");
   $("pane-schema").classList.toggle("hidden", tab !== "schema");
   $("pane-semantic").classList.toggle("hidden", tab !== "semantic");
+  $("pane-inspector").classList.toggle("hidden", tab !== "inspector");
   if (tab === "semantic") loadSemanticPane();
+  if (tab === "inspector") loadInspector();
 }
 
 // ---- theme toggle ---------------------------------------------------------
@@ -975,6 +1092,204 @@ $("sql").addEventListener("keydown", (e) => {
 });
 $("save-query").onclick = saveCurrentQuery;
 $("load-stats").onclick = loadColumnStats;
+
+// ---- Inspector tab (MCP tool bridge) ---------------------------------------
+// A thin MCP-inspector: the SAME tools/schemas an MCP client's tools/list sees
+// (GET /api/inspector/tools), one auto-generated arguments form per tool, and
+// POST /api/inspector/call dispatching through the server's own tools/call
+// path — so identity, policy, caching, audit and the saved-query write gate
+// behave exactly as over /mcp. Tool errors come back MCP-shaped
+// ({content, isError:true}); only bridge validation is an HTTP 4xx.
+const INSP_GROUPS = [
+  ["Discovery & schema", ["list_tables", "search_tables", "describe_table", "profile_table", "column_stats", "sample_rows"]],
+  ["Querying", ["run_sql", "scan_table", "explain_query", "ask_data"]],
+  ["Async jobs", ["query_submit", "query_status", "query_result", "query_cancel"]],
+  ["Saved queries", ["query_save", "query_list", "query_delete", "query_saved"]],
+];
+const insp = { tools: [], byName: {}, loaded: false };
+
+async function loadInspector() {
+  if (insp.loaded) return;
+  const sel = $("insp-tool");
+  sel.innerHTML = '<option value="">loading tools…</option>';
+  try {
+    const data = await api("/api/inspector/tools");
+    insp.tools = data.tools || [];
+    insp.byName = {};
+    insp.tools.forEach((t) => { insp.byName[t.name] = t; });
+    // Grouped picker (documentation/MCP.md groupings); unlisted tools land in
+    // a trailing "Other" group so a future tool is still callable.
+    const grouped = new Set(INSP_GROUPS.flatMap((g) => g[1]));
+    let html = "";
+    for (const [label, names] of INSP_GROUPS) {
+      const present = names.filter((n) => insp.byName[n]);
+      if (!present.length) continue;
+      html += '<optgroup label="' + esc(label) + '">';
+      for (const n of present) html += '<option value="' + esc(n) + '">' + esc(n + " — " + inspFirstSentence(insp.byName[n])) + "</option>";
+      html += "</optgroup>";
+    }
+    const others = insp.tools.filter((t) => !grouped.has(t.name));
+    if (others.length) {
+      html += '<optgroup label="Other">';
+      for (const t of others) html += '<option value="' + esc(t.name) + '">' + esc(t.name + " — " + inspFirstSentence(t)) + "</option>";
+      html += "</optgroup>";
+    }
+    sel.innerHTML = html || '<option value="">(no tools returned)</option>';
+    sel.onchange = inspRenderForm;
+    insp.loaded = true;
+    inspRenderForm();
+  } catch (e) {
+    sel.innerHTML = "";
+    inspShowError("Cannot load the tool list: " + e.message);
+  }
+}
+
+function inspFirstSentence(t) {
+  const d = (t.description || "").trim();
+  const m = d.match(/^[^\n.]+[.\n]?/); // first sentence; falls back to the whole thing
+  return (m ? m[0] : d).replace(/\s+/g, " ").trim().slice(0, 90);
+}
+
+// The schema is the contract: type-driven form. string→text, integer→number,
+// boolean→checkbox, enum→select, array-of-string→comma-separated text,
+// object/other→JSON textarea. `table` (and `column` when it names a column of
+// the selected table — NOT attempted) auto-fills from the left list; only the
+// table autofill is wired (the task's explicit scope).
+function inspRenderForm() {
+  const sel = $("insp-tool");
+  const name = sel.value;
+  const form = $("insp-form");
+  $("insp-error").className = "";
+  $("insp-error").textContent = "";
+  if (!name || !insp.byName[name]) { form.innerHTML = ""; $("insp-tool-desc").textContent = ""; return; }
+  const tool = insp.byName[name];
+  const schema = tool.inputSchema || {};
+  const props = schema.properties || {};
+  const required = new Set(schema.required || []);
+  $("insp-tool-desc").textContent = tool.description || "";
+  if (!Object.keys(props).length) {
+    form.innerHTML = '<div class="hint">No arguments — the tool takes none.</div>';
+    return;
+  }
+  let html = "";
+  for (const [key, spec] of Object.entries(props)) {
+    const label = spec && spec.title ? spec.title : key;
+    const desc = spec && spec.description ? " — " + spec.description : "";
+    const req = required.has(key) ? '<span class="req" title="required">✱</span>' : "";
+    html += '<div class="insp-field" data-key="' + esc(key) + '">';
+    html += "<label><b>" + esc(label) + "</b>" + req + esc(desc) + "</label>";
+    const type = (spec && spec.type) || "string";
+    const auto = key === "table" && state.selected
+      ? ' value="' + esc(state.selected.path) + '" title="auto-filled from the selected table"'
+      : "";
+    if (Array.isArray(spec && spec.enum)) {
+      html += '<select data-arg="' + esc(key) + '">';
+      html += '<option value=""></option>';
+      for (const v of spec.enum) {
+        const cur = required.has(key) && v === (spec.default !== undefined ? spec.default : spec.enum[0]);
+        html += '<option value="' + esc(v) + '"' + (cur ? " selected" : "") + ">" + esc(String(v)) + "</option>";
+      }
+      html += "</select>";
+    } else if (type === "boolean") {
+      html += '<input type="checkbox" data-arg="' + esc(key) + '"' + (spec && spec.default === true ? " checked" : "") + " />";
+    } else if (type === "integer" || type === "number") {
+      html += '<input type="number" data-arg="' + esc(key) + '" step="any"' + auto + (spec && spec.default !== undefined ? ' value="' + esc(spec.default) + '"' : "") + " />";
+    } else if (type === "array") {
+      html += '<input type="text" data-arg="' + esc(key) + '" placeholder="comma-separated values"' + auto + " />";
+    } else if (type === "object") {
+      html += '<textarea data-arg="' + esc(key) + '" rows="2" placeholder=\'{"param": "value"} or ["p1", "p2"]\' style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:12px;padding:7px 10px;resize:vertical"></textarea>';
+    } else {
+      html += '<input type="text" data-arg="' + esc(key) + '"' + auto + " />";
+    }
+    html += "</div>";
+  }
+  form.innerHTML = html;
+  // Ctrl+Enter inside the form runs the call — the Query tab's muscle memory.
+  form.onkeydown = (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); inspRun(); }
+  };
+}
+
+// Live table autofill: re-fill (don't overwrite user-edited non-table fields)
+// the `table` argument whenever the selection changes — same event showSchema uses.
+function inspRefillTable(t) {
+  const field = document.querySelector("#insp-form .insp-field[data-key='table'] [data-arg='table']");
+  if (field && t && t.path) field.value = t.path;
+}
+
+function inspCollect() {
+  const args = {};
+  document.querySelectorAll("#insp-form [data-arg]").forEach((el) => {
+    const key = el.dataset.arg;
+    let val;
+    if (el.type === "checkbox") val = el.checked;
+    else if (el.type === "number") val = el.value === "" ? null : Number(el.value);
+    else val = el.value;
+    if (val === null || val === undefined || val === "" || val === false) return; // optional: omit
+    args[key] = val;
+  });
+  return args;
+}
+
+function inspSetOut(payload) {
+  const out = $("insp-result");
+  const isError = !!payload.isError;
+  const text = payload.content && payload.content[0] && payload.content[0].text ? payload.content[0].text : "(empty content)";
+  out.innerHTML =
+    '<div class="result-meta"><span class="' + (isError ? "bad" : "ok") + '">' +
+    (isError ? "⚠ isError — the tool reported an error" : "✓ ok") +
+    '</span><span>tool: ' + esc($("insp-tool").value || "?") + "</span>" +
+    '<button class="copy" id="insp-copy">copy text</button></div>' +
+    '<div class="insp-out' + (isError ? " is-error" : "") + '">' + esc(text) + "</div>";
+  const btn = $("insp-copy");
+  if (btn) btn.onclick = () => navigator.clipboard.writeText(text).then(() => toast("Copied"));
+}
+
+function inspShowError(msg) {
+  const el = $("insp-error");
+  el.textContent = msg;
+  el.className = "show";
+}
+
+async function inspRun() {
+  const name = $("insp-tool").value;
+  if (!name) { inspShowError("Pick a tool first."); return; }
+  const args = inspCollect();
+  $("insp-run").disabled = true;
+  $("insp-result").innerHTML = '<div class="loading">calling ' + esc(name) + "…</div>";
+  $("insp-error").className = "";
+  try {
+    const res = await fetch("/api/inspector/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, arguments: args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+    inspSetOut(data);
+  } catch (e) {
+    $("insp-result").innerHTML = "";
+    inspShowError(e.message); // bridge errors only (HTTP 4xx); tool errors render above
+  } finally {
+    $("insp-run").disabled = false;
+  }
+}
+
+$("insp-run").onclick = inspRun;
+$("insp-raw").onclick = () => {
+  const out = $("insp-result");
+  const box = out.querySelector(".insp-out");
+  if (!box) { toast("Run a tool first", true); return; }
+  // Toggle: re-render the SAME payload the bridge returned, JSON-formatted.
+  const payload = { content: [{ type: "text", text: box.textContent }], isError: out.querySelector(".bad") !== null };
+  const raw = out.dataset.raw === "1";
+  out.dataset.raw = raw ? "0" : "1";
+  if (raw) inspSetOut(payload);
+  else {
+    out.innerHTML = '<div class="result-meta"><span class="hint">raw bridge response ({content, isError} — inspector fidelity)</span></div>' +
+      '<div class="insp-out">' + esc(JSON.stringify(payload, null, 2)) + "</div>";
+  }
+};
 
 // ---- semantic catalog ------------------------------------------------------
 async function refreshCatalog() {
@@ -1029,6 +1344,129 @@ $("catalog-clear").onclick = async () => {
     refreshCatalog();
   } catch (e) { toast(e.message, true); }
 };
+
+// ---- dbt manifest import (preview → explicit Apply) -------------------------
+// Reads target/manifest.json client-side, POSTs it to the preview route
+// (parse-only — nothing is written), shows imported/virtuals/skipped counts
+// plus the first warnings, and only the Apply button writes — through the
+// same validated upload store as a manual upload. Virtual tables need BOTH
+// the node's meta.sqlhandler.virtual AND the allow-virtual checkbox.
+const dbtImport = { manifest: null, preview: null };
+
+function dbtModalClose() {
+  $("dbt-modal").classList.add("hidden");
+  dbtImport.manifest = null;
+  dbtImport.preview = null;
+  $("dbt-modal-apply").disabled = true;
+  $("dbt-modal-catalog").style.display = "none";
+  $("dbt-modal-catalog").textContent = "";
+  $("dbt-modal-warnings").textContent = "";
+  $("dbt-modal-err").textContent = "";
+  $("dbt-modal-summary").textContent = "Pick a target/manifest.json and click Preview.";
+  $("dbt-modal-summary").className = "empty";
+}
+
+function dbtDbtBody() {
+  const body = { manifest: dbtImport.manifest };
+  if ($("dbt-allow-virtual").checked) body.allow_virtual = true;
+  return body;
+}
+
+function dbtShowPreview(res) {
+  dbtImport.preview = res;
+  const summary = $("dbt-modal-summary");
+  summary.className = "";
+  summary.innerHTML =
+    "<b>" + res.imported + "</b> table" + (res.imported === 1 ? "" : "s") + " would be imported" +
+    " · <b>" + res.virtuals + "</b> virtual" +
+    " · <b>" + res.skipped + "</b> skipped" +
+    (res.warnings && res.warnings.length
+      ? " · " + res.warnings.length + " warning" + (res.warnings.length === 1 ? "" : "s")
+      : "");
+  const warns = $("dbt-modal-warnings");
+  warns.textContent = "";
+  (res.warnings || []).slice(0, 8).forEach((w) => {
+    const line = document.createElement("div");
+    line.className = "hint";
+    line.style.marginTop = "4px";
+    line.textContent = "⚠ " + w;
+    warns.appendChild(line);
+  });
+  if ((res.warnings || []).length > 8) {
+    const more = document.createElement("div");
+    more.className = "hint";
+    more.style.marginTop = "4px";
+    more.textContent = "… and " + (res.warnings.length - 8) + " more";
+    warns.appendChild(more);
+  }
+  const pre = $("dbt-modal-catalog");
+  pre.style.display = "block";
+  pre.textContent = JSON.stringify(res.catalog, null, 2);
+  $("dbt-modal-apply").disabled = !res.imported || !dbtImport.manifest;
+}
+
+async function dbtPreview() {
+  if (!dbtImport.manifest) { $("dbt-modal-err").textContent = "Pick a manifest.json first."; return; }
+  const err = $("dbt-modal-err");
+  err.textContent = "";
+  $("dbt-modal-apply").disabled = true;
+  $("dbt-modal-summary").textContent = "parsing manifest…";
+  $("dbt-modal-summary").className = "empty";
+  try {
+    dbtShowPreview(await api("/api/semantic-catalog/import-dbt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dbtDbtBody()),
+    }));
+  } catch (e) {
+    $("dbt-modal-summary").textContent = "Pick a target/manifest.json and click Preview.";
+    $("dbt-modal-summary").className = "empty";
+    err.textContent = e.message;
+  }
+}
+
+async function dbtApply() {
+  if (!dbtImport.manifest) return;
+  const err = $("dbt-modal-err");
+  err.textContent = "";
+  $("dbt-modal-apply").disabled = true;
+  try {
+    const res = await api("/api/semantic-catalog/import-dbt/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dbtDbtBody()),
+    });
+    dbtModalClose();
+    toast("dbt import applied: " + res.tables + " table" + (res.tables === 1 ? "" : "s") +
+      " (" + res.overwritten + " refreshed)");
+    refreshCatalog();
+  } catch (e) {
+    err.textContent = e.message;
+    $("dbt-modal-apply").disabled = false;
+  }
+}
+
+$("catalog-dbt").onclick = () => $("catalog-dbt-file").click();
+$("catalog-dbt-file").onchange = async () => {
+  const f = $("catalog-dbt-file").files[0];
+  if (!f) return;
+  $("catalog-dbt-file").value = "";
+  let parsed;
+  try {
+    parsed = JSON.parse(await f.text());
+  } catch (e) {
+    toast(f.name + " is not valid JSON (need dbt's target/manifest.json)", true);
+    return;
+  }
+  dbtImport.manifest = parsed;
+  $("dbt-modal-info").textContent = f.name + " → semantic catalog";
+  $("dbt-modal").classList.remove("hidden");
+  await dbtPreview();
+};
+$("dbt-modal-close").onclick = dbtModalClose;
+$("dbt-modal-backdrop").onclick = dbtModalClose;
+$("dbt-allow-virtual").onchange = () => { if (dbtImport.manifest) dbtPreview(); };
+$("dbt-modal-apply").onclick = dbtApply;
 
 // ---- SV editor component ----------------------------------------------------
 // A transparent-text textarea layered over a <pre> the SERVER highlights with

@@ -83,7 +83,6 @@ import asyncio
 import contextvars
 import fnmatch
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -91,7 +90,7 @@ import sys
 import threading
 import traceback
 from datetime import UTC, datetime
-from typing import Any, NamedTuple
+from typing import Any
 
 import yaml
 from mcp.server import MCPServer
@@ -687,44 +686,21 @@ _audit_lock = threading.Lock()
 _caller_context: contextvars.ContextVar = contextvars.ContextVar("applygate_caller", default=None)
 
 
-class _Caller(NamedTuple):
-    """Resolved identity of the request's caller for the audit trail.
-
-    Fleet pattern mirrors K8S-MCP's _Caller (its per-client name registry has
-    no applygate equivalent yet): `key_fp` is a stable, NON-SECRET fingerprint
-    of the matched key (sha256, first 12 hex) — the raw key never enters the
-    audit trail; `client` is the ASGI client host:port when known.
-    """
-
-    key_fp: str | None
-    client: str | None
-
-
-def _resolve_caller(scope) -> _Caller:
-    """Resolve the caller from raw ASGI scope — the same inputs the auth
-    middleware uses, re-resolved here because the shared mcp_auth middleware
-    authenticates without exposing the matched identity."""
-    client = scope.get("client")
-    client_str = f"{client[0]}:{client[1]}" if client else None
-    presented = mcp_auth.presented_keys(scope)
-    if not presented:
-        return _Caller(key_fp=None, client=client_str)
-    for candidate in presented:
-        for valid in mcp_auth.configured_keys(AUTH_ENV_NAMES):
-            if hmac.compare_digest(candidate.encode("utf-8"), valid.encode("utf-8")):
-                return _Caller(
-                    key_fp="sha256:" + hashlib.sha256(valid.encode("utf-8")).hexdigest()[:12],
-                    client=client_str,
-                )
-    return _Caller(key_fp=None, client=client_str)
-
-
 class _CallerAuditMiddleware:
     """Outermost ASGI wrapper: capture WHO is calling into a contextvar so
     the audit trail can attribute entries, then delegate to the real auth
     middleware. Runs on every path (console included) — attribution is
     best-effort and never gates anything. Exposes `.routes` pass-through so
-    introspection of the wrapped app keeps working."""
+    introspection of the wrapped app keeps working.
+
+    This is now a thin DELEGATE to the shared resolver (fleet Item A1):
+    ``mcp_auth.capture_caller`` re-implements the key match + fingerprint +
+    optional name/via resolution ONCE for the whole fleet. The wrapper stays
+    OUTSIDE ``ApiKeyAuthMiddleware`` on purpose — the auth middleware
+    short-circuits non-protected paths BEFORE any logic, so capture inside
+    it would change console-path audit lines from ``caller={"key_fp":null,
+    "client":…}`` to ``caller`` absent. Zero audit-shape drift.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -735,15 +711,22 @@ class _CallerAuditMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
-            _caller_context.set(_resolve_caller(scope))
+            _caller_context.set(mcp_auth.capture_caller(scope, AUTH_ENV_NAMES, clients_env=CLIENTS_ENV))
         await self.app(scope, receive, send)
 
 
 def _audit_caller() -> dict:
+    """The ``caller`` audit field: the shared Caller rendered to exactly the
+    keys that are SET — ``{"key_fp", "client"}`` for every deployment that
+    configures no registry and relays no header (byte-identical to the
+    pre-attribution shape), up to ``{"key_fp", "client", "name", "via"}``
+    when the ``CLIENTS_ENV`` registry / a trusted relay are configured.
+    ``Caller.as_dict`` includes name/via only when set, so every existing
+    chain reader (subset check) keeps parsing old and new lines alike."""
     caller = _caller_context.get()
     if caller is None:
         return {"key_fp": None, "client": None}
-    return {"key_fp": caller.key_fp, "client": caller.client}
+    return caller.as_dict()
 
 
 def _last_audit_line_sha(path: str) -> str:
@@ -1351,6 +1334,14 @@ _mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protect
 APPLYGATE_API_KEYS_ENV = "APPLYGATE_API_KEYS"
 
 AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, APPLYGATE_API_KEYS_ENV)
+
+# Per-request caller-name registry (fleet Item A4): "name:key;name:key;..."
+# — OPTIONAL, off by default (default render stays fp-only). Read PER REQUEST
+# by mcp_auth.capture_caller (Secret rotation without restart). The registry
+# only NAMES keys that the auth middleware already matched — it can never
+# unlock anything; an unparseable entry is skipped loudly and degrades to
+# fp-only attribution. Chart: values.clients.existingSecret → this env.
+CLIENTS_ENV = "APPLYGATE_CLIENTS"
 
 
 def _configured_api_keys() -> list:

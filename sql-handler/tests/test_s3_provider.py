@@ -46,24 +46,32 @@ def test_endpoint_override_none_when_empty():
 
 def test_derive_flat_single_file():
     info = _provider()._derive("orders.parquet")
-    assert info == TableInfo(name="orders", schema="default", format="parquet", location="orders.parquet")
+    assert info == TableInfo(
+        name="orders", schema="default", format="parquet", location="orders.parquet"
+    )
     assert info.path == "orders"
 
 
 def test_derive_folder_table():
     info = _provider()._derive("customers/part-0.parquet")
-    assert info == TableInfo(name="customers", schema="default", format="parquet", location="customers")
+    assert info == TableInfo(
+        name="customers", schema="default", format="parquet", location="customers"
+    )
 
 
 def test_derive_schema_folder_table():
     info = _provider()._derive("sales/customers/part-0.parquet")
-    assert info == TableInfo(name="customers", schema="sales", format="parquet", location="sales/customers")
+    assert info == TableInfo(
+        name="customers", schema="sales", format="parquet", location="sales/customers"
+    )
     assert info.path == "sales/customers"
 
 
 def test_derive_skips_hive_partition():
     info = _provider()._derive("hr/employees/year=2024/part.parquet")
-    assert info == TableInfo(name="employees", schema="hr", format="parquet", location="hr/employees")
+    assert info == TableInfo(
+        name="employees", schema="hr", format="parquet", location="hr/employees"
+    )
 
 
 def test_derive_ignores_non_parquet_and_hidden():
@@ -116,7 +124,9 @@ def test_list_tables_discovers_all_layouts(monkeypatch):
             pafs.FileInfo("lakehouse/datasets/orders.parquet", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets/sales/customers/a.parquet", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets/sales/customers/b.parquet", pafs.FileType.File),
-            pafs.FileInfo("lakehouse/datasets/hr/employees/year=2024/part.parquet", pafs.FileType.File),
+            pafs.FileInfo(
+                "lakehouse/datasets/hr/employees/year=2024/part.parquet", pafs.FileType.File
+            ),
             pafs.FileInfo("lakehouse/datasets/readme.txt", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets", pafs.FileType.Directory),
         ]

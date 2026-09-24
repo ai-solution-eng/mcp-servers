@@ -23,6 +23,19 @@ site-private may live here.
 | `values.g2.yaml` | The HPE SE-G2 lab cluster (literal G2 endpoints, sanitized) — the working reference, including its proxy + MITM-CA wiring. |
 | `values.hosted-trial.yaml` | A customer hosted-trial environment — `${DOMAIN_NAME}` placeholders where the PCAI build resolves them, corporate-proxy/CA wiring off. |
 
+**Before the first apply — pre-deploy the key Secret.** Both examples point
+`apiKey.existingSecret` at the fleet convention `mcp-fleet-apikeys` (key
+`api-keys`); the pod fails loud (`CreateContainerConfigError`) until the
+Secret exists, and the chart never creates or inlines the key:
+
+```bash
+kubectl -n <namespace> create secret generic mcp-fleet-apikeys \
+  --from-literal='api-keys=<key1>,<key2>'
+```
+
+This server runs arbitrary allowlisted commands and holds agent scratch
+space — never expose it without the key gate and the gateway's oauth2 layer.
+
 Sanitization rule for anything added here: no keys, tokens, passwords, or
 usernames — only role-named `<UPPER_SNAKE>` placeholders (e.g. `<ALLOWED_NAMESPACES>`,
 `<IN_CLUSTER_PROMETHEUS_URL>`, `<USERNAME>`) and the already-public G2 endpoint

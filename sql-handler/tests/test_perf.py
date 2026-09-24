@@ -149,7 +149,9 @@ def test_block_cache_warm_scan_avoids_the_base_stream(cached_env):
 
     # fresh wrapper (new process state, same disk cache): zero base opens
     counter2 = _CountingHandler(pafs.SubTreeFileSystem(str(cached_env), pafs.LocalFileSystem()))
-    warm = pad.dataset(path, filesystem=maybe_block_cache(pafs.PyFileSystem(counter2)), format="parquet")
+    warm = pad.dataset(
+        path, filesystem=maybe_block_cache(pafs.PyFileSystem(counter2)), format="parquet"
+    )
     out = warm.to_table()
     assert out.num_rows == 4000
     assert counter2.stream_opens == 0  # every byte came from the local block cache
@@ -171,7 +173,9 @@ def test_block_cache_skips_local_and_survives_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_BLOCK_CACHE", "1")
     assert isinstance(maybe_block_cache(pafs.LocalFileSystem()), pafs.LocalFileSystem)
     # a handler failure degrades to the plain fs, never raises into the data path
-    monkeypatch.setattr(pafs, "PyFileSystem", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(
+        pafs, "PyFileSystem", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
     fs = pafs.LocalFileSystem()
     assert maybe_block_cache(fs, purpose="probe") is fs
 
@@ -189,7 +193,9 @@ def test_s3_options_passthrough(monkeypatch):
             created.update(kw)
 
     monkeypatch.setattr(s3mod.pafs, "S3FileSystem", FakeS3)
-    monkeypatch.setenv("SQLHANDLER_S3_OPTIONS", json.dumps({"request_timeout": 99, "retry_limit": 7}))
+    monkeypatch.setenv(
+        "SQLHANDLER_S3_OPTIONS", json.dumps({"request_timeout": 99, "retry_limit": 7})
+    )
     cfg = S3Config(endpoint_url="http://127.0.0.1:9000", access_key="k", secret_key="s")
     s3mod.build_s3fs(cfg)
     assert created["request_timeout"] == 99
@@ -393,8 +399,12 @@ def test_block_cache_scope_keeps_snapshots_isolated(cached_env):
     (snap0 / "data.parquet").write_bytes(content0)
     (snap1 / "data.parquet").write_bytes(content1)
 
-    w0 = maybe_block_cache(pafs.SubTreeFileSystem(str(snap0), pafs.LocalFileSystem()), scope="delta-v0")
-    w1 = maybe_block_cache(pafs.SubTreeFileSystem(str(snap1), pafs.LocalFileSystem()), scope="delta-v1")
+    w0 = maybe_block_cache(
+        pafs.SubTreeFileSystem(str(snap0), pafs.LocalFileSystem()), scope="delta-v0"
+    )
+    w1 = maybe_block_cache(
+        pafs.SubTreeFileSystem(str(snap1), pafs.LocalFileSystem()), scope="delta-v1"
+    )
 
     assert w0.open_input_file("data.parquet").read() == content0
     assert w1.open_input_file("data.parquet").read() == content1
@@ -602,7 +612,9 @@ def test_profile_table_single_scan(tmp_path, monkeypatch):
     n = 5000
     d = tmp_path / "workorder" / "t"
     d.mkdir(parents=True)
-    pq.write_table(pa.table({"id": list(range(n)), "txt": [f"v{i}" for i in range(n)]}), d / "part.parquet")
+    pq.write_table(
+        pa.table({"id": list(range(n)), "txt": [f"v{i}" for i in range(n)]}), d / "part.parquet"
+    )
 
     eng = SqlEngine(_ProfileProvider(tmp_path), cache_ttl=0, cache_dir=str(tmp_path))
     sqls = _profile_recording_connect(monkeypatch)
@@ -702,7 +714,11 @@ def test_clustering_disabled_by_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_VIRTUAL_CACHE_SORT", "0")
     from test_virtual import _write
 
-    _write(tmp_path, "shop/sales2", pa.table({"id": list(range(5000)), "grp": [f"g{i % 4}" for i in range(5000)]}))
+    _write(
+        tmp_path,
+        "shop/sales2",
+        pa.table({"id": list(range(5000)), "grp": [f"g{i % 4}" for i in range(5000)]}),
+    )
 
     class P2:
         kind = "p2"
@@ -721,7 +737,9 @@ def test_clustering_disabled_by_env(tmp_path, monkeypatch):
 
     cat = tmp_path / "catalog.yaml"
     cat.write_text(
-        yaml.safe_dump({"tables": {"vw_clustered": {"definition": "SELECT grp, id FROM sales2 WHERE id >= 0"}}}),
+        yaml.safe_dump(
+            {"tables": {"vw_clustered": {"definition": "SELECT grp, id FROM sales2 WHERE id >= 0"}}}
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))

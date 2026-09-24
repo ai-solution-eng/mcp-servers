@@ -185,5 +185,7 @@ def duckdb_budget() -> dict[str, object]:
         budget["memory_limit"] = _memory_budget_string(int(memory * fraction))
     if cpu is not None:
         budget["threads"] = max(1, int(cpu))
-    budget["temp_directory"] = os.environ.get("SQLHANDLER_DUCKDB_TEMP_DIR", "/tmp/sqlhandler-duckdb-spill")
+    budget["temp_directory"] = os.environ.get(
+        "SQLHANDLER_DUCKDB_TEMP_DIR", "/tmp/sqlhandler-duckdb-spill"
+    )
     return budget

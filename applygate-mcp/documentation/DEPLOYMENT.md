@@ -39,6 +39,8 @@ ezua:
 | `audit.file` | `/data/audit.jsonl` | JSONL audit sink path inside the volume. The trail is **hash-chained** (tamper-evident; verify with `server.verify_audit_chain` — README procedure) and caller-attributed. Fleet convention: this audit.path is documented for ops mount/expose — mount the same path/PVC into the logsearch pod to make it searchable. |
 | `planBinding.unplannedApply` | `''` (renders nothing) | D11 transition knob — renders `APPLYGATE_UNPLANNED_APPLY` ONLY when set. Unset = the server's built-in default **deny**: `apply_manifest` refuses without a matching `plan_apply` (sha256-bound to the planned bytes). `warn` = documented migration path (applies + logs loudly); `allow` = pre-D11 behavior. Unknown values fail closed. |
 | `metrics.enabled` / `metrics.interval` | `false` / `30s` | ADDITIVE and OFF by default (default render stays byte-identical to the Wave-0 baseline). Renders `APPLYGATE_METRICS_ENABLED` + the ServiceMonitor; `/metrics` serves on the same container port (prometheus-client import-guarded — honest fallback without it). Requires prometheus-operator CRDs. |
+| `clients.existingSecret` / `existingSecretKey` | `''` (renders nothing) | Wave-6 caller attribution, optional: the per-request caller-name registry `APPLYGATE_CLIENTS` (`name:key;name:key;...` — NAMES keys the API-key middleware already matched → audit `caller.name`; never authenticates anything). Secret material — existingSecret-only, the chart never creates or inlines it: `kubectl -n <ns> create secret generic applygate-mcp-clients --from-literal=clients='pipeline-bot:key-1;deploy-bot:key-2'`. Omitted ⇒ fp-only caller audit, unchanged behavior. |
+| `callerPassthrough.trustedCidrs` | `''` (renders nothing) | Wave-6, optional: comma-separated CIDRs of trusted direct peers whose `X-MCP-Caller` claim is recorded → audit `caller.via` (sanitized, ≤200 chars; non-secret account names, never tokens). **Empty = fail-closed: the header is ignored from every peer.** Attribution-never-authorization: neither knob unlocks anything (not namespaces, kinds, the D11 plan binding, or confirm gates). |
 | `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request. |
 | `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml`/`pyproject.toml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
@@ -65,6 +67,8 @@ touch these directly:
 | `APPLYGATE_UNPLANNED_APPLY` | `planBinding.unplannedApply` (only when set; unset = server default deny) |
 | `APPLYGATE_METRICS_ENABLED` | `metrics.enabled` (only when true) |
 | `APPLYGATE_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
+| `APPLYGATE_CLIENTS` | `clients.existingSecret{,Key}` (only when set) — the caller-name registry Secret |
+| `MCP_CALLER_TRUSTED_CIDRS` | `callerPassthrough.trustedCidrs` (only when set; empty = header ignored everywhere) |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` |
 
 ## Gateway exposure (ezua / Istio)
@@ -88,7 +92,7 @@ matches nothing (the route silently vanishes).
 ## Cross-namespace writes (operator bootstrap, one-time)
 
 The release's Role can only grant access inside its own namespace — that is a
-PCA I constraint, not a choice. To let the server write into OTHER
+PCAI constraint, not a choice. To let the server write into OTHER
 namespaces, an admin with rights over those namespaces applies a one-time
 bootstrap manifest that creates the same writer Role + RoleBinding per target
 namespace, bound to the release's ServiceAccount (see
@@ -98,6 +102,47 @@ namespaces that bootstrap covers: a namespace in the policy without a
 bootstrap Role means the tool's policy passes but the API answers 403. Revoke
 by removing the namespace from both places — the tool-level blocklist always
 wins.
+
+## Deployment targets
+
+Behavior that differs by target, and the paste-ready values for each
+(`helm/values-examples/` — sanitized; real per-site values live in
+`helm/local/`):
+
+### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+
+- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
+  write the literal domain into `ezua.domainName` and
+  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Fleet API key.** The shared fleet Secret `mcp-fleet-apikeys` (key
+  `api-keys`), created cluster-side before the deploy — the examples point
+  `apiKey.existingSecret` at it.
+- **RBAC bootstrap.** Cross-namespace writes (the `project-user-*` and
+  tool namespaces on the allowlist) need the one-time
+  `helm/local/rbac-bootstrap.se-g2.yaml` applied by an admin per target
+  namespace — see the section above.
+- `hpe_proxies: true`, `kyverno.enabled: true` (EZUA labeling enforced),
+  metrics + ServiceMonitor on.
+- Sanitized example:
+  [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
+
+### Hosted trial (customer-hosted PCAI)
+
+- **`${DOMAIN_NAME}` placeholders stay as-is** — PCAI resolves them before
+  rendering on current builds; on a build that does not, substitute the
+  literal domain (an unresolved placeholder registers a gateway host that
+  matches nothing).
+- **API-key Secret is provisioned out of band** per the customer's key
+  process (`apiKey.existingSecret`/`existingSecretKey` name it — the chart
+  never creates or inlines keys); keep the default-deny write surface
+  (`namespaces.allowed` = only the trial namespaces) and expose the host only
+  where the ezaf-gateway enforces real auth.
+- `hpe_proxies: false`, `kyverno.enabled: false` unless the platform
+  enforces vendor labels; metrics off keeps the render minimal.
+- Cross-namespace writes need the same per-namespace admin bootstrap as on
+  G2 (the release Role is namespace-scoped everywhere).
+- Sanitized example:
+  [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
 
 ## Upgrading
 

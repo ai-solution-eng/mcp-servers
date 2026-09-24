@@ -20,7 +20,7 @@ image:
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
-  tag: v1.3.0
+  tag: v1.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -59,14 +59,31 @@ searxng:
   baseUrl: ""
   # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
   language: "en-US"
-  # Engines to disable via settings.yml (top-level engines key). Default: []
-  # — every default SearXNG engine stays enabled, including ddg/brave/
-  # startpage. SearXNG auto-suspends engines that fail repeatedly and the
-  # search tool reports per-query which engines did not respond, so leaving
-  # them on is cheap. If one proves consistently dead on a given network
-  # (startpage showed a hard CAPTCHA wall on the HPE proxy), add its name
-  # here and re-deploy.
-  disabledEngines: []
+  # Engines to disable via settings.yml (top-level engines key).
+  #
+  # Default: the engines with a track record of dying behind corporate
+  # egress proxies (SE-G2 evidence: ddg/brave/startpage serve CAPTCHA walls
+  # to datacenter IPs; wikidata SPARQL times out through the proxy). Keeping
+  # dead engines enabled is NOT cheap on a shared egress IP: every search
+  # pays their request/timeout budget, auto-suspension merely reports them
+  # per query while the quota keeps burning, and the whole cluster's
+  # instances share one source IP. Names MUST match SearXNG engine names
+  # exactly (dots for brave variants, spaces for ddg/startpage variants) —
+  # a wrong name is silently ignored. Set to [] only on open-internet
+  # (non-proxied) installs.
+  disabledEngines:
+    - brave
+    - brave.images
+    - brave.news
+    - brave.videos
+    - duckduckgo
+    - duckduckgo images
+    - duckduckgo news
+    - duckduckgo videos
+    - startpage
+    - startpage images
+    - startpage news
+    - wikidata
   resources:
     requests:
       cpu: 100m

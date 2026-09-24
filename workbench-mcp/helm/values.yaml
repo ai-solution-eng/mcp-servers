@@ -34,8 +34,11 @@ imagePullSecrets: []
 # run-command console, and an audit tail. The /api/* endpoints call the
 # SAME core functions the MCP tools use — path confinement, size caps, the
 # argv allowlist/denylist and the JSONL audit all still apply; the UI gets
-# NO new powers. It is read/write and unauthenticated at the pod: the
-# endpoint must sit behind gateway authn (PCAI Istio gateway). Rendered
+# NO new powers. Auth posture (K8S-MCP console pattern): the console HTML at
+# / and /ui is public-but-INERT (an in-page unlock bar collects the key — the
+# browser cannot load the page behind a 401); every /api/* data route and
+# /mcp stay API-key-gated at the pod, and the endpoint must ALSO sit behind
+# gateway authn (PCAI Istio gateway). Rendered
 # into the container as WORKBENCH_UI_ENABLED by deployment.yaml.
 webui:
   enabled: true

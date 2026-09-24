@@ -31,6 +31,9 @@ Configuration (environment variables):
                               internally (legitimate internal targets)
   SEARXNG_FETCH_DENY_EXTRA    SSRF-guard: extra comma-separated denied
                               hosts/CIDRs (deny wins over allow)
+  SEARXNG_SEARCH_CACHE_TTL    search result cache TTL seconds (default 120,
+                              0 disables) — dedupes the multi-tenant
+                              duplicate-query fan-out
   SEARXNG_FETCH_CACHE_TTL     fetch result cache TTL seconds (default 300,
                               0 disables)
   SEARXNG_FETCH_MAX_BODY_BYTES  response-body cap bytes (default 5000000)
@@ -198,6 +201,11 @@ async def search(
             pageno=pageno,
         )
         await ctx.info(f"Found {len(resp.results)} results for: {query}")
+        # getattr: test stubs may not carry the attribute (duck-typed seam).
+        if getattr(resp, "cache_hit", False):
+            await ctx.info(
+                f"Served from search cache (TTL {searcher.result_cache.ttl_seconds:.0f}s): {query}"
+            )
         return format_search_response(resp, max(1, min(20, int(max_results))))
     except SearXNGError as e:
         await ctx.error(f"Search error: {e}")

@@ -6,8 +6,8 @@ description: >-
   SearXNG MCP Server — MCP 2.0 metasearch + content fetcher backed by a
   bundled SearXNG sidecar, behind the PCAI Istio gateway.
 type: application
-version: 1.3.0
-appVersion: "v1.3.0"
+version: 1.4.0
+appVersion: "v1.4.0"
 keywords:
   - mcp
   - search

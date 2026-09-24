@@ -91,6 +91,26 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            {{- if .Values.clients.existingSecret }}
+            # Caller-name registry (values: clients.existingSecret →
+            # APPLYGATE_CLIENTS, "name:key;name:key;..."). Only rendered when
+            # set — the default render stays byte-identical and the audit
+            # stays fp-only. The registry NAMES keys the API-key middleware
+            # already matched; it can never authenticate anything.
+            - name: APPLYGATE_CLIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clients.existingSecret }}
+                  key: {{ .Values.clients.existingSecretKey }}
+            {{- end }}
+            {{- if .Values.callerPassthrough.trustedCidrs }}
+            # X-MCP-Caller trusted peers (values: callerPassthrough.trustedCidrs
+            # → MCP_CALLER_TRUSTED_CIDRS). Only rendered when set — UNSET =
+            # fail-closed: the header is ignored from every peer and the
+            # default render stays byte-identical (fp-only attribution).
+            - name: MCP_CALLER_TRUSTED_CIDRS
+              value: {{ .Values.callerPassthrough.trustedCidrs | quote }}
+            {{- end }}
             {{- if and .Values.hpe_proxies .Values.proxy.http }}
             # HPE corporate proxy env — wired ONLY when hpe_proxies=true. The
             # Kubernetes API is in-cluster and covered by the NO_PROXY
