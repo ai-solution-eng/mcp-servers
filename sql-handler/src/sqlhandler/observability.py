@@ -14,6 +14,7 @@ Metrics (rendered at GET /metrics):
   sqlhandler_tables                        gauge  (current table count)
   sqlhandler_process_rss_bytes             gauge
   sqlhandler_container_memory_limit_bytes  gauge (0 when unlimited)
+  sqlhandler_readiness_state               gauge  (1 ready, 0.5 degraded, 0 not ready)
 
 Additive families (later waves — absent until first observed, so existing
 series and dashboards render byte-identically):
@@ -228,6 +229,14 @@ class Metrics:
                 "counter",
                 [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(wo.items())],
             )
+        # Readiness rollup (HA review 2026-09): rendered ALWAYS, engine or
+        # not — it is most informative exactly when the backend is down.
+        emit(
+            "sqlhandler_readiness_state",
+            "Readiness: 1 ready, 0.5 degraded (backend failing < grace), 0 not ready",
+            "gauge",
+            [("", drift.rollup())],
+        )
         if engine is not None:
             try:
                 stats = engine.cache_stats()
@@ -262,6 +271,67 @@ class Metrics:
 metrics = Metrics()  # process-wide registry
 
 
+def _ready_degraded_grace() -> float:
+    """Seconds a failing backend check reports as DEGRADED before NOT READY.
+
+    `SQLHANDLER_READY_DEGRADED_GRACE` (default 60s). 0 disables the
+    degraded band entirely (the historical binary behavior). The grace
+    exists so a single flaky check (one blip on the storage endpoint)
+    stops draining every replica of a scaled-out deployment at once, while
+    a persistent failure still does within a minute.
+    """
+    raw = os.environ.get("SQLHANDLER_READY_DEGRADED_GRACE", "").strip()
+    try:
+        return max(float(raw), 0.0) if raw else 60.0
+    except ValueError:
+        return 60.0
+
+
+class ReadinessDrift:
+    """Backend-check rollup shared by /ready, /metrics and the drift gate.
+
+    `note_backend(ok)` is called after every readiness probe (HTTP mode);
+    `rollup()` maps the state onto the readiness gauge's three values.
+    Per-process BY DESIGN — this is the per-pod signal an HPA or a
+    dashboard needs; a shared/global view would defeat the purpose.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._failed_since: float | None = None
+
+    def note_backend(self, ok: bool) -> None:
+        with self._lock:
+            if ok:
+                self._failed_since = None
+            elif self._failed_since is None:
+                self._failed_since = time.monotonic()
+
+    def backend_failed(self) -> bool:
+        with self._lock:
+            return self._failed_since is not None
+
+    def failed_seconds(self) -> float:
+        with self._lock:
+            if self._failed_since is None:
+                return 0.0
+            return max(time.monotonic() - self._failed_since, 0.0)
+
+    def rollup(self) -> float:
+        """1.0 ready | 0.5 degraded (failing, within the grace) | 0.0 not ready."""
+        failed = self.failed_seconds()
+        if failed <= 0.0:
+            return 1.0
+        grace = _ready_degraded_grace()
+        if grace <= 0.0:
+            return 0.0
+        return 0.5 if failed < grace else 0.0
+
+
+#: Process-wide readiness-drift state (per-pod by design).
+drift = ReadinessDrift()
+
+
 # ---------------------------------------------------------------------------
 # audit log
 # ---------------------------------------------------------------------------
@@ -270,6 +340,16 @@ metrics = Metrics()  # process-wide registry
 def audit_log_path() -> str:
     """Configured audit JSONL path ('' = audit logging off)."""
     return os.environ.get("SQLHANDLER_AUDIT_LOG", "").strip()
+
+
+def _audit_pod() -> str | None:
+    """Serving replica identity for audit lines (never fails).
+
+    `SQLHANDLER_POD_NAME` (the chart wires the downward API) then
+    `HOSTNAME` (set by k8s even without the downward API). The field is
+    omitted entirely outside k8s, so local/stdio trails stay byte-identical.
+    """
+    return os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or None
 
 
 def audit_query(
@@ -295,6 +375,7 @@ def audit_query(
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "event": "query",
+        "pod": _audit_pod(),
         "sql": sql[:2000],
         "state": state,
         "duration_ms": round(duration_ms, 1) if duration_ms is not None else None,
@@ -337,6 +418,7 @@ def audit_write(
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "event": "write",
+        "pod": _audit_pod(),
         "sql": sql[:2000],
         "state": state,
         "duration_ms": round(duration_ms, 1) if duration_ms is not None else None,

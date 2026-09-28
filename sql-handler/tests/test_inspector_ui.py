@@ -86,7 +86,10 @@ def call_tool(client, name, arguments=None):
     r = client.post("/api/inspector/call", json={"name": name, "arguments": arguments or {}})
     assert r.status_code == 200, r.text
     payload = r.json()
-    assert set(payload) == {"content", "isError"}
+    # duration_ms is additive (the inspector's time-to-result display,
+    # 2026-09 perf review); content/isError stay the MCP-shaped contract.
+    assert set(payload) == {"content", "isError", "duration_ms"}
+    assert isinstance(payload["duration_ms"], (int, float)) and payload["duration_ms"] >= 0
     assert isinstance(payload["content"], list) and payload["content"]
     assert payload["content"][0]["type"] == "text"
     return payload["isError"], payload["content"][0]["text"]

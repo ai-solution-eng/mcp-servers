@@ -4,6 +4,19 @@ autoscaling:
   minReplicas: 4
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
+  # CAUTION (2026-09-28): this target is a percentage OF THE CPU REQUEST —
+  # the HPA never sees limits. With requests.cpu=500m (this file's setting)
+  # the effective scale threshold is 0.8 x 500m = 400m per pod: enough
+  # headroom for a burst toward the 800m limit before scale-out, still firing
+  # before saturation. Request far below real usage => HPA rails at
+  # maxReplicas on normal load; far above => it never fires.
+  # Load-following scale-out (HA review 2026-09): opt-in — needs
+  # prometheus-adapter serving sqlhandler_http_requests_per_second from the
+  # PodMonitor path. The CPU target above stays the burst/runaway
+  # protection either way; 1.5 = the measured per-pod saturation point.
+  requestRateEnabled: false
+  requestRateMetricName: sqlhandler_http_requests_per_second
+  requestRateTarget: "1.5"
   extraMetrics: []
   behavior:
     scaleUpStabilizationSeconds: 30
@@ -17,9 +30,17 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 2
 terminationGracePeriodSeconds: 90
+
+# Drain before SIGTERM (HA review 2026-09): the preStop hook sleeps so
+# readiness + endpoint deregistration land FIRST — a rolling upgrade no
+# longer drops the MCP calls in flight (the gateway allows 3600s per call).
+preStopDelaySeconds: 5        # runs inside terminationGracePeriodSeconds: 90
+readiness:
+  degradedGraceSeconds: "60"  # one storage blip must not drain ALL replicas
+  driftGate: false            # optional fail-fast for new scans while degraded
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.4.0
+  tag: v2.6.1
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3
@@ -151,8 +172,8 @@ query:
   previewFastpath: true
 resources:
   requests:
-    cpu: 250m
-    memory: 1Gi
+    cpu: 500m  # SITE (2026-09-28): HPA threshold carrier + headroom for runaway scans (0.8x = 400m gate). Was 250m.
+    memory: 2Gi  # SITE (2026-09-28): covers the measured hot-pod working set (1.9-3Gi); was 1Gi.
   limits:
     cpu: 800m
     memory: 16Gi
@@ -402,6 +423,11 @@ cache:
     ttl: '3600'
     minBytes: '262144'
     maxBytes: '2147483648'
+    # Async write-out (HA review 2026-09): the disk publish runs on a
+    # background worker — the computing query returns once its memory L1
+    # copy is placed; other replicas read the artifact at a small non-RAM
+    # cost once it lands (the sglang HiCache write-through shape).
+    writeAsync: true
   blockCache:
     enabled: true
     dir: ''

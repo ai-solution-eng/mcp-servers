@@ -276,6 +276,27 @@ def test_mcp_get_sse_stream_stays_uncompressed(monkeypatch):
     application = _build_http_app()
 
     async def drive():
+        # The MCP session manager requires its lifespan to run before any
+        # /mcp scope: without it, the raw ASGI call dies with the SDK's
+        # "Task group is not initialized" RuntimeError (the bug this test
+        # used to trip). Drive the lifespan first — receive() must RETURN
+        # lifespan.startup (a never-returning receive blocks the startup
+        # itself), then park so the context stays open while the GET runs.
+        async def lifespan_task():
+            first = True
+
+            async def ls_receive():
+                nonlocal first
+                if first:
+                    first = False
+                    return {"type": "lifespan.startup"}
+                await anyio.sleep_forever()  # park: context open until cancel
+
+            async def ls_send(message):
+                pass
+
+            await application({"type": "lifespan", "asgi": {"version": "3.0"}}, ls_receive, ls_send)
+
         scope = {
             "type": "http",
             "http_version": "1.1",
@@ -304,10 +325,12 @@ def test_mcp_get_sse_stream_stays_uncompressed(monkeypatch):
                 got_start.set()
 
         async with anyio.create_task_group() as tg:
+            tg.start_soon(lifespan_task)
+            await anyio.sleep(0.3)  # lifespan startup completes
             tg.start_soon(application, scope, receive, send)
             with anyio.move_on_after(2.0):
                 await got_start.wait()
-            tg.cancel_scope.cancel()
+            tg.cancel_scope.cancel()  # cancels lifespan + (still-open) GET
         return messages
 
     messages = anyio.run(drive)

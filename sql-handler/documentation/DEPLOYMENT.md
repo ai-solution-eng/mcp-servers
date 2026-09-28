@@ -127,11 +127,29 @@ topologySpread:
   topologyKey: kubernetes.io/hostname    # domain to spread across (per node)
   whenUnsatisfiable: ScheduleAnyway      # permissive — keeps single-node clusters schedulable
 
+# Drain before SIGTERM (HA review 2026-09): the preStop hook sleeps so
+# readiness flips and endpoint deregistration land FIRST — without it every
+# rollout dropped the MCP calls in flight (the gateway allows 3600s per call).
+preStopDelaySeconds: 5        # inside terminationGracePeriodSeconds: 90
+readiness:
+  degradedGraceSeconds: "60"  # one storage blip must not drain ALL replicas
+  driftGate: false            # optional fail-fast for new scans while degraded
+
+# Async jobs across replicas (query_submit/status/result/cancel): the job
+# registry is per-pod — without a shared store, polling a job submitted on
+# another replica returns "Unknown job id" (live-seen on a 4-replica release).
+query:
+  jobsDir: /var/lib/sqlhandler-catalog/jobs   # RWX PVC mounted on every replica
+
 # Resources (chart default below; raise LIMITS — not requests — for wide
 # tables / large joins; DuckDB's memory budget is duckdbMemoryFraction × the
-# memory limit):
+# memory limit). HPA note: a CPU Utilization target is a percentage OF THE
+# REQUEST — requests.cpu doubles as the HPA's scale-threshold carrier
+# (0.8 × 500m = 400m gate at the CPU@80% target; limits are invisible to
+# the HPA), so keep requests.cpu above ~2x measured steady CPU but below
+# limit/1.25:
 resources:
-  requests: { cpu: 250m, memory: 1Gi }
+  requests: { cpu: 500m, memory: 2Gi }
   limits:   { cpu: "4",  memory: 16Gi }
 
 # Gateway authn: oauth2-proxy AuthorizationPolicy (enabled by default; keep ON
@@ -184,12 +202,15 @@ that map to engine features are additionally described in
 | Key | Default | Effect |
 |---|---|---|
 | `autoscaling.minReplicas` / `autoscaling.maxReplicas` | 2 / 8 | HPA floor/ceiling (autoscaling/v2); the Deployment omits `spec.replicas` while the HPA is on |
-| `autoscaling.targetCPUUtilizationPercentage` | 80 | CPU target. Steady-state CPU is ~8% of the limit even under full load (BENCHMARKS.md), so this fires only on heavy scan bursts — not on request volume. Load-following scale-out needs a custom metric via `autoscaling.extraMetrics` (prometheus-adapter) |
+| `autoscaling.targetCPUUtilizationPercentage` | 80 | CPU target. Steady-state CPU is ~8% of the limit even under full load (BENCHMARKS.md), so this fires only on heavy scan bursts — not on request volume. Load-following scale-out: set `autoscaling.requestRateEnabled: true` (adds the built-in `sqlhandler_http_requests_per_second` Pods metric, target `requestRateTarget` ~1.5 = the measured per-pod saturation point; needs prometheus-adapter serving the PodMonitor series) or append your own via `autoscaling.extraMetrics` |
 | `autoscaling.behavior.scaleUpStabilizationSeconds` | 30 | HPA scale-up stabilization window: how long a CPU burst must persist before scaling up |
 | `autoscaling.behavior.scaleDownStabilizationSeconds` | 300 | HPA scale-down stabilization window: deliberately slow so a burst of MCP tool calls doesn't thrash the fleet |
 | `topologySpread.maxSkew` | 1 | Max replica-count difference between topology domains when `topologySpread.enabled` |
 | `topologySpread.topologyKey` | `kubernetes.io/hostname` | Topology domain to spread across (one domain per node) |
 | `topologySpread.whenUnsatisfiable` | `ScheduleAnyway` | Permissive — scheduling proceeds even when the spread cannot be honored (single-node clusters) |
+| `preStopDelaySeconds` | 5 | preStop drain delay (seconds) before SIGTERM: readiness + endpoint deregistration land first, so a rolling upgrade no longer drops the in-flight MCP calls. Runs inside `terminationGracePeriodSeconds`; `0` disables the hook |
+| `readiness.degradedGraceSeconds` | "60" | Seconds of continuous backend-check failure before `/ready` returns 503. Inside the grace the pod answers `{"status": "degraded"}` (HTTP 200) and `sqlhandler_readiness_state` reports 0.5 — one storage blip no longer drains every replica at once; `0` restores the binary behavior |
+| `readiness.driftGate` | false | While the backend check is failing, refuse NEW /api scan-shaped requests (503) instead of queueing doomed scans; `/mcp` stays open for agents. Off by default |
 
 **Standard Kubernetes knobs** (pod-template / workload boilerplate; the chart
 passes each through verbatim — cover the paths explicitly for PCAI values
@@ -199,7 +220,7 @@ audits):
 |---|---|---|
 | `nameOverride` / `fullnameOverride` | "" | Override the release's resource-name derivation (`<release>-sqlhandler` by default) — needed only for DNS-label or name-collision constraints |
 | `image.pullPolicy` | `IfNotPresent` | Container `imagePullPolicy` (set `Always` for moving tags) |
-| `resources.limits.cpu` / `resources.requests.cpu` | `"4"` / `250m` | CPU limit (DuckDB's thread count) / scheduler reservation — see the resources comment above |
+| `resources.limits.cpu` / `resources.requests.cpu` | `"4"` / `500m` | CPU limit (DuckDB's thread count) / scheduler reservation AND the HPA scale-threshold carrier (0.8 × request = the CPU@80% gate) — see the resources comment above |
 | `service.targetPort` | `9097` | Container port the Service forwards to — kept separate from `service.port` so the listener can move without touching the VirtualService/NetworkPolicy port |
 | `ingress.className` / `ingress.hosts` / `ingress.tls` | "" / `sqlhandler.local` + `/` Prefix / [] | Standard Ingress block (`ingress.enabled: true` only; PCAI normally uses the ezua VirtualService) |
 | `podAnnotations` | {} | Extra pod-template annotations (e.g. metrics scrape config) |
@@ -252,6 +273,7 @@ audits):
 | `cache.virtualCacheTtl` | 3600 | Seconds a virtual table's materialized result is reused; cache key carries the definition + base-snapshot versions, so ETL commits invalidate instantly (0 disables materialization) |
 | `cache.virtualCacheSort` | `true` | Cluster materialized virtual results by their lowest-cardinality columns so row-group statistics prune filtered reads (0 disables) |
 | `cache.l2.dir` | "" | Shared directory for the cross-replica L2 result cache (zstd parquet + JSON sidecars). REQUIRED for L2 operation — even with `cache.l2.enabled: true` nothing is cached until this points at an RWX volume visible to every replica; the engine refuses to default it to pod-local /tmp (that would look like sharing while sharing nothing) |
+| `cache.l2.writeAsync` | true | Publish L2 results to the shared dir on a background worker instead of the query path — the computing query returns once its memory L1 copy is placed (the sglang HiCache write-through shape); `false` restores the synchronous publish |
 | `cache.l2.ttl` | `"3600"` | Seconds a published result stays valid (lazy delete on lookup + daemon sweep). Keys already carry base-snapshot versions, so ETL invalidates instantly — TTL is only a backstop |
 | `cache.l2.minBytes` | `"262144"` | Results SMALLER than this skip the L2 (a PVC round-trip costs more than recomputing a small result) |
 | `cache.l2.maxBytes` | `"2147483648"` (2GiB) | Results LARGER than this skip the L2 (one runaway result must not fill the shared volume); `"0"` = unlimited |
@@ -289,6 +311,8 @@ audits):
 | `query.maxRows` | `"1000"` | Default row cap for `run_sql` / `scan_table` / `query_result` (`0` = uncapped — a runaway `SELECT *` fills the wire and the model's context); per-call `limit` overrides downward |
 | `query.profileMaxRows` | `"1000000"` | Row-sample cap for `profile_table` / `column_stats` (`0` = full table; statistics over a bounded sample are what an agent needs — exact counts still come from Parquet/Delta metadata) |
 | `query.maxJobs` | `8` | Max concurrent async query jobs (`query_submit`; HTTP 429 beyond it) |
+| `query.jobsDir` | `""` | Cross-replica async-job hand-off (env `SQLHANDLER_JOBS_DIR`). Empty = pod-local registry (fine for single replicas). On `replicaCount > 1` / autoscaling, set it to a path on an RWX PVC every replica mounts (the render FAILS without `query.jobsAccessModes` including `ReadWriteMany`): finished jobs publish state + result there, any replica can poll/fetch/cancel, fetch-once holds cluster-wide |
+| `query.jobsAccessModes` | `[ReadWriteMany]` | Access modes the PVC backing `query.jobsDir` must declare (render guard only — the chart never creates the volume; mount an existing claim like `semanticCatalog.store`). `[ReadWriteOnce]` only for single-replica deployments |
 | `query.queryMemorySize` | `50` | Recent query outcomes kept for the `sqlhandler://query-memory` resource (`0` disables recording) |
 | `query.previewFastpath` | `true` | Bare `LIMIT n` previews read the first data file's first row group instead of enumerating every fragment of a large table |
 | `query.maxConcurrentQueries` | `8` | Per-pod concurrency gate (engine.py): max simultaneous DuckDB queries; excess QUEUE up to `queueTimeoutSeconds` then fail with a clear error. `0` = unlimited (pre-gate behavior — not recommended). Chart wires `SQLHANDLER_MAX_CONCURRENT_QUERIES` |

@@ -573,3 +573,49 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
         client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"]
         is False
     )
+
+
+def test_export_csv_arrow_semantics(tmp_path):
+    """The Arrow CSV writer's pinned semantics (bench follow-up 2026-09).
+
+    Header unquoted; integers EXACT (no pandas float-upcast of null-bearing
+    int columns); booleans 'True'/'False' (pandas capitalization); float NaN
+    as '' (pandas na_rep default); all parse-identical for CSV consumers.
+    """
+    import io
+
+    import pandas as pd
+    import pyarrow as pa
+
+    from sqlhandler.webui import _arrow_to_csv_bytes
+
+    tbl = pa.table(
+        {
+            "i": pa.array([1, None, 4611686018427387904], pa.int64()),
+            "f": pa.array([1.5, float("nan"), 0.1], pa.float64()),
+            "b": pa.array([True, None, False], pa.bool_()),
+            "s": ["a,b", None, "plain"],
+        }
+    )
+    out = _arrow_to_csv_bytes(tbl).decode()
+    lines = out.strip().splitlines()
+    assert lines[0] == "i,f,b,s"  # header unquoted
+    assert "4611686018427387904" in lines[3]  # exact int, not 4.61169e+18
+    assert '"True"' in lines[1] and '"False"' in lines[3]  # pandas caps
+    assert ",," in lines[2]  # NaN and null both render ''
+    # consumer round-trip: pandas reads the big int exactly, nulls as NaN/''
+    back = pd.read_csv(io.StringIO(out))
+    assert back["i"].iloc[2] == 4611686018427387904
+    assert pd.isna(back["f"].iloc[1]) and pd.isna(back["b"].iloc[1])
+
+
+def test_export_csv_fallback_preserved_for_exotic_types(tmp_path):
+    """Types Arrow's CSV writer refuses fall back to the pandas path."""
+    import pyarrow as pa
+
+    from sqlhandler.webui import _arrow_to_csv_bytes
+
+    # decimal128 is renderable by pandas; Arrow's CSV writer refuses it.
+    tbl = pa.table({"d": pa.array([None], pa.decimal128(10, 2))})
+    out = _arrow_to_csv_bytes(tbl)
+    assert out  # fell back rather than raised

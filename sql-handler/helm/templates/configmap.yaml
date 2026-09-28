@@ -340,22 +340,38 @@ data:
   {{- with .Values.cache.virtualCacheDir }}
   SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
   {{- end }}
-  {{- /* Shared L2 result cache (cross-replica): opt-in like the block
-         cache. Disabled renders only the master switch "false"; nothing
-         else leaks. Even when enabled, SQLHANDLER_L2_DIR is rendered ONLY
-         when cache.l2.dir is set — the engine refuses to default the dir
-         to pod-local /tmp, which would look like sharing while sharing
-         nothing. When replicas can exceed 1 the dir must sit on an RWX
-         volume (see values.yaml cache.l2 note; the RWO/stranded-replica
-         discipline is semanticCatalog.store's render-guard precedent). */}}
-  SQLHANDLER_L2_ENABLED: {{ ternary "1" "0" .Values.cache.l2.enabled | quote }}
-  {{- if .Values.cache.l2.enabled }}
+  {{- /* Shared L2 result cache (cross-replica). DEFAULT IS AUTO: enabled
+         whenever the deployment can run more than one replica (autoscaling
+         or replicaCount > 1 — the PVC guards' $multi condition), disabled
+         for single-replica deployments (nothing to share; the L1 memory
+         cache is the whole story there). cache.l2.enabled true/false
+         overrides the auto behavior explicitly. Even when enabled,
+         SQLHANDLER_L2_DIR is rendered ONLY when cache.l2.dir is set — the
+         engine refuses to default the dir to pod-local /tmp, which would
+         look like sharing while sharing nothing. When replicas can exceed 1
+         the dir must sit on an RWX volume (see values.yaml cache.l2 note;
+         the RWO/stranded-replica discipline is semanticCatalog.store's
+         render-guard precedent). */}}
+  {{- $l2Enabled := false }}
+  {{- if eq (.Values.cache.l2.enabled | toString) "" }}
+    {{- $l2Enabled = or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) }}
+  {{- else }}
+    {{- $l2Enabled = .Values.cache.l2.enabled }}
+  {{- end }}
+  {{- if and $l2Enabled (not .Values.cache.l2.dir) }}
+    {{- fail "cache.l2: the L2 result cache is enabled (auto: replicas can exceed 1) but cache.l2.dir is empty — point it at an RWX path shared by every replica (e.g. the semanticCatalog.store claim mount), or set cache.l2.enabled: false to opt out. A pod-local dir would look like sharing while sharing nothing." }}
+  {{- end }}
+  SQLHANDLER_L2_ENABLED: {{ ternary "1" "0" $l2Enabled | quote }}
+  {{- if $l2Enabled }}
   {{- with .Values.cache.l2.dir }}
   SQLHANDLER_L2_DIR: {{ . | quote }}
   {{- end }}
   SQLHANDLER_L2_TTL: {{ .Values.cache.l2.ttl | quote }}
   SQLHANDLER_L2_MIN_BYTES: {{ .Values.cache.l2.minBytes | quote }}
   SQLHANDLER_L2_MAX_BYTES: {{ .Values.cache.l2.maxBytes | quote }}
+  {{- /* Async write-out (values: cache.l2.writeAsync): the disk publish
+         runs on a background worker instead of the query path. */}}
+  SQLHANDLER_L2_WRITE_ASYNC: {{ ternary "1" "0" .Values.cache.l2.writeAsync | quote }}
   {{- end }}
   # D5: per-query wall-clock timeout (seconds; 0 = no timeout). A runaway
   # query used to hold one of the concurrency-gate slots forever; >10-minute
@@ -367,7 +383,18 @@ data:
   SQLHANDLER_MAX_ROWS: {{ .Values.query.maxRows | quote }}
   SQLHANDLER_PROFILE_MAX_ROWS: {{ .Values.query.profileMaxRows | quote }}
   SQLHANDLER_MAX_JOBS: {{ .Values.query.maxJobs | quote }}
+  {{- if .Values.query.jobsDir }}
+  # Multi-replica async jobs: the shared registry dir (RWX PVC). Empty keeps
+  # the registry pod-local (single-replica deployments never need this).
+  SQLHANDLER_JOBS_DIR: {{ .Values.query.jobsDir | quote }}
+  {{- end }}
   SQLHANDLER_QUERY_MEMORY_SIZE: {{ .Values.query.queryMemorySize | quote }}
+  {{- /* Readiness degraded band (HA review 2026-09, values: readiness.*):
+         seconds of continuous backend failure before /ready drains the
+         pod; a blip inside the grace keeps the replica in rotation with
+         the degradation visible on /metrics instead. */}}
+  SQLHANDLER_READY_DEGRADED_GRACE: {{ .Values.readiness.degradedGraceSeconds | quote }}
+  SQLHANDLER_READY_DRIFT_GATE: {{ ternary "1" "0" .Values.readiness.driftGate | quote }}
   # Bare-LIMIT preview fast path: first-row-group read instead of the full
   # fragment enumeration (query.previewFastpath; engine default is ON).
   SQLHANDLER_PREVIEW_FASTPATH: {{ ternary "1" "0" .Values.query.previewFastpath | quote }}

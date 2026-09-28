@@ -1022,7 +1022,8 @@ async function loadColumnStats() {
     });
     const fmt = (v) => esc(v === null || v === undefined ? "" : String(v));
     let html = '<div class="hint" style="margin-bottom:8px">rows: ' + fmt(p.n_rows) +
-      " · profiled: " + fmt(p.profiled_rows) + "</div>";
+      " · profiled: " + fmt(p.profiled_rows) +
+      (p.duration_ms === undefined || p.duration_ms === null ? "" : " · took: " + p.duration_ms + " ms") + "</div>";
     html += '<div style="overflow:auto"><table class="grid"><thead><tr><th>column</th><th>min</th><th>max</th><th>distinct≈</th><th>null %</th><th>q25</th><th>q50</th><th>q75</th></tr></thead><tbody>';
     (p.columns || []).forEach((c) => {
       html += "<tr><td>" + esc(c.name) + "</td><td>" + fmt(c.min) + "</td><td>" + fmt(c.max) + "</td><td>" +
@@ -1235,10 +1236,16 @@ function inspSetOut(payload) {
   const out = $("insp-result");
   const isError = !!payload.isError;
   const text = payload.content && payload.content[0] && payload.content[0].text ? payload.content[0].text : "(empty content)";
+  // Time-to-result (perf review 2026-09): the bridge reports the tool call's
+  // wall time — the slow-vs-cached story is the point of this tab (first
+  // profile/preview pays the scan, cached and cross-replica L2 hits drop
+  // to ms scale).
+  const took = payload.duration_ms === undefined || payload.duration_ms === null ? "" :
+    '<span class="hint">took: ' + payload.duration_ms + " ms</span>";
   out.innerHTML =
     '<div class="result-meta"><span class="' + (isError ? "bad" : "ok") + '">' +
     (isError ? "⚠ isError — the tool reported an error" : "✓ ok") +
-    '</span><span>tool: ' + esc($("insp-tool").value || "?") + "</span>" +
+    '</span><span>tool: ' + esc($("insp-tool").value || "?") + "</span>" + took +
     '<button class="copy" id="insp-copy">copy text</button></div>' +
     '<div class="insp-out' + (isError ? " is-error" : "") + '">' + esc(text) + "</div>";
   const btn = $("insp-copy");

@@ -58,6 +58,16 @@ Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables
 | `query_result(job_id, output_format?)` | Fetch a finished job's result **ONCE** (markdown default, json, csv, arrow), then the spooled result is freed — a second fetch of the same job is refused (resubmit instead). | Result in chosen format |
 | `query_cancel(job_id)` | Cancel a running job (DuckDB interrupt). | Cancellation confirmation |
 
+> **Multi-replica note.** The job registry is per-replica (in-memory; a restart
+> clears it). On a scaled-out deployment the stateless HTTP layer may route
+> `query_status` / `query_result` to any replica — without a shared store a
+> poll for a job submitted on another replica returns *"Unknown job id"*. With
+> `SQLHANDLER_JOBS_DIR` (chart `query.jobsDir`, an RWX PVC) finished jobs
+> publish state + result to the shared dir, any replica can poll/fetch/cancel,
+> and the fetch-once contract holds cluster-wide (an atomic claim file
+> serializes fetches). A cancel is still owner-only while the job runs — the
+> interrupt handle is pod-local; the shared record is marked cancelled either way.
+
 ### Saved queries
 
 | Tool | Purpose | Returns |

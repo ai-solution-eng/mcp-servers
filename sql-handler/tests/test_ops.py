@@ -224,3 +224,41 @@ def test_token_middleware_blocks_and_allows():
     assert _run_middleware(None, "/ui", {}) == 200
     assert _run_middleware(None, "/mcp", {}) == 200
     assert _run_middleware(None, "/health", {}) == 200
+
+
+
+# --------------------------------------------------- readiness drift rollup
+
+# The 2026-09 HA-review fix: one failing backend check used to report 503
+# immediately, draining EVERY replica of a scaled-out deployment on one
+# storage blip. A failing check now reports degraded (still HTTP 200 to the
+# kubelet) until SQLHANDLER_READY_DEGRADED_GRACE of CONTINUOUS failure has
+# elapsed; the /metrics gauge rolls the state up as 1 / 0.5 / 0.
+
+
+def test_readiness_drift_rollup(monkeypatch):
+    from sqlhandler.observability import ReadinessDrift, _ready_degraded_grace
+
+    monkeypatch.setenv("SQLHANDLER_READY_DEGRADED_GRACE", "60")
+    assert _ready_degraded_grace() == 60.0
+    d = ReadinessDrift()
+    assert d.rollup() == 1.0  # never failed
+    d.note_backend(False)
+    assert d.rollup() == 0.5  # failing, inside the grace
+    assert 0 <= d.failed_seconds() < 5
+    d.note_backend(True)
+    assert d.rollup() == 1.0  # a healthy check resets the clock
+    monkeypatch.setenv("SQLHANDLER_READY_DEGRADED_GRACE", "0")
+    d.note_backend(False)
+    assert d.rollup() == 0.0  # grace 0 = the historical binary behavior
+
+
+def test_readiness_gauge_renders_without_engine(monkeypatch):
+    # The gauge renders ALWAYS (most informative exactly when the backend is
+    # down, i.e. when the engine block may be skipped).
+    from sqlhandler.observability import metrics
+
+    text = metrics.render(None)
+    line = [l for l in text.splitlines() if l.startswith("sqlhandler_readiness_state ")]
+    assert len(line) == 1
+    assert line[0].split()[-1] in ("1.0", "0.5", "0.0")

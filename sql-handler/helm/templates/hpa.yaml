@@ -22,6 +22,22 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- if .Values.autoscaling.requestRateEnabled }}
+    {{- /* Load-following scale-out (HA review 2026-09): the per-pod request
+           rate (sqlhandler_http_requests_per_second, from the PodMonitor
+           path via prometheus-adapter) targeted at the measured per-pod
+           saturation point (~1.5 qps on G2). Requires prometheus-adapter
+           serving the custom.metrics API; without it the HPA fails with
+           "metric not found" — which is why this is opt-in. The CPU
+           metric above stays as the burst/runaway protection. */}}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.requestRateMetricName }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.requestRateTarget | quote }}
+    {{- end }}
     {{- with .Values.autoscaling.extraMetrics }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

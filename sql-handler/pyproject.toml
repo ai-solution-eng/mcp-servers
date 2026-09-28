@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlhandler"
-version = "2.4.0"
+version = "2.6.1"
 description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,8 @@ dependencies = [
     "starlette>=0.40.0",    # ASGI app for /health, /ready and /mcp
     "pyyaml>=6.0",          # YAML semantic catalogs (uploads accept JSON or YAML)
     "pygments>=2.11",       # SV editor highlighting — server-side, guessed lexer (rcat's pygmentize -g)
+    "orjson>=3.9",          # fast hot-path JSON (fastrender.dumps; stdlib fallback keeps parity)
+    "uvloop>=0.19",         # fast asyncio loop for uvicorn (guarded import, asyncio fallback)
 ]
 
 [project.optional-dependencies]

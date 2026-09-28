@@ -52,6 +52,12 @@ autoscaling:
   minReplicas: 2
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
+  # ⚠️ 2026-09-28: with the DEFAULT resources (requests.cpu=250m), the CPU@80%
+  # target is only a 200m per-pod scale threshold — measured steady CPU on the
+  # same-shaped G2 site is 4-91m, so a mildly busy trial railed the HPA at
+  # maxReplicas. If you enable the HPA here, first set resources.requests.cpu
+  # to ~500m (see the resources block below): threshold becomes 400m, above
+  # real peaks, and the HPA only fires on true runaway scans.
   # Raw extra HPA metrics appended verbatim (autoscaling/v2 schema).
   extraMetrics: []
   behavior:
@@ -81,7 +87,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.4.0
+  tag: v2.6.1
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -386,8 +392,8 @@ query:
 # large joins; the requests can stay put in every case observed so far.
 resources:
   requests:
-    cpu: 250m
-    memory: 1Gi
+    cpu: 500m  # SITE (2026-09-28): HPA threshold carrier — the CPU@80% target fires at 0.8x REQUEST; 500m puts the scale gate at 400m, above the measured 91m 7d peak. Was 250m.
+    memory: 2Gi  # SITE (2026-09-28): covers the measured hot-pod working set (1.9-3Gi on G2); was 1Gi.
   limits:
     cpu: "4"
     memory: 16Gi

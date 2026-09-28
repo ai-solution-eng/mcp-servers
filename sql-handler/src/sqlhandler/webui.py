@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import math
 import os
 import time as _time
@@ -211,6 +212,58 @@ def arrow_to_ipc_text(arrow) -> str:
     raw = arrow_to_ipc_stream_bytes(arrow)
     header = f"# arrow: {arrow.num_rows} rows x {arrow.num_columns} cols, {len(raw)} bytes ipc-stream base64"
     return header + "\n" + base64.b64encode(raw).decode("ascii")
+
+
+def _arrow_to_csv_bytes(arrow) -> bytes:
+    """CSV-export an Arrow Table via pyarrow's native writer (no pandas).
+
+    Bench follow-up (2026-09): the pandas round-trip (to_pandas().to_csv)
+    was ~10x slower on a 200k-row export (297 ms vs 30 ms) and materialized
+    a full DataFrame for the privilege. The Arrow writer's output differs
+    from pandas' in exactly these deliberate ways, all parse-equivalent for
+    CSV consumers (Excel, pandas.read_csv, duckdb read_csv_auto):
+
+    * integers export EXACT ('4611686018427387904') where pandas upcast
+      null-bearing int columns to float64 ('4.61...e+18') — the pandas
+      behavior was a lossy artifact, not a feature;
+    * booleans as 'True'/'False' (pandas' capitalization, kept by casting
+      through string — Arrow's native 'true'/'false' would be a silent
+      consumer-visible change);
+    * float NaN exports as '' (pandas' na_rep default) instead of 'nan';
+    * tz-aware timestamps use 'Z' where pandas used '+00:00' (both
+      ISO-8601, identical when parsed).
+
+    Falls back to the pandas path for anything Arrow's CSV writer refuses
+    (nested types cannot appear in CSV anyway; the guard is cheap parity).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    cols = []
+    names = []
+    for f in arrow.schema:
+        col = arrow.column(f.name)
+        if pa.types.is_boolean(f.type):
+            col = pc.if_else(col, "True", "False")
+        elif pa.types.is_floating(f.type):
+            # pandas' to_csv writes NaN as ''; Arrow writes 'nan' — replace
+            # NaN with null so the writer emits '' like pandas did.
+            nan_mask = pc.fill_null(pc.is_nan(col), False)
+            col = pc.if_else(nan_mask, pa.scalar(None, f.type), col)
+        cols.append(col)
+        names.append(f.name)
+    normalized = pa.table(cols, names=names)
+    sink = io.BytesIO()
+    try:
+        pa.csv.write_csv(
+            normalized,
+            sink,
+            write_options=pa.csv.WriteOptions(quoting_header="none"),
+        )
+        return sink.getvalue()
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        # Arrow CSV writer refused (exotic type) — the historical path.
+        return arrow.to_pandas().to_csv(index=False).encode("utf-8")
 
 
 def arrow_to_payload(arrow, limit: int | None = None) -> dict:
@@ -586,7 +639,7 @@ def api_export(engine: SqlEngine, body: dict) -> dict:
         raise ValueError("Provide either 'sql' or 'table' to export.")
 
     if fmt == "csv":
-        content = arrow.to_pandas().to_csv(index=False).encode("utf-8")
+        content = _arrow_to_csv_bytes(arrow)
         media_type = "text/csv"
     elif fmt == "arrow":
         content = arrow_to_ipc_stream_bytes(arrow)
@@ -1386,11 +1439,26 @@ def register_ui(app, engine_getter) -> None:
         # tools/call: the dispatcher reads the caller identity off its scope
         # state (audit + policy) and query_save/query_delete verify the
         # presented credential per call (the mutation gate).
+        t0 = _time.perf_counter()
         try:
             text, is_error = await asyncio.to_thread(dispatch, name.strip(), args, request)
         except Exception as exc:  # dispatcher-level failure → MCP-shaped error
             text, is_error = f"Tool dispatch failed: {exc}", True
-        return JSONResponse({"content": [{"type": "text", "text": text}], "isError": is_error})
+        # Time-to-result (perf review 2026-09): the inspector displays the
+        # tool call's wall time (its slow-vs-cached story is the point of
+        # the tab), and the response names the serving replica so an
+        # operator correlating "same call, sometimes fast" with the L2
+        # shared tier knows WHICH pod answered.
+        payload = {
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error,
+            "duration_ms": round((_time.perf_counter() - t0) * 1000, 1),
+        }
+        headers = {}
+        pod = os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or ""
+        if pod:
+            headers["X-Sqlhandler-Pod"] = pod
+        return JSONResponse(payload, headers=headers)
 
     app.add_route("/api/inspector/tools", inspector_tools, methods=["GET"])
     app.add_route("/api/inspector/call", inspector_call, methods=["POST"])

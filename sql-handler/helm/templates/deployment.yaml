@@ -43,6 +43,16 @@ spec:
           type: RuntimeDefault
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- if and .Values.query.jobsDir (or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled) }}
+      {{- /* Async-job shared store must be visible to EVERY replica: a
+             ReadWriteOnce claim attaches on one node only, so the other
+             replicas would still answer "Unknown job id" — the exact outage
+             this feature exists to fix. Fail the render loudly, same guard
+             as semanticCatalog.store (values.yaml: RWX note). */}}
+      {{- if not (has "ReadWriteMany" (.Values.query.jobsAccessModes | default list)) }}
+      {{- fail "query.jobsDir on replicaCount > 1 / autoscaling requires query.jobsAccessModes to include ReadWriteMany (an RWX PVC must back SQLHANDLER_JOBS_DIR on every replica)" }}
+      {{- end }}
+      {{- end }}
       containers:
         - name: sqlhandler
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
@@ -174,6 +184,13 @@ spec:
               value: {{ .Values.query.maxConcurrentQueries | quote }}
             - name: SQLHANDLER_QUEUE_TIMEOUT
               value: {{ .Values.query.queueTimeoutSeconds | quote }}
+            {{- /* Pod identity for /metrics + audit lines (downward API; HA
+                   review 2026-09): an aggregate alert over per-pod series
+                   must be able to name the replica that answered. */}}
+            - name: SQLHANDLER_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- if .Values.query.auditLog }}
             {{- /* JSONL query-audit log (values: query.auditLog). The value is a
                    PATH; the chart only renders the env var and (below) a writable
@@ -294,6 +311,20 @@ spec:
             {{- range .Values.containerArgs }}
             - {{ . | quote }}
             {{- end }}
+          {{- if gt (.Values.preStopDelaySeconds | int) 0 }}
+          {{- /* Drain before SIGTERM (HA review 2026-09): preStop sleeps so
+                 the endpoint deregistration (readiness flip) lands FIRST and
+                 in-flight MCP tool calls stop being routed to this replica
+                 before it dies — without the delay every rollout dropped the
+                 calls in flight (the gateway allows 3600s per call, the pod
+                 only terminationGracePeriodSeconds). The sleep runs INSIDE
+                 the terminationGracePeriodSeconds budget, so the app still
+                 gets the remainder to finish draining. 0 disables the hook. */}}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep {{ .Values.preStopDelaySeconds }}"]
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- /* Probes render via the shared fleet library (pcai-fleet-lib,

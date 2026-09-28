@@ -20,12 +20,25 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.dataset as pad
 import pyarrow.parquet as pq
+import pytest
 
 from sqlhandler.engine import SqlEngine
 from sqlhandler.l2cache import DEFAULT_MAX_BYTES, DEFAULT_MIN_BYTES, L2ResultCache, load_l2_config
 from sqlhandler.provider import TableInfo
 
 TABLES = [TableInfo(name="sales", schema="shop", format="parquet")]
+
+
+@pytest.fixture(autouse=True)
+def _sync_l2_writes(monkeypatch):
+    """Default the suite to the SYNCHRONOUS write-out.
+
+    These tests pin the publish semantics (atomicity, caps, TTL, sweep,
+    degradation) — identical in both modes — and dozens of them read the
+    shared directory the moment query() returns, which is only guaranteed
+    in sync mode. The async write-out has its own tests below.
+    """
+    monkeypatch.setenv("SQLHANDLER_L2_WRITE_ASYNC", "0")
 
 
 class FakeProvider:
@@ -624,3 +637,212 @@ def test_virtual_tables_stay_out_of_both_layers(tmp_path, monkeypatch):
     a.query_duckdb("SELECT count(*) AS c FROM vw_sales")
     assert a._result_cache_writes == 0  # L1 exclusion preserved
     assert a._l2_cache.stats()["writes"] == 0  # L2 exclusion preserved
+
+
+
+# ---------------------------------------------------- async write-out (HA 2026-09)
+
+# The sglang write-through analogy applied to result caching: the computing
+# replica hands the result to a bounded background queue (its query returns
+# once the memory L1 copy is placed), a single worker serializes zstd
+# parquet + sidecar off the query path, and OTHER replicas read the artifact
+# at a small non-RAM cost once it lands. Queue-full backpressure DROPS the
+# write (an ordinary cache miss) rather than growing replica memory.
+
+
+def test_async_store_publishes_after_return(tmp_path, monkeypatch):
+    """Default mode: query returns first, the worker publishes, flush makes
+    it observable deterministically."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
+    assert a._l2_cache._write_queue is not None
+    r1 = a.query_duckdb(QUERY)
+    key = a._result_cache_key(QUERY, None, None, None, None)
+    assert a._l2_cache.flush_async_stores() is True
+    assert sorted(p.suffix for p in Path(l2).iterdir()) == [".json", ".parquet"]
+    stored = L2ResultCache(l2, ttl=3600).lookup(key)
+    assert stored.to_pylist() == r1.to_pylist()
+    stats = a._l2_cache.stats()
+    assert stats["write_mode"] == "async" and stats["writes"] == 1
+    assert stats["write_dropped"] == 0
+
+
+def test_async_cross_replica_sharing(tmp_path, monkeypatch):
+    """The whole point: replica 2 serves a result replica 1 paid for —
+    the publish happened on replica 1's background worker."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
+    r1 = a.query_duckdb(QUERY)
+    assert a._l2_cache.flush_async_stores() is True
+    b = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
+    r2 = b.query_duckdb(QUERY)
+    assert r2.to_pylist() == r1.to_pylist()
+    assert b._l2_cache.stats()["hits"] == 1
+    assert b._result_cache_writes == 1  # L1 warmed for the next call
+
+
+def test_async_disabled_falls_back_to_sync(tmp_path, monkeypatch):
+    """SQLHANDLER_L2_WRITE_ASYNC=0: the artifact is on disk the moment
+    query() returns — the historical byte-for-byte behavior."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "0"})
+    a.query_duckdb(QUERY)
+    assert a._l2_cache._write_queue is None
+    assert sorted(p.suffix for p in Path(l2).iterdir()) == [".json", ".parquet"]
+    assert a._l2_cache.stats()["write_mode"] == "sync"
+
+
+def test_async_queue_full_drops_and_counts(tmp_path, monkeypatch):
+    """Backpressure: a full queue drops the write and counts it — the
+    queue never grows and the query path never blocks."""
+    from sqlhandler import l2cache as l2mod
+
+    cache = L2ResultCache(str(tmp_path / "l2"), ttl=3600)
+    monkeypatch.setattr(l2mod, "DEFAULT_ASYNC_QUEUE_DEPTH", 1)
+    release, entered = threading.Event(), threading.Event()
+
+    def slow_store(key, table):
+        entered.set()
+        release.wait(5)
+
+    monkeypatch.setattr(cache, "store", slow_store)
+    cache._ensure_write_worker()
+    assert cache.async_store("k1", pa.table({"a": [1]})) is True
+    assert entered.wait(5)  # worker picked it up and is blocked in store
+    # maxsize=1 bounds PENDING items (k1 is in flight, not pending): k2 fills
+    # the queue, k3 is the one that finds it full and is dropped.
+    assert cache.async_store("k2", pa.table({"a": [2]})) is True
+    assert cache.async_store("k3", pa.table({"a": [3]})) is False  # queue full
+    assert cache.stats()["write_dropped"] == 1
+    release.set()
+    assert cache.flush_async_stores() is True
+
+
+def test_write_worker_started_once(tmp_path):
+    """_ensure_write_worker is idempotent."""
+    cache = L2ResultCache(str(tmp_path / "l2"), ttl=3600)
+    cache._ensure_write_worker()
+    w1 = cache._write_worker
+    assert w1 is not None and w1.daemon and w1.name == "sqlhandler-l2-writeout"
+    cache._ensure_write_worker()
+    assert cache._write_worker is w1
+
+
+
+# --------------------------------------------- shared metadata tier (2026-09)
+
+# profile_table / column_stats outputs join the shared tier: a few KB of
+# JSON whose recompute is a multi-second sampled scan, so sharing beats
+# recomputing on every replica (the G2 observation: first calls seconds,
+# warm per-replica calls ~100ms — but every OTHER replica re-paid the cold
+# scan). Artifacts live under <l2-dir>/meta/ with snapshot-version keys.
+
+
+def test_profile_shared_across_engines(tmp_path, monkeypatch):
+    """Replica A pays the scan; replica B's identical profile is a shared
+    hit (no rescan) and warms B's L1."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    r1 = a.profile_table("sales")
+    assert a._l2_meta.stats()["writes"] == 1
+    b = _make_engine(l2, root, monkeypatch)
+    r2 = b.profile_table("sales")
+    # Compare the JSON-fidelity forms: DuckDB SUMMARIZE hands back Decimal
+    # scalars on the fresh path; the shared artifact carries their str form
+    # — which is exactly what every JSON/markdown consumer renders anyway
+    # (str(Decimal("0.00")) == "0.00", identical display).
+    assert json.loads(json.dumps(r2, default=str)) == json.loads(json.dumps(r1, default=str))
+    assert b._l2_meta.stats()["hits"] == 1
+    assert b._profile_misses == 0  # B never scanned anything
+    b.profile_table("sales")
+    assert b._profile_hits == 2  # shared hit + L1 hit
+
+
+def test_profile_shared_invalidated_by_snapshot(tmp_path, monkeypatch):
+    """An ETL commit (version bump) invalidates instantly — no TTL wait."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    a.profile_table("sales")
+    assert a._l2_meta.stats()["writes"] == 1
+    a.provider.versions["shop/sales"] = 7  # ETL commit
+    a.profile_table("sales")
+    assert a._l2_meta.stats()["writes"] == 2  # new key → recompute + republish
+
+
+def test_column_stats_shared_across_engines(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    r1 = a.column_stats("sales", "amount")
+    assert a._l2_meta.stats()["writes"] == 1
+    b = _make_engine(l2, root, monkeypatch)
+    r2 = b.column_stats("sales", "amount")
+    assert r2 == r1
+    assert b._l2_meta.stats()["hits"] == 1
+    assert b._profile_misses == 0
+
+
+def test_meta_tier_opt_out(tmp_path, monkeypatch):
+    """SQLHANDLER_L2_METADATA=0: per-replica-only behavior, no meta cache."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_METADATA": "0"})
+    assert a._l2_meta is None
+    a.profile_table("sales")
+    assert not (Path(l2) / "meta").exists()
+
+
+def test_meta_tier_never_breaks_profile(tmp_path, monkeypatch):
+    """A broken meta dir degrades to a plain per-replica profile."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    (Path(l2)).mkdir(parents=True, exist_ok=True)
+    (Path(l2) / "meta").write_text("not a dir", encoding="utf-8")  # sabotage
+    a = _make_engine(l2, root, monkeypatch)
+    r = a.profile_table("sales")  # must not raise
+    assert r["n_columns"] == len(r["columns"])
+
+
+# ---------------------------------------------------- preview result sharing
+
+def test_preview_cached_on_repeat(tmp_path, monkeypatch):
+    """The 2026-09 fix: a bare-LIMIT preview is cached — the second identical
+    call is an L1 hit instead of another object-store read."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    sql = "SELECT * FROM sales LIMIT 5"
+    r1 = a.query_duckdb(sql)
+    r2 = a.query_duckdb(sql)
+    assert r2.to_pylist() == r1.to_pylist()
+    assert a._result_cache_hits == 1  # the cache answered, not the fast path
+
+
+def test_preview_shared_across_engines(tmp_path, monkeypatch):
+    """Replica B serves replica A's preview from the shared tier (floor 0 —
+    a preview's recompute is an object-store round trip, not arithmetic)."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    sql = "SELECT * FROM sales LIMIT 5"
+    r1 = a.query_duckdb(sql)
+    assert a._l2_cache.flush_async_stores() is True
+    b = _make_engine(l2, root, monkeypatch)
+    r2 = b.query_duckdb(sql)
+    assert r2.to_pylist() == r1.to_pylist()
+    assert b._l2_cache.stats()["hits"] == 1  # served from the SHARED dir

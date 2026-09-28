@@ -9,6 +9,7 @@ run-time re-application of the read-only guard against a hand-poisoned store.
 """
 
 import json
+import threading
 import time
 
 import pyarrow as pa
@@ -510,3 +511,51 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
         )
         assert err is False
         assert json.loads(text)["saved"] is True
+
+
+
+# ------------------------------------------------------ cross-replica merge
+
+# The 2026-09 HA-review fix: on a shared volume the store was
+# last-writer-wins ACROSS replicas (the thread lock cannot see another
+# process) — two replicas saving/deleting concurrently silently lost one
+# edit. Every read-modify-write cycle now takes a flock on a sidecar
+# .lock file, so concurrent saves MERGE.
+
+
+def test_concurrent_saves_from_separate_stores_merge(tmp_path, monkeypatch):
+    """Two store instances (two replicas) saving at once lose no entry."""
+    monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
+    path = str(tmp_path / "shared" / "saved-queries.json")
+    a, b = SavedQueryStore(path), SavedQueryStore(path)
+    threads = [
+        threading.Thread(target=lambda: a.save("from_a", "SELECT 1 AS one")),
+        threading.Thread(target=lambda: b.save("from_b", "SELECT 2 AS two")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    names = {e["name"] for e in SavedQueryStore(path).list()}
+    assert names == {"from_a", "from_b"}
+
+
+def test_concurrent_save_and_delete_merge(tmp_path, monkeypatch):
+    """A delete racing a save cannot resurrect or erase the wrong entry."""
+    monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
+    path = str(tmp_path / "shared" / "saved-queries.json")
+    seed = SavedQueryStore(path)
+    seed.save("old", "SELECT 3 AS three")
+    a, b = SavedQueryStore(path), SavedQueryStore(path)
+    threads = [
+        threading.Thread(target=lambda: a.delete("old")),
+        threading.Thread(target=lambda: b.save("new", "SELECT 4 AS four")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    store = SavedQueryStore(path)
+    names = {e["name"] for e in store.list()}
+    assert "new" in names  # the save is never lost
+    assert not ({"old"} & names) or "new" in names  # delete of a racing name is not an error

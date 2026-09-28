@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import uvicorn
 from mcp.server.lowlevel.server import Server
@@ -549,7 +550,10 @@ _TOOLS = [
             "(600s default, watchdog-enforced) and SQLHANDLER_MAX_ROWS cap. "
             "Poll query_status, then fetch ONCE with query_result. The registry "
             "is in-memory (a restart clears it) and bounded by SQLHANDLER_MAX_JOBS "
-            "(default 8; beyond the cap the submit is refused)."
+            "(default 8; beyond the cap the submit is refused). Multi-replica "
+            "deployments: the registry is per-replica — a finished job is only "
+            "fetchable from any replica when the operator sets SQLHANDLER_JOBS_DIR "
+            "to a directory every replica shares (an RWX PVC)."
         ),
         input_schema={
             "type": "object",
@@ -580,7 +584,9 @@ _TOOLS = [
         description=(
             "Poll an async query job: state (running/done/error/cancelled), "
             "elapsed_ms, error, and — when done and not yet fetched — the column "
-            "names and row count. No row data; fetch rows with query_result."
+            "names and row count. No row data; fetch rows with query_result. With "
+            "the SQLHANDLER_JOBS_DIR shared store, any replica can poll any job "
+            "(a running job submitted elsewhere reports running, not unknown)."
         ),
         input_schema={
             "type": "object",
@@ -593,7 +599,9 @@ _TOOLS = [
         description=(
             "Fetch a finished async query job's result ONCE (markdown default, "
             "json, csv, arrow), then the spooled result is freed from memory — a second "
-            "fetch of the same job is refused (resubmit instead)."
+            "fetch of the same job is refused (resubmit instead). On multi-replica "
+            "deployments (SQLHANDLER_JOBS_DIR shared store) the once-only contract "
+            "holds cluster-wide: a second fetch from ANY replica is refused."
         ),
         input_schema={
             "type": "object",
@@ -840,6 +848,76 @@ def _truthy(name: str, default: str = "0") -> bool:
 # The equivalent protection runs in _McpTransportGuard below, which applies
 # the same checks with deployment-configurable lists.
 _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def _ready_response(status_code: int, error: str) -> JSONResponse:
+    """Build the /ready body for a failing backend check (drift-aware).
+
+    The HTTP status follows the check's age: a first failure still returns
+    200 {status: degraded} so the kubelet does NOT drain the pod for a
+    blip; once SQLHANDLER_READY_DEGRADED_GRACE of continuous failure has
+    elapsed it becomes 503 (the historical outcome). Callers that want the
+    raw verdict read "backend_ok" / "degraded".
+    """
+    rollup = observability.drift.rollup()
+    if rollup >= 1.0:  # unreachable here (only called on failure) but safe
+        return JSONResponse({"status": "ready"})
+    failed_s = round(observability.drift.failed_seconds(), 1)
+    if rollup > 0.0:
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "backend_ok": False,
+                "degraded": True,
+                "failing_for_s": failed_s,
+                "error": error,
+            }
+        )
+    return JSONResponse(
+        {"status": "not ready", "backend_ok": False, "failing_for_s": failed_s, "error": error},
+        status_code=status_code,
+    )
+
+
+class _DriftGateMiddleware:
+    """ASGI middleware: shed NEW SQL work while the backend check is failing.
+
+    Active only when SQLHANDLER_READY_DRIFT_GATE=1. Gate classes: the /api
+    run/scan endpoints (calls that would otherwise queue a doomed scan into
+    the concurrency gate); /mcp is EXEMPT (agents must still be able to
+    interrogate the failure); /health, /ready, /metrics and UI pages pass
+    through. Off by default — enabling it is a per-site decision (it trades
+    "always answer something" for "fail fast on doomed work").
+    """
+
+    _GATED_PREFIXES = ("/api/query", "/api/scan", "/api/sample", "/api/profile")
+
+    def __init__(self, app):
+        self.app = app
+        self.enabled = os.environ.get("SQLHANDLER_READY_DRIFT_GATE", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    async def __call__(self, scope, receive, send):
+        gated = scope["type"] == "http" and scope.get("path", "").startswith(self._GATED_PREFIXES)
+        if not (self.enabled and gated):
+            await self.app(scope, receive, send)
+            return
+        if observability.drift.backend_failed():
+            resp = JSONResponse(
+                {
+                    "error": "Backend degraded: the data source check is failing "
+                    "(SQLHANDLER_READY_DRIFT_GATE refuses new scans while the "
+                    "readiness probe is in its degraded band). Retry shortly."
+                },
+                status_code=503,
+            )
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 class _McpTransportGuard:
@@ -1167,10 +1245,18 @@ def profile_table(table: str, columns: list[str] | None = None, *, caller=None) 
                     else ""
                 )
             )
-        import pandas as pd
+        # fastrender.profile_to_markdown: the same pandas-dtype-faithful
+        # rendering without the DataFrame materialization (fuzz-verified
+        # byte-identical incl. the object-dtype/fobj transform rules); falls
+        # back to pandas for any shape outside its proven contract.
+        from .fastrender import profile_to_markdown
 
-        df = pd.DataFrame(p["columns"])
-        return "\n".join(header) + "\n\n" + df.to_markdown(index=False)
+        body = profile_to_markdown(p["columns"])
+        if body is None:
+            import pandas as pd
+
+            body = pd.DataFrame(p["columns"]).to_markdown(index=False)
+        return "\n".join(header) + "\n\n" + body
     except Exception as exc:
         return f"Error profiling table: {_errors.enrich(str(exc))}"
 
@@ -1914,7 +2000,20 @@ def _resolve_scan_limit(limit: int | None) -> int | None:
 
 
 def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
-    """Render a pyarrow Table as a compact markdown table for an LLM."""
+    """Render a pyarrow Table as a compact markdown table for an LLM.
+
+    Bench follow-up (2026-09): the pure-Arrow renderer (fastrender) renders
+    from Arrow chunks — no pandas DataFrame materialization, no per-cell
+    boxing — and is byte-identical to the pandas path for every type in its
+    proven contract (tests/test_fastrender.py pins the contract per-type
+    against the real pandas/tabulate stack, plus a seeded differential fuzz).
+    When the table falls outside the contract (nested/binary/decimal types,
+    multiline cells, tabulate internals moved) fastrender returns None and
+    the historical pandas renderer below runs — pandas stays the source of
+    truth for every shape the pure renderer has not proven. One pinned
+    divergence: naive timestamps render ISO instead of pandas 3.x's
+    sci-notation epoch floats (an LLM-facing defect; see fastrender docstring).
+    """
     try:
         raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
         try:
@@ -1926,10 +2025,17 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
             max_rows = min(max_rows, cap)
         if cap > 0 and arrow.num_rows > cap:
             arrow = arrow.slice(0, cap)
+        # Boundary rule (unchanged): only a POSITIVE max_rows may reach
+        # .head()/the renderer. 0 means unlimited (no head at all), and a
+        # negative count would silently drop the last row — never allowed.
+        if max_rows is not None and max_rows <= 0:
+            max_rows = None
+        from .fastrender import arrow_to_markdown_fast
+
+        fast = arrow_to_markdown_fast(arrow, max_rows=max_rows)
+        if fast is not None:
+            return fast
         df = arrow.to_pandas()
-        # Boundary rule: only a POSITIVE max_rows may reach .head(). 0 means
-        # unlimited (no head at all), and a negative count would silently
-        # drop the last row (pandas head(-N) semantics) — never allowed.
         if max_rows is not None and max_rows > 0 and len(df) > max_rows:
             df = df.head(max_rows)
         return df.to_markdown(index=False)
@@ -1978,7 +2084,11 @@ def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
         # tail tells an agent WHY more rows exist and how to reach them.
         if capped or payload.get("truncated"):
             payload["error"] = {"code": _errors.E_ROWS_CAPPED, "fix_hints": _ROWS_CAPPED_HINTS}
-        return json.dumps(payload, default=str)
+        # fastrender.dumps: orjson when available (3-8x faster than stdlib on
+        # this row-dict-heavy payload), parse-identical, stdlib fallback.
+        from .fastrender import dumps as _fast_json
+
+        return _fast_json(payload, default=str)
     if fmt == "csv":
         payload = arrow_to_payload(arrow, limit=max_rows)
         buf = io.StringIO()
@@ -2000,6 +2110,10 @@ def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
         # rides as a structured tail line (same additive posture as errors).
         return body + _errors.structured(_errors.E_ROWS_CAPPED, _ROWS_CAPPED_HINTS)
     return body
+
+
+#: Process start time (wall anchor) for the /metrics uptime header.
+_START_TIME = time.time()
 
 
 class _ApiTokenMiddleware:
@@ -2028,6 +2142,35 @@ class _ApiTokenMiddleware:
                 resp = JSONResponse({"error": "Unauthorized: missing or invalid API token."}, status_code=401)
                 await resp(scope, receive, send)
                 return
+        await self.app(scope, receive, send)
+
+
+class _MetricsPodIdentityMiddleware:
+    """ASGI middleware: add the serving replica's identity to /metrics.
+
+    Deliberately a header, not a body annotation: the exposition body stays
+    byte-identical (the whole fleet contract on additive metrics), while an
+    aggregate alert can still name the replica that answered. The header is
+    also how a human correlating a scrape with kubectl output confirms
+    which pod they are looking at.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "") == "/metrics":
+            pod = os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or ""
+
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start" and pod:
+                    headers = list(message.get("headers", []))
+                    headers.append((b"x-sqlhandler-pod", pod.encode("latin-1")))
+                    message = {**message, "headers": headers}
+                await send(message)
+
+            await self.app(scope, receive, send_wrapper)
+            return
         await self.app(scope, receive, send)
 
 
@@ -2173,6 +2316,34 @@ def main(argv: list | None = None) -> None:
         return
 
     app = _build_http_app()
+
+    # Event loop (bench follow-up, 2026-09): uvloop's C loop instead of the
+    # default asyncio selector loop — the ASGI hop (uvicorn + Starlette
+    # middleware stack) is pure-Python callback churn, and uvloop cuts that
+    # overhead measurably on the warm/cache-hit path that dominates
+    # agent-facing traffic. Guarded on three axes so it can never become a
+    # hard dependency or a behavior change:
+    #   * importable (the wheel ships in pyproject, but a stripped install
+    #     without it still runs on the default loop);
+    #   * opt-out (SQLHANDLER_EVENT_LOOP=asyncio) for incident triage — if a
+    #     uvloop regression is ever suspected, flip the env and restart,
+    #     no code change;
+    #   * stdio transport untouched (asyncio.run above — uvloop adds nothing
+    #     to a single-session pipe and stdio tooling expects default asyncio).
+    # The engine is unaffected: DuckDB/pyarrow calls release the GIL and run
+    # on worker threads regardless of which loop schedules them.
+    _loop_pref = os.environ.get("SQLHANDLER_EVENT_LOOP", "uvloop").strip().lower()
+    _loop_log = logging.getLogger("sqlhandler.server")
+    if _loop_pref in ("", "uvloop", "auto"):
+        try:
+            import uvloop
+
+            uvloop.install()
+            _loop_log.info("Event loop: uvloop (SQLHANDLER_EVENT_LOOP=asyncio to opt out)")
+        except ImportError:
+            _loop_log.info("Event loop: asyncio (uvloop not installed — add the wheel for the fast loop)")
+    else:
+        _loop_log.info("Event loop: asyncio (SQLHANDLER_EVENT_LOOP=%s)", _loop_pref)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -2203,12 +2374,22 @@ def _build_http_app():
         return JSONResponse({"status": "ok"})
 
     async def _ready(_request) -> JSONResponse:
-        # Backend-aware readiness: only report "ready" when the configured data
+        # Backend-aware readiness: report "ready" when the configured data
         # source is actually reachable (OneLake DFS token+list, S3 list,
         # Iceberg catalog, NFS root, or Delta Sharing GET /shares). If the
         # credential/endpoint breaks, the pod drops out of the Service so
         # traffic stops reaching a dead backend and the failure becomes
         # visible. Disable with SQLHANDLER_READINESS_CHECK=0.
+        #
+        # DEGRADED band (HA review 2026-09): a failing check is NOT reported
+        # to the kubelet until SQLHANDLER_READY_DEGRADED_GRACE (default 60s)
+        # of CONTINUOUS failure has elapsed. One flaky storage blip used to
+        # drain every replica of a scaled-out deployment simultaneously (a
+        # correlated outage the replicas were bought to prevent); within the
+        # grace the pod stays Ready, keeps serving cached/metadata paths,
+        # and the /metrics gauge drops to 0.5 so alerting still sees the
+        # degradation. Persistent failure still goes NotReady (the
+        # historical outcome) and a healthy check resets the clock.
         if os.environ.get("SQLHANDLER_READINESS_CHECK", "1").strip().lower() not in (
             "1",
             "true",
@@ -2220,11 +2401,15 @@ def _build_http_app():
             engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=2)
             err = await asyncio.wait_for(asyncio.to_thread(engine.provider.check_connection), timeout=15)
         except TimeoutError:
-            return JSONResponse({"status": "not ready", "error": "backend check timed out"}, status_code=503)
+            observability.drift.note_backend(False)
+            return _ready_response(503, "backend check timed out")
         except Exception as exc:
-            return JSONResponse({"status": "not ready", "error": str(exc)}, status_code=503)
+            observability.drift.note_backend(False)
+            return _ready_response(503, str(exc))
         if err:
-            return JSONResponse({"status": "not ready", "error": err}, status_code=503)
+            observability.drift.note_backend(False)
+            return _ready_response(503, err)
+        observability.drift.note_backend(True)
         return JSONResponse({"status": "ready"})
 
     app.add_route("/health", _health)
@@ -2238,10 +2423,18 @@ def _build_http_app():
             engine = await asyncio.to_thread(_handler)
         except Exception:
             engine = None
-        return Response(
+        response = Response(
             content=observability.metrics.render(engine),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
+        # Explicit value first (set only when the operator wires it); the
+        # hostname fallback (empty on stdio/local runs) renders NO header
+        # at all — never a misleading "pod=unknown" label.
+        pod = os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or ""
+        if pod:
+            response.headers["X-Sqlhandler-Pod"] = pod
+        response.headers["X-Sqlhandler-Ready-Seconds"] = f"{time.time() - _START_TIME:.1f}"
+        return response
 
     app.add_route("/metrics", _metrics)
 
@@ -2252,6 +2445,20 @@ def _build_http_app():
     api_token = os.environ.get("SQLHANDLER_API_TOKEN", "").strip()
     if api_token:
         app.add_middleware(_ApiTokenMiddleware, token=api_token)
+
+    # Label /metrics responses with the serving replica (HA review 2026-09):
+    # aggregate alerts over per-pod series need to know WHICH replica
+    # answered (pod identity is otherwise only in the k8s scrape labels).
+    # ON by default for /metrics only; SQLHANDLER_METRICS_POD_LABEL=0 opts
+    # out. Additive response headers — body bytes unchanged, so scrapers
+    # see the same exposition.
+    if os.environ.get("SQLHANDLER_METRICS_POD_LABEL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        app.add_middleware(_MetricsPodIdentityMiddleware)
 
     # OPTIONAL /mcp API-key gate (fleet decision 2026-09 — SQL is optional
     # until per-user keys/roles land): when neither MCP_API_KEYS (the
@@ -2357,6 +2564,16 @@ def _build_http_app():
             "MCP_API_KEYS / SQLHANDLER_API_KEYS) — saved-query WRITES are OPEN "
             "(known single-user-local mode). Set a credential to gate them."
         )
+
+    # Cross-replica readiness drift gate (HA review 2026-09): while the
+    # backend check is failing (the /ready degraded band), stop admitting
+    # NEW SQL work so a pod in a dead-backend window answers cheap calls
+    # instead of starting doomed scans. OFF by default
+    # (SQLHANDLER_READY_DRIFT_GATE: kubelet-independent, byte-identical
+    # behavior until enabled). /mcp is exempt — MCP responses self-describe
+    # errors and an agent should still be able to ask "why is my query
+    # failing".
+    app.add_middleware(_DriftGateMiddleware)
 
     # DNS-rebinding protection on /mcp (ON by default — Origin validation
     # always; strict Host validation when SQLHANDLER_ALLOWED_HOSTS is set).

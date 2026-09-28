@@ -20,6 +20,16 @@ same pattern for GENERAL query results, behind the memory LRU:
 * **Degradation** — every failure (missing sidecar, corrupt JSON, unreadable
   parquet, unwritable dir) degrades to a miss / a skipped write. The cache
   is an accelerator, never a dependency; nothing here can fail a query.
+* **Async write-out** (HA review 2026-09, the sglang HiCache write-through
+  analogy): the computing replica hands the result to a bounded queue and a
+  single daemon worker serializes zstd parquet + sidecar OFF the query path
+  (the sglang L3 write-out, applied to result caching). The query returns
+  when its L1 (memory) copy is placed; other replicas pick the result up
+  from disk at a small non-RAM read cost once the worker publishes it.
+  Fallback to the historical synchronous publish when disabled
+  (SQLHANDLER_L2_WRITE_ASYNC=0) or when the queue is full (backpressure:
+  drop the write rather than grow the queue — a dropped write is an
+  ordinary cache miss, a grown queue is replica memory).
 * **Cleanup** — expired entries are removed lazily on lookup, and one
   daemon thread per process sweeps sidecars past the TTL (mtime pass, same
   shape as the engine's ``_auto_refresh_loop``). Sweeping uses the sidecar
@@ -36,10 +46,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+from .fastrender import dumps as _fast_json_dumps
 
 logger = logging.getLogger("sqlhandler.l2cache")
 
@@ -51,6 +64,22 @@ DEFAULT_MIN_BYTES = 256 * 1024
 DEFAULT_MAX_BYTES = 2 * 1024**3
 DEFAULT_TTL = 3600.0
 SWEEP_INTERVAL_FRACTION = 0.5  # daemon sweeps at ttl/2 (min 30s)
+
+# Async write-out: bounded pending-store queue (ENTRIES, not bytes — every
+# queued entry is already capped by SQLHANDLER_L2_MAX_BYTES, so a full queue
+# of the largest allowed results is ~40GiB of pending parquet worst-case;
+# a full queue DROPS the write — an ordinary cache miss — instead of growing).
+DEFAULT_ASYNC_QUEUE_DEPTH = 32
+
+
+def write_async_enabled() -> bool:
+    """Async L2 write-out on/off (SQLHANDLER_L2_WRITE_ASYNC, default on)."""
+    return os.environ.get("SQLHANDLER_L2_WRITE_ASYNC", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -84,6 +113,9 @@ class L2ResultCache:
         self.hits = 0
         self.writes = 0
         self._sweeper: threading.Thread | None = None
+        self._write_queue: queue.Queue[tuple[str, object]] | None = None
+        self._write_worker: threading.Thread | None = None
+        self._write_dropped = 0  # backpressure drops (an ordinary miss each)
 
     # ------------------------------------------------------------- config
     @property
@@ -97,13 +129,20 @@ class L2ResultCache:
     def stats(self) -> dict:
         """Counters + config snapshot for cache_stats()/metrics (additive)."""
         with self._lock:
-            return {
+            payload = {
                 "enabled": True,
                 "dir": self._dir,
                 "ttl": self._ttl,
                 "hits": self.hits,
                 "writes": self.writes,
             }
+            if self._write_queue is not None:
+                payload["write_mode"] = "async"
+                payload["write_queue_depth"] = self._write_queue.qsize()
+                payload["write_dropped"] = self._write_dropped
+            else:
+                payload["write_mode"] = "sync"
+            return payload
 
     # ------------------------------------------------------------- paths
     def _artifact(self, key: str) -> Path:
@@ -203,6 +242,63 @@ class L2ResultCache:
             logger.debug("L2 drop_for_table failed for %s", table_path, exc_info=True)
         return dropped
 
+    # -------------------------------------------------- async write-out
+    def async_store(self, key: str, table) -> bool:
+        """Hand a result to the background publisher (the write-through).
+
+        Returns True when queued, False when the write falls back to the
+        synchronous path (async disabled or queue full — the caller then
+        calls :meth:`store` itself, preserving the historical behavior).
+        The reference is queued, not copied: the table is already paid for
+        in the computing replica's L1, and L1 eviction dropping the last
+        reference only means the worker loses a race it can lose anyway
+        (a replica crash mid-publish) — the artifact write itself holds
+        its own reference while serializing.
+        """
+        if self._write_queue is None:
+            return False
+        try:
+            self._write_queue.put_nowait((key, table))
+            return True
+        except queue.Full:
+            with self._lock:
+                self._write_dropped += 1
+            return False
+
+    def _ensure_write_worker(self) -> None:
+        """Start the single write-out worker (idempotent, daemon)."""
+        if self._write_worker is not None and self._write_worker.is_alive():
+            return
+        self._write_queue = queue.Queue(maxsize=DEFAULT_ASYNC_QUEUE_DEPTH)
+        self._write_worker = threading.Thread(
+            target=self._write_loop, daemon=True, name="sqlhandler-l2-writeout"
+        )
+        self._write_worker.start()
+
+    def _write_loop(self) -> None:
+        while True:
+            key, table = self._write_queue.get()
+            try:
+                self.store(key, table)
+            except Exception:  # store() never raises, but never trust a loop to die
+                logger.debug("L2 async write-out failed for key %s…", key[:16], exc_info=True)
+            finally:
+                self._write_queue.task_done()
+
+    def flush_async_stores(self, timeout: float = 30.0) -> bool:
+        """Block until every queued write-out is published (tests/shutdown).
+
+        True when the queue drained within the timeout. A no-op (True) when
+        async mode never started. (Polled rather than Queue.join(timeout=)
+        — that parameter is 3.13+ and the engine supports 3.11.)
+        """
+        if self._write_queue is None:
+            return True
+        deadline = time.monotonic() + timeout
+        while self._write_queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not self._write_queue.unfinished_tasks
+
     # ------------------------------------------------------------- store
     def store(self, key: str, table) -> None:
         """Publish one result as parquet + sidecar (best-effort, never raises).
@@ -234,7 +330,7 @@ class L2ResultCache:
                 dir=str(path.parent), prefix=path.name + ".", suffix=".meta.tmp"
             )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(json.dumps(meta))
+                f.write(_fast_json_dumps(meta))
             os.replace(tmp_meta, str(self._sidecar(key)))
             with self._lock:
                 self.writes += 1
@@ -319,6 +415,127 @@ class L2ResultCache:
                     )
             except Exception:
                 logger.debug("L2 result cache sweep skipped", exc_info=True)
+
+
+def metadata_shared_enabled() -> bool:
+    """Share profile/column_stats outputs through the L2 dir (default on).
+
+    `SQLHANDLER_L2_METADATA=0` opts out. Active only when the L2 layer
+    itself is configured (a shared dir); a per-replica-only deployment
+    (no dir) is unaffected either way.
+    """
+    return os.environ.get("SQLHANDLER_L2_METADATA", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+class L2JsonCache:
+    """Shared read-through tier for small JSON results (profile, column_stats).
+
+    The result cache's L2 moves Arrow tables (zstd parquet — the async
+    write-out exists because those can be hundreds of MB). Profile and
+    column_stats outputs are a few KB of JSON whose recompute is a
+    multi-second sampled scan, so the floor-vs-recompute economics invert:
+    sharing a small artifact beats recomputing it on every replica. Same
+    discipline as the table tier, JSON-flavored:
+
+    * artifacts live in a `meta/` SUBDIRECTORY of the L2 dir — a separate
+      namespace so a metadata entry can never collide with a result
+      sidecar, and the table-tier sweeper never sees them;
+    * publish is a synchronous atomic temp+rename (sub-millisecond for a
+      few KB — no queue, no worker);
+    * TTL lives in the entry (`created`), checked lazily on get; a hit
+      PAST the ttl deletes the file and misses;
+    * every failure degrades to a miss / skipped write. Never raises.
+
+    Fidelity: values serialize as their JSON text (a DATE min/max becomes
+    its string form) — exactly how the MCP/UI layers render these outputs
+    anyway, so consumers see identical text; direct python equality on a
+    round-tripped dict holds for JSON-native scalars.
+    """
+
+    def __init__(self, dir_path: str, ttl: float):
+        self._dir = Path(dir_path) / "meta"
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.writes = 0
+
+    @property
+    def dir(self) -> str:
+        return str(self._dir)
+
+    @property
+    def ttl(self) -> float:
+        return self._ttl
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "enabled": True,
+                "dir": str(self._dir),
+                "ttl": self._ttl,
+                "hits": self.hits,
+                "misses": self.misses,
+                "writes": self.writes,
+            }
+
+    def _path(self, key: str) -> Path:
+        return self._dir / f"{key[:16]}.json"
+
+    def get(self, key: str) -> dict | None:
+        """The cached dict for `key` when fresh and readable, else None."""
+        result = self._get(key)
+        with self._lock:
+            if result is None:
+                self.misses += 1
+        return result
+
+    def _get(self, key: str) -> dict | None:
+        try:
+            entry = json.loads(self._path(key).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if entry.get("key") != key:  # prefix-collision guard, same as the table tier
+            return None
+        if self._ttl > 0 and time.time() - float(entry.get("created", 0)) >= self._ttl:
+            self.remove(key)
+            return None
+        with self._lock:
+            self.hits += 1
+        payload = entry.get("payload")
+        return payload if isinstance(payload, dict) else None
+
+    def put(self, key: str, payload: dict) -> None:
+        """Publish one dict (best-effort, never raises)."""
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return  # no shared dir — the tier is inert, never a failure
+        fd, tmp = tempfile.mkstemp(dir=str(self._dir), prefix=f"{key[:16]}.", suffix=".tmp")
+        try:
+            os.write(
+                fd,
+                _fast_json_dumps(
+                    {"key": key, "created": time.time(), "payload": payload}, default=str
+                ).encode("utf-8"),
+            )
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, self._path(key))
+        with self._lock:
+            self.writes += 1
+
+    def remove(self, key: str) -> None:
+        try:
+            self._path(key).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_l2_config() -> dict | None:

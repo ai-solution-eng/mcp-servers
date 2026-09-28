@@ -24,6 +24,10 @@ data
 test_parquet
 bench
 .duckdb_home
+# Vendored DuckDB scanner extensions (257 MB) — used ONLY by local dev tests
+# (SQLHANDLER_DUCKDB_EXTENSION_DIR points here); the image build downloads
+# fresh extensions from extensions.duckdb.org into /opt/duckdb-ext instead.
+duckdb-ext
 
 # Repo tooling and release artifacts
 *.tar.gz

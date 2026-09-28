@@ -25,3 +25,16 @@ def _isolated_saved_query_store(tmp_path, monkeypatch):
     leak into (or read) a store left behind by another test or a real run.
     """
     monkeypatch.setenv("SQLHANDLER_SAVED_QUERIES_PATH", str(tmp_path / "saved-queries.json"))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_shared_job_store(tmp_path, monkeypatch):
+    """Point every test's shared job store at its own tmp_path.
+
+    SQLHANDLER_JOBS_DIR enables the cross-replica job hand-off; a leftover
+    store from another test (or a real run sharing this home dir) would make
+    a fresh-registry test suddenly see foreign finished jobs. Autouse +
+    per-test tmp_path isolates it the same way the catalog/saved-query
+    stores are isolated.
+    """
+    monkeypatch.delenv("SQLHANDLER_JOBS_DIR", raising=False)

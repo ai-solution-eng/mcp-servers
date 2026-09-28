@@ -18,16 +18,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR ${APP_HOME}
 
-# Install the package + deps. The explicit azure-* pair is also listed in
-# pyproject.toml (keep the two in sync): deltalake's OneLake service-principal
-# flow uses them. The [iceberg] extra backs the iceberg backend the helm
-# chart advertises. The build requires network (pip).
+# Install deps and the local package as SEPARATE layers (bench follow-up,
+# 2026-09 — build-speed fix): dependency wheels (~600 MB) live in a layer
+# keyed on pyproject.toml+README only, so a code-only release rebuilds just
+# the cheap COPY/chmod layers instead of re-downloading every wheel. The
+# dependency list is the FULL transitive closure of pyproject's dependencies
+# + the [iceberg] extra (verified against pyproject; keep the three in sync):
+# the azure-* pair backs deltalake's OneLake service-principal flow; pyiceberg
+# + sqlalchemy are the [iceberg] extra. The local package then installs
+# --no-deps (its dependencies are all present by construction). The build
+# requires network (pip).
 COPY pyproject.toml README.md ./
-COPY src ./src
 
 RUN uv pip install --system \
-        pyarrow duckdb azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette pyyaml pygments \
-    && uv pip install --system -e ".[iceberg]"
+        pyarrow duckdb deltalake mcp orjson uvloop azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette pyyaml pygments \
+        "pyiceberg[pyarrow]>=0.10" "sqlalchemy>=2.0"
+
+COPY src ./src
+RUN uv pip install --system --no-deps -e .
+
+# Sanity gate (build-time, cheap): the local package must import with zero
+# dependency resolution — catches "dep added to pyproject but not to the
+# RUN above" drift immediately, in the build log, instead of as a first-query
+# ImportError in the pod.
+RUN python -c "import sqlhandler; print('sqlhandler', sqlhandler.__version__, 'imports clean')"
 
 # Preinstall the external-database scanner extensions (SQLHANDLER_ATTACH):
 # DuckDB extension autoinstall is DISABLED at runtime (fs lockdown), so these

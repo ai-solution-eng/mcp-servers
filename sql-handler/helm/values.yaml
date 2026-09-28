@@ -36,6 +36,15 @@ autoscaling:
   minReplicas: 2
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
+  # Load-following scale-out (HA review 2026-09): adds the per-pod request
+  # rate as a second HPA metric so replica count follows TRAFFIC (the CPU
+  # target above stays as runaway/burst protection). Needs prometheus-adapter
+  # serving sqlhandler_http_requests_per_second from the PodMonitor path —
+  # without it the HPA fails with "metric not found", hence opt-in.
+  # 1.5 = the measured per-pod saturation point (G2 benchmark).
+  requestRateEnabled: false
+  requestRateMetricName: sqlhandler_http_requests_per_second
+  requestRateTarget: "1.5"
   # Raw extra HPA metrics appended verbatim (autoscaling/v2 schema).
   extraMetrics: []
   behavior:
@@ -61,11 +70,18 @@ podDisruptionBudget:
 # to 3600s per call; the pod gets this many seconds to finish draining).
 terminationGracePeriodSeconds: 90
 
+# preStop drain delay (HA review 2026-09): seconds the pod sleeps in its
+# preStop hook before SIGTERM, so readiness flips and endpoint
+# deregistration land FIRST and no new MCP call is routed to a dying
+# replica. Runs inside the terminationGracePeriodSeconds budget (keep
+# preStop << grace). 0 disables the hook.
+preStopDelaySeconds: 5
+
 image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.4.0
+  tag: v2.6.1
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -364,6 +380,23 @@ query:
   profileMaxRows: "1000000"
   # Max concurrent async query jobs (query_submit; HTTP 429 beyond it).
   maxJobs: 8
+  # Cross-replica job hand-off (SQLHANDLER_JOBS_DIR). EMPTY (default) = the
+  # registry stays pod-local: on replicaCount > 1 / autoscaling, query_status /
+  # query_result for a job submitted on another replica return "Unknown job id"
+  # (~3 of 4 polls on a 4-replica deployment). Set to an ABSOLUTE path on a
+  # volume every replica mounts read-write — k8s: an RWX PVC (same discipline
+  # as semanticCatalog.store and cache.l2.dir). Finished jobs then publish
+  # state + result there (atomic per write), any replica can poll/fetch/cancel,
+  # and fetch-once holds cluster-wide. RWX is enforced at render time when
+  # replicas can exceed 1.
+  jobsDir: ""
+  # Access modes the PVC backing jobsDir must declare (render guard only —
+  # the chart never creates this volume; mount it via an existing claim the
+  # same way as semanticCatalog.store). Default [ReadWriteMany]: with
+  # replicas > 1 an RWO claim would strand the store on one node and the
+  # other replicas would still 404 on foreign jobs. Set [ReadWriteOnce] ONLY
+  # for single-replica deployments.
+  jobsAccessModes: [ReadWriteMany]
   # Query-memory resource depth: how many recent query outcomes the
   # sqlhandler://query-memory resource keeps (0 disables recording).
   queryMemorySize: 50
@@ -390,6 +423,22 @@ query:
   # PVC-backed mount provides. Must be an absolute path (render guard).
   auditLog: ""
 
+# -- Readiness (HA review 2026-09) ---------------------------------------------
+readiness:
+  # Seconds of CONTINUOUS backend-check failure before /ready returns 503
+  # (the pod drains). Within the grace a failing check reports
+  # {"status": "degraded"} with HTTP 200 and the
+  # sqlhandler_readiness_state metric drops to 0.5 — one flaky storage
+  # blip can no longer drain every replica of a scaled-out deployment at
+  # once. A healthy check resets the clock; 0 = the historical binary
+  # behavior.
+  degradedGraceSeconds: "60"
+  # Fail-fast gate: while the backend check is failing, refuse NEW /api
+  # scan-shaped requests (503) instead of queueing doomed scans into the
+  # concurrency gate. /mcp stays open so agents can interrogate the
+  # failure. Off by default — a per-site posture decision.
+  driftGate: false
+
 # -- Resources ----------------------------------------------------------------
 # Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
 # at 16 concurrent clients with a fleet-wide peak of 0.24 cores / 1.3GiB, so
@@ -405,14 +454,24 @@ query:
 # The memory REQUEST is purely a scheduler reservation (DuckDB's budget keys
 # off the LIMIT — see src/sqlhandler/resources.py) — but keep it at or above
 # steady-state RSS: under node memory pressure the kubelet evicts pods whose
-# usage exceeds their request first. 1Gi covers observed usage (~0.3GiB fresh,
-# ~1.1GiB long-warmed) with margin; don't go below that.
-# Raise the limits (not the requests) on sites running very wide tables or
-# large joins; the requests can stay put in every case observed so far.
+# usage exceeds their request first. NOTE (2026-09-28, live G2 v2.6.0): hot
+# pods repeatedly hold 1.9-3Gi working sets (cache pressure, pipeline
+# buffers) vs the old "~1.1GiB long-warmed" estimate, hence the 2Gi request.
+# cpu: HPA CAUTION — a CPU Utilization target is a percentage OF THE REQUEST:
+# the HPA never sees limits. With requests.cpu=250m and the CPU@80% target
+# the scale gate is only 200m; measured steady CPU is 4-91m, so even mild
+# load can rail the HPA at maxReplicas. Keep requests.cpu >= ~2x the measured
+# steady peak AND request < limit/1.25 so bursts can exceed the gate before
+# the limit caps the pod. Raise the LIMITS (not the requests) on sites
+# running very wide tables or large joins — limits are invisible to the HPA
+# and are what DuckDB's thread count/budget actually key off.
 resources:
+  # requests.cpu doubles as the HPA scale threshold carrier (see cpu comment
+  # above); 500m puts the CPU@80% gate at 400m — above the measured 91m 7d
+  # peak, with room for a burst toward the 800m-class limits before scale-out.
   requests:
-    cpu: 250m
-    memory: 1Gi
+    cpu: 500m
+    memory: 2Gi
   limits:
     cpu: "4"
     memory: 16Gi
@@ -758,11 +817,16 @@ cache:
   # the same pattern as virtual-table materialization). Off by default: it
   # needs a volume mounted at the SAME path on every replica.
   l2:
-    # Master switch. Even with enabled: true nothing is cached until l2Dir
-    # points somewhere shared — the dir must be set explicitly so a typo can
-    # never quietly degrade to pod-local /tmp (which would look like sharing
-    # while sharing nothing).
-    enabled: false
+    # Master switch. DEFAULT: auto — the chart enables the tier whenever the
+    # deployment can run MORE THAN ONE replica (autoscaling or
+    # replicaCount > 1, the same $multi condition the PVC guards use) and
+    # disables it for single-replica deployments (where there is nothing to
+    # share and the L1 memory cache is the whole story). Set true/false to
+    # override the auto behavior explicitly. Even when enabled, nothing is
+    # cached until l2Dir points somewhere shared — the dir must be set
+    # explicitly so a typo can never quietly degrade to pod-local /tmp
+    # (which would look like sharing while sharing nothing).
+    enabled: ""   # "" = auto (on when replicas can exceed 1), true, false
     # Shared directory for result parquet artifacts (zstd) + .json sidecars.
     # Point at an RWX PVC mounted on every replica (e.g. the semantic-catalog
     # store claim, or its own claim); on a single-replica deployment a
@@ -779,6 +843,13 @@ cache:
     # Results LARGER than this skip the L2 — one runaway result must not
     # fill the shared volume. "0" = unlimited.
     maxBytes: "2147483648"
+    # Async write-out (HA review 2026-09): the computing replica queues the
+    # disk publish to a background worker instead of serializing the result
+    # on the query path (the sglang HiCache write-through shape). The
+    # writer's query returns when its memory L1 copy is placed; other
+    # replicas read the artifact at a small non-RAM cost once published.
+    # 0 = the historical synchronous publish.
+    writeAsync: true
     # NOTE (RWX): with replicaCount > 1 or autoscaling enabled, l2.dir MUST
     # be on a ReadWriteMany volume — a ReadWriteOnce claim attaches on one
     # node only, so every other replica silently never hits the cache (no
@@ -805,6 +876,47 @@ cache:
     # to pyarrow while being network; real-local disk is already covered by
     # the OS page cache.
     includeLocal: false
+
+# -- Sticky (consistent-hash) routing ------------------------------------------
+# A DestinationRule that makes the SAME caller stick to the SAME replica, so
+# the per-replica in-memory result cache (cache.resultCacheTtl) actually hits.
+# WHY: with replicaCount > 1 behind the round-robin Service, a repeat query
+# lands on a random replica and pays the cold cost again — that is the warm
+# p95 outlier in bench/BENCHMARK.md ("Per-replica cache physics": 1-of-5 reps
+# at 1.0–3.2 s vs ~105 ms p50). Sticky routing turns those outliers into L1
+# hits. OFF by default: see the caller caveat below.
+routing:
+  affinity:
+    # Master switch — renders the DestinationRule when true. Even when true,
+    # behavior only changes if some caller actually SENDS headerKey.
+    enabled: false
+    # HTTP header Istio hashes on to pick a replica (e.g. an agent session
+    # id). The VALUE is arbitrary — any request carrying the header with the
+    # same value goes to the same pod. Requests WITHOUT it stay round-robin.
+    headerKey: "x-sqlhandler-session"
+    # Destination host the rule applies to. Empty = the in-cluster service
+    # FQDN ({{ include "sqlhandler.fullname" . }}.<ns>.svc.cluster.local —
+    # the same destination the VirtualService routes to).
+    host: ""
+    # Interplay with cache.l2 (both default-off, complementary, pick per
+    # deployment): sticky routing raises the L1 hit rate for callers that
+    # send the header; the shared L2 covers the replicas a sticky miss still
+    # lands on (new session, header dropped by a proxy, or a caller that
+    # never sends it). Enabling both is reasonable; enabling neither leaves
+    # today's per-replica physics.
+    #
+    # CAVEAT (read before enabling): Istio hashes on headerKey WHATEVER its
+    # value — it does not create or enforce it. If the caller (agent client)
+    # or the ezua ingress gateway sidecar does not inject the header, every
+    # request arrives header-less and behavior stays plain round-robin (the
+    # rule is then a no-op, not an error). Verify end-to-end with a request
+    # carrying the header and a repeated query landing warm.
+    #
+    # SCOPE: a consistent-hash DestinationRule only steers in-mesh traffic —
+    # the istio ingressgateway sidecar → service hop inside the cluster
+    # (and any sidecar'd in-mesh caller). External callers reaching the pod
+    # outside the mesh, or traffic that bypasses sidecar handling, is not
+    # affected.
 
 # -- Semantic catalog ----------------------------------------------------------
 # The "semantic view": human-written table/column descriptions merged into

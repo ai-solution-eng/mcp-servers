@@ -53,7 +53,13 @@ from .external import (
     sql_references_attach,
     validate_qualified_name,
 )
-from .l2cache import L2ResultCache, load_l2_config
+from .l2cache import (
+    L2JsonCache,
+    L2ResultCache,
+    load_l2_config,
+    metadata_shared_enabled,
+    write_async_enabled,
+)
 from .policy import TableRule, policy_store
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import is_raw_format
@@ -1006,6 +1012,14 @@ class SqlEngine:
         # for both, and that must not "fixed".
         l2_cfg = load_l2_config()
         self._l2_cache: L2ResultCache | None = L2ResultCache(l2_cfg["dir"], ttl=l2_cfg["ttl"]) if l2_cfg else None
+        # Shared tier for small JSON outputs (profile / column_stats): same
+        # dir discipline as the result L2, artifacts under <dir>/meta/. On
+        # when the L2 dir is configured; SQLHANDLER_L2_METADATA=0 opts out.
+        self._l2_meta: L2JsonCache | None = (
+            L2JsonCache(l2_cfg["dir"], ttl=l2_cfg["ttl"])
+            if l2_cfg is not None and metadata_shared_enabled()
+            else None
+        )
         self._l2_min_bytes = l2_cfg["min_bytes"] if l2_cfg else 0
         self._l2_max_bytes = l2_cfg["max_bytes"] if l2_cfg else 0
         # External read-only database attaches (SQLHANDLER_ATTACH[_FILE]):
@@ -1082,6 +1096,14 @@ class SqlEngine:
         # slice: adding GC there is a separate decision, not L2 scope.
         if self._l2_cache is not None:
             self._l2_cache.start_sweeper()
+            # Async write-out worker (HA review 2026-09): publish result
+            # parquet to the shared dir OFF the query path — the query
+            # returns once its L1 copy is placed, exactly the sglang
+            # write-through/L3 shape applied to result caching. Per-write
+            # fallback to the synchronous publish when the opt-out env is
+            # set or the queue is full.
+            if write_async_enabled():
+                self._l2_cache._ensure_write_worker()
 
     # ---------------------------------------------------------------- list
     def list_tables(self, *, caller=None) -> list[TableInfo]:
@@ -1522,11 +1544,15 @@ class SqlEngine:
         server can parse back.
         """
         if fmt != "yaml":
-            return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            from .fastrender import dumps as _fast_json
+
+            return _fast_json(data, indent=True) + "\n"
         try:
             import yaml  # optional dependency (pyproject: pyyaml)
         except ImportError:
-            return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            from .fastrender import dumps as _fast_json
+
+            return _fast_json(data, indent=True) + "\n"
         return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
     def catalog_content(self, fmt: str = "yaml") -> dict:
@@ -2444,6 +2470,18 @@ class SqlEngine:
                 self._profile_hits += 1
                 return hit[1]
 
+        shared_key = self._metadata_shared_key(
+            ["profile", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
+        )
+        if shared_key is not None:
+            shared = self._l2_meta.get(shared_key)
+            if shared is not None:
+                with self._lock:
+                    self._profile_hits += 1
+                    if self.cache_ttl > 0:
+                        self._profile_cache[key] = (time.monotonic(), shared)
+                return shared
+
         dset = self._open_dataset(info)
 
         # Full-table row count from metadata (Parquet row-group counts /
@@ -2526,6 +2564,8 @@ class SqlEngine:
             self._profile_misses += 1
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
+        if shared_key is not None:
+            self._l2_meta.put(shared_key, result)
         return result
 
     @staticmethod
@@ -2674,6 +2714,18 @@ class SqlEngine:
                 self._profile_hits += 1
                 return hit[1]
 
+        shared_key = self._metadata_shared_key(
+            ["colstats", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
+        )
+        if shared_key is not None:
+            shared = self._l2_meta.get(shared_key)
+            if shared is not None:
+                with self._lock:
+                    self._profile_hits += 1
+                    if self.cache_ttl > 0:
+                        self._profile_cache[key] = (time.monotonic(), shared)
+                return shared
+
         described = self.describe_table(table, caller=effective_caller)
         col, col_type = _validate_column(described, column, table)
         if rule.column_masks and col.lower() in {c.lower() for c in rule.column_masks}:
@@ -2735,6 +2787,8 @@ class SqlEngine:
             self._profile_misses += 1
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
+        if shared_key is not None:
+            self._l2_meta.put(shared_key, result)
         return result
 
     def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:
@@ -3329,6 +3383,22 @@ class SqlEngine:
         # path; params would change the SQL identity mid-flight. The result
         # IS identical in shape to the normal path's, so the cache and
         # rendering below never see the difference.
+        # Cache FIRST (HA/perf review 2026-09): the result cache (memory L1,
+        # shared-disk L2) is consulted BEFORE the preview fast path, so a
+        # bare SELECT * FROM t LIMIT n — the most repeated call agents and
+        # the inspector make — is served from cache like any other query.
+        # Previously the fast path returned before any cache access, so
+        # previews re-read the first row group from object storage on EVERY
+        # call, on EVERY replica (live-seen on G2: identical LIMIT queries
+        # never accelerated across calls). The fast path remains the COMPUTE
+        # accelerator on a miss (first row group, not a full scan), and its
+        # result is stored into L1+L2 exactly like a full query's.
+        cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of, caller=effective_caller)
+        if cache_key is not None:
+            cached = self._result_cache_lookup(cache_key)
+            if cached is not None:
+                self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
+                return cached
         if _preview_fastpath_enabled() and not params and version_as_of is None and limit is None:
             fast = self._preview_fastpath(sql, version_as_of)
             if fast is not None:
@@ -3337,13 +3407,12 @@ class SqlEngine:
                 if fast.num_rows > eff_cap > 0:
                     fast = fast.slice(0, eff_cap)
                 self._record_outcome(sql, (time.monotonic() - t0) * 1000, fast.num_rows, state="ok", caller=effective_caller)
+                if cache_key is not None:
+                    # Floor 0: a preview's recompute is an object-store read,
+                    # so even a small result is worth publishing for the
+                    # other replicas (and for this one after a restart).
+                    self._result_cache_store(cache_key, fast, sql=sql, l2_min_bytes=0)
                 return fast
-        cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of, caller=effective_caller)
-        if cache_key is not None:
-            cached = self._result_cache_lookup(cache_key)
-            if cached is not None:
-                self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
-                return cached
         timeout = _query_timeout()
         job = QueryJob(
             self,
@@ -4018,6 +4087,27 @@ class SqlEngine:
         """
         return f"policy={policy_hash}" if policy_hash else ""
 
+    def _metadata_shared_key(self, parts: list, info: TableInfo, caller=None) -> str | None:
+        """sha256 key for the shared metadata tier (profile / column_stats).
+
+        Same identity discipline as ``_result_cache_key`` — identity parts +
+        the table's snapshot-version token + the conditional `policy=` part —
+        so an ETL commit invalidates instantly (no waiting out the L1 TTL)
+        and masked callers never share entries with unmasked ones. None
+        when the shared tier is off or the version check fails (best-
+        effort by contract: the per-replica L1 cache still applies).
+        """
+        if self._l2_meta is None:
+            return None
+        try:
+            full = list(parts) + [f"{info.source}/{info.path}={self._safe_version(info)}"]
+            policy_part = self._cache_policy_part(self._policy_hash(caller))
+            if policy_part:
+                full.append(policy_part)
+            return hashlib.sha256("\x1f".join(str(p) for p in full).encode()).hexdigest()
+        except Exception:
+            return None
+
     def _result_cache_key(
         self,
         sql: str,
@@ -4097,14 +4187,20 @@ class SqlEngine:
                 return table
         return None
 
-    def _result_cache_store(self, key: str, table: pa.Table, sql: str | None = None) -> None:
+    def _result_cache_store(
+        self, key: str, table: pa.Table, sql: str | None = None, *, l2_min_bytes: int | None = None
+    ) -> None:
         """Cache one query result: memory L1 always, shared L2 when in band.
 
         L2 gets only results in the byte band ``SQLHANDLER_L2_MIN_BYTES``
         (smaller results round-trip the PVC slower than recomputing them) ≤
         nbytes ≤ ``SQLHANDLER_L2_MAX_BYTES`` (a runaway result must not fill
-        the shared volume; default mirrors the virtual cache's 2 GiB). The
-        L1 cap logic is unchanged; L2 failures never raise.
+        the shared volume; default mirrors the virtual cache's 2 GiB) —
+        unless the caller overrides the floor (``l2_min_bytes``: the preview
+        fast path passes 0, because its "recompute" is an object-store
+        round trip, not arithmetic — sharing a 40KB preview beats re-reading
+        MinIO on every replica). The L1 cap logic is unchanged; L2 failures
+        never raise.
 
         The key -> referenced-table-paths mapping is remembered (write tier):
         the stored key is the FINAL sha256 hex — the parts are hashed away —
@@ -4126,10 +4222,17 @@ class SqlEngine:
             self._result_cache_writes += 1
             if sql is not None:
                 self._result_cache_sql[key] = sql
+        # Write-through OFF the hot path when async mode is on: the caller's
+        # result is already safe in L1; the disk publish races nothing and
+        # other replicas pick the artifact up when it lands. async_store
+        # returns False (→ the synchronous publish below) when the worker is
+        # off or the queue is full, preserving the historical behavior.
+        floor = self._l2_min_bytes if l2_min_bytes is None else l2_min_bytes
         if (
             self._l2_cache is not None
-            and self._l2_min_bytes <= nbytes
+            and floor <= nbytes
             and (self._l2_max_bytes <= 0 or nbytes <= self._l2_max_bytes)
+            and not self._l2_cache.async_store(key, table)
         ):
             self._l2_cache.store(key, table)
 
@@ -5340,6 +5443,7 @@ class SqlEngine:
                 "l2_hits": self._l2_cache.stats()["hits"] if self._l2_cache is not None else 0,
                 "l2_writes": self._l2_cache.stats()["writes"] if self._l2_cache is not None else 0,
                 "l2": self._l2_cache.stats() if self._l2_cache is not None else None,
+                "l2_meta": self._l2_meta.stats() if self._l2_meta is not None else None,
                 "tables_cached": self._tables is not None,
                 "tables_cached_age_s": round((time.monotonic() - self._tables_ts), 1)
                 if self._tables is not None

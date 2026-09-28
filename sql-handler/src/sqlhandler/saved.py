@@ -34,6 +34,7 @@ atomic-replaced on every write, and independent of the engine's caches.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import logging
@@ -44,6 +45,11 @@ import threading
 import time
 from pathlib import Path
 
+try:  # cross-process file locking (POSIX); elsewhere the store stays thread-safe only
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
 from .engine import _validate_params
 from .sqlguard import assert_mcp_readonly, extract_statement_spans, mcp_readonly_enabled
 
@@ -51,6 +57,55 @@ logger = logging.getLogger("sqlhandler.saved")
 
 _SAVED_PATH_ENV = "SQLHANDLER_SAVED_QUERIES_PATH"
 _STORE_VERSION = 1
+
+# Cross-replica serialization: every read-modify-write cycle of the store
+# holds this flock (see _process_lock). The timeout keeps a wedged lock
+# file from turning query_save into an outage — availability over strict
+# serialization for a human-rate store.
+_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+@contextlib.contextmanager
+def _process_lock(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS):
+    """Serialize one read-modify-write cycle ACROSS replicas (advisory flock).
+
+    The store file may live on an RWX PVC shared by every replica of a
+    scaled-out deployment; the class's thread lock cannot see another
+    process, so two replicas saving/deleting concurrently were
+    last-writer-wins and one edit was silently lost. An flock on a sidecar
+    lock file (same directory as the store) closes that without changing
+    the file format. Degrades: no fcntl → thread-only; lock busy past the
+    timeout → proceed unlocked with a warning (never an outage).
+    """
+    if fcntl is None:  # pragma: no cover - non-POSIX
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "saved-query store lock %s stayed busy past %.0fs; "
+                        "proceeding unlocked (concurrent edits may conflict)",
+                        lock_path,
+                        timeout,
+                    )
+                    break
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 # A saved query is a JSON-file entry, not a filesystem path: forbid path
 # separators, control characters and surrounding whitespace, cap the length.
@@ -196,7 +251,13 @@ def assert_write_allowed(request) -> None:
 
 
 class SavedQueryStore:
-    """Name → {sql, params, description} JSON store (atomic, thread-safe)."""
+    """Name → {sql, params, description} JSON store (atomic, thread-safe).
+
+    Cross-replica safe when the path is on a shared volume: every
+    read-modify-write cycle takes a process-level flock on a sidecar
+    lock file, so concurrent saves/deletes from different replicas
+    MERGE instead of last-writer-wins.
+    """
 
     def __init__(self, path: str | None = None):
         self._path = path or saved_queries_path()
@@ -296,7 +357,7 @@ class SavedQueryStore:
         from . import policy as policy_mod
 
         owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
-        with self._lock:
+        with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             queries = data["queries"]
             created = now
@@ -331,7 +392,7 @@ class SavedQueryStore:
         from . import policy as policy_mod
 
         owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
-        with self._lock:
+        with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             items = sorted(data["queries"].items())
         if owner is None:
@@ -340,7 +401,7 @@ class SavedQueryStore:
 
     def get(self, name: object, caller=None) -> dict | None:
         clean = validate_query_name(name)
-        with self._lock:
+        with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             entry = data["queries"].get(clean)
         if entry is None:
@@ -358,7 +419,7 @@ class SavedQueryStore:
         clean = validate_query_name(name)
         from . import policy as policy_mod
 
-        with self._lock:
+        with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             if clean not in data["queries"]:
                 return False
