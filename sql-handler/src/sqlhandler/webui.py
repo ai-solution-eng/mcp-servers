@@ -48,6 +48,19 @@ Endpoints (all JSON unless noted):
   POST   /api/semantic-catalog/import-dbt/apply   -> same body + writes the merged catalog to the store
   POST   /api/highlight                -> pygments-guessed HTML (rcat-style -g) for editors
 
+  Admin API — the administration plane (admin-designation gated via
+  server.require_admin: 401 anonymous / 403 non-admin; the REST twins of
+  the admin_* MCP tools):
+  GET    /api/admin/grants     -> admins, datasets doc, assignments, blocked,
+                                  groups, policy_hash, keys (minted KeyEntries
+                                  + Secret keys fp-only, source:"secret")
+  PUT    /api/admin/policy     -> replace the policy document (validated
+                                  first; atomic write; returns the new hash)
+  POST   /api/admin/keys       -> mint one key {label, assign?} — the raw key
+                                  is returned ONCE (201)
+  DELETE /api/admin/keys/{fp}  -> revoke one minted key + its assignment
+                                  (Secret-managed fps: 409; unknown: 404)
+
 The HTML page is served at ``/`` and ``/ui``.
 """
 
@@ -1462,3 +1475,110 @@ def register_ui(app, engine_getter) -> None:
 
     app.add_route("/api/inspector/tools", inspector_tools, methods=["GET"])
     app.add_route("/api/inspector/call", inspector_call, methods=["POST"])
+
+    # ---- Admin API (/api/admin/*): the administration-plane REST surface —
+    # the REST twins of the admin_grants / admin_policy_set / admin_key_mint
+    # / admin_key_revoke MCP tools (the SAME cores in server.py run under
+    # both, so the REST and MCP contracts cannot drift). GATED by
+    # server.require_admin (D1): authenticate the presented key FIRST
+    # (401 anonymous — the /api surface has no key middleware, so the admin
+    # routes read the credential themselves), THEN authorize against the
+    # policy's admins list (403 non-admin). This surface is exempt from the
+    # identity-required gate (self-gated, strictly stronger — see
+    # _IdentityRequiredMiddleware.SELF_GATED_PREFIX).
+    from .server import AdminHTTPError as _AdminHTTPError
+    from .server import require_admin as _require_admin
+
+    def _admin_response(exc: _AdminHTTPError) -> JSONResponse:
+        # A 401 carries WWW-Authenticate: Bearer (RFC 7235 — the credential
+        # schemas this surface accepts), matching the /mcp gate's posture.
+        return JSONResponse(exc.body, status_code=exc.status, headers=exc.headers)
+
+    async def admin_grants(request) -> JSONResponse:
+        try:
+            _require_admin(request)
+            from .server import _admin_grants_payload
+
+            return JSONResponse(await asyncio.to_thread(_admin_grants_payload))
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def admin_policy_set(request) -> JSONResponse:
+        try:
+            caller = _require_admin(request)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        try:
+            from .server import _admin_created_by, _admin_write_policy, _audit_admin_event
+
+            result = await asyncio.to_thread(_admin_write_policy, str(body.get("policy", body)))
+            _audit_admin_event(
+                "admin.policy_set", policy_hash=result["policy_hash"], by=_admin_created_by(caller)
+            )
+            return JSONResponse(result)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def admin_key_mint(request) -> JSONResponse:
+        try:
+            caller = _require_admin(request)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        label = body.get("label")
+        assign = body.get("assign")
+        if assign is not None and not isinstance(assign, list):
+            return JSONResponse({"error": "'assign' must be a list of dataset globs."}, status_code=400)
+        try:
+            from .server import _admin_created_by, _admin_mint_key
+
+            result = await asyncio.to_thread(
+                _admin_mint_key,
+                str(label) if label else "",
+                [str(g) for g in assign if str(g).strip()] if isinstance(assign, list) else None,
+                _admin_created_by(caller),
+            )
+            return JSONResponse(result, status_code=201)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def admin_key_revoke(request) -> JSONResponse:
+        try:
+            caller = _require_admin(request)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        try:
+            from .server import _admin_created_by, _admin_revoke_key
+
+            result = await asyncio.to_thread(
+                _admin_revoke_key,
+                str(request.path_params["fp"]).strip(),
+                _admin_created_by(caller),
+            )
+            return JSONResponse(result)
+        except _AdminHTTPError as exc:
+            return _admin_response(exc)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    app.add_route("/api/admin/grants", admin_grants, methods=["GET"])
+    app.add_route("/api/admin/policy", admin_policy_set, methods=["PUT"])
+    app.add_route("/api/admin/keys", admin_key_mint, methods=["POST"])
+    app.add_route("/api/admin/keys/{fp}", admin_key_revoke, methods=["DELETE"])

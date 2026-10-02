@@ -1,0 +1,49 @@
+# searxng-mcp — HARDENED example: the MCP network zone ON.
+# USER-FACING MCP: the browser path stays ON (allowEzafGatewayIngress: true +
+# the VirtualService still rendered) — the SearXNG web UI must keep working.
+# In-cluster callers are allowlisted explicitly; everyone else is denied.
+#
+# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
+# with the zone on, every unlisted caller times out (deny by absence).
+#
+# Zone list: least-privilege — the namespaces the LIVE gateway netpol names
+# as authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
+# Widen deliberately, one ns at a time.
+networkPolicy:
+  enabled: true
+  sameNamespace: true
+  authorizedClients:
+    namespaces:
+      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
+      - dsh-web-helm        # DSH web (gateway allowlist)
+      - owebui0-11-0        # OWUI instance on the gateway allowlist
+      - opencode-web-helm   # OpenCode web
+      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
+                            # ns `prometheus`) — the monitoring ns holds otel/UA,
+                            # NOT the scraper; omit and up=0 within one interval
+      - monitoring          # Prometheus scraping /metrics (ServiceMonitor) —
+                            # omit and metrics scraping dies SILENTLY
+                            # (check Prometheus targets after enabling)
+  # USER-FACING: the gateway rule stays ON — SearXNG web UI (8080) + /mcp
+  # (9090) both arrive via the VirtualService.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  # Kubelet probes originate at the NODE: allow the site's node IPs only
+  # (SITE: replace with the cluster's master/worker node IPs — /32 allows),
+  # with the pod CIDR carved out so pod traffic stays governed by the zone
+  # rules above.
+  probeCidrs:
+    - 10.0.0.1/32           # SITE: node IP example — replace per cluster
+    - 10.0.0.2/32           # SITE: node IP example — replace per cluster
+  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
+  # be a STRICT SUBSET of the cidr — pod IPs are not inside a node /32, so
+  # there is nothing to carve out. Only a BROAD probe allow (e.g. 0.0.0.0/0)
+  # pairs with a carve-out.
+  probeExceptCidrs: []
+
+# USER-FACING: the VirtualService stays rendered (browser path unchanged).
+ezua:
+  virtualService:
+    enabled: true

@@ -47,7 +47,7 @@ ezua:
 | `resources` | `100m`/`256Mi` requests, `1`/`512Mi` limits | Modest; this is a policy gate, not a compute node. |
 | `securityContext`, `podSecurityContext`, `containerSecurityContext` | non-root uid/gid 10001, `readOnlyRootFilesystem`, drop ALL caps, RuntimeDefault seccomp | Keep. The k8s client needs a writable `/tmp` — the chart mounts an `emptyDir` there. |
 | `serviceAccount.create` / `name`, `rbac.create` | `true` / `applygate-mcp` / `true` | Creates the ServiceAccount + the namespaced writer Role/RoleBinding. |
-| `hpe_proxies` + `proxy.http/https/noProxy` | `false` | Fleet-consistency block. The only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries; `*_PROXY` env is wired only when `hpe_proxies=true`. |
+| `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring (fleet convention): each key is wired only when non-empty, and `proxy: {}` (or omitting the block) means fully off. Fleet-consistency block — the only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
 | `kyverno.enabled` | `false` | Pre-install ClusterPolicy stamping `hpe-ezua/*` vendor labels. Cluster-scoped, so off by default — enable where EZUA labeling is enforced. |
 | `service.type` / `port` / `targetPort` | `ClusterIP` / `9102` | Don't move the port without moving the probes' target. |
 
@@ -69,7 +69,7 @@ touch these directly:
 | `APPLYGATE_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
 | `APPLYGATE_CLIENTS` | `clients.existingSecret{,Key}` (only when set) — the caller-name registry Secret |
 | `MCP_CALLER_TRUSTED_CIDRS` | `callerPassthrough.trustedCidrs` (only when set; empty = header ignored everywhere) |
-| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*` — each key wired only when non-empty (empty = not rendered) |
 
 ## Gateway exposure (ezua / Istio)
 
@@ -109,7 +109,7 @@ Behavior that differs by target, and the paste-ready values for each
 (`helm/values-examples/` — sanitized; real per-site values live in
 `helm/local/`):
 
-### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+### Proxied corporate site (SITE: your-cluster.example)
 
 - **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
   write the literal domain into `ezua.domainName` and
@@ -121,8 +121,10 @@ Behavior that differs by target, and the paste-ready values for each
   tool namespaces on the allowlist) need the one-time
   `helm/local/rbac-bootstrap.se-g2.yaml` applied by an admin per target
   namespace — see the section above.
-- `hpe_proxies: true`, `kyverno.enabled: true` (EZUA labeling enforced),
-  metrics + ServiceMonitor on.
+- explicit `proxy` block wired (each key non-empty; the former
+  `hpe_proxies` flag is removed — see "Migrating from hpe_proxies" in the
+  README), `kyverno.enabled: true` (EZUA labeling enforced), metrics +
+  ServiceMonitor on.
 - Sanitized example:
   [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
 
@@ -137,8 +139,9 @@ Behavior that differs by target, and the paste-ready values for each
   never creates or inlines keys); keep the default-deny write surface
   (`namespaces.allowed` = only the trial namespaces) and expose the host only
   where the ezaf-gateway enforces real auth.
-- `hpe_proxies: false`, `kyverno.enabled: false` unless the platform
-  enforces vendor labels; metrics off keeps the render minimal.
+- `proxy: {}` (fully off — the old `hpe_proxies` flag is removed),
+  `kyverno.enabled: false` unless the platform enforces vendor labels;
+  metrics off keeps the render minimal.
 - Cross-namespace writes need the same per-namespace admin bootstrap as on
   G2 (the release Role is namespace-scoped everywhere).
 - Sanitized example:

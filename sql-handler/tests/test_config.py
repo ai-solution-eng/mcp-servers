@@ -16,7 +16,18 @@ from sqlhandler.config import (
 from sqlhandler.provider import LakehouseError, make_provider
 
 
-def test_config_from_env():
+def test_config_from_env(monkeypatch):
+    # Pin the dotenv seam AND scrub the FABRIC_* ambient vars: app-building
+    # suites (test_require_identity / test_webui / ...) import the operator's
+    # config/.env into os.environ via server.load_dotenv(), and _getenv
+    # reads os.environ FIRST (deliberate: real env must beat the default) —
+    # without the delenv this test's explicit env dict is a floor, not an
+    # override, and the assertion fails on suite ORDER, not content
+    # (seen 2026-09-30: 'abfss://8168...f1f233/Tables' != 'abfss://w@...').
+    monkeypatch.setenv("SQLHANDLER_ENV_FILE", "/nonexistent/.env")
+    for var in ("FABRIC_TENANT_ID", "FABRIC_CLIENT_ID", "FABRIC_CLIENT_SECRET",
+                "FABRIC_WORKSPACE_ID", "FABRIC_LAKEHOUSE_ID"):
+        monkeypatch.delenv(var, raising=False)
     env = {
         "FABRIC_TENANT_ID": "t",
         "FABRIC_CLIENT_ID": "c",

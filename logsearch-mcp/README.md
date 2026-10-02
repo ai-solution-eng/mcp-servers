@@ -230,11 +230,20 @@ helm upgrade --install logsearch-mcp helm/ -n <namespace> -f helm/local/values.<
 ```
 
 Fleet conventions in the chart: Owner header + `imagePullSecrets` in
-`values.yaml`; `hpe_proxies`/`proxy.*` (default false — this server's only
-peer, the k8s API, is in-cluster and stays covered by the NO_PROXY
-cluster-local entries); no `caCert` wiring (the in-cluster API uses the
-service-account CA — there is no MITM egress to trust); a vendor-label
-Kyverno policy gated on `ezua.enabled`.
+`values.yaml`; per-key `proxy` dict (`proxy.http/https/noProxy` — each key
+wired only when non-empty, `proxy: {}` = fully off; this server's only peer,
+the k8s API, is in-cluster and stays covered by the NO_PROXY cluster-local
+entries); no `caCert` wiring (the in-cluster API uses the service-account CA
+— there is no MITM egress to trust); a vendor-label Kyverno policy gated on
+`ezua.enabled`.
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` boolean flag is removed. Configure `proxy.http`,
+`proxy.https` and `proxy.noProxy` directly — a key is active only when
+non-empty, and `proxy: {}` (or omitting the block entirely) means fully off.
+A site that previously relied on `hpe_proxies: true` + the chart's built-in
+proxy defaults now needs an explicit `proxy` block with its real addresses.
 
 Per-site values live in `helm/local/` (never committed, never packaged);
 sanitized paste-ready per-target examples (SE-G2 / hosted trial) live in
@@ -287,3 +296,23 @@ packages the chart (`helm-p`), prunes stale chart archives
 `pcai-solutions/mcp-servers/logsearch-mcp/` by the hardlinker
 (`hardlinker.py --config hardlink_config.json --run`; config ships with
 `dry_run: true` — mirrors are created only on an explicit `--run`).
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the MCP: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and — only if you flip `allowEzafGatewayIngress` — the gateway pods).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) the browser path stays OPEN by fleet doctrine — do NOT set
+`ezua.virtualService.enabled: false` (closing a console is an explicit
+per-chart, per-site decision, never a default);
+(5) apply via the PCAI values editor (`helm upgrade` for operators); (6)
+verify — an allowed namespace gets HTTP 200 from `service:port/mcp`, any
+other namespace times out. See `values-examples/values-hardened-g2.yaml`
+for the full hardened profile.

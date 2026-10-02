@@ -1,6 +1,7 @@
-# searxng-mcp — SE-G2 lab cluster values (values-examples, secret-free).
-# Cluster: pcai-se-ai-application.hst.rdlabs.hpecorp.net (HPE network —
-# corporate proxy required; browser sidecar + MITM CA enabled).
+# searxng-mcp — corporate-egress lab cluster values (values-examples,
+# secret-free). Cluster: <cluster-domain> (HPE-network style — corporate
+# proxy required; browser sidecar + MITM CA enabled). Replace every
+# <cluster-domain> placeholder with the site's literal domain.
 # FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
 # Paste-ready: this file alone is the full values document (helm deep-merges
 # it over identical chart defaults; PCAI's values editor replaces the chart's
@@ -51,7 +52,7 @@ searxng:
   existingSecretKey: secret
   # SITE: public base URL of the SearXNG UI (rendered into settings.yml
   # server.base_url); set the literal https://<endpoint>/ for correct UI links.
-  baseUrl: "https://searxng-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net/"
+  baseUrl: "https://searxng-mcp.<cluster-domain>/"
   # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
   language: "en-US"
   # Engines to disable via settings.yml (top-level engines key). Default: []
@@ -129,27 +130,26 @@ fetch:
   maxScreenshotKb: ""
   maxRedirects: ""
 
-# -- HPE corporate proxy -------------------------------------------------------------------------------
-# SITE: ON for SE-G2 — this cluster has no direct internet egress: SearXNG
-# engine requests and fetch_content must go through the corporate proxy.
-# When true this configures BOTH: env proxies for the MCP container
-# (fetch_content) and SearXNG's outgoing.proxies (engine requests).
-hpe_proxies: true
-
+# -- Egress proxy ---------------------------------------------------------------------------------------
+# SITE: ON — this cluster has no direct internet egress: SearXNG engine
+# requests and fetch_content must go through the corporate proxy. Each key
+# is wired into the pod only when non-empty; non-empty keys configure BOTH
+# env proxies for the MCP container (fetch_content) and SearXNG's
+# outgoing.proxies (engine requests).
 proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,localhost"
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
 # SITE: literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
 ezua:
   enabled: true
-  domainName: "pcai-se-ai-application.hst.rdlabs.hpecorp.net"   # informational only — no template reads it
+  domainName: "<cluster-domain>"   # informational only — no template reads it
   virtualService:
-    # SITE: literal host for SE-G2. Root of this host serves the normal
+    # SITE: literal host for the lab site. Root of this host serves the normal
     # SearXNG web page; /mcp is routed to the MCP server (streamable-http + SSE).
-    endpoint: "searxng-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    endpoint: "searxng-mcp.<cluster-domain>"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
   authorizationPolicy:

@@ -104,7 +104,7 @@ def test_inspector_tools_payload(client):
     r = client.get("/api/inspector/tools")
     assert r.status_code == 200
     tools = r.json()["tools"]
-    assert len(tools) == 18
+    assert len(tools) == 23  # + whoami (identity gate) + 4 admin twins (task-6)
     for t in tools:
         assert set(t) == {"name", "description", "inputSchema"}
         assert isinstance(t["name"], str) and t["name"]
@@ -263,6 +263,6 @@ def test_inspector_routes_behind_api_token(tmp_path, monkeypatch):
     assert c.post("/api/inspector/call", json={"name": "list_tables"}).status_code == 401
     auth = {"X-API-Token": "tok-123"}
     assert c.get("/api/inspector/tools", headers=auth).status_code == 200
-    assert len(c.get("/api/inspector/tools", headers=auth).json()["tools"]) == 18
+    assert len(c.get("/api/inspector/tools", headers=auth).json()["tools"]) == 23  # + whoami + 4 admin twins (task-6)
     r = c.post("/api/inspector/call", json={"name": "list_tables"}, headers=auth)
     assert r.status_code == 200 and r.json()["isError"] is False

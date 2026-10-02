@@ -23,7 +23,19 @@ from .provider import LakehouseError
 
 
 def _getenv(name: str, default: str = "") -> str:
-    """Read an environment variable with a stripped fallback."""
+    """Read an environment variable with a stripped fallback.
+
+    Precedence note (test-isolation gotcha, 2026-09-30): os.environ FIRST,
+    ``default`` second — the deployment-correct order (a real env var must
+    win over a .env-derived fallback). But it makes an explicit ``env=``
+    dict a FLOOR, not an override: load_config(env={"K": "v"}) still sees
+    an ambient os.environ value for K. Server-built test suites import the
+    operator's config/.env into os.environ via load_dotenv()
+    (server.py _handler/main), so config tests running AFTER them observe
+    .env values — pin SQLHANDLER_ENV_FILE to a missing path (the
+    test_env_not_polluted_by_dotenv pattern) or monkeypatch.delenv the
+    FABRIC_* vars when constructing configs in tests.
+    """
     return os.environ.get(name, default).strip()
 
 

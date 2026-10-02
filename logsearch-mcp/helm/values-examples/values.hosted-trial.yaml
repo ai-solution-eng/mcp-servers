@@ -91,16 +91,15 @@ rbac:
   create: true
   clusterWide: false
 
-# -- HPE corporate proxy -------------------------------------------------------------------------
-# SITE: off unless the trial cluster sits behind the HPE proxy — the k8s API
-# is in-cluster and covered by the NO_PROXY entries either way (fleet
-# consistency only).
-hpe_proxies: false
-
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+# -- Per-key proxy wiring -------------------------------------------------------------------------
+# SITE: off unless the trial cluster sits behind a corporate proxy — the k8s
+# API is in-cluster and covered by the NO_PROXY entries either way (fleet
+# consistency only). Each key is wired only when non-empty; `proxy: {}`
+# (or omitting the block entirely) means fully off.
+proxy: {}
+#   http: http://proxy.corp.example:8080
+#   https: http://proxy.corp.example:8080
+#   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
 # SITE: gateway exposure — /mcp for agents, / for the web console.

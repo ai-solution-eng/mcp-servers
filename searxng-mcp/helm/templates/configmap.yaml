@@ -44,7 +44,7 @@ data:
       enable_http2: true
       max_request_timeout: 10
       request_timeout: 5
-      {{- if and .Values.hpe_proxies .Values.proxy.https }}
+      {{- if .Values.proxy.https }}
       proxies:
         all://:
           - {{ .Values.proxy.https }}

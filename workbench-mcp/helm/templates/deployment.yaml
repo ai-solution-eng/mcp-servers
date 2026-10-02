@@ -111,29 +111,31 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
-            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            {{- if .Values.proxy.http }}
             # Corporate proxy: reaches fetch/pip from the server process AND
             # every run_command child (the server passes these through).
+            # Wired only when the corresponding proxy.<key> is non-empty.
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
             - name: http_proxy
               value: {{ .Values.proxy.http | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            {{- if .Values.proxy.https }}
             - name: HTTPS_PROXY
               value: {{ .Values.proxy.https | quote }}
             - name: https_proxy
               value: {{ .Values.proxy.https | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            {{- if .Values.proxy.noProxy }}
             - name: NO_PROXY
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy
               value: {{ .Values.proxy.noProxy | quote }}
             {{- end }}
             {{- if .Values.caCert.enabled }}
-            # Corporate MITM CA: pip/requests inside run_command verify TLS
-            # against these files (passed through to children by the server).
+            # Corporate MITM CA (independent of the proxy wiring): pip/requests
+            # inside run_command verify TLS against these files (passed
+            # through to children by the server).
             - name: SSL_CERT_FILE
               value: /workbench-certs/ca.crt
             - name: REQUESTS_CA_BUNDLE

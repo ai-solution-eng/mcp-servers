@@ -68,8 +68,8 @@ curl -sS http://searxng-mcp-service.<release-namespace>.svc.cluster.local:8080/c
 |---|---|
 | `curl` to `/mcp` returns 404 | Wrong endpoint host or the VirtualService was not rendered — verify `ezua.virtualService.endpoint` (unique full FQDN) and `ezua.enabled: true`. |
 | `search` fails with a 403-from-SearXNG hint | SearXNG's `search.formats` lost `json` — the chart's ConfigMap always sets it; check that no custom settings override removed it. |
-| Every engine "did not respond" | No internet egress from the SearXNG sidecar. Set `hpe_proxies: true` on HPE networks (wires `outgoing.proxies` in `settings.yml`); verify with `GET /config` after re-apply. |
-| One engine consistently fails | Expected noise if transient (SearXNG auto-suspends and recovers). If permanent (e.g. a hard CAPTCHA wall on the HPE proxy), add it to `searxng.disabledEngines` and re-apply. |
+| Every engine "did not respond" | No internet egress from the SearXNG sidecar. On corporate-proxy networks set `proxy.http`/`proxy.https` (wires `outgoing.proxies` in `settings.yml` — `proxy: {}` keeps egress direct); verify with `GET /config` after re-apply. |
+| One engine consistently fails | Expected noise if transient (SearXNG auto-suspends and recovers). If permanent (e.g. a hard CAPTCHA wall behind the corporate proxy), add it to `searxng.disabledEngines` and re-apply. |
 | `fetch_content` cannot read a JS-only page and no browser footer appears | The browser sidecar is not enabled — set `browser.enabled: true` (image must exist), or use `render: "never"` consciously and accept plain-HTTP limits. |
 | Browser sidecar stuck/not-ready | Probes exec a CDP `json/version` check inside the container — check `kubectl logs deploy/searxng-mcp -c browser`; a corporate-MITM network usually needs `browser.caCert.enabled: true`. |
 | Screenshots come back blank/tiny | Resource blocking is on by design (images/media/fonts aborted for speed); this only affects rendering speed, but a page that IS an image may render empty. |

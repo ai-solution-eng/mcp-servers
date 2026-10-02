@@ -482,16 +482,24 @@ byte-identical to the Wave-0 baseline** (verified by render-diff):
   documented for ops mount/expose** — the fleet convention is to mount the
   same path/PVC into the logsearch pod so the trail is searchable.
 
-Fleet-convention blocks: the Owner header, `imagePullSecrets`, the gated
-`hpe_proxies`/`proxy` block (default false — the k8s API is in-cluster and
-covered by the standard NO_PROXY cluster-local entries; `*_PROXY` env is
-wired only when `hpe_proxies=true`), an explanatory comment where `caCert`
-would be (deliberately not wired — in-cluster SA CA, no MITM egress), and an
+Fleet-convention blocks: the Owner header, `imagePullSecrets`, the per-key
+`proxy` dict (`proxy.http/https/noProxy` — each key wired only when non-empty,
+`proxy: {}` = fully off; the k8s API is in-cluster and covered by the standard
+NO_PROXY cluster-local entries), an explanatory comment where `caCert` would
+be (deliberately not wired — in-cluster SA CA, no MITM egress), and an
 optional Kyverno vendor-label ClusterPolicy ported from searxng-mcp
 (`kyverno.enabled`, default false — cluster-scoped, so it never changes the
 default render). The `webui.enabled` flag (default true) ships the read-only
 console and, when `ezua.enabled=true`, routes `/` alongside `/mcp` through
 the gateway.
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` boolean flag is removed. Configure `proxy.http`,
+`proxy.https` and `proxy.noProxy` directly — a key is active only when
+non-empty, and `proxy: {}` (or omitting the block entirely) means fully off.
+A site that previously relied on `hpe_proxies: true` + the chart's built-in
+proxy defaults now needs an explicit `proxy` block with its real addresses.
 
 ## Release
 
@@ -499,3 +507,23 @@ the gateway.
 ./automation.sh 0.1.1   # bump → docker buildx --push → helm package → prune
 python3 hardlinker.py --config hardlink_config.json --run   # mirror to pcai-solutions
 ```
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the MCP: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and — only if you flip `allowEzafGatewayIngress` — the gateway pods).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) the browser path stays OPEN by fleet doctrine — do NOT set
+`ezua.virtualService.enabled: false` (closing a console is an explicit
+per-chart, per-site decision, never a default);
+(5) apply via the PCAI values editor (`helm upgrade` for operators); (6)
+verify — an allowed namespace gets HTTP 200 from `service:port/mcp`, any
+other namespace times out. See `values-examples/values-hardened-g2.yaml`
+for the full hardened profile.

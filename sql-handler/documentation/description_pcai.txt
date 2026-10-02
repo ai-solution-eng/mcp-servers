@@ -1,0 +1,1 @@
+Faster EzPresto with better LLM centric tooling. Uses a semantic catalog to imbue information and accelerate path to query.

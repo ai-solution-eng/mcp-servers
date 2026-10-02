@@ -14,19 +14,35 @@ Resolution ladder (the final OAuth posture, DECISIONS.md "OAuth REVISION"):
    never-authorization: the gateway stamps the header on already-authorized
    calls, so a leaked header without a key resolves to the key-fingerprint rung
    at worst.
-2. **oauth2-proxy browser headers** ``X-Auth-Request-User`` (+ ``X-Forwarded-Groups``)
+3. **OIDC bearer JWT** — an ``Authorization: Bearer`` value that (a) has the
+   three-segment JWT shape and (b) does NOT match a configured static key
+   is verified RS256-only against the operator's JWKS
+   (``sqlhandler.oidc_identity``; envs SQLHANDLER_OIDC_*). A Bearer value
+   that DOES match a configured static key is the key rung, never parsed
+   as JWT (disjoint credential spaces, RAG D21/D19 convention). Verified
+   token → a named ``user`` Caller (subject = the identity claim, default
+   ``preferred_username``, fallback ``sub`` — RAG's registry convention);
+   ANY verification failure declines SILENTLY (debug-level) and the ladder
+   continues — the 401 happens downstream when the identity gate is on.
+4. **oauth2-proxy browser headers** ``X-Auth-Request-User`` (+ ``X-Forwarded-Groups``)
    — honored only when ``SQLHANDLER_TRUST_BROWSER_HEADERS`` is set. TRUST-GATED:
    the flag asserts the deployment's workload AuthorizationPolicy pins ingress
    to the gateway (the chart ships the template); enabling it without that pin
    lets any client that can reach the pod claim any identity.
-3. **Matched-key fingerprint** — ``_McpApiKeyMiddleware`` records the matched
+5. **Matched-key fingerprint** — ``_McpApiKeyMiddleware`` records the matched
    key's fingerprint into ``scope["state"]``; an unattributed key-valid request
    resolves to this pseudonymous rung (enforcement unchanged for legacy keys).
-4. **Anonymous** — no key gate active (or stdio transport): the dev posture.
+   The matched key may be EITHER a bootstrap static key (the env vars) OR a
+   minted key from the admin keys store (``sqlhandler.admin_keys``,
+   SQLHANDLER_ADMIN_KEYS_FILE) — the middleware authenticates env-first and
+   falls back to the store (presentation-hash match), recording the SAME
+   fingerprint vocabulary either way, so this rung is source-agnostic by
+   construction (it reads the recorded fp, never the credential).
+6. **Anonymous** — no key gate active (or stdio transport): the dev posture.
 
 The class label vocabulary matches the gateway's subject kinds:
-``user`` (relay-attributed) | ``browser`` (trusted headers) | ``key`` (fingerprint)
-| ``anonymous``.
+``user`` (relay-attributed / OIDC JWT) | ``browser`` (trusted headers)
+| ``key`` (fingerprint) | ``anonymous``.
 
 Everything here is cheap and re-read per request (the fleet convention) — no
 caching of identity, no global state beyond the per-request ``scope["state"]``
@@ -42,6 +58,9 @@ from dataclasses import dataclass, field
 
 from .mcp_fleet_common.audit import CALLER_CONTEXT, key_fingerprint
 from .mcp_fleet_common.audit import Caller as FleetCaller
+from .oidc_identity import is_jwt_format as _is_jwt_format
+from .oidc_identity import subject_from_claims as _oidc_subject_from_claims
+from .oidc_identity import verify_and_decode as _oidc_verify_and_decode
 
 logger = logging.getLogger("sqlhandler.identity")
 
@@ -65,8 +84,10 @@ __all__ = [
     "class_for_subject_kind",
     "key_fp",
     "match_api_key",
+    "resolve_bearer_jwt",
     "resolve_browser_caller",
     "resolve_relay_caller",
+    "set_static_keys_source",
 ]
 
 # -- the resolution ladder's inputs -------------------------------------------
@@ -127,8 +148,8 @@ class Caller:
     ``key_fp`` — the stable fingerprint of the MATCHED key (``sha256:<12hex>``),
     or None when no key was presented/needed. Never the raw key.
     ``groups`` — IdP groups from the browser rung (empty elsewhere).
-    ``via`` — which ladder rung resolved: ``relay`` | ``browser`` | ``key`` |
-    ``anonymous`` | ``stdio``.
+    ``via`` — which ladder rung resolved: ``relay`` | ``jwt`` | ``browser`` |
+    ``key`` | ``anonymous`` | ``stdio``.
 
     Frozen so a resolved identity cannot be mutated after the fact; hashable
     so tests/engines can key on it.
@@ -249,15 +270,90 @@ def match_api_key(provided: str, keys: list[str]) -> str | None:
     return None
 
 
+def resolve_bearer_jwt(scope) -> Caller | None:
+    """The OIDC rung: a JWT-shaped Bearer that no static key owns.
+
+    Reads the ``Authorization: Bearer <value>`` header. A value that matches
+    a configured STATIC key (``match_api_key`` against
+    ``_McpApiKeyMiddleware._keys()``) is the KEY rung's credential — this
+    rung declines (returns None) so the key ladder resolves it; a static key
+    is never parsed as a JWT (disjoint credential spaces — the RAG D21/D19
+    convention). A three-segment base64url value that no static key claims
+    is verified (RS256 + iss + aud/azp + exp/nbf, ``sqlhandler.oidc_identity``);
+    a verified token resolves to Caller(cls=user, subject=<identity claim or
+    sub>, via="jwt"). ANY verification failure declines SILENTLY (debug-level
+    reason code, no log spam) — the ladder continues and the 401 (when the
+    identity gate is on) happens downstream. An unparseable/absent Bearer,
+    a disabled resolver, or a non-JWT-shaped Bearer also declines here.
+    """
+    raw = _header(scope, "Authorization")
+    if not raw:
+        return None
+    scheme, _, token = raw.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    token = token.strip()
+    keys = _static_keys()
+    if match_api_key(token, keys) is not None:
+        return None  # a static key's credential — never parsed as JWT
+    if not _is_jwt_format(token):
+        return None
+    try:
+        claims = _oidc_verify_and_decode(token)
+    except Exception:
+        # Fail closed AND fail quiet: an unexpected verification error must
+        # never 500 a request that would otherwise be anonymous.
+        logger.debug("OIDC JWT verification raised; rung declines", exc_info=True)
+        return None
+    if claims is None:
+        return None
+    subject = _oidc_subject_from_claims(claims)
+    if not subject:
+        return None
+    return Caller(cls=CALLER_CLASS_USER, subject=subject, key_fp=None, via="jwt")
+
+
+def _static_keys() -> list[str]:
+    """The configured static keys, read lazily to avoid an import cycle with
+    server.py (the middleware module owns the env names)."""
+    global _static_keys_fn
+    fn = _static_keys_fn
+    if fn is None:
+        return []
+    try:
+        return fn() or []
+    except Exception:
+        return []
+
+
+#: Injected by server.py at import time (``identity.set_static_keys_source(
+#: _McpApiKeyMiddleware._keys)``) — avoids importing server from identity.
+_static_keys_fn: "callable | None" = None
+
+
+def set_static_keys_source(fn) -> None:
+    """Register the static-key source (the key middleware's ``_keys()``).
+
+    Called once from server.py import; the callable itself re-reads the env
+    PER CALL (the fleet convention), so key rotation needs no restart and
+    no caching happens here.
+    """
+    global _static_keys_fn
+    _static_keys_fn = fn
+
+
 def caller_from_scope(scope) -> Caller:
     """Resolve one request's identity from the ASGI scope (the middleware's
-    entry point). Rungs: relay-attribution → browser-headers → key-fp.
+    entry point). Rungs: relay-attribution → OIDC bearer-JWT →
+    browser-headers → key-fp.
 
     The key fingerprint comes from ``scope["state"]`` where
     ``_McpApiKeyMiddleware`` recorded it when a key matched. When no key gate
-    is active (no keys configured) the request is anonymous — there is no
-    credential to anchor any rung, and the relay/browser headers are then NOT
-    trusted either (a keyless request cannot prove anything).
+    is active (no keys configured) the static-key rung has nothing to
+    anchor, but the OIDC rung stays LIVE (a Bearer JWT is verified on its
+    own merit, independent of any configured static key); without a verified
+    JWT the relay/browser headers are NOT trusted either (a keyless request
+    cannot prove anything they say).
     """
     if scope.get("type") != "http":
         return anonymous_caller(via="stdio")
@@ -267,6 +363,9 @@ def caller_from_scope(scope) -> Caller:
     relay = resolve_relay_caller(scope, key_valid)
     if relay is not None:
         return Caller(cls=relay.cls, subject=relay.subject, key_fp=key_fpr, via="relay")
+    jwt_caller = resolve_bearer_jwt(scope)
+    if jwt_caller is not None:
+        return jwt_caller
     browser = resolve_browser_caller(scope)
     if browser is not None:
         return Caller(

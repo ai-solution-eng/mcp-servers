@@ -22,6 +22,28 @@ ezua:
     endpoint: "mcp-seaborn-server.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
 
+# -- MCP network zone (ADDITIVE, DEFAULT OFF — fleet contract, 2026-09) --------
+# Ingress default-deny for the MCP pods, admitting ONLY the listed sources.
+# OFF by default: the default render is byte-identical to the baseline.
+# USER-FACING chart: gateway rule ON so the browser VS keeps working.
+# `monitoring` belongs in the list whenever a ServiceMonitor scrapes this
+# server — an unlisted scrape ns dies SILENTLY.
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # LIVE-VERIFIED (G2 inventory): edge pods carry app=istio-ingressgateway —
+  # ezaf-gateway is the Gateway CR NAME, no pod carries it as a label.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  probeCidrs: []            # node /32s (kubelet probes) — see hardened example
+  probeExceptCidrs: []      # pod CIDR carve-out; NEVER equal to a probeCidr
+  egress:
+    enabled: false          # egress intentionally unrestricted (SQLhandler peer)
+
 certificatesPolicy:
   enabled: false
   env: []                 # e.g. NODE_EXTRA_CA_CERTS / SSL_CERT_DIR / REQUESTS_CA_BUNDLE / DOCKER_CERT_PATH

@@ -21,6 +21,7 @@ standard tools; we deliberately avoid that class here.
 
 Tools exposed:
   * list_tables        - enumerate the tables in the configured source
+  * whoami             - the caller's own identity + their own per-table ACL view
   * search_tables      - keyword search over names/columns/catalog descriptions
   * describe_table     - inspect columns/types of a table
   * profile_table      - column-level statistics (min/max, null %, distinct,
@@ -28,6 +29,12 @@ Tools exposed:
   * run_sql            - execute SQL via DuckDB (aggregations etc.); output
                          as markdown, JSON, CSV or Arrow IPC
   * scan_table         - pull rows via pyarrow with column projection + limit
+
+Admin tools (admin-designation gated — policy ``admins:`` list):
+  * admin_grants       - the whole grants view (keys, assignments, blocked, admins)
+  * admin_policy_set   - replace the policy document (validated first)
+  * admin_key_mint     - mint one API key (raw key returned ONCE)
+  * admin_key_revoke   - revoke one key by fingerprint
 """
 
 from __future__ import annotations
@@ -38,8 +45,11 @@ import hmac
 import json
 import logging
 import os
+import secrets
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import uvicorn
 from mcp.server.lowlevel.server import Server
@@ -57,9 +67,12 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import JSONResponse, Response
 
 from . import __version__, mcp_resources, observability
+from . import admin_keys as _admin_keys
 from . import errors as _errors
 from . import identity as _identity
 from . import jobs as _jobs
+from . import oidc_identity as _oidc_identity
+from . import policy as _policy
 from . import saved as _saved
 from . import writes as _writes
 from .config import (
@@ -77,6 +90,12 @@ from .sqlguard import assert_mcp_readonly, mcp_readonly_enabled
 from .webui import register_ui
 
 logger = logging.getLogger("sqlhandler")
+
+# The OIDC rung's static-key source: a Bearer value matching a configured
+# static key is the KEY rung's credential and is NEVER parsed as a JWT.
+# The callable is registered at the middleware-definition site below (after
+# _McpApiKeyMiddleware exists) and re-reads the env per call, so key
+# rotation needs no restart.
 
 # --------------------------------------------------------------------------
 # MCP server (standard MCP, interoperable initialize handshake)
@@ -171,6 +190,8 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
     try:
         if name == "list_tables":
             return list_tables(caller=caller), False
+        elif name == "whoami":
+            return whoami(caller=caller), False
         elif name == "describe_table":
             return describe_table(str(args.get("table", "")), caller=caller), False
         elif name == "profile_table":
@@ -282,6 +303,30 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
             if execute is not None and not isinstance(execute, bool):
                 return _errors.enrich("Error planning question: execute must be a boolean."), True
             return ask_data(str(args.get("question", "")), execute=bool(execute)), False
+        elif name == "admin_grants":
+            return admin_grants(caller=caller), False
+        elif name == "admin_policy_set":
+            doc = args.get("policy")
+            if not isinstance(doc, str):
+                return (
+                    "Error setting policy: 'policy' must be the FULL policy document as a JSON string"
+                    + _errors.structured(
+                        _errors.E_PARAM_INVALID,
+                        ["Call admin_policy_set with {\"policy\": \"{...}\"} — the whole document, JSON-encoded."],
+                    ),
+                    True,
+                )
+            return admin_policy_set(doc, caller=caller), False
+        elif name == "admin_key_mint":
+            label = args.get("label")
+            if label is not None and not isinstance(label, str):
+                return _errors.enrich("Error minting key: label must be a string."), True
+            assign = args.get("assign")
+            if assign is not None and not isinstance(assign, list):
+                return _errors.enrich("Error minting key: assign must be a list of glob strings."), True
+            return admin_key_mint(label, assign, caller=caller), False
+        elif name == "admin_key_revoke":
+            return admin_key_revoke(str(args.get("fp", "")), caller=caller), False
         return f"Unknown tool: {name}", True
     except Exception as exc:
         # The dispatch-level catch: the human message stays primary, the
@@ -310,6 +355,19 @@ _TOOLS = [
         description=(
             "List the tables available in the configured data source, plus a live "
             "inventory of any attached (read-only) external databases."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="whoami",
+        description=(
+            "Report the caller's OWN resolved identity (class/subject — never a raw "
+            "key), which ladder rung resolved it (relay | jwt | browser | key | "
+            "anonymous | stdio), whether the identity-required gate is on, and the "
+            "caller's OWN policy view per table (visible / row_filter / "
+            "masked_columns / hidden — hidden tables listed with visible:false). "
+            "Use it to confirm authentication and see exactly which tables and "
+            "columns your credentials expose before writing queries."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
@@ -774,6 +832,100 @@ _TOOLS = [
             "required": ["question"],
         },
     ),
+    # ---- admin twins (task-6): the administration plane. Registered like
+    # every other tool so tools/list is the single contract surface, but
+    # each one is ADMIN-GATED AT THE TOOL LEVEL (require_admin's is_admin
+    # check in-process — MCP has no HTTP routes for middleware to guard);
+    # a non-admin caller gets the SAME 403-shaped structured error.
+    Tool(
+        name="admin_grants",
+        description=(
+            "ADMIN (policy-designated admins only). The whole grants view: "
+            "designated admins, the raw datasets document (or null), the "
+            "assignments map (identity -> globs), the blocked globs, group "
+            "names, the policy hash, and every API key (minted keys with "
+            "label/created_at/created_by/source:file; bootstrap Secret keys "
+            "fp-only with source:secret — not removable here). Never returns "
+            "a raw key."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="admin_policy_set",
+        description=(
+            "ADMIN (policy-designated admins only). Replace the policy "
+            "document: pass the FULL document as a JSON string (datasets "
+            "form AND/OR groups form + optional admins list — the same "
+            "shapes the policy file accepts). Validated FIRST (an invalid "
+            "document is refused with the loader's message and the previous "
+            "policy keeps enforcing), then written atomically; the mtime "
+            "hot-reload picks it up. Returns the new policy hash."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "policy": {
+                    "type": "string",
+                    "description": (
+                        "The FULL policy document as a JSON string, e.g. "
+                        '\'{"datasets": {"global": ["workorder/*"], '
+                        '"assignments": {...}}, "admins": ["sha256:..."]}\'.'
+                    ),
+                },
+            },
+            "required": ["policy"],
+        },
+    ),
+    Tool(
+        name="admin_key_mint",
+        description=(
+            "ADMIN (policy-designated admins only). Mint one API key: "
+            "generates the secret, stores ONLY its fingerprint + sha256 "
+            "(never the raw), binds the assignment into the policy's "
+            "datasets.assignments (datasets form required — the groups form "
+            "binds by hand), and returns the raw key ONCE — copy it now, it "
+            "is not recoverable. The minted key authenticates on /mcp "
+            "immediately (the key middleware matches the store live)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": "Free-text label for the key's owner/purpose (audit + UI display).",
+                },
+                "assign": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional dataset globs to grant, e.g. [\"workorder/*\"]. "
+                        "Omitted = [\"*\"] (full access) recorded in the policy."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="admin_key_revoke",
+        description=(
+            "ADMIN (policy-designated admins only). Revoke one minted key "
+            "by fingerprint (the sha256:<12hex> admin_grants lists): drops "
+            "the store entry AND its policy assignment. Secret-managed keys "
+            "are refused (409 — revoke via kubectl, the Secret's lifecycle); "
+            "an unknown fingerprint is a 404-shaped error."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "fp": {
+                    "type": "string",
+                    "description": "The key fingerprint to revoke, 'sha256:' + 12 hex (from admin_grants).",
+                },
+            },
+            "required": ["fp"],
+        },
+    ),
 ]
 
 
@@ -783,7 +935,7 @@ def mcp_tool_specs() -> list[dict]:
     The WEB UI's Inspector tab (webui.py ``/api/inspector/*``) serves this so
     the browser sees the exact tool surface an MCP client's tools/list sees —
     one source of truth (_TOOLS), no second table to drift. Re-derived per
-    call (a Tool is a pydantic model; 18 items is cheap) so test monkeypatching
+    call (a Tool is a pydantic model; 23 items is cheap) so test monkeypatching
     is reflected too. Tools only — resources/prompts stay out of scope, the
     same boundary an MCP client's tools/list draws.
     """
@@ -1279,6 +1431,63 @@ def search_tables(query: str, *, caller=None) -> str:
         return "\n".join(lines)
     except Exception as exc:
         return f"Error searching tables: {exc}"
+
+
+def whoami(*, caller=None) -> str:
+    """The caller's own identity + their OWN ACL view, per table.
+
+    Returns the resolved Caller (audit-safe shape: class/subject/key_fp —
+    never a raw key), which ladder rung resolved it, whether the
+    identity-required gate is currently on, and ONE entry per provider
+    table computed through the engine's ``_effective_rule(info, caller)``:
+    visible / row_filter / masked_columns / hidden. The table list is the
+    UNFILTERED provider list (engine.list_tables would already omit hidden
+    tables; here the point is to SHOW the caller their own view of
+    everything) — hidden tables appear with ``visible: false``. Honest for
+    anonymous callers too: their default-group view, or everything when no
+    policy is configured. A caller NEVER sees another user's view: the
+    rules are computed for THIS caller only.
+    """
+    try:
+        effective_caller = caller if caller is not None else _identity.ANONYMOUS
+        handler = _handler()
+        physical = handler._provider_tables()
+        tables = list(physical) + list(handler._virtual_infos(physical))
+        datasets: list[dict] = []
+        for info in tables:
+            try:
+                rule = handler._effective_rule(info, effective_caller)
+            except Exception:
+                # Fail-closed honesty: an unresolvable rule must never
+                # render the table as open — mark it hidden + not visible.
+                datasets.append(
+                    {
+                        "table": info.qualified_name,
+                        "visible": False,
+                        "row_filter": None,
+                        "masked_columns": [],
+                        "hidden": True,
+                    }
+                )
+                continue
+            datasets.append(
+                {
+                    "table": info.qualified_name,
+                    "visible": not rule.hidden,
+                    "row_filter": rule.row_filter,
+                    "masked_columns": sorted(rule.column_masks.keys()),
+                    "hidden": bool(rule.hidden),
+                }
+            )
+        payload = {
+            "caller": effective_caller.as_audit_dict(),
+            "via": effective_caller.via,
+            "require_identity": _IdentityRequiredMiddleware._required(),
+            "datasets": datasets,
+        }
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return f"Error computing whoami: {_errors.enrich(str(exc))}"
 
 
 def _validate_output_format(output_format: str) -> str:
@@ -2112,6 +2321,605 @@ def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
     return body
 
 
+# ---------------------------------------------------------------------------
+# Admin API (route cores + MCP twins) — admin-designation gated
+# ---------------------------------------------------------------------------
+
+#: The 403 body every admin surface returns to an authenticated non-admin
+#: (one shape everywhere: REST JSON body, MCP tool text, the UI renders it
+#: verbatim).
+_ADMIN_FORBIDDEN = "admin access required"
+
+
+class AdminHTTPError(Exception):
+    """An admin operation's refusal, carrying its HTTP status + JSON body.
+
+    Raised by the SHARED admin cores (the REST routes and the MCP twins run
+    the same code); the route wrappers translate it to a JSONResponse (via
+    ``.body``, + ``.headers``), the MCP twins let it PROPAGATE to
+    _dispatch_tool's catch-all — which renders ``str(this)`` as an isError
+    tool result, the structured 403-shaped error the MCP contract requires
+    (never a bare traceback). ``status`` is one of 400/401/403/404/409/503 —
+    never 500.
+    """
+
+    def __init__(self, status: int, error: str, **extra):
+        super().__init__(error)
+        self.status = status
+        self.body: dict = {"error": error, **extra}
+
+    @property
+    def headers(self) -> dict:
+        """RFC 7235: a 401 carries WWW-Authenticate (the credential
+        schemas this surface accepts — the same Bearer/X-API-Key pair the
+        /mcp gate names)."""
+        if self.status == 401:
+            return {"WWW-Authenticate": "Bearer"}
+        return {}
+
+    def __str__(self) -> str:
+        """The MCP-facing text: the human message, plus — where the CALLER
+        can act on it — the machine-parseable fix_hints tail (the REST body
+        stays the bare message via .body; str() exists for the tool path)."""
+        message = self.args[0] if self.args else "admin error"
+        if self.status == 403:
+            return message + _errors.structured(
+                _errors.E_PARAM_INVALID,
+                [
+                    "This surface is restricted to policy-designated admins (the policy document's 'admins' list).",
+                    "Check whoami — an authenticated key that is not designated gets this refusal, not a retry.",
+                ],
+            )
+        if self.status == 400:
+            return message + _errors.structured(
+                _errors.E_PARAM_INVALID,
+                ["Fix the document and retry — the previous policy is untouched and still enforcing."],
+            )
+        if self.status == 404:
+            return message + _errors.structured(
+                _errors.E_PARAM_INVALID,
+                ["List the revocable keys (and their exact fingerprints) with admin_grants."],
+            )
+        if self.status == 409:
+            return message + _errors.structured(
+                _errors.E_PARAM_INVALID,
+                ["Secret-managed keys rotate via kubectl (the Secret's lifecycle) — this store cannot revoke them."],
+            )
+        if self.status == 503:
+            return message + _errors.structured(
+                _errors.E_PARAM_INVALID,
+                [
+                    (
+                        "Configuration problem — check SQLHANDLER_ADMIN_KEYS_FILE (the keys store) and "
+                        "SQLHANDLER_POLICY_FILE (the policy path) point at writable files."
+                    ),
+                ],
+            )
+        return message
+
+
+def _admin_gate(caller) -> None:
+    """The MCP twins' tool-level admin gate: raise (→ isError result) when
+    the caller is anonymous or not designated. The REST routes run the same
+    check through require_admin (which adds the 401/403 distinction)."""
+    if caller is None or not _admin_keys.is_admin(caller):
+        raise AdminHTTPError(403, _ADMIN_FORBIDDEN)
+
+
+def _admin_presented_key(request) -> str:
+    """The caller's credential from an admin route request ('' when none).
+
+    Same header conventions as the /mcp gate and saved.py's mutation gate:
+    ``Authorization: Bearer <key>``, ``X-API-Key``, ``X-API-Token``.
+    """
+    if request is None:
+        return ""
+    try:
+        headers = request.headers
+    except Exception:
+        return ""
+    auth = headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
+
+
+def _admin_resolve_caller(request, presented: str):
+    """Resolve the Caller for an admin request, or None (anonymous).
+
+    Mirrors _McpApiKeyMiddleware.__call__ on an /api path: /api/* has NO key
+    middleware (pinned by tests/test_require_identity.py — the key gate is a
+    /mcp concept), so the admin surface authenticates the PRESENTED key
+    itself. Resolution order matches the middleware's union exactly:
+
+    1. a presented static env key (MCP_API_KEYS / SQLHANDLER_API_KEYS,
+       constant-time) → Caller(cls=key, key_fp=sha256-of-presentation);
+    2. a minted store key via ``admin_keys.match_presentation`` (the
+       presented key hashed, compared constant-time against each stored
+       ``key_sha256``) → Caller(cls=key, key_fp=the stored fp).
+
+    A relay subject header is NOT honored here (attribution-never-
+    authorization — a header without a validated key proves nothing, the
+    same rule the identity spine applies). Everything else → None.
+    """
+    if not presented:
+        return None
+    static = _identity.match_api_key(presented, _McpApiKeyMiddleware._keys())
+    if static is not None:
+        return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
+    try:
+        entry = _admin_keys.match_presentation(presented)
+    except Exception:
+        entry = None
+    if entry is not None:
+        return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
+    return None
+
+
+def require_admin(request) -> object:
+    """The D1 admin gate: authenticate first (401), then authorize (403).
+
+    Returns the resolved Caller on success; raises :class:`AdminHTTPError`
+    otherwise. Applied to EVERY admin surface (the four REST routes via the
+    webui wrappers, the four MCP twins at tool level).
+
+    * anonymous (no credential, or one that matches nothing configured) →
+      401 {"error": "unauthorized: ..."} — authentication precedes
+      authorization so an anonymous caller can never probe the admins list;
+    * authenticated but NOT in the policy's ``admins`` list (subjects and/or
+      ``sha256:<12hex>`` fingerprints, read through
+      ``admin_keys.is_admin`` — hot-reloaded with the policy file) →
+      403 {"error": "admin access required"}.
+    """
+    presented = _admin_presented_key(request)
+    caller = _admin_resolve_caller(request, presented)
+    if caller is None:
+        # The message leads with "identity required" (the UI's Access-control
+        # panel renders the refusal verbatim, and an anonymous admin-route
+        # request IS an identity-required situation) + names the accepted
+        # credential headers. WWW-Authenticate: Bearer rides .headers.
+        raise AdminHTTPError(
+            401,
+            "identity required: admin access requires a valid API key "
+            "(X-API-Key / Authorization: Bearer) designated in the policy's admins list",
+        )
+    if not _admin_keys.is_admin(caller):
+        raise AdminHTTPError(403, _ADMIN_FORBIDDEN)
+    return caller
+
+
+def _admin_created_by(caller) -> str:
+    """The minting admin's audit-safe identity (subject, else the fp)."""
+    return getattr(caller, "subject", None) or getattr(caller, "key_fp", None) or "unknown"
+
+
+def _policy_atomic_write(text: str) -> None:
+    """Atomically replace the policy file (temp file in the SAME directory +
+    ``os.replace`` — a crash never truncates the operator's policy).
+
+    Raises AdminHTTPError(503) when no policy file is configured or the
+    path is unwritable. The temp file carries 0o600: the policy document
+    names identities and grants, not secrets, but there is no reason for it
+    to be group/world-readable either.
+    """
+    path = _policy.policy_file_path()
+    if not path:
+        raise AdminHTTPError(503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — the policy is read-only")
+    target = Path(path)
+    try:
+        directory = target.parent if str(target.parent) else Path(".")
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".policy-", suffix=".tmp", dir=str(directory))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except AdminHTTPError:
+        raise
+    except OSError as exc:
+        raise AdminHTTPError(503, f"cannot write the policy file ({path}): {exc}") from exc
+
+
+def _policy_assignments_view(pol) -> dict:
+    """The grants view's ``assignments`` (raw keys → their glob lists).
+
+    The RAW document's object (the compiled vocabulary is enforcement's
+    business, not the admin UI's — an operator edits the same keys they
+    wrote).
+    """
+    doc = getattr(pol, "datasets", None)
+    if not isinstance(doc, dict):
+        return {}
+    raw = doc.get("assignments")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _policy_groups_view(pol) -> list:
+    """The grants view's ``groups`` (names only, sorted).
+
+    The datasets form's compiled machinery (``_acl_*``) is enforcement
+    detail, NOT operator-authored content — only the hand-written form's
+    groups are shown (an operator editing the policy file recognizes their
+    own names; the compiled ones would be noise that invites edits that
+    hot-reload would then refuse).
+    """
+    return sorted(g for g in (getattr(pol, "groups", {}) or {}) if not str(g).startswith("_acl_"))
+
+
+def _admin_secret_keys() -> list[dict]:
+    """The bootstrap Secret keys as fp-only grants entries (source "secret").
+
+    These are the keys the deployment booted with (SQLHANDLER_API_KEYS /
+    MCP_API_KEYS): the store does not own them (their lifecycle is the
+    Secret's — kubectl), so they are reported READ-ONLY and NOT removable.
+    Only the FINGERPRINT leaves the process — never the raw value.
+    """
+    out: list[dict] = []
+    for raw in _McpApiKeyMiddleware._keys():
+        out.append(
+            {
+                "fp": _identity.key_fp(raw),
+                "label": "bootstrap secret key",
+                "created_at": None,
+                "created_by": None,
+                "source": "secret",
+            }
+        )
+    return out
+
+
+def _admin_grants_payload() -> dict:
+    """The whole grants view (the GET route's body AND admin_grants' text).
+
+    ``admins`` is read DEFENSIVELY (``getattr(pol, "admins", ())``): the
+    field lands with the policy-side change and older snapshots of the
+    module must not break the route.
+    """
+    pol = _policy.policy_store().get()
+    entries: list[dict] = []
+    for e in _admin_keys.list_keys():
+        # KeyEntry shapes from the store (source "file"); a defensive copy
+        # so a caller mutating the payload can never touch the cache.
+        entries.append(dict(e) if isinstance(e, dict) else {"fp": str(e)})
+    entries.extend(_admin_secret_keys())
+    return {
+        "admins": list(getattr(pol, "admins", ()) or ()),
+        "datasets": getattr(pol, "datasets", None),
+        "assignments": _policy_assignments_view(pol),
+        "blocked": list((getattr(pol, "datasets", None) or {}).get("blocked") or []),
+        "groups": _policy_groups_view(pol),
+        "policy_hash": getattr(pol, "hash", "") or "",
+        "keys": entries,
+    }
+
+
+def _admin_validate_policy_text(text: str) -> dict:
+    """FULLY validate a policy document WITHOUT writing it.
+
+    ``_parse_text`` only decodes (JSON/YAML → dict); the deep validation
+    (glob shapes, fp formats, mutual exclusion, admins entries) lives in
+    ``load_policy`` — so validation goes through the loader on a THROWAWAY
+    temp file: a PolicyError → 400 with the loader's message, the previous
+    policy file untouched. Returns the parsed document.
+    """
+    tmp = None
+    try:
+        data = _policy._parse_text(text, "admin policy set")  # decode
+        fd, tmp = tempfile.mkstemp(prefix=".policy-validate-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        _policy.load_policy(tmp)  # the FULL validation (globs, fps, exclusion)
+    except _policy.PolicyError as exc:
+        raise AdminHTTPError(400, str(exc)) from exc
+    except OSError as exc:
+        raise AdminHTTPError(400, f"policy document could not be validated: {exc}") from exc
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return data
+
+
+def _admin_write_policy(text: str) -> dict:
+    """Validate + atomically write + hot-reload the policy file.
+
+    The shared PUT/admin_policy_set path: validation runs FIRST (a bad
+    document never touches the file — PolicyError → 400, previous policy
+    keeps enforcing), then the atomic replace, then the store is re-read
+    (mtime hot-reload picks it up; the response returns the new hash).
+    """
+    _admin_validate_policy_text(text)
+    _policy_atomic_write(text)
+    # Force the reload (the mtime granularity on fast filesystems can hide
+    # a same-second rewrite from get()'s stat signature — one explicit
+    # load makes the response's hash the WRITTEN truth).
+    path = _policy.policy_file_path()
+    pol = _policy.load_policy(path) if path else _policy.Policy()
+    store = _policy.policy_store()
+    with store._lock:
+        store._policy = pol
+        st = os.stat(path) if path else None
+        store._stat = (path, st.st_mtime, st.st_size) if st is not None else None
+        store._broken_since = None
+    return {"ok": True, "policy_hash": pol.hash, "admins": list(getattr(pol, "admins", ()) or ())}
+
+
+def _admin_assignments_doc(pol) -> dict | None:
+    """The current policy document's ``datasets`` doc, or None (groups form)."""
+    doc = getattr(pol, "datasets", None)
+    return doc if isinstance(doc, dict) else None
+
+
+def _admin_drop_assignment(fp: str) -> bool:
+    """Remove one fp's assignment from the policy document (if present).
+
+    Atomic; returns True when an entry was dropped. A missing entry is NOT
+    an error (the key may never have had one; the binding and the store
+    entry are removed independently so neither orphan can block the other).
+    """
+    path = _policy.policy_file_path()
+    if not path:
+        return False
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = _admin_validate_policy_text(text)
+    except AdminHTTPError:
+        return False
+    doc = data.get("datasets")
+    if not isinstance(doc, dict):
+        return False
+    assignments = doc.get("assignments")
+    if not isinstance(assignments, dict):
+        return False
+    dropped = False
+    for key in [k for k in assignments if _assignment_fp(k) == fp]:
+        del assignments[key]
+        dropped = True
+    if not dropped:
+        return False
+    _policy_atomic_write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return True
+
+
+def _assignment_fp(key: str) -> str:
+    """The bare fp an assignments key binds (the ``key:`` prefix normalized)."""
+    return key.removeprefix("key:").strip()
+
+
+def _admin_grants_text() -> str:
+    """The grants view as the MCP tool text (stable JSON, no raw keys)."""
+    return json.dumps(_admin_grants_payload(), indent=2, default=str)
+
+
+def _audit_admin_event(event: str, **fields) -> None:
+    """One audit line for an admin mutation (best-effort, never raises).
+
+    Same JSONL trail as observability.audit_query (event/ts/pod) with the
+    event named for the action and the RAW KEY NEVER included — the mint
+    event carries the fingerprint only (the raw key exists in exactly one
+    place: the mint response body).
+    """
+    path = observability.audit_log_path()
+    if not path:
+        return
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        "pod": os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or None,
+        **fields,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        logging.getLogger("sqlhandler.server").debug("admin audit line skipped", exc_info=True)
+
+
+def admin_grants(*, caller=None) -> str:
+    """MCP twin of GET /api/admin/grants (admin-gated at the tool level).
+
+    Returns the whole grants view: the designated admins, the raw datasets
+    document (or null), the assignments map, the blocked globs, the group
+    names, the policy hash, and every key (minted: full KeyEntry; Secret
+    keys: fp-only, source "secret", not removable).
+
+    The gate raises AdminHTTPError — _dispatch_tool's catch-all renders it
+    (via __str__) as the structured 403-shaped isError result. NEVER a bare
+    exception traceback, never a silent empty view.
+    """
+    _admin_gate(caller)
+    try:
+        return _admin_grants_text()
+    except AdminHTTPError:
+        raise
+    except Exception as exc:
+        return f"Error reading grants: {_errors.enrich(str(exc))}"
+
+
+def admin_policy_set(policy: str, *, caller=None) -> str:
+    """MCP twin of PUT /api/admin/policy (admin-gated at the tool level).
+
+    ``policy`` is the FULL policy document as a JSON string. Validated first
+    (an invalid document → the loader's message as an isError result, the
+    previous policy untouched and enforcing); written atomically; the
+    hot-reload picks it up. Returns the new policy hash.
+    """
+    _admin_gate(caller)
+    try:
+        result = _admin_write_policy(str(policy))
+        _audit_admin_event("admin.policy_set", policy_hash=result["policy_hash"], by=_admin_created_by(caller))
+        return json.dumps(result, indent=2)
+    except AdminHTTPError:
+        raise  # __str__ carries the structured fix_hints (dispatcher renders)
+    except Exception as exc:
+        return f"Error setting policy: {_errors.enrich(str(exc))}"
+
+
+def admin_key_mint(label=None, assign=None, *, caller=None) -> str:
+    """MCP twin of POST /api/admin/keys (admin-gated at the tool level).
+
+    Mints one key; the raw key is in this response ONCE and nowhere else
+    (the store keeps the fingerprint + the full sha256 the middleware
+    matches against — never the raw). ``assign`` is the optional glob list
+    bound into the policy's datasets.assignments (omitted = ["*"]).
+    """
+    _admin_gate(caller)
+    try:
+        result = _admin_mint_key(
+            str(label) if label else "",
+            [str(g).strip() for g in assign if str(g).strip()] if isinstance(assign, list) else None,
+            _admin_created_by(caller),
+        )
+        return json.dumps(result, indent=2)
+    except AdminHTTPError:
+        raise
+    except Exception as exc:
+        return f"Error minting key: {_errors.enrich(str(exc))}"
+
+
+def admin_key_revoke(fp: str, *, caller=None) -> str:
+    """MCP twin of DELETE /api/admin/keys/{fp} (admin-gated at the tool level).
+
+    Removes the store key AND its assignment entry. A Secret-managed fp is
+    refused (409-shaped error text — the Secret's lifecycle owns it); an
+    unknown fp is 404-shaped text.
+    """
+    _admin_gate(caller)
+    try:
+        result = _admin_revoke_key(str(fp or "").strip(), _admin_created_by(caller))
+        return json.dumps(result, indent=2)
+    except AdminHTTPError:
+        raise
+    except Exception as exc:
+        return f"Error revoking key: {_errors.enrich(str(exc))}"
+
+
+def _admin_mint_key(label: str, assign: list[str] | None, created_by: str) -> dict:
+    """The shared mint core (POST route + admin_key_mint twin).
+
+    secrets.token_urlsafe(32) → fingerprint via the audit layer's
+    key_fingerprint (the SAME formula the auth layer matches with) →
+    add_key (fp-unique; AdminKeysError → 409 dup / 503 unconfigured or
+    unwritable) → the assignment merged into the policy document (datasets
+    form required — refusal otherwise) → the response carries the raw key
+    ONCE. The audit line carries the FINGERPRINT, never the raw.
+    """
+    raw = secrets.token_urlsafe(32)
+    from .mcp_fleet_common.audit import key_fingerprint
+
+    fp = key_fingerprint(raw)
+    if _admin_keys.keys_file_path() is None:
+        raise AdminHTTPError(
+            503,
+            "admin keys store not configured (SQLHANDLER_ADMIN_KEYS_FILE unset) — the key cannot be stored",
+        )
+    try:
+        entry = _admin_keys.add_key(raw, label=label, created_by=created_by)
+    except _admin_keys.AdminKeysError as exc:
+        message = str(exc)
+        status = 409 if "already exists" in message else 503
+        raise AdminHTTPError(status, message) from exc
+    # The assignment is ALWAYS recorded (omitted assign = ["*"], the
+    # mint_key.py convention): a key minted with no grant is a trap for the
+    # next reader. The merge may REFUSE (groups form / no policy file) —
+    # the compensating remove below keeps the store from stranding a
+    # minted-but-never-granted key.
+    try:
+        _admin_merge_assignment_with_fp(fp, assign if assign else ["*"])
+    except AdminHTTPError:
+        try:
+            _admin_keys.remove_key(fp)
+        except Exception:
+            pass
+        raise
+    _audit_admin_event("admin.key_mint", fp=fp, label=label, by=created_by, assign=list(assign) if assign else ["*"])
+    return {
+        "key": raw,  # THE ONE TIME the raw key is returned — store it now.
+        "fp": fp,
+        "label": label,
+        "assignment": {fp: list(assign) if assign else ["*"]},
+        "entry": entry,
+    }
+
+
+def _admin_merge_assignment_with_fp(fp: str, globs: list[str]) -> dict:
+    """The assignment merge for the mint path (fp in hand — no round-trip).
+
+    Reads the policy FILE (the authored truth, not the compiled Policy),
+    merges ``{fp: globs}`` into ``datasets.assignments``, and writes the
+    whole document back atomically. Returns the merged assignments map.
+
+    503 "bind via the policy form when a datasets doc is absent" when the
+    file uses the hand-written groups form: silently creating a datasets
+    doc would make the file carry BOTH forms and the loader refuses that
+    on principle (mutual exclusion) — the operator binds by hand there.
+    503 when no policy file is configured (assignments are file content).
+    """
+    path = _policy.policy_file_path()
+    if not path:
+        raise AdminHTTPError(503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — cannot record the assignment")
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AdminHTTPError(503, f"cannot read the policy file ({path}): {exc}") from exc
+    data = _admin_validate_policy_text(text)
+    doc = data.get("datasets")
+    if not isinstance(doc, dict):
+        raise AdminHTTPError(503, "bind via the policy form when a datasets doc is absent")
+    assignments = doc.get("assignments")
+    if not isinstance(assignments, dict):
+        assignments = {}
+        doc["assignments"] = assignments
+    # One fp, one binding: an existing entry for the same fp (either
+    # spelling) is REPLACED — the fresh mint defines the grant.
+    normalized = {_assignment_fp(k): k for k in assignments}
+    existing_key = normalized.get(fp)
+    if existing_key:
+        del assignments[existing_key]
+    assignments[fp] = list(globs) if globs else ["*"]
+    doc["assignments"] = assignments
+    _policy_atomic_write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return dict(assignments)
+
+
+def _admin_revoke_key(fp: str, by: str = "") -> dict:
+    """The shared revoke core (DELETE route + admin_key_revoke twin).
+
+    Secret-managed fps are refused (409 — the Secret's lifecycle owns
+    them); unknown fps 404; a store hit removes the entry AND its policy
+    assignment (dropping the assignment alone would leave a dead binding;
+    dropping the key alone would leave an orphan grant).
+    """
+    if not fp:
+        raise AdminHTTPError(400, "provide the key fingerprint to revoke (sha256:<12hex>)")
+    secret_fps = {e["fp"] for e in _admin_secret_keys()}
+    if fp in secret_fps:
+        raise AdminHTTPError(409, "Secret-managed key — revoke via kubectl (the Secret's lifecycle)")
+    removed = _admin_keys.remove_key(fp)
+    if not removed:
+        # remove_key returns False for BOTH an unknown fp and a disabled
+        # store; with no store configured the whole surface is moot and the
+        # fp cannot have been a file key — same 404, honest message.
+        raise AdminHTTPError(404, f"no minted key with fingerprint {fp}")
+    assignment_removed = _admin_drop_assignment(fp)
+    _audit_admin_event("admin.key_revoke", fp=fp, by=by or None)
+    return {"removed": fp, "assignment_removed": bool(assignment_removed)}
+
+
 #: Process start time (wall anchor) for the /metrics uptime header.
 _START_TIME = time.time()
 
@@ -2192,6 +3000,23 @@ class _McpApiKeyMiddleware:
     pod without a restart. /api/* keeps its own _ApiTokenMiddleware; /ui,
     /health, /ready and /metrics are unaffected.
 
+    Keys file UNION (SQLHANDLER_ADMIN_KEYS_FILE): ``_keys()`` stays
+    env-only (it feeds /metrics auth and the static-key-vs-JWT check);
+    the union lives in ``__call__`` — a minted store key is authenticated
+    via ``admin_keys.match_presentation`` (the presented key is hashed and
+    compared constant-time against each stored ``key_sha256``; the raw key
+    is never stored or logged). ENV-FIRST precedence: the env keys are
+    tried first, and a value present in both is authenticated by the env
+    path (a static key wins its own fingerprint). A store match records
+    the minted entry's fingerprint into ``scope["state"]`` exactly like an
+    env match, so the identity spine is unchanged (key-class caller, same
+    fp vocabulary). The gate ARMS on the union: env keys alone (exactly as
+    before) OR a keys-file-only deployment with at least one minted entry
+    (a disabled store or an empty one never arms it — no bootstrap
+    lockout, zero store I/O beyond one env read). When the store is
+    disabled the match is a cheap no-op and behavior is byte-identical to
+    the env-only days.
+
     Identity spine (additive, behavior-neutral): when a key MATCHES, its
     fingerprint (``sha256:<12hex>`` — never the key) is recorded into
     ``scope["state"]["sqlhandler.key_fp"]`` for _CallerIdentityMiddleware
@@ -2222,6 +3047,18 @@ class _McpApiKeyMiddleware:
         if scope["type"] == "http" and scope.get("path", "").startswith("/mcp"):
             keys = self._keys()
             if keys:
+                gate_on = True
+            else:
+                # The union's store half can arm the gate on its own (a
+                # keys-file-only deployment): configured AND non-empty.
+                # A disabled store or an empty one never arms it — no
+                # bootstrap lockout, and env-only deployments keep the
+                # exact env-only behavior (zero store I/O: the path check
+                # is one env read).
+                gate_on = (
+                    _admin_keys.keys_file_path() is not None and bool(_admin_keys.list_keys())
+                )
+            if gate_on:
                 provided = ""
                 for k, v in scope.get("headers", []):
                     lk = k.lower() if isinstance(k, bytes) else k
@@ -2233,20 +3070,40 @@ class _McpApiKeyMiddleware:
                     if lk == b"x-api-key":
                         provided = v.decode("latin-1").strip()
                         break
-                matched = _identity.match_api_key(provided, keys)
+                matched = _identity.match_api_key(provided, keys) if keys else None
                 if matched is None:
-                    resp = JSONResponse(
-                        {"error": "unauthorized: missing or invalid API key"},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                    await resp(scope, receive, send)
+                    # Store fallback: a minted key (keys file) when no env
+                    # key matched. No-op (None, zero I/O) when the store is
+                    # disabled or nothing was presented — the env-only
+                    # deployments keep their exact behavior.
+                    entry = _admin_keys.match_presentation(provided)
+                    if entry is None:
+                        resp = JSONResponse(
+                            {"error": "unauthorized: missing or invalid API key"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+                        await resp(scope, receive, send)
+                        return
+                    # A store match records the minted fingerprint the SAME
+                    # way an env match records the static one (identity
+                    # spine unchanged: key-class caller).
+                    state = scope.setdefault("state", {})
+                    state[self.KEY_FP_STATE] = entry.get("fp")
+                    await self.app(scope, receive, send)
                     return
                 # ADDITIVE identity feed: record WHICH key matched (its
                 # fingerprint, never the key) for the inner middleware.
                 state = scope.setdefault("state", {})
                 state[self.KEY_FP_STATE] = _identity.key_fp(matched)
         await self.app(scope, receive, send)
+
+
+# The OIDC rung's static-key source (registered now that the middleware
+# above exists): a Bearer value matching a configured static key is the KEY
+# rung's credential and is NEVER parsed as a JWT. The callable re-reads the
+# env per call, so key rotation needs no restart and nothing is cached here.
+_identity.set_static_keys_source(_McpApiKeyMiddleware._keys)
 
 
 class _CallerIdentityMiddleware:
@@ -2257,7 +3114,9 @@ class _CallerIdentityMiddleware:
     fingerprint the key middleware recorded in ``scope["state"]``.
 
     Pure resolution + recording: it never rejects anything (the 401 posture
-    stays _McpApiKeyMiddleware's). The resolved Caller rides
+    stays _McpApiKeyMiddleware's, and the anonymous-401 posture when
+    ``SQLHANDLER_REQUIRE_IDENTITY`` is on stays _IdentityRequiredMiddleware's —
+    the gate wraps OUTSIDE this one). The resolved Caller rides
     ``scope["state"]["sqlhandler.caller"]`` where the tool dispatch /
     webui / resource handlers read it, and is also published to
     ``identity.CALLER_CONTEXT`` so the audit writer (and any contextvar-based
@@ -2266,7 +3125,9 @@ class _CallerIdentityMiddleware:
     ``threading.Thread``.
 
     Rungs (see sqlhandler.identity for the full ladder): relay attribution
-    headers only over a key-valid request → oauth2-proxy headers only under
+    headers only over a key-valid request → OIDC bearer JWT (verified RS256
+    against the configured JWKS, and only when the Bearer value is not a
+    configured static key) → oauth2-proxy headers only under
     SQLHANDLER_TRUST_BROWSER_HEADERS → matched-key fingerprint → anonymous.
     """
 
@@ -2285,6 +3146,107 @@ class _CallerIdentityMiddleware:
             # it never leaks across requests — ContextVar.set is scoped to
             # the current task.
             _identity.CALLER_CONTEXT.set(caller)
+        await self.app(scope, receive, send)
+
+
+class _IdentityRequiredMiddleware:
+    """ASGI middleware: reject ANONYMOUS callers on the data surfaces.
+
+    Env ``SQLHANDLER_REQUIRE_IDENTITY`` (truthy: 1/true/yes/on,
+    case-insensitive, re-read PER REQUEST like every SQLhandler env) turns
+    the optional-auth posture into an enforced one: a request to ``/mcp``
+    or ``/api/*`` whose resolved Caller is anonymous gets
+
+        401 {"error": "identity required: authenticate with a key
+        (X-API-Key/Bearer), an OIDC bearer token, or via the gateway"}
+        + WWW-Authenticate: Bearer
+
+    NEVER gated: ``/health``, ``/ready``, ``/metrics`` — kubelet probes
+    cannot carry secrets (live-learned 2026-09-18; gating them makes the
+    pod NotReady and unscrapeable, an outage, not a hardening) — and the
+    ``/ui`` shell, whose page loads from static bytes and fetches its data
+    through the gated ``/api`` routes (webui.register_ui: every /api/*
+    handler is separate from the HTML shell; the browser then authenticates
+    exactly like any other client). An unset env is BYTE-IDENTICAL to the
+    pre-gate behavior (the middleware is registered either way so its env
+    stays per-request flippable, and the gate body returns False without
+    touching anything).
+
+    ``/api/admin/*`` is EXEMPT (Lead-approved 2026-09-30): the admin surface
+    self-gates with a STRICTER check than this middleware could apply here —
+    ``require_admin`` authenticates the presented key itself (the /api surface
+    has no key middleware, so the generic gate's caller is anonymous there
+    regardless of a presented X-API-Key) and then authorizes against the
+    policy's ``admins`` list (403 non-admin). Exempting it changes NO outcome
+    (a credentialed admin passes both layers; an anonymous or non-admin
+    caller is refused by require_admin with 401/403) while keeping the gate's
+    /api posture byte-identical for every other route. Scope is EXACTLY the
+    admin prefix — never /api/*.
+
+    Added AFTER ``_CallerIdentityMiddleware`` in the add_middleware order →
+    Starlette LIFO puts it OUTSIDE the resolver (which is outside the key
+    middleware) — the layering is: key gate → identity gate → caller
+    resolution → routes. By the time this runs, _CallerIdentityMiddleware
+    has already populated ``scope["state"]["sqlhandler.caller"]`` on the
+    request's way IN (this middleware sits between the resolver and the
+    routes, so the state slot is populated before BOTH the gate check and
+    the app), so the gate reads the resolved Caller instead of re-resolving.
+    """
+
+    ENV_NAME = "SQLHANDLER_REQUIRE_IDENTITY"
+
+    #: Path prefixes the gate protects (the data surfaces). /api/admin/* is
+    #: subtracted below (SELF-GATED: require_admin's 401-anonymous +
+    #: 403-non-admin is strictly stronger than this 401-anonymous-only gate).
+    GATED_PREFIXES = ("/mcp", "/api")
+
+    #: The self-gating admin surface (exempt from the generic gate; Lead
+    #: approval 2026-09-30 — see the class docstring for the reasoning).
+    SELF_GATED_PREFIX = "/api/admin/"
+
+    #: Paths NEVER gated — kubelet probes cannot carry secrets (2026-09-18),
+    #: and the UI shell is static bytes (its data comes through gated /api):
+    #: the html_page mounts at "/", "/ui" and "/ui/index.html".
+    UNGATED_EXACT = ("/", "/health", "/ready", "/metrics", "/ui", "/ui/index.html")
+
+    def __init__(self, app):
+        self.app = app
+
+    @classmethod
+    def _required(cls) -> bool:
+        return os.environ.get(cls.ENV_NAME, "").strip().lower() in ("1", "true", "yes", "on")
+
+    @classmethod
+    def _gated_path(cls, path: str) -> bool:
+        if path in cls.UNGATED_EXACT or path == "/" or path.startswith(("/ui/", "/static/")):
+            return False
+        # /api/admin/* self-gates (require_admin: 401 anon THEN 403
+        # non-admin — strictly stronger than this gate's 401-only check;
+        # the exemption is the Lead-approved 2026-09-30 design note).
+        if path.startswith(cls.SELF_GATED_PREFIX):
+            return False
+        return path.startswith(cls.GATED_PREFIXES)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self._required() and self._gated_path(scope.get("path", "")):
+            caller = (scope.get("state") or {}).get(_CallerIdentityMiddleware.CALLER_STATE)
+            if caller is None:
+                # Defense in depth: no resolver output in scope state (a
+                # re-ordered stack, or a direct call). Resolve here rather
+                # than trusting the slot — an absent slot must never widen
+                # the gate.
+                caller = _identity.caller_from_scope(scope)
+            if caller is not None and caller.is_anonymous:
+                resp = JSONResponse(
+                    {
+                        "error": "identity required: authenticate with a key "
+                        "(X-API-Key/Bearer), an OIDC bearer token, or via the gateway"
+                    },
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await resp(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
@@ -2472,6 +3434,13 @@ def _build_http_app():
     # _McpApiKeyMiddleware records into scope["state"]. Resolution-only —
     # it never rejects (the 401 posture stays the key middleware's).
     app.add_middleware(_CallerIdentityMiddleware)
+    # Identity-required gate: registered AFTER the resolver → LIFO puts it
+    # OUTSIDE the resolver but still INSIDE the key middleware — the gate
+    # reads the resolver's Caller from scope state and adds the anonymous
+    # 401 on /mcp + /api/* when SQLHANDLER_REQUIRE_IDENTITY is truthy.
+    # Registered unconditionally so the env stays per-request flippable;
+    # unset env = byte-identical pass-through inside the middleware.
+    app.add_middleware(_IdentityRequiredMiddleware)
     app.add_middleware(_McpApiKeyMiddleware)
     if _identity.browser_headers_trusted():
         logging.getLogger("sqlhandler.server").info(
@@ -2502,6 +3471,44 @@ def _build_http_app():
             "(the gateway remains the outer layer)."
         )
         logging.getLogger("sqlhandler.server").warning("=" * 72)
+
+    # Identity-required posture (the gate + its two misconfiguration notes).
+    _require_identity = os.environ.get(_IdentityRequiredMiddleware.ENV_NAME, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if _require_identity:
+        _log_gate = logging.getLogger("sqlhandler.server")
+        if not _mcp_keys and not _oidc_identity.oidc_enabled():
+            _log_gate.warning("=" * 72)
+            _log_gate.warning(
+                "%s is SET but no key gate is configured (MCP_API_KEYS/SQLHANDLER_API_KEYS) "
+                "and OIDC is not enabled (SQLHANDLER_OIDC_ENABLED/SQLHANDLER_OIDC_ISSUER) — "
+                "the ONLY rung that can resolve an identity is the browser-header rung "
+                "(%s). Every other caller gets 401 on /mcp and /api/* (probes stay open). "
+                "Configure a key gate or OIDC, or enable %s deliberately.",
+                _IdentityRequiredMiddleware.ENV_NAME,
+                _identity.TRUST_BROWSER_HEADERS_ENV,
+                _identity.TRUST_BROWSER_HEADERS_ENV,
+            )
+            _log_gate.warning("=" * 72)
+        else:
+            _log_gate.info(
+                "Identity REQUIRED on /mcp and /api/* (%s) — anonymous callers get 401 "
+                "(WWW-Authenticate: Bearer); /health /ready /metrics and the /ui shell stay ungated.",
+                _IdentityRequiredMiddleware.ENV_NAME,
+            )
+    elif os.environ.get("SQLHANDLER_POLICY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+        logging.getLogger("sqlhandler.server").info(
+            "SQLHANDLER_POLICY_ENABLED is on but %s is unset — ACLs are ADVISORY without it: "
+            "anonymous callers resolve the default group. Set %s=1 to make identity required.",
+            _IdentityRequiredMiddleware.ENV_NAME,
+            _IdentityRequiredMiddleware.ENV_NAME,
+        )
+    if _oidc_identity.warn_if_misconfigured("sqlhandler"):
+        pass  # the vendored module prints the loud fail-closed banner itself
 
     # MCP read-only mode (decision D2): run_sql is SELECT-only unless the
     # operator sets SQLHANDLER_MCP_READONLY=0. Enforced in run_sql(); logged

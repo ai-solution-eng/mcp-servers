@@ -24,6 +24,11 @@ sqlhandler {{ .Chart.Version }} deployed to namespace {{ $ns }}.
    — no restart needed. The fleet-universal MCP_API_KEYS env is honored
    too (either var works).
 
+   DATASET ACLs: mint a per-identity key with `python scripts/mint_key.py`,
+   append it to the same Secret, and add its fingerprint assignment
+   (key:sha256:<fp>) to the policy ConfigMap's datasets.assignments — both
+   hot-reload, no restart (see documentation/DEPLOYMENT.md §4.7.1).
+
 ════════════════════════════════════════════════════════════════════
 2. Endpoints:
   MCP   : /mcp   (X-API-Key: <api-key> — only when enabled)

@@ -304,3 +304,29 @@ store above is per-server).
 | [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), Prometheus target, GPU/NVLink detector, ezua/Istio + oauth2-proxy auth gate, upgrading |
 | [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | MCP handshake + first tool test, optional operator kubectl checks, troubleshooting |
 | [helm/values-examples/README.md](helm/values-examples/README.md) | What the example values files are, how to use them (PCAI editor or `helm -f`) |
+
+## Enabling the network zone (MCP NetworkPolicy — ADDITIVE, DEFAULT OFF)
+
+The chart can default-deny all ingress to the MCP pods and admit ONLY the
+listed client namespaces ("the zone"). Default OFF — the default render is
+byte-identical to the baseline; nothing changes until you enable it:
+
+```yaml
+networkPolicy:
+  enabled: true
+  authorizedClients:
+    namespaces: [pcai-llm, monitoring]   # the LLM gateway relay + Prometheus scrape
+  allowEzafGatewayIngress: true          # browser path stays OPEN (fleet doctrine)
+  probeCidrs: [172.28.1.61/32, 172.28.1.62/32, 172.28.1.63/32,
+               172.28.1.161/32, 172.28.1.162/32]   # node IPs (kubelet probes)
+  probeExceptCidrs: []                   # MUST stay empty with /32 allows (strict-subset rule)
+```
+
+Enable one namespace at a time (add the ns name under
+`authorizedClients.namespaces`, apply, verify — see the fleet RUNBOOK in the
+`mcp-netzone` workbench workspace). Ready-made hardened profile:
+`helm/values-examples/values-hardened-g2.yaml`. `monitoring` MUST stay
+listed or Prometheus scraping dies silently. Fleet doctrine (2026-09): the
+zone restricts IN-CLUSTER model access only — the browser path stays open
+through the SSO-gated edge gateway (closing a console is an explicit
+per-chart, per-site decision, never a default).

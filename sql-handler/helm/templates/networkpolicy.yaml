@@ -44,4 +44,34 @@ spec:
     {{- with .Values.security.networkPolicy.additionalIngress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+    {{- /* MCP network zone (fleet decision 2026-09, ADDITIVE): authorized
+         client namespaces on kubernetes.io/metadata.name — agentic frontends
+         and (when a ServiceMonitor/PodMonitor ships) `monitoring` for the
+         Prometheus scrape. Appends only: the W6 rules above stay untouched.
+         Empty list renders nothing (byte-identical default). */}}
+    {{- with .Values.security.networkPolicy.authorizedClients }}
+    - from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    {{- /* SQL local access (OPTIONAL, DEFAULT OFF): allow a CIDR list (e.g.
+         an operator desktop subnet) direct to the service port — for
+         SQL workbench clients that bypass the gateway. Empty list renders
+         nothing. */}}
+    {{- with .Values.security.networkPolicy.sqlLocalAccess }}
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
 {{- end }}

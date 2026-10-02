@@ -95,24 +95,25 @@ spec:
             - name: LOGSEARCH_METRICS_ENABLED
               value: "true"
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.http }}
-            # HPE corporate proxy (fleet convention, searxng-mcp). Only wired
-            # when hpe_proxies=true; the k8s API this server talks to is
-            # IN-CLUSTER and stays covered by the NO_PROXY cluster-local
-            # entries below — these vars exist for fleet consistency and any
-            # future egress need, not for the current tool calls.
+            {{- if .Values.proxy.http }}
+            # Corporate proxy env (fleet convention, searxng-mcp). Wired only
+            # when the corresponding proxy.<key> is non-empty; the k8s API
+            # this server talks to is IN-CLUSTER and stays covered by the
+            # NO_PROXY cluster-local entries below — these vars exist for
+            # fleet consistency and any future egress need, not for the
+            # current tool calls.
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
             - name: http_proxy
               value: {{ .Values.proxy.http | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            {{- if .Values.proxy.https }}
             - name: HTTPS_PROXY
               value: {{ .Values.proxy.https | quote }}
             - name: https_proxy
               value: {{ .Values.proxy.https | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            {{- if .Values.proxy.noProxy }}
             - name: NO_PROXY
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy

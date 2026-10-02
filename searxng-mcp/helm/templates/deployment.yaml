@@ -70,19 +70,19 @@ spec:
             - name: SEARXNG_SECRET
               value: {{ .Values.searxng.secretKey | required "searxng.secretKey is required (SEARXNG_SECRET) — or set searxng.existingSecret" | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            {{- if .Values.proxy.http }}
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
             - name: http_proxy
               value: {{ .Values.proxy.http | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            {{- if .Values.proxy.https }}
             - name: HTTPS_PROXY
               value: {{ .Values.proxy.https | quote }}
             - name: https_proxy
               value: {{ .Values.proxy.https | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            {{- if .Values.proxy.noProxy }}
             - name: NO_PROXY
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy
@@ -162,19 +162,19 @@ spec:
             - name: SEARXNG_FETCH_MAX_REDIRECTS
               value: {{ . | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            {{- if .Values.proxy.http }}
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
             - name: http_proxy
               value: {{ .Values.proxy.http | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            {{- if .Values.proxy.https }}
             - name: HTTPS_PROXY
               value: {{ .Values.proxy.https | quote }}
             - name: https_proxy
               value: {{ .Values.proxy.https | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            {{- if .Values.proxy.noProxy }}
             - name: NO_PROXY
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy
@@ -204,9 +204,13 @@ spec:
           imagePullPolicy: {{ .Values.browser.image.pullPolicy }}
           env:
             # Chromium ignores *_PROXY env vars; the entrypoint converts
-            # this into --proxy-server.
+            # this into --proxy-server. Rendered ONLY when proxy.https is
+            # non-empty — with proxy: {} the var is absent and the browser
+            # egresses directly.
+            {{- if .Values.proxy.https }}
             - name: BROWSER_PROXY
-              value: {{ if and .Values.hpe_proxies .Values.proxy.https }}{{ .Values.proxy.https | quote }}{{ else }}""{{ end }}
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
             {{- if .Values.browser.extraArgs }}
             - name: BROWSER_EXTRA_ARGS
               value: {{ .Values.browser.extraArgs | quote }}

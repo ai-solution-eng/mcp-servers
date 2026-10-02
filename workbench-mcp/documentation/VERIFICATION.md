@@ -85,6 +85,6 @@ kubectl get configmap ezaf-root-ca -n <namespace>   # only when caCert.enabled=t
 | `content is N bytes; cap is ...` | `write_file` over 8 MiB | Write in chunks or raise `workbench.maxFileBytes` |
 | `[workbench] timed out after Ns` | Command exceeded the timeout bound | Raise per-call `timeout_s` (clamped by `execTimeoutMax`, default 600 s) |
 | Pod CrashLoopBackOff / PVC not writable | `fsGroup` mismatch or non-RWX class with `replicaCount > 1` | Keep `securityContext` (uid/fsGroup 10001); use RWX for multi-replica or RWO + `replicaCount: 1` |
-| `pip` fails TLS inside `run_command` on a proxied cluster | Proxy/CA env not wired | `hpe_proxies: true` + `caCert.enabled: true` (with the `ezaf-root-ca` ConfigMap present in the release namespace) |
+| `pip` fails TLS inside `run_command` on a proxied cluster | Proxy/CA env not wired | non-empty `proxy.http/https` + `caCert.enabled: true` (with the `ezaf-root-ca` ConfigMap present in the release namespace) — the old `hpe_proxies` flag is removed |
 | Console 404s at `/` but `/mcp` works | `webui.enabled=false` | Re-enable, re-apply |
 | Client hangs or 504 on `/mcp` | Gateway route missing (`ezua.enabled=false`) or command ran past the VS timeout | Enable ezua with a literal endpoint; keep `timeout: 660s` |

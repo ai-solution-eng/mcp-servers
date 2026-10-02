@@ -1,5 +1,5 @@
 # applygate-mcp — values for the SE-G2 lab cluster
-# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+# (SITE: your-cluster.example — proxied corporate PCAI site)
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document (PCAI's Helm Values editor replaces the
@@ -116,16 +116,14 @@ rbac:
   # SITE: kept at the chart default (explicitly pinned by this file)
   create: true
 
-# -- HPE corporate proxy --------------------------------------------------------------------------
+# -- Per-key proxy wiring --------------------------------------------------------------------------
 # The k8s API is in-cluster and covered by the standard NO_PROXY cluster-local
-# entries, so the proxy block is fleet consistency only — *_PROXY env is wired
-# only when hpe_proxies=true.
-hpe_proxies: true
-
+# entries, so the proxy block is fleet consistency only — each key is wired
+# only when non-empty.
 proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost
 
 # -- Kyverno vendor-label policy ------------------------------------------------------------------
 # Optional cluster-scoped ClusterPolicy — off by default so the default render
@@ -139,10 +137,10 @@ kyverno:
 ezua:
   enabled: true   # SITE: deploy the VirtualService on this cluster
   # SITE: literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
-  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  domainName: your-cluster.example   # informational only — no template reads it
   virtualService:
     # SITE: literal host — /mcp -> MCP server (9102); / -> read-only console
-    endpoint: applygate-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    endpoint: applygate-mcp.your-cluster.example
     istioGateway: istio-system/ezaf-gateway
     timeout: 120s
 

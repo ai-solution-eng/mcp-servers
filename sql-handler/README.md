@@ -544,7 +544,122 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off; each line carries `pod` when running in k8s, so a fleet-wide trail can be attributed per replica). Chart value: `query.auditLog` (the chart also mounts a pod-local writable dir for the path; durable audit = point it at your own PVC-backed mount) |
 | `SQLHANDLER_API_TOKEN` | Require this bearer token on `/api/*` (unset = no token check) |
 | `SQLHANDLER_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | OPTIONAL `/mcp` API-key gate: comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). Unset → `/mcp` runs open exactly as before (loud startup warning; gateway remains the outer layer). Rotation: append the new key, move clients, drop the old — env re-read per request, no restart. Chart wiring: `security.apiKey.existingSecret` (empty default = not wired). | unset → `/mcp` open |
+| `SQLHANDLER_ADMIN_KEYS_FILE` | File path of the frontend **admin-keys store** (default unset = store disabled — Secret keys only). The file is the full JSON keys document (`{"keys": [...]}`); minted keys' fingerprints + assignments are written there atomically (temp + rename) and hot-reloaded on mtime, so the web UI's Access-control panel works with no restart. Chart wiring: `security.adminKeys.existingSecret` (empty default = not wired) — the chart MOUNTS the Secret's key as a file and renders this var as the mounted path (deliberately file-based, not env, precisely so mtime hot-reload works; an env var from a Secret is frozen at container start). The store COMPLEMENTS the `SQLHANDLER_API_KEYS` Secret keys — the middleware matches the union; Secret-sourced keys are reported `source: "secret"` and are read-only (revoke via kubectl). |
+| `SQLHANDLER_POLICY_ADMINS` (policy document `"admins": [...]`) | Not an env var — a field IN the policy document: the list of designated **admins** (subjects and/or `key:sha256:<12hex>` fingerprints), hot-reloaded with the file. Admins can call the `/api/admin/*` routes (and their MCP twins) to mint keys, edit grants and save the policy from the web UI's Access-control panel — everyone else gets `403 admin access required`. Bootstrap is the one-time hand-edit of the policy ConfigMap: add your admin key's fingerprint under `"admins":`, then never touch kubectl again (README: Administering from the frontend). | unset → no admins |
 | `S3_FORMAT` | `auto` (detect Delta by `_delta_log`), `parquet`, or `delta` |
+
+## Dataset access control (ACL)
+
+The policy file (`SQLHANDLER_POLICY_FILE`, enabled via `SQLHANDLER_POLICY_ENABLED`,
+hot-reloaded on mtime — no restart) has two forms. They are **mutually exclusive**:
+a file containing both a `datasets` document and hand-written `groups` is refused
+at load (`PolicyError` — the previous valid file keeps enforcing, fail-closed).
+
+**Form 1 — `datasets` (simple visibility ACL, the operator's default):** a
+top-level `datasets` document with a default-closed grant model — identities see
+what `global` + their `assignments` list, minus `blocked`:
+
+```json
+{
+  "version": 1,
+  "datasets": {
+    "global": ["workorder/*", "reports/*", "public*"],
+    "assignments": {
+      "alice":             ["payroll*"],
+      "key:sha256:2689a1c0f3e2": ["*"]
+    },
+    "blocked": ["scratch/*", "*_raw"]
+  }
+}
+```
+
+- `global` — visible to **every** authenticated identity (the default grant).
+- `assignments` — **added to** `global` for that identity. Keys are a subject
+  (gateway-relayed / SSO-asserted, e.g. `alice`) or a key fingerprint
+  (`key:sha256:<12hex>` — the matched API key's fingerprint; `scripts/mint_key.py`
+  prints it at mint time, and the existing admin key keeps working unchanged when
+  you add `"key:sha256:<admin-fp>": ["*"]` for it).
+- `blocked` — hidden for **everyone**, and it wins over any grant (a blocked glob
+  cannot be unblocked by `global` or an assignment).
+- Globs match both the `schema/name` path and the bare table name
+  (`workorder/*`, `payroll*`, `*`). An identity with **no** assignment sees
+  `global` only.
+
+**Form 2 — `groups` (the escape hatch, full rule surface):** anything beyond
+visible/hidden — row filters and column masks — needs the groups form:
+
+```json
+{
+  "version": 1,
+  "default_group": "restricted",
+  "groups": {
+    "restricted": {
+      "tables": {
+        "workorder/*": {"row_filter": "kind != 'secret'",
+                        "column_masks": {"ssn": "redact", "email": "hash"}},
+        "payroll*": {"column_masks": {"amount": "***"}}
+      },
+      "hidden_tables": ["scratch/*"]
+    }
+  },
+  "subjects": {"alice": ["restricted"]},
+  "key_fps":  {"sha256:2689a1c0f3e2": ["analysts"]}
+}
+```
+
+Note the posture difference: `groups` is **default-open** (a table is visible
+unless a resolved group hides it), while `datasets` is **default-closed** (a
+dataset is invisible unless granted). Partial access in the groups form combines
+the same three primitives: visible (`workorder/*` table entry with no mask) +
+`column_masks` on `ssn` + a `row_filter` of `"region = 'EMEA'"` — exactly what
+the `restricted` group above expresses for `workorder/*`.
+
+**Who is an identity?** The resolution ladder (see [Security notes](#security-notes)):
+a minted static API key (pseudonymous fingerprint, `sha256:<12hex>` of the key —
+never the key itself), a gateway relay attribution (`X-MCP-Caller-Subject` over a
+key-valid request — the MCP-bundle topology where the gateway holds the key), an
+SSO bearer JWT, or oauth2-proxy browser headers (only behind the
+`security.identity.trustBrowserHeaders` trust gate — the workload
+AuthorizationPolicy must pin ingress to the gateway). See
+[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) for the full
+mint → Secret → policy-assignment workflow.
+
+### Administering from the frontend (Access-control panel)
+
+After the one-time bootstrap (below), grants are administered from the web
+UI — open `/ui` → **Access control** tab, paste the admin key once (held in
+the page's memory only, never stored), and everything is a button:
+
+| Route | Panel action | MCP twin |
+|---|---|---|
+| `GET /api/admin/grants` | the tab itself — admins list, assignments, blocked, keys table | `admin_grants` |
+| `POST /api/admin/keys` | **Mint a key** (label + assignment globs) — the raw key is shown **once** in a copyable field; it is not recoverable (only its `sha256:<12hex>` fingerprint is stored) | `admin_mint_key` |
+| `DELETE /api/admin/keys/{fp}` | **Revoke** per file-source key (confirm dialog; the key's assignment goes with it). Secret-sourced keys are read-only in the panel — their lifecycle is the Secret's (`kubectl`) | `admin_revoke_key` |
+| `PUT /api/admin/policy` | the **policy editor** — the `datasets` document as JSON, pre-filled from the live file; a refused document returns the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
+
+Who may call these: a **designated admin** only — `401 {"error": "identity
+required: …"}` for anonymous callers when `SQLHANDLER_REQUIRE_IDENTITY` is on,
+`403 {"error": "admin access required"}` for authenticated non-admins; the
+panel renders the message verbatim. The admin designation is **orthogonal to
+grants**: a grants entry says which datasets an identity sees, the policy
+document's top-level `"admins": ["alice", "key:sha256:2689a1c0f3e2"]` list says
+who may administer. Key matching is the union of the api-keys Secret (env) and
+the admin-keys store (file) — env keys first, Secret-sourced entries reported
+`source: "secret"` and not removable through the store.
+
+**Bootstrap (the only kubectl step):** mint an admin key offline
+(`scripts/mint_key.py`), put it in the api-keys Secret, and add its
+fingerprint to the policy document's `"admins":` list — a one-time
+`kubectl edit configmap <policy-configmap>` (mtime hot-reload, no restart).
+From then on: zero kubectl — minting a new admin from the panel, editing
+grants, revoking and policy edits are all frontend buttons.
+
+The store behind mint/revoke is the admin-keys **file**
+(`SQLHANDLER_ADMIN_KEYS_FILE`; chart: `security.adminKeys.existingSecret` —
+the Secret's key is mounted as a file, not rendered as env, so the store
+hot-reloads on mtime). Leaving it unset disables minting/revoke (the routes
+answer that the store is not configured) while Secret-sourced keys keep
+authenticating exactly as before.
 
 ## Performance & caching
 
@@ -1036,3 +1151,23 @@ uv pip install -e '.[dev]'
 ruff check src
 pytest
 ```
+
+## Enabling the network zone
+
+The chart ships TWO optional ingress NetworkPolicies (both default **off** —
+the default render is byte-identical to the baseline): the W6
+`security.networkPolicy` (gateway + same-namespace + `allowedNamespaces`) and
+the fleet network-zone rules (`security.networkPolicy.authorizedClients` —
+the agentic frontends + the Prometheus scrape namespace — plus the optional
+`sqlLocalAccess` CIDR list). Six steps: (1) `kubectl get ns` to find your
+callers' namespaces; (2) append caller namespaces to
+`security.networkPolicy.authorizedClients` (keep `monitoring` — Prometheus
+scrapes `/metrics` via the PodMonitor on the same port, and an unlisted scrape
+namespace dies **silently**); (3) optionally uncomment `sqlLocalAccess` with
+your operator subnet for direct SQL workbench access (default OFF; requires a
+`helm upgrade` per chart — expect the MCP port reachable only from that CIDR);
+(4) enable with `security.networkPolicy.enabled: true` (the W6 gateway +
+same-namespace rules stay authoritative — these keys APPEND); (5) apply via
+the PCAI values editor; (6) verify — an allowed namespace gets HTTP 200 from
+`service:9097/mcp`, any other namespace times out. See
+`values-examples/values-hardened-g2.yaml` for the hardened fragment.

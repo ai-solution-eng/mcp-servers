@@ -81,7 +81,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.6.1
+  tag: v3.0.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -521,6 +521,20 @@ security:
   apiKey:
     existingSecret: ""
     existingSecretKey: api-keys
+  # Frontend admin-keys store (fleet decision 2026-09-30, README: Administering
+  # from the frontend): a Secret whose KEY contains the FULL JSON keys file
+  # the store reads/writes ({"keys": [...]}) — the chart MOUNTS it as a file
+  # (never env-rendered) and sets SQLHANDLER_ADMIN_KEYS_FILE to the mounted
+  # path, precisely so the store can hot-reload on mtime the way the policy
+  # file does. Empty (default) = store DISABLED: no env, no volume, minting
+  # via the frontend returns "store not configured" (the Secret-sourced
+  # api-keys above still authenticate). Operator note: kubectl edits to that
+  # Secret are NOT picked up by a mounted Secret until the kubelet resyncs
+  # (about a minute) — the bootstrap keys inside it reach the store through
+  # the file, and the api-keys Secret above stays the /mcp gate.
+  adminKeys:
+    existingSecret: ""
+    existingSecretKey: admin-keys-file
   # Per-caller identity + policy-as-code (implementation review §3/§5):
   identity:
     # TRUST GATE for the oauth2-proxy browser rung (X-Auth-Request-User /
@@ -531,12 +545,63 @@ security:
     # (authorizationPolicy.enabled above) — only then can a browser header
     # be trusted (anyone who can reach the pod can otherwise forge them).
     trustBrowserHeaders: false
+    # IDENTITY-REQUIRED gate (fleet decision 2026-09-30). FALSE (default) =
+    # anonymous /mcp + /api/* callers keep working exactly as today.
+    # TRUE renders SQLHANDLER_REQUIRE_IDENTITY=1: /mcp and /api/* REFUSE
+    # anonymous callers with 401. /health /ready /metrics stay open (kubelet
+    # probes cannot carry a secret) and the webui shell stays open (data is
+    # gated at /api/*). Key-valid relay calls are unaffected — attribution
+    # rides a key-valid request. Enable ONLY with an auth source wired (an
+    # api-keys Secret, OIDC, or a gateway-fronted identity) — on with no
+    # credential source 401s everyone (fail closed).
+    requireIdentity: false
+  # Resource-server JWT verification (SSO bearer rung, fleet decision
+  # 2026-09-30): users present their SSO bearer token and SQLhandler verifies
+  # it against the issuer's JWKS. NO client secret, NO redirect URIs — this
+  # is NOT the browser-SSO oauth2-proxy pattern (that terminates at the
+  # gateway per DECISIONS.md "OAuth REVISION" §3); it is the plain
+  # resource-server posture for servers reached directly. enabled + issuer
+  # (audience unless jwksUrl is explicit) = the JWT rung is active;
+  # otherwise off (default, byte-identical).
+  # In-cluster JWKS example (Keycloak):
+  #   jwksUrl: http://keycloak.<realm-ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs
+  oidc:
+    # Master switch for the bearer-JWT rung (SQLHANDLER_OIDC_ENABLED).
+    # false = the rung is closed (a Bearer JWT is never parsed). Setting
+    # enabled WITHOUT an issuer is a loud startup warning — the resolver
+    # stays inert and every JWT 401s (fail-closed).
+    enabled: false
+    issuer: ""     # e.g. https://keycloak.<domain>/realms/<realm>
+    audience: ""   # the client/audience claim these tokens must carry
+    jwksUrl: ""    # e.g. http://keycloak.<realm-ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs
+    # Caller-subject identity claim (default preferred_username; sub is the
+    # ABSENT-claim fallback — a present-but-unsuitable claim REJECTS the
+    # token rather than silently falling back).
+    identityClaim: ""
+    # Tuning knobs — empty = module defaults (JWKS refresh 3600s, fetch
+    # timeout 3s, clock skew 60s).
+    jwksRefreshSeconds: ""
+    fetchTimeoutSeconds: ""
+    clockSkewSeconds: ""
   # Policy-as-code: per-caller row filters + column masks + hidden tables
   # from an operator-authored JSON/YAML file (hot-reloaded on mtime).
   # DEFAULT OFF = the whole feature is byte-identical to before (no policy
   # hash in any cache key, no masking views, shared query memory/saved
   # queries). Enabling requires a policy file — unbound keys then fall to
   # the file's default_group (the restricted default).
+  #
+  # The file has TWO mutually exclusive forms (both present = refused,
+  # fail-closed). The simple form is the `datasets` ACL (default-closed):
+  #   {"datasets": {"global": ["workorder/*", "reports/*"],
+  #                 "assignments": {"alice": ["payroll*"],
+  #                                 "key:sha256:2689a1c0f3e2": ["*"]},
+  #                 "blocked": ["scratch/*"]}}
+  # global = visible to EVERY authenticated identity; assignments ADD for
+  # that subject or key fingerprint (minted via scripts/mint_key.py — the
+  # admin key keeps working unchanged once its fingerprint is assigned ["*"]);
+  # blocked wins over any grant. The escape hatch for anything beyond
+  # visible/hidden (row_filter / column_masks) is the groups form — see the
+  # README "Dataset access control (ACL)" section for both, side by side.
   policy:
     enabled: false
     # ConfigMap (or any readable path) carrying the policy document; wire it
@@ -569,6 +634,30 @@ security:
   networkPolicy:
     enabled: false
     gatewayNamespace: istio-system
+    # MCP network zone (fleet decision 2026-09) — APPENDS to the rules above
+    # (which stay authoritative). Authorized client namespaces on
+    # kubernetes.io/metadata.name: agentic frontends (pcai-llm, dsh-web-helm,
+    # owebui0-11-0, opencode-web-helm) + `monitoring` whenever a
+    # PodMonitor/ServiceMonitor ships — Prometheus scrapes /metrics on the
+    # SAME port and an unlisted scrape ns dies SILENTLY (check Prometheus
+    # targets after enabling). Appends only; empty = renders nothing.
+    authorizedClients: []
+    # SQL local access (OPTIONAL, DEFAULT OFF): CIDRs allowed direct to the
+    # service port (e.g. an operator desktop subnet) for SQL workbench
+    # clients that bypass the gateway. Empty = off.
+    sqlLocalAccess: []
+    # MCP network zone (fleet decision 2026-09) — APPENDS to the rules above
+    # (which stay authoritative). Authorized client namespaces on
+    # kubernetes.io/metadata.name: agentic frontends (pcai-llm, dsh-web-helm,
+    # owebui0-11-0, opencode-web-helm) + `monitoring` whenever a
+    # PodMonitor/ServiceMonitor ships — Prometheus scrapes /metrics on the
+    # SAME port and an unlisted scrape ns dies SILENTLY (check Prometheus
+    # targets after enabling). Appends only; empty = renders nothing.
+    authorizedClients: []
+    # SQL local access (OPTIONAL, DEFAULT OFF): CIDRs allowed direct to the
+    # service port (e.g. an operator desktop subnet) for SQL workbench
+    # clients that bypass the gateway. Empty = off.
+    sqlLocalAccess: []
     # Extra namespaces whose pods may call this service directly
     # (in-cluster MCP clients, OWUI, DSH, ...). Cluster-internal access
     # stays frictionless: add the client's namespace here.

@@ -25,7 +25,7 @@ The same process also serves the read-only web UI (`/ui`, `/`), a JSON API (`/ap
 
 ---
 
-## 2. Available tools (18)
+## 2. Available tools (19)
 
 Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables` → `describe_table` → `profile_table` (or `column_stats`/`sample_rows`) → `explain_query` (optional) → `run_sql`. Errors carry structured codes and did-you-mean hints — a bad table name in SQL returns the nearest real table names, so an agent self-corrects in one round-trip.
 
@@ -39,6 +39,7 @@ Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables
 | `profile_table(table, columns?)` | Column-level statistics **before** writing SQL: min/max, approx distinct count, null %, avg/std, q25/q50/q75, exact row count from Parquet/Delta metadata. Scans a bounded sample (chart value `query.profileMaxRows`, default 1M; 0 = full). | Stats table |
 | `column_stats(table, column)` | The same statistics for ONE column, plus top-5 values with counts — over the same bounded sample (never a full-table scan beyond it). Pick filter values, spot skew. | Stats + top values |
 | `sample_rows(table, limit?, columns?)` | A bounded head of actual rows with per-column fill rates (fill %, null counts) — one bounded look at the DATA before writing SQL. The scan stops early. | Sample rows + fill rates |
+| `whoami()` | The caller's own ACL view: which identity the request resolved to (caller class: key fingerprint / relay-attributed subject / SSO bearer / browser headers) and, when the dataset policy is on, which datasets are visible to it (granted minus blocked). Read-only introspection of the caller's OWN access — never other identities'. | Identity + visible datasets |
 
 ### Querying
 

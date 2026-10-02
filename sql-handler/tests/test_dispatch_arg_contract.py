@@ -210,7 +210,15 @@ def test_tools_list_schema_is_the_enforced_contract(call_tool):
         "explain_query": ("sql",),
         "ask_data": ("question",),
         "list_tables": (),
+        "whoami": (),
         "query_list": (),
+        # task-6 admin twins (registered like every tool — the tools/list
+        # schema stays the contract; the tools themselves are admin-gated
+        # at the tool level, which the gate never sees).
+        "admin_grants": (),
+        "admin_policy_set": ("policy",),
+        "admin_key_mint": (),
+        "admin_key_revoke": ("fp",),
     }
     advertised = {t.name: tuple(t.input_schema.get("required") or ()) for t in server._TOOLS}
     assert advertised == expected
@@ -253,6 +261,11 @@ def test_param_invalid_all_validated_tools_accept_their_required_keys(stub_engin
         "job_id": "j0",
         "name": "n",
         "question": "q",
+        # task-6 admin twins' required keys (a non-admin caller gets the
+        # tool-level 403 DOWNSTREAM — the point here is only that the gate
+        # itself does not mis-fire on validly-shaped calls).
+        "policy": "{}",
+        "fp": "sha256:0123456789ab",
     }
     for tool in server._TOOLS:
         required = tool.input_schema.get("required") or []

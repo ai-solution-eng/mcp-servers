@@ -96,7 +96,7 @@ Behavior that differs by target, and the paste-ready values for each
 `helm/local/`). This server has no API-key Secret to provision — the auth
 posture is entirely the `ezua.authorizationPolicy` gate above.
 
-### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+### Proxied corporate site (SITE: your-cluster.example)
 
 - **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
   write the literal domain into `ezua.virtualService.endpoint` (the G2

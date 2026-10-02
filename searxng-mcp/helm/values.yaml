@@ -202,24 +202,29 @@ fetch:
   # SEARXNG_FETCH_MAX_REDIRECTS — redirect hops, each re-validated ("" = 5).
   maxRedirects: ""
 
-# -- HPE corporate proxy -------------------------------------------------------------------------------
-# Route outbound HTTP(S) traffic through the HPE corporate proxy.
-# Default false: open-internet systems must NOT use the proxy (DNS/egress
-# failures). Set true (and configure proxy.*) only behind the HPE proxy.
-# When true this configures BOTH: env proxies for the MCP container
+# -- Egress proxy ---------------------------------------------------------------------------------------
+# Per-key proxy wiring — each key is wired into the pod only when non-empty,
+# so a corporate-proxy site sets http/https (and usually noProxy), while a
+# direct-egress site leaves proxy: {} (or omits it) and everything renders off.
+# Non-empty keys configure BOTH: env proxies for the MCP container
 # (fetch_content) and SearXNG's outgoing.proxies (engine requests).
-hpe_proxies: false
-
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+# CAUTION: a wrong proxy breaks DNS/egress — only set it behind a real proxy.
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+proxy: {}
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
   virtualService:
+    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
+    # ezua.enabled keeps driving every other gate (kyverno, deployment).
+    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
+    # `default` treats an explicit `false` as empty and would return true.
+    enabled: true
     # Root of this host serves the normal SearXNG web page; /mcp is routed
     # to the MCP server (streamable-http + SSE).
     endpoint: "searxng-mcp.${DOMAIN_NAME}"
@@ -229,3 +234,32 @@ ezua:
     enabled: true
     namespace: "istio-system"
     providerName: "oauth2-proxy"
+
+# -- MCP network zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF) ------------
+# Ingress allowlist for this MCP (kubernetes.io/metadata.name ns selectors).
+# Once enabled, anything not matched below is DENIED (a real posture, not a
+# no-op); egress stays unrestricted (policyTypes: [Ingress] only).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # The MCP network zone: client namespaces allowed to call this server
+  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
+  # namespace goes here first; add agentic frontends from the hardened-G2
+  # example. `monitoring` belongs here whenever the chart ships a
+  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
+  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
+  authorizedClients:
+    namespaces: []
+  # USER-FACING chart: the ezaf-gateway (browser) path stays ON so the
+  # SearXNG web UI + VS routing keep working unchanged.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
+  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
+  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
+  # with an empty probeExceptCidrs (the template fails the render).
+  probeCidrs: []
+  probeExceptCidrs: []

@@ -120,17 +120,65 @@ serviceAccount:
   name: applygate-mcp
 rbac:
   create: true
-hpe_proxies: false
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost
+# Per-key proxy wiring (fleet convention: searxng-mcp) — each key is wired
+# into the pod only when non-empty, so a corporate-proxy site sets http/https
+# (and usually noProxy), while a direct-egress site leaves proxy: {} (or
+# omits it) and everything renders off:
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+# The k8s API is in-cluster and covered by the standard NO_PROXY cluster-local
+# entries, so the proxy block is fleet consistency only.
+proxy: {}
 kyverno:
   enabled: false
 ezua:
   enabled: false
   domainName: ${DOMAIN_NAME}
   virtualService:
+    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
+    # ezua.enabled keeps driving every other gate (kyverno, deployment).
+    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
+    # `default` treats an explicit `false` as empty and would return true.
+    enabled: true
     endpoint: applygate-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 120s
+
+# -- MCP network zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF) ------------
+# Ingress allowlist for this MCP (kubernetes.io/metadata.name ns selectors).
+# Once enabled, anything not matched below is DENIED (a real posture, not a
+# no-op); egress stays unrestricted (policyTypes: [Ingress] only).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # The MCP network zone: client namespaces allowed to call this server
+  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
+  # namespace goes here first; add agentic frontends from the hardened-G2
+  # example. `monitoring` belongs here whenever the chart ships a
+  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
+  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
+  authorizedClients:
+    namespaces: []
+  # Browser/console path stays OPEN (fleet doctrine 2026-09): the zone exists
+  # to stop RANDOM IN-CLUSTER model access — external traffic keeps flowing
+  # through the SSO-gated edge gateway exactly as pre-zone. Only flip to
+  # false as an explicit, per-chart, per-site decision (e.g. exec/mutation
+  # consoles) — never as a class default.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
+  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
+  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
+  # with an empty probeExceptCidrs (the template fails the render).
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
+    # k8s API / Prometheus / internet legitimately per site).
+    enabled: false
+    extraEgress: []

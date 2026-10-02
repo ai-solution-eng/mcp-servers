@@ -194,8 +194,18 @@ specific argv tools instead. Operators re-add interpreters explicitly via
 | `WORKBENCH_UI_ENABLED` | `true` | mount the web UI + `/api/*` routes |
 | `WORKBENCH_TEMPLATES` | *(unset)* | JSON object of named workspace templates for `workspace_create(name, template=...)` — `{name: {description, extra_allowed, canned_setup}}`. **Opt-in**: unset/empty = the parameter is refused and behavior is byte-identical to the pre-template server. A template can only WIDEN the workspace's exec allowlist with these operator-supplied bare binary names (denylist still wins) and pre-run its canned setup argv commands inside the new workspace (same guards, audited with the template name). Chart: `workbench.templates` (rendered only when non-empty). See "Workspace templates". |
 | `WORKBENCH_METRICS_ENABLED` | `false` | serve `GET /metrics` — Prometheus self-metrics: `workbench_mcp_tool_requests_total{tool,outcome}` (per-tool call counts, ok/error; nothing else is exported). Chart-gated default-OFF (`metrics.enabled: false` renders no env and no ServiceMonitor — the default pod has no `/metrics` route); when on, `/metrics` is key-free like the probes. See `helm/values.yaml` (which also documents the fleet audit-JSONL searchability convention for `<root>/.audit.jsonl`). |
-| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | passed through to `run_command` children (chart: `hpe_proxies`) so `pip` works behind the corporate proxy |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | passed through to `run_command` children (chart: `proxy.http/https/noProxy` — each key wired only when non-empty) so `pip` works behind a corporate proxy |
 | `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`PIP_CERT` | — | corporate MITM CA for pip/requests (chart: `caCert` → `ezaf-root-ca`) |
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` boolean flag is removed. Configure `proxy.http`,
+`proxy.https` and `proxy.noProxy` directly — a key is active only when
+non-empty, and `proxy: {}` (or omitting the block entirely) means fully off.
+A site that previously relied on `hpe_proxies: true` + the chart's built-in
+proxy defaults now needs an explicit `proxy` block with its real addresses.
+`caCert` is unaffected: it is independent of the proxy wiring (enable it
+whenever workloads must trust a corporate MITM CA).
 
 ### Helm chart — standard Kubernetes knobs
 
@@ -247,3 +257,23 @@ Health: `GET /health` / `/healthz`.
 ```sh
 python -m pytest tests/ -v     # offline: tmp dirs only, no cluster, no network
 ```
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the MCP: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and — only if you flip `allowEzafGatewayIngress` — the gateway pods).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) the browser path stays OPEN by fleet doctrine — do NOT set
+`ezua.virtualService.enabled: false` (closing a console is an explicit
+per-chart, per-site decision, never a default);
+(5) apply via the PCAI values editor (`helm upgrade` for operators); (6)
+verify — an allowed namespace gets HTTP 200 from `service:port/mcp`, any
+other namespace times out. See `values-examples/values-hardened-g2.yaml`
+for the full hardened profile.

@@ -12,7 +12,7 @@ values.
 
 | File | Target | Posture |
 |---|---|---|
-| [`values.g2.yaml`](values.g2.yaml) | SE-G2 lab cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`) | Literal domain, exec enabled (lab posture), KServe/HPE CRD groups granted |
+| [`values.g2.yaml`](values.g2.yaml) | Proxied corporate PCAI site (placeholder addresses) | Literal domain, exec enabled (lab posture), KServe/HPE CRD groups granted |
 
 No `values.hosted-trial.yaml` here on purpose: the trusted chart is the HPE-operators distribution — customer-facing deliveries use the structurally locked `helm-customer/` chart, whose examples live in [`../../helm-customer/values-examples/`](../../helm-customer/values-examples/README.md).
 

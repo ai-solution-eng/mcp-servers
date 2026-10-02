@@ -40,7 +40,7 @@ readiness:
   driftGate: false            # optional fail-fast for new scans while degraded
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v2.6.1
+  tag: v3.0.0
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3
@@ -276,6 +276,79 @@ security:
     principals: []
     # Allowed caller namespaces (Istio identity namespaces).
     namespaces: []
+  # -- SSO IDENTITY PILOT (2026-09-30 wave, part of the SAME security block
+  #    above — a second `security:` key here would last-wins REPLACE the
+  #    whole first block, silently dropping apiKey/hardened/runAsUser) -----
+  identity:
+    # The gate: /mcp + /api/* refuse anonymous callers with 401.
+    # Probes (/health /ready /metrics) stay open; the /ui shell stays open
+    # (its data routes are gated). Kill-switch: set false and re-apply.
+    requireIdentity: true
+    # Browser rung stays OFF here — the G2 virtualService terminates at the
+    # ezaf-gateway, and trusting X-Auth-Request-User without the workload
+    # AuthorizationPolicy pin would let any pod-reachable client forge an
+    # identity. The two SSO channels under test are the JWT rung (browser
+    # users) and minted keys (headless users).
+    trustBrowserHeaders: false
+  # Policy-as-code ON with the volume-mounted ConfigMap (the chart mounts
+  # it as a directory volume when existingConfigMap is set) — grants
+  # hot-reload on mtime; without the mount, grants go stale until rollout.
+  policy:
+    enabled: true
+    existingConfigMap: sqlhandler-policy
+    existingConfigMapKey: policy.json
+    mountPath: /etc/sqlhandler/policy
+  # Resource-server JWT rung: users paste their SSO bearer token and
+  # SQLhandler verifies it via the realm's JWKS (RS256, TLS always on).
+  # NO client secret, NO redirect URIs — this is NOT the browser-SSO D22
+  # pattern; OAuth terminates at the ezaf-gateway (OAuth REVISION §3).
+  # The issuer URL below must resolve IN-CLUSTER for JWKS fetches.
+  oidc:
+    enabled: true
+    issuer: https://keycloak.${DOMAIN_NAME}/realms/ezaf
+    audience: ua
+    # jwksUrl derived from the issuer (…/protocol/openid-connect/certs);
+    # set it explicitly ONLY if the realm path differs.
+    jwksUrl: ""
+    identityClaim: ""          # default preferred_username; sub as fallback
+  # Admin keys store (frontend minting): the Secret-mounted JSON keys file
+  # lets mint/revoke happen from the /ui Access-control tab with zero
+  # kubectl after bootstrap. Empty = store disabled (Secret keys only).
+  # Bootstrap admin (one-time, pre-deploy): create the policy ConfigMap with
+  #   "admins": ["key:sha256:<fp-of-a-key-in-mcp-fleet-apikeys>"]
+  # (compute the fp: python scripts/mint_key.py --label bootstrap --assign '[]'
+  #  and read the fingerprint line — or read any audit line's caller.key_fp).
+  adminKeys:
+    existingSecret: ""         # create the Secret, then set its name here
+    existingSecretKey: admin-keys-file
+  metricsAuth: false
+
+# Policy ConfigMap: rendered by the chart when security.policy.enabled is
+# true — create it with the bootstrap datasets doc + admins list BEFORE the
+# first helm upgrade (kubectl apply -f below). ⚠️ GLOB SEMANTICS (verified
+# against the real code): policy globs match the PROVIDER path — for S3 that
+# is "<schema>/<name>" or "<name>" WITHOUT the bucket name — so a
+# bucket-prefixed glob like "test-parquet/*" matches NOTHING and hides every
+# table. Use "*" for global, or schema-prefixed globs like "workorder/*".
+# Also: omit "blocked" entirely when there is nothing to block — an explicit
+# EMPTY list is a PolicyError (fail-closed).
+#
+#   kubectl create configmap sqlhandler-policy \
+#     --from-file=policy.json=- <<'EOF'
+#   {
+#     "admins": ["key:sha256:<bootstrap-admin-fp>"],
+#     "datasets": {
+#       "global": ["*"],
+#       "assignments": {}
+#     }
+#   }
+#   EOF
+#
+# Pilot note: global = "*" (everything in the G2 benchmark bucket) so every
+# authenticated identity can query; assignments open per-user slices
+# ("alice": ["payroll*"]) as users onboard; blocked wins over any grant.
+
+
 fabric:
   credentialsSecret:
     name: fabric-credentials

@@ -8,7 +8,7 @@ description: >-
   default-deny namespace policy and a JSONL audit trail, behind the PCAI
   Istio gateway.
 type: application
-version: 0.3.0
+version: 0.4.0
 appVersion: "v0.3.0"
 keywords:
   - mcp

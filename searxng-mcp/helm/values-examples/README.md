@@ -4,7 +4,7 @@ Paste-ready **full-values** examples for the `searxng-mcp` chart. This folder is
 
 | File | Target | Posture |
 |---|---|---|
-| [`values.g2.yaml`](values.g2.yaml) | SE-G2 lab cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`) | Literal domain, corporate proxy on, browser sidecar on, MITM CA wired |
+| [`values.g2.yaml`](values.g2.yaml) | Corporate-egress lab cluster (`<cluster-domain>`) | Literal domain, corporate proxy on, browser sidecar on, MITM CA wired |
 | [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | PCAI hosted trial (`${DOMAIN_NAME}`) | PCAI-resolved domain, browser sidecar off (enable if JS pages matter), proxy on |
 
 Real per-site values — the actual `searxng.secretKey` and any site-specific tuning — live in `helm/local/` (gitignored, hardlink-ignored, and `.helmignore`d out of chart packaging; never copy them here).

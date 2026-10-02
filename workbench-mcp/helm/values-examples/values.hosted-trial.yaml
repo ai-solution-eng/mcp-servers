@@ -58,19 +58,15 @@ workbench:
   # workspace_create tool's template parameter is refused; nothing renders).
   templates: {}
 
-# -- HPE corporate proxy --------------------------------------------------------------------------
-# SITE: off unless the trial cluster sits behind the HPE corporate proxy —
-# when true, proxy env passes through to run_command children so `pip` works.
-hpe_proxies: false
+# -- Per-key proxy wiring --------------------------------------------------------------------------
+# SITE: off unless the trial cluster sits behind a corporate proxy — a
+# non-empty key wires proxy env on the pod and passes it through to
+# run_command children so `pip` works; `proxy: {}` = fully off.
+proxy: {}
 
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
-
-# -- Corporate MITM CA ---------------------------------------------------------------------------
-# Off unless hpe_proxies is true and pip/requests must trust the MITM proxy
-# (requires the ezaf-root-ca ConfigMap in the release namespace).
+# -- Corporate MITM CA (independent of the proxy wiring) ------------------------------------------
+# Off — enable only when workloads must trust a corporate MITM CA (requires
+# the ezaf-root-ca ConfigMap in the release namespace).
 caCert:
   enabled: false
   configMap: "ezaf-root-ca"

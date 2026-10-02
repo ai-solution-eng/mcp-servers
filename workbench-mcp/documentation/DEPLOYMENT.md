@@ -45,8 +45,8 @@ ezua:
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
 | `resources` | `250m`/`256Mi` requests, `1`/`512Mi` limits | A scratch pad, not a compute node. |
 | `securityContext` | non-root uid 10001, `fsGroup: 10001` | Keep — `fsGroup` is what makes the mounted PVC writable by the server user. |
-| `hpe_proxies` + `proxy.http/https/noProxy` | `false` | When `true`, proxy env lands on the pod AND passes through to `run_command` children — this is what makes `pip install ...` work inside a workspace on a cluster with no direct internet egress. NO_PROXY keeps in-cluster traffic direct. |
-| `caCert.enabled` / `configMap` / `configMapKey` | `false` / `ezaf-root-ca` / `ezaf-root-ca.crt` | The HPE proxy re-terminates TLS; when enabled, mounts the namespace's `ezaf-root-ca` ConfigMap and points `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`PIP_CERT` at it for the container AND every `run_command` child (copy the ConfigMap into the release namespace if absent). |
+| `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring: each key is wired only when non-empty — a non-empty key puts proxy env on the pod AND passes it through to `run_command` children — this is what makes `pip install ...` work inside a workspace on a cluster with no direct internet egress. `proxy: {}` (or omitting the block) means fully off; NO_PROXY keeps in-cluster traffic direct. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
+| `caCert.enabled` / `configMap` / `configMapKey` | `false` / `ezaf-root-ca` / `ezaf-root-ca.crt` | Independent of the proxy wiring: set when workloads must trust a corporate MITM CA. When enabled, mounts the namespace's `ezaf-root-ca` ConfigMap and points `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`PIP_CERT` at it for the container AND every `run_command` child (copy the ConfigMap into the release namespace if absent). |
 | `kyverno.enabled` | `false` | Pre-install ClusterPolicy stamping `hpe-ezua/*` vendor labels. Cluster-scoped, so off by default (also keeps clusters without the Kyverno CRD installable). |
 | `service.type` / `port` / `targetPort` | `ClusterIP` / `9103` | Don't move the port without moving the probes' target. |
 
@@ -67,7 +67,7 @@ these directly):
 | `WORKBENCH_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
 | `HOME` | fixed `/tmp` (read-only-rootfs scratch so pip/tempfiles keep working; resets with the pod — workspaces persist on the PVC) |
 | `WORKBENCH_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
-| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` (passed through to `run_command` children) |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*` — each key wired only when non-empty (empty = not rendered; passed through to `run_command` children) |
 | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `PIP_CERT` | `caCert.*`, only when `caCert.enabled=true` |
 
 Numeric caps tolerate helm's float-ish rendering (`8.388608e+06`) — the
@@ -96,17 +96,19 @@ Behavior that differs by target, and the paste-ready values for each
 (`helm/values-examples/` — sanitized; real per-site values live in
 `helm/local/`):
 
-### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+### Proxied corporate site (SITE: your-cluster.example)
 
 - **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
   write the literal domain into `ezua.domainName` and
   `ezua.virtualService.endpoint` (the G2 example ships it already).
-- **Proxy + MITM CA on** — `hpe_proxies: true` and `caCert.enabled: true`
-  (the `ezaf-root-ca` ConfigMap present in the release namespace): this is
-  what lets `pip install ...` inside `run_command` reach PyPI through the
-  HPE proxy. Note the interplay with fleet decision D18: `pip` must also be
-  allow-listed (`workbench.execAllowlist`) for it to run at all — the G2
-  site chooses its allowlist deliberately.
+- **Proxy + MITM CA on** — explicit `proxy.http/https` block and
+  `caCert.enabled: true` (the `ezaf-root-ca` ConfigMap present in the release
+  namespace; the former `hpe_proxies` flag is removed — see "Migrating from
+  hpe_proxies" in the README): this is what lets `pip install ...` inside
+  `run_command` reach PyPI through the corporate proxy. Note the interplay
+  with fleet decision D18: `pip` must also be allow-listed
+  (`workbench.execAllowlist`) for it to run at all — the G2 site chooses its
+  allowlist deliberately.
 - Fleet API key (Secret `mcp-fleet-apikeys`, key `api-keys`), Kyverno
   vendor-label policy on, metrics + ServiceMonitor on.
 - Sanitized example:
@@ -121,9 +123,10 @@ Behavior that differs by target, and the paste-ready values for each
   package managers) unless the trial explicitly needs them; the trial posture
   leans on the documented defense-in-depth (no SA token, read-only rootfs,
   argv screening).
-- `hpe_proxies: false` / `caCert.enabled: false` unless the trial cluster
-  egresses via the HPE proxy; `kyverno.enabled: false` unless the platform
-  enforces vendor labels; metrics off keeps the render minimal.
+- `proxy: {}` (fully off — the old `hpe_proxies` flag is removed) /
+  `caCert.enabled: false` unless the trial cluster sits behind a corporate
+  proxy; `kyverno.enabled: false` unless the platform enforces vendor labels;
+  metrics off keeps the render minimal.
 - API-key Secret provisioned out of band per the customer's key process
   (`mcp-fleet-apikeys` convention or the customer's own Secret name) — every
   route except `/health`/`/healthz` is keyed, so the read/write web UI also

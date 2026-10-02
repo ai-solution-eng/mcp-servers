@@ -1,5 +1,5 @@
 # workbench-mcp — values for the SE-G2 lab cluster
-# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+# (SITE: your-cluster.example — proxied corporate PCAI site)
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document (PCAI's Helm Values editor replaces the
@@ -62,21 +62,21 @@ workbench:
   # See the helm/values.yaml comment block for a worked example.
   templates: {}
 
-# -- HPE corporate proxy --------------------------------------------------------------------------
-# SITE: this cluster sits behind the HPE corporate proxy — wiring it is what
-# makes `pip install ...` inside run_command reach PyPI through the MITM
-# proxy. NO_PROXY keeps cluster-local traffic direct.
-hpe_proxies: true
-
+# -- Per-key proxy wiring --------------------------------------------------------------------------
+# SITE: this cluster sits behind a corporate proxy — wiring it is what makes
+# `pip install ...` inside run_command reach PyPI through the MITM proxy.
+# NO_PROXY keeps cluster-local traffic direct. Each key is wired only when
+# non-empty.
 proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost"
 
-# -- Corporate MITM CA ---------------------------------------------------------------------------
-# SITE: on — the proxy re-terminates TLS, so pip/requests inside run_command
-# need the PCAI root CA (mounted from the ezaf-root-ca ConfigMap; copy it into
-# the release namespace if absent).
+# -- Corporate MITM CA (independent of the proxy wiring) ------------------------------------------
+# SITE: on — workloads here must trust the corporate MITM CA (the proxy
+# re-terminates TLS, so pip/requests inside run_command need the PCAI root CA,
+# mounted from the ezaf-root-ca ConfigMap; copy it into the release namespace
+# if absent).
 caCert:
   enabled: true
   configMap: "ezaf-root-ca"
@@ -142,10 +142,10 @@ persistence:
 ezua:
   enabled: true   # SITE: deploy the VirtualService on this cluster
   # SITE: literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
-  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  domainName: your-cluster.example   # informational only — no template reads it
   virtualService:
     # SITE: literal host — /mcp -> MCP server (9103); / -> web UI
-    endpoint: workbench-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    endpoint: workbench-mcp.your-cluster.example
     istioGateway: istio-system/ezaf-gateway
     timeout: 660s
 

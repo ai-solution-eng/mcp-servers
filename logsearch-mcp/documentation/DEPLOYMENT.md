@@ -50,7 +50,7 @@ ezua:
 | `securityContext` | non-root uid 10001 | Keep. |
 | `rbac.create` | `true` | Creates the ServiceAccount + the read-only Role/RoleBinding (release namespace only). `false` falls back to the namespace default ServiceAccount — leave `true`. |
 | `rbac.clusterWide` | `false` | Opt-in: renders the SAME two read-only rules (`pods` get/list + `pods/log` get — nothing else, ever) as a ClusterRole + ClusterRoleBinding, so the SA reads pods/logs cluster-wide. Lab/trusted clusters only; pair with a deliberate namespace policy — RBAC bounds what the SA can read, the policy bounds what agents may ask for. Cluster-wide includes `kube-system`; use `logsearch.blockedNamespaces` ("kube-*") to keep system logs out of agents' reach. Switching an existing release from false→true removes the old namespaced Role/RoleBinding on upgrade. |
-| `hpe_proxies` + `proxy.http/https/noProxy` | `false` | Fleet-consistency block. The only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries; no `caCert` wiring exists because there is no outbound TLS to trust. |
+| `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring (fleet convention): each key is wired only when non-empty, and `proxy: {}` (or omitting the block) means fully off. Fleet-consistency block — the only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries; no `caCert` wiring exists because there is no outbound TLS to trust. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
 
 ## Underlying detail: values → environment variables
 
@@ -72,7 +72,7 @@ these directly):
 | `LOGSEARCH_WEBUI_ENABLED` | `webui.enabled` |
 | `LOGSEARCH_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
 | `LOGSEARCH_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
-| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*`, only when `hpe_proxies=true` |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*` — each key wired only when non-empty (empty = not rendered) |
 
 ## Gateway exposure (ezua / Istio)
 
@@ -137,7 +137,7 @@ Behavior that differs by target, and the paste-ready values for each
 (`helm/values-examples/` — sanitized; real per-site values live in
 `helm/local/`):
 
-### Internal G2 (SE-G2 lab cluster, `pcai-se-ai-application.hst.rdlabs.hpecorp.net`)
+### Proxied corporate site (SITE: your-cluster.example)
 
 - **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
   write the literal domain into `ezua.domainName` and
@@ -168,7 +168,8 @@ Behavior that differs by target, and the paste-ready values for each
   (`mcp-fleet-apikeys` convention or the customer's own Secret name); pod
   logs are sensitive — the key gate and the namespace policy are the two
   controls that matter.
-- `hpe_proxies: false`; metrics off keeps the render minimal.
+- `proxy: {}` (fully off — the old `hpe_proxies` flag is removed); metrics
+  off keeps the render minimal.
 - Sanitized example:
   [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
 

@@ -1,8 +1,11 @@
-{{- if .Values.ezua.enabled }}
+{{- if and .Values.ezua.enabled .Values.ezua.virtualService.enabled }}
 {{- /* PCAI envsubst-ed ${DOMAIN_NAME} in the submitted values before helm
      runs, so the endpoint arrives fully resolved. The gateway host is built
      ONLY from ezua.virtualService.endpoint — ezua.domainName is informational
-     and no template reads it. */ -}}
+     and no template reads it. virtualService.enabled (default true) is the
+     HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
+     ezua.enabled keeps driving every other gate (kyverno, deployment) —
+     the fleet MCP network zone's break-glass complement. */ -}}
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
 metadata:

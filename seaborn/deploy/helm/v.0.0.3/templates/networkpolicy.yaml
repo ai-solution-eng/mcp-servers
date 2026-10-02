@@ -1,0 +1,77 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicy — the MCP network zone (fleet decision 2026-09). ADDITIVE and
+# OFF by default (networkPolicy.enabled, default false): the DEFAULT render is
+# byte-identical to the baseline. Once enabled, this policy DEFAULT-DENIES all
+# ingress to the MCP pods and admits ONLY the listed sources — a real posture,
+# not a no-op.
+#
+# USER-FACING chart: the ezaf-gateway rule is ENABLED by default — the
+# VirtualService (browser path) must keep working unchanged. Egress is
+# intentionally NOT restricted: the server calls SQLhandler
+# (sqlhandler.sqlhandler.svc.cluster.local:9097) and rendering runs locally.
+#
+# L3 trust: an allowed namespace admits ANY pod in it. Workload identity
+# (L7) requires mesh injection + a workload AuthorizationPolicy — see
+# pcai-fleet-lib docs (SQLhandler's principals pattern).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mcp-seaborn-server.fullname" . }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-seaborn-server.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mcp-seaborn-server.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # (i) Same-namespace callers.
+    {{- if .Values.networkPolicy.sameNamespace }}
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (ii) The MCP network zone: authorized client namespaces — the callers
+    #      listed in networkPolicy.authorizedClients.namespaces.
+    {{- with .Values.networkPolicy.authorizedClients.namespaces }}
+    - from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (iii) Edge-gateway pods — the ezua VirtualService path (browser traffic).
+    {{- if .Values.networkPolicy.allowEzafGatewayIngress }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressGatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressGatewayLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (iv) Node-originated kubelet health probes + `kubectl port-forward`.
+    {{- range .Values.networkPolicy.probeCidrs }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | quote }}
+            {{- with $.Values.networkPolicy.probeExceptCidrs }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+{{- end }}

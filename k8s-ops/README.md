@@ -225,3 +225,23 @@ A static, HPE-branded single-page console served by the server itself (`/` redir
 | [helm/values-examples/](helm/values-examples/README.md) | Paste-ready, secret-free full-values examples (trusted chart) |
 | [helm-customer/values-examples/](helm-customer/values-examples/README.md) | Paste-ready, secret-free examples (locked customer chart) |
 | [helm/values.yaml](helm/values.yaml) / [helm-customer/values.yaml](helm-customer/values.yaml) | Chart defaults — the authoritative list of every knob |
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the MCP: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and — only if you flip `allowEzafGatewayIngress` — the gateway pods).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) the browser path stays OPEN by fleet doctrine — do NOT set
+`ezua.virtualService.enabled: false` (closing a console is an explicit
+per-chart, per-site decision, never a default);
+(5) apply via the PCAI values editor (`helm upgrade` for operators); (6)
+verify — an allowed namespace gets HTTP 200 from `service:port/mcp`, any
+other namespace times out. See `values-examples/values-hardened-g2.yaml`
+for the full hardened profile.

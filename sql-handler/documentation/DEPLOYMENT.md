@@ -286,7 +286,8 @@ audits):
 
 | Key | Default | Effect |
 |---|---|---|
-| `security.apiKey.existingSecretKey` | `api-keys` | Key inside `security.apiKey.existingSecret` holding the comma-separated /mcp API-key list (`SQLHANDLER_API_KEYS`) — rotate by appending, then dropping, keys in that value |
+| `security.apiKey.existingSecretKey` | `api-keys` | Key inside `security.apiKey.existingSecret` holding the comma-separated /mcp API-key list (`SQLHANDLER_API_KEYS`) — rotate by appending, then dropping, keys in that value. NOTE: a secretKeyRef env var reaches pods only via a rollout (the checksum/secret annotation automates it on helm upgrade) — it is NOT re-read per request by a running pod |
+| `security.adminKeys.existingSecret` / `.existingSecretKey` | "" / `admin-keys-file` | Frontend admin-keys store: a Secret whose key contains the FULL JSON keys file (`{"keys": [...]}`). The chart mounts it as a FILE at `security.adminKeys.mountPath` (default `/etc/sqlhandler/admin-keys`) and renders `SQLHANDLER_ADMIN_KEYS_FILE` = `<mountPath>/<existingSecretKey>` — file-based, not env, so the store hot-reloads on mtime. Empty (default) = store disabled: no env, no volume, minting via the frontend answers "not configured" |
 | `security.policy.existingConfigMapKey` | `policy.json` | Key inside `security.policy.existingConfigMap` holding the policy document; `SQLHANDLER_POLICY_FILE` resolves to `<mountPath>/<existingConfigMapKey>` |
 | `security.policy.mountPath` | `/etc/sqlhandler/policy` | Container mount point for the policy file. Wire the ConfigMap yourself as a volume+mount (the chart renders the path only) |
 | `security.networkPolicy.gatewayNamespace` | `istio-system` | Namespace whose pods may call the Service (the Istio gateway) — always allowed by the ingress NetworkPolicy |
@@ -324,7 +325,133 @@ audits):
 | Key | Default | Effect |
 |---|---|---|
 | `security.identity.trustBrowserHeaders` | `false` | TRUST GATE for the oauth2-proxy browser rung (`X-Auth-Request-User` / `X-Forwarded-Groups`). False = those headers are ignored. True ASSERTS the workload AuthorizationPolicy pins ingress to the gateway — only then can a browser header be trusted (headers are forgeable on any pod reachable without that pin) |
-| `security.policy.enabled` | `false` | Policy-as-code: per-caller row filters + column masks + hidden tables from an operator-authored file (hot-reloaded). Enabling requires you to wire `security.policy.existingConfigMap` as a volume+mount yourself (the chart renders `SQLHANDLER_POLICY_FILE` = `<mountPath>/<existingConfigMapKey>` only — the ConfigMap mount is not chart-rendered) |
+| `security.identity.requireIdentity` | `false` | Identity-required gate: when `true` (renders `SQLHANDLER_REQUIRE_IDENTITY=1`), `/mcp` and `/api/*` REFUSE anonymous callers with 401 — an authenticated identity is required. `/health` `/ready` `/metrics` stay open (probes cannot carry secrets) and the webui shell stays open (data is gated at `/api/*`). Keyless-but-attributed relay calls keep working — the attribution header only rides a key-valid request |
+| `security.oidc.issuer` / `.audience` / `.jwksUrl` | "" / "" / "" | Resource-server JWT verification (SSO bearer rung): users present their SSO bearer token and SQLhandler verifies it via the issuer's JWKS — **NO client secret, NO redirect URIs** (unlike the browser-SSO oauth2-proxy pattern, which the gateway owns; this is the plain resource-server posture). All three set = the JWT rung is active; any empty = off. In-cluster example: `jwksUrl: http://keycloak.<realm-ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs` |
+| `security.policy.enabled` | `false` | Policy-as-code: per-caller row filters + column masks + hidden tables from an operator-authored file (hot-reloaded). Enabling requires you to wire `security.policy.existingConfigMap` as a volume+mount yourself (the chart renders `SQLHANDLER_POLICY_FILE` = `<mountPath>/<existingConfigMapKey>` only — the ConfigMap mount is not chart-rendered). The policy file gains the optional `datasets` ACL form (below) — mutually exclusive with hand-written `groups` |
+
+### 4.7.1 Dataset ACLs — mint + grants (the admin workflow)
+
+The `datasets` ACL document turns the policy file into a per-identity grant
+list (README "Dataset access control (ACL)" for the full semantics:
+`global` = every authenticated identity, `assignments` = added per identity,
+`blocked` = wins over any grant). Minting a key and granting it is a
+three-step loop with **no pod restart** — both ends hot-reload:
+
+```bash
+# 1) MINT — prints the key, its fingerprint (sha256:<12hex>, computed by the
+#    server's own audit.key_fingerprint), the append line and the snippet:
+python scripts/mint_key.py --label "reports-bot" --assign "workorder/*,reports/*"
+```
+
+```bash
+# 2) APPEND the key to the existing comma-separated Secret value (rotation =
+#    append → move clients → drop the old). NOTE: a Secret secretKeyRef env
+#    var does NOT update in a running container — the new value reaches the
+#    pods only via a ROLLOUT. The chart's checksum/secret annotation automates
+#    that on the next helm upgrade (§2); between the kubectl apply and the
+#    upgrade, the running pods keep authenticating with the OLD list):
+kubectl -n <namespace> get secret sqlhandler-apikey \
+  -o jsonpath='{.data.api-keys}' | base64 -d          # read current value
+kubectl -n <namespace> create secret generic sqlhandler-apikey \
+  --from-literal="api-keys=<new-key>,<existing-keys>" \
+  --dry-run=client -o yaml | kubectl apply -f -
+helm -n <namespace> upgrade <release> .   # rolls the pods so the env updates
+```
+
+```bash
+# 3) MERGE the printed assignments entry — keyed by the FINGERPRINT, never
+#    the key itself — into the policy ConfigMap's datasets.assignments:
+kubectl -n <namespace> edit configmap <policy-configmap>   # mtime hot reload
+```
+
+Two hot-reload truths, stated plainly (both easy to get wrong):
+
+- **The policy file hot-reloads on mtime ONLY when the ConfigMap is
+  VOLUME-MOUNTED.** The kubelet propagates ConfigMap edits into non-subPath
+  projected volumes and bumps the mount's mtime — that is what the store
+  watches. `SQLHANDLER_POLICY_FILE` rendered as a path into a volume the
+  operator wired (the chart's posture: the chart renders the path env,
+  the volume+mount is operator-wired per the `security.policy` values
+  comment). If the file instead only exists because of some non-mounted
+  copy (a baked-in image file, an env-injected value), edits do NOT
+  hot-reload — grants go stale until a pod restart.
+- **The api-keys Secret is NOT re-read per request.** A secretKeyRef env
+  var is read at container start and frozen for the container's life —
+  the claim that a running pod picks up Secret edits was wrong and is
+  corrected here. Secret env changes reach pods via a rollout (the chart's
+  `checksum/config`/`checksum/secret` pod annotations automate that on
+  `helm upgrade`, §2). The ADMIN-KEYS store avoids this limitation
+  deliberately: `SQLHANDLER_ADMIN_KEYS_FILE` is file-based (a mounted
+  Secret's key), not env-rendered, precisely so mint/revoke can hot-reload
+  on mtime like the policy file.
+
+**Admin key note:** today's admin key (the existing
+`SQLHANDLER_API_KEYS`/`MCP_API_KEYS` value used for admin tasks) keeps
+working unchanged — API keys authenticate exactly as before. To give it full
+dataset access under a `datasets` document, add an assignment for its
+fingerprint (compute once: `python -c "from sqlhandler.mcp_fleet_common.audit import key_fingerprint; print(key_fingerprint('<admin-key>'))"`,
+or read it off an audit line's `caller.key_fp`):
+
+```json
+{ "assignments": { "key:sha256:<admin-fp>": ["*"] } }
+```
+
+**Identity channels (who can be an identity):** minted static keys
+(`X-API-Key`/`Bearer`, bound to their fingerprint), gateway relay attribution
+(`X-MCP-Caller-Subject` over a key-valid request — the MCP-bundle topology
+where the gateway holds the key), SSO bearer JWTs (verified via JWKS with the
+`security.oidc.*` values above), and oauth2-proxy browser headers (only with
+the workload AuthorizationPolicy enabled — the existing
+`security.identity.trustBrowserHeaders` pin).
+
+#### Administering from the frontend (Access-control panel)
+
+The mint → Secret → policy loop above is the **bootstrap**; after it, the
+same operations are buttons in the web UI — open `/ui` → **Access control**,
+paste the admin key (kept in the page's memory only, never persisted), and
+work from there with zero kubectl:
+
+| Route | Panel action | MCP twin |
+|---|---|---|
+| `GET /api/admin/grants` | the tab itself — admins, assignments, blocked, keys table | `admin_grants` |
+| `POST /api/admin/keys` | **Mint** (label + assignment globs) — the raw key is shown **once** in a copyable field with a "store it now — it is not recoverable" warning; only the fingerprint is stored | `admin_mint_key` |
+| `DELETE /api/admin/keys/{fp}` | **Revoke** (confirm dialog; assignment removed with the key). Secret-source keys are read-only in the panel — revoke those via kubectl (the Secret's lifecycle) | `admin_revoke_key` |
+| `PUT /api/admin/policy` | **Policy editor** — the `datasets` document, pre-filled from the live file; a refused document renders the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
+
+Authorization: a policy-designated **admin** only (`"admins"` list in the
+policy document — orthogonal to the grants lists: admins administer, grants
+authorize data access). Anonymous callers with `SQLHANDLER_REQUIRE_IDENTITY`
+on get `401 {"error": "identity required: …"}`; authenticated non-admins get
+`403 {"error": "admin access required"}` — the panel renders the message
+verbatim. The keys the routes manage come from the admin-keys **file store**
+(`security.adminKeys.existingSecret` — the Secret's key is MOUNTED as a file
+and `SQLHANDLER_ADMIN_KEYS_FILE` points at it, so mint/revoke hot-reload on
+mtime; unset = store disabled and minting answers "not configured" while
+Secret keys keep authenticating — the middleware matches the union, env
+Secret keys first).
+
+The day-to-day recipes, as frontend buttons with kubectl fallbacks:
+
+- **Suspend** an identity's access — panel: remove its rows via the policy
+  editor (drop the assignment), Save. Fallback: `kubectl edit configmap
+  <policy-configmap>` — delete the `assignments` entry; the identity falls
+  back to `global` on the next mtime reload.
+- **Revoke** a key — panel: **✕ revoke** on its row in the keys table.
+  Fallback: `kubectl edit` the admin-keys Secret's key to drop the entry
+  from the JSON `{"keys": [...]}` (and drop its assignment, or suspend above
+  removes it), then `helm upgrade` is NOT needed — the mounted file mtime
+  bumps on kubelet resync (~1 min). For a Secret-sourced (`source: "secret"`)
+  key: revoke means the Secret's lifecycle — `kubectl create secret generic
+  --from-literal="api-keys=<list-without-the-key>" --dry-run=client -o yaml |
+  kubectl apply -f -` + a rollout (env is frozen at container start, see the
+  correction above).
+- **Rotate** — append first, drop later (never a window without a valid
+  key): panel: **Mint** the replacement (same assignment globs) → hand the
+  raw key to the client → after cutover **revoke** the old. Fallback:
+  `scripts/mint_key.py` → append to the api-keys Secret → merge the new
+  assignment into the policy ConfigMap → move clients → drop the old key +
+  assignment (a Secret append needs the helm-upgrade rollout; a store mint
+  does not).
 
 ### 4.8 Write tier (scratch)
 

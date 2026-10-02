@@ -40,7 +40,13 @@ data:
   SQLHANDLER_METRICS_AUTH: {{ ternary "1" "0" .Values.security.metricsAuth | quote }}
   {{- /* Identity spine + policy-as-code (security.identity / security.policy).
          The trust flag is the operator's AuthorizationPolicy assertion —
-         comment rendered so the posture is auditable in the ConfigMap. */}}
+         comment rendered so the posture is auditable in the ConfigMap.
+         SECURITY NOTE (2026-09-30): the frontend admin-keys store joins this
+         spine as SQLHANDLER_ADMIN_KEYS_FILE — deliberately FILE-based, never
+         env-rendered, precisely so the store can hot-reload on mtime (an env
+         var from a Secret is frozen at container start). Its path is rendered
+         in deployment.yaml next to the admin-keys volume mount; this
+         ConfigMap renders nothing for it. */}}
   SQLHANDLER_TRUST_BROWSER_HEADERS: {{ ternary "1" "0" .Values.security.identity.trustBrowserHeaders | quote }}
   {{- if .Values.security.policy.enabled }}
   SQLHANDLER_POLICY_ENABLED: "1"

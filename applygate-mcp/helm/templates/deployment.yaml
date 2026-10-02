@@ -111,24 +111,24 @@ spec:
             - name: MCP_CALLER_TRUSTED_CIDRS
               value: {{ .Values.callerPassthrough.trustedCidrs | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.http }}
-            # HPE corporate proxy env — wired ONLY when hpe_proxies=true. The
-            # Kubernetes API is in-cluster and covered by the NO_PROXY
-            # cluster-local entries, so this is fleet consistency with
-            # searxng-mcp, and the default-false gate keeps proxy-less sites
-            # proxy-free.
+            {{- if .Values.proxy.http }}
+            # Corporate proxy env — wired only when the corresponding
+            # proxy.<key> is non-empty. The Kubernetes API is in-cluster and
+            # covered by the NO_PROXY cluster-local entries, so this is fleet
+            # consistency with searxng-mcp, and the empty proxy: {} default
+            # keeps proxy-less sites proxy-free.
             - name: HTTP_PROXY
               value: {{ .Values.proxy.http | quote }}
             - name: http_proxy
               value: {{ .Values.proxy.http | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            {{- if .Values.proxy.https }}
             - name: HTTPS_PROXY
               value: {{ .Values.proxy.https | quote }}
             - name: https_proxy
               value: {{ .Values.proxy.https | quote }}
             {{- end }}
-            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            {{- if .Values.proxy.noProxy }}
             - name: NO_PROXY
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy

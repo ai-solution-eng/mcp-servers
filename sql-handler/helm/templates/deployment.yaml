@@ -163,6 +163,51 @@ spec:
                   name: {{ .Values.security.apiKey.existingSecret }}
                   key: {{ .Values.security.apiKey.existingSecretKey }}
             {{- end }}
+            {{- if .Values.security.adminKeys.existingSecret }}
+            {{- /* Frontend admin-keys store (values: security.adminKeys): the
+                   Secret's key IS the store's JSON file — mounted as a FILE
+                   (never env-rendered) so the store hot-reloads on mtime like
+                   the policy file; SQLHANDLER_ADMIN_KEYS_FILE names the mount.
+                   Empty default renders nothing (store disabled). */}}
+            - name: SQLHANDLER_ADMIN_KEYS_FILE
+              value: {{ printf "%s/%s" (.Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys") .Values.security.adminKeys.existingSecretKey | quote }}
+            {{- end }}
+            {{- /* Identity + SSO rungs (values: security.identity.requireIdentity,
+                   security.oidc.*). Rendered UNCONDITIONALLY with "" when unset
+                   (the env contract: empty string = feature off, the same
+                   re-read-per-request discipline as every SQLHANDLER_* var)
+                   so the posture is visible and flippable in the PCAI Helm
+                   Values editor without a code change. REQUIRE_IDENTITY="1":
+                   /mcp + /api/* refuse anonymous callers with 401; /health
+                   /ready /metrics stay open (probes cannot carry secrets)
+                   and the webui shell stays open (data gated at /api). The
+                   OIDC trio turns on resource-server JWT verification via
+                   JWKS — NO client secret, NO redirect URIs (not the
+                   gateway's browser-SSO pattern; DECISIONS.md "OAuth
+                   REVISION" §3). */}}
+            - name: SQLHANDLER_REQUIRE_IDENTITY
+              value: {{ ternary "1" "" .Values.security.identity.requireIdentity | quote }}
+            - name: SQLHANDLER_OIDC_ISSUER
+              value: {{ .Values.security.oidc.issuer | default "" | quote }}
+            - name: SQLHANDLER_OIDC_AUDIENCE
+              value: {{ .Values.security.oidc.audience | default "" | quote }}
+            - name: SQLHANDLER_OIDC_JWKS_URL
+              value: {{ .Values.security.oidc.jwksUrl | default "" | quote }}
+            {{- /* Tuning knobs + master switch (values: security.oidc.*).
+                   Empty = module defaults (claim preferred_username, JWKS
+                   refresh 3600s, fetch timeout 3s, clock skew 60s).
+                   ENABLED="1" WITHOUT an issuer is a loud startup warning —
+                   the resolver stays inert and every JWT 401s (fail-closed). */}}
+            - name: SQLHANDLER_OIDC_ENABLED
+              value: {{ ternary "1" "" .Values.security.oidc.enabled | quote }}
+            - name: SQLHANDLER_OIDC_IDENTITY_CLAIM
+              value: {{ .Values.security.oidc.identityClaim | default "" | quote }}
+            - name: SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS
+              value: {{ .Values.security.oidc.jwksRefreshSeconds | default "" | quote }}
+            - name: SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS
+              value: {{ .Values.security.oidc.fetchTimeoutSeconds | default "" | quote }}
+            - name: SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS
+              value: {{ .Values.security.oidc.clockSkewSeconds | default "" | quote }}
             {{- if .Values.semanticCatalog.store.enabled }}
             # Upload store on the shared PVC (values: semanticCatalog.store):
             # UI/API uploads become cross-pod + durable and still hot-reload.
@@ -244,14 +289,27 @@ spec:
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
           {{- $needCatalog := .Values.semanticCatalog.enabled }}
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
+          {{- $needPolicy := and .Values.security.policy.enabled .Values.security.policy.existingConfigMap }}
           {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
           {{- $needSharing := and (eq .Values.backend "sharing") .Values.sharing.enabled .Values.sharing.existingConfigMap }}
           {{- $needAudit := and (.Values.query.auditLog) (ne (dir .Values.query.auditLog) "/") }}
-          {{- if or $needTmp $needData $needCatalog $needStore $needScratch $needSharing $needAudit }}
+          {{- $needAdminKeys := .Values.security.adminKeys.existingSecret }}
+          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needSharing $needAudit $needAdminKeys }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
               mountPath: /tmp
+            {{- end }}
+            {{- if $needPolicy }}
+            {{- /* The policy ConfigMap as a DIRECTORY mount (never subPath):
+                   the kubelet only propagates ConfigMap edits into
+                   non-subPath mounts and PolicyStore hot-reloads on mtime —
+                   a grant edit reaches every replica without a restart.
+                   Without this mount the env var names a file that never
+                   changes (grants stale until rollout). */}}
+            - name: policy
+              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}
+              readOnly: true
             {{- end }}
             {{- if $needData }}
             - name: data
@@ -297,6 +355,14 @@ spec:
                    profile is read once at startup today). */}}
             - name: sharing-profile
               mountPath: /etc/sqlhandler-sharing
+              readOnly: true
+            {{- end }}
+            {{- if $needAdminKeys }}
+            {{- /* Directory mount, NOT subPath — the keys store hot-reloads
+                   on mtime exactly like the policy file; a subPath mount
+                   never sees Secret updates. */}}
+            - name: admin-keys
+              mountPath: {{ .Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys" }}
               readOnly: true
             {{- end }}
           {{- end }}
@@ -358,12 +424,23 @@ spec:
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
+      {{- $needPolicy := and .Values.security.policy.enabled .Values.security.policy.existingConfigMap }}
       {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
-      {{- if or $needTmp $needData $needCatalog $needStore $needScratch $needAudit }}
+      {{- $needAdminKeys := .Values.security.adminKeys.existingSecret }}
+      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needAudit $needAdminKeys }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
           emptyDir: {}
+        {{- end }}
+        {{- if $needPolicy }}
+        {{- /* An out-of-band operator ConfigMap (security.policy.existingConfigMap,
+               must carry the policy.existingConfigMapKey key) — directory
+               volume so ConfigMap edits propagate to the mounted file and
+               PolicyStore hot-reloads them (the grants-edit workflow). */}}
+        - name: policy
+          configMap:
+            name: {{ .Values.security.policy.existingConfigMap }}
         {{- end }}
         {{- if $needData }}
         - name: data
@@ -408,6 +485,17 @@ spec:
                your own PVC-backed mount. */}}
         - name: audit-log
           emptyDir: {}
+        {{- end }}
+        {{- if $needAdminKeys }}
+        {{- /* Operator-owned Secret (security.adminKeys.existingSecret); the
+               key must carry the FULL JSON keys file ({"keys": [...]}). The
+               mounted file is the store's live backend — the frontend mints
+               and revokes through the server's API, which writes the file
+               atomically; the Secret is the bootstrap copy. Never a values-
+               rendered credential. */}}
+        - name: admin-keys
+          secret:
+            secretName: {{ required "security.adminKeys.existingSecret is required for the admin-keys file" .Values.security.adminKeys.existingSecret }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

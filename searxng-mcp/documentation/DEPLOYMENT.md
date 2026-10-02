@@ -53,7 +53,11 @@ ezua:
 | `browser.extraArgs` | `""` | Extra Chromium command-line flags. |
 | `env` | `SEARXNG_URL=http://localhost:8080` | MCP container env. `SEARXNG_URL` points at the sidecar — leave it. Other server knobs (`SEARXNG_TIMEOUT`, `FETCH_REQUESTS_PER_MINUTE`, …) can be added here. |
 | `fetch.*` | `""` (built-in defaults) | `fetch_content` SSRF-guard escapes/caps (fleet decision D6 — the guard is default-ON in the server): `allowHosts` (internal hosts/CIDRs to permit), `denyExtra`, `cacheTtl`, `maxBodyBytes`, `maxScreenshotKb`, `maxRedirects`. Wired to the `SEARXNG_FETCH_*` envs; loopback/pod-local/metadata targets are never fetchable regardless. See README "fetch_content SSRF guard". |
-| `hpe_proxies` + `proxy.{http,https,noProxy}` | `false` + HPE defaults | **On HPE-network clusters set `true`** — wires the corporate proxy into BOTH SearXNG's engine requests (`settings.yml` `outgoing.proxies`) AND the MCP container's `fetch_content` egress (env). On open-internet systems leave `false`. |
+| `proxy.{http,https,noProxy}` | `{}` (all off) | Per-key egress proxy wiring — each key is injected only when non-empty: `http`/`https` → `HTTP(S)_PROXY` env on BOTH containers, `noProxy` → `NO_PROXY`; a non-empty `https` additionally wires SearXNG's `outgoing.proxies` (`settings.yml`). **On corporate-proxy clusters set `http`/`https` (and usually `noProxy`)**; on direct-egress systems leave `proxy: {}` — a wrong proxy breaks DNS/egress. |
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` flag was removed (chart ≥ 1.5.0) — the per-key `proxy:` dict replaced it. Set `proxy.http` / `proxy.https` / `proxy.noProxy` directly; each key is active only when non-empty, and `proxy: {}` is fully off. Former `hpe_proxies: true` sites must now write the explicit proxy block (the chart no longer carries built-in HPE proxy defaults in shipped values).
 | `ezua.enabled` | `true` | `false` skips the VirtualService (in-cluster-only exposure). |
 
 ## ezua / Istio wiring

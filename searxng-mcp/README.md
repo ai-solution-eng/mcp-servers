@@ -302,7 +302,11 @@ Chart contents:
 - `virtualservice.yaml` — `/mcp` → 9090 (MCP), `/` → 8080 (**the normal SearXNG web page**), behind the EZAF gateway.
 - `kyverno.yaml` — vendor label policy (same as ddgs-lite).
 
-On HPE-network clusters set `hpe_proxies: true` — this wires the corporate proxy into both SearXNG's engine requests (settings.yml) and the MCP container's `fetch_content` egress (env), matching the ddgs-lite convention.
+On corporate-proxy clusters (no direct internet egress) set `proxy.http`/`proxy.https` (and usually `proxy.noProxy`) — each key is wired into the pod only when non-empty, configuring both SearXNG's engine requests (settings.yml `outgoing.proxies`) and the MCP container's `fetch_content` egress (env). `proxy: {}` (the default) renders everything off.
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` flag was removed (chart ≥ 1.5.0) in favor of the per-key `proxy:` dict. Set `proxy.http` / `proxy.https` / `proxy.noProxy` directly — each key is active only when non-empty, so `proxy: {}` (or omitting the block) is fully off; there is no separate flag to flip. Old `hpe_proxies: true` + chart-default-proxy sites should copy their site's real proxy addresses into an explicit `proxy:` block (see the example in `helm/values.yaml`).
 
 ### MCP client registration
 
@@ -374,3 +378,23 @@ searxng_mcp/
     ├── test_url_policy.py  # SSRF guard tests (denylist, hops, pin, cache, caps)
     └── live_check.py       # end-to-end check vs a real instance (+ sidecar)
 ```
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the service: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and the edge-gateway pods — the browser path stays open by default via
+`allowEzafGatewayIngress: true`, so the VirtualService keeps working).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) leave `ezua.virtualService.enabled: true` — the browser path is a feature
+here, not a break-glass; (5) apply via the PCAI values editor (`helm upgrade`
+for operators); (6) verify — an allowed namespace gets HTTP 200 from
+`service:port/mcp`, any other namespace times out (browsers keep working via
+the gateway). See `values-examples/values-hardened-g2.yaml` for the full
+hardened profile.

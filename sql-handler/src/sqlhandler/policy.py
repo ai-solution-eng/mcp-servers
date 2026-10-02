@@ -9,7 +9,13 @@ identity (subjects / key fingerprints, via groups) to table rules:
   file, it never silently degrades),
 * ``column_masks`` — per-column ``redact`` | ``hash`` | ``<const>``,
 * ``hidden_tables`` — glob list: tables that do not exist for that caller
-  (list/describe/search/profile/scan/query all refuse or omit).
+  (list/describe/search/profile/scan/query all refuse or omit),
+* ``visible_tables`` — glob list, the ALLOW-list twin of ``hidden_tables``
+  (the dataset-ACL vocabulary). Absent from EVERY group the caller resolves
+  to ⇒ today's deny-list posture, byte-identical. Non-empty in ANY resolved
+  group ⇒ default-DENY: a table is hidden unless some ``visible_tables``
+  glob hits it — and an explicit ``hidden_tables`` hit always wins (a block
+  is never undone by a grant; deny-bias over the allow-list too).
 
 Hot-reloaded on mtime change exactly like the semantic catalog; a broken
 file fails CLOSED (the previous file keeps enforcing; an INVALID FIRST file
@@ -35,12 +41,56 @@ The file's SHAPE (see tests/test_policy.py for the exact grammar)::
       "key_fps":  {"sha256:2689...": ["analysts"]}   # direct fp binding
     }
 
+The OPTIONAL dataset-ACL document (keys + globs instead of per-table rules;
+compiled onto the SAME group machinery — mutually exclusive with a
+hand-written ``groups``)::
+
+    {
+      "datasets": {
+        "global": ["workorder/*", "public_*"],   # everyone (default group)
+        "assignments": {
+          "alice":  ["payroll/*"],               # subject slug
+          "sha256:2689ab12cd34": ["payroll/*"]   # key fp (bare fp spelling)
+        },
+        "blocked": ["scratch/*", "*_pii"]        # wins over every grant
+      }
+    }
+
+``assignments`` keys bind EITHER a subject OR a key fingerprint (bare
+``sha256:<12hex>`` — the mint-key spelling — or the self-documenting
+``key:sha256:<12hex>``; both accepted, compiled to the bare fp binding).
+Compilation is fail-closed: a malformed fp, a non-list/empty glob, or the
+presence of BOTH ``datasets`` and ``groups`` refuses the file.
+
+The OPTIONAL ``admins`` designation (the administration plane — orthogonal
+to the access plane above)::
+
+    "admins": ["alice", "sha256:2689ab12cd34", "key:sha256:2689ab12cd34"]
+
+A list of subjects and/or key fingerprints naming who may ADMINISTER (the
+``/api/admin/*`` routes and the MCP admin twins read it via
+``sqlhandler.admin_keys.is_admin``). It composes with BOTH authoring
+shapes — hand-written groups AND the compiled ``datasets`` document —
+because designation says nothing about grants and grants say nothing about
+designation; the ONLY mutual exclusion in the vocabulary remains
+datasets-vs-groups. Entries use the same two fp spellings as
+``assignments`` (the ``key:``-prefixed spelling normalizes to the bare fp)
+and validation is fail-closed under the same conventions: a non-list, a
+non-string/empty entry, or an fp-SHAPED entry that fails the real
+fingerprint format refuses the file (a typo'd fp must never silently
+become "just a weird subject name"). ``admins`` folds into the file hash
+(any edit hot-reloads) and loads as ``Policy.admins`` (stripped subjects +
+bare fps, insertion order kept).
+
 EFFECTIVE POLICY HASH: sha256 of the caller's canonicalized effective rule
 set (sorted JSON). THIS is what ``SqlEngine._policy_hash()`` returns — the
 conditional slot from the L2 slice activates here: empty when enforcement
 is off (byte-identical cache keys, cross-caller sharing unchanged), a value
 when on (masked results can never share an entry with unmasked ones — the
-non-negotiable invariant).
+non-negotiable invariant). The ``datasets`` document folds into the file
+hash (any edit reloads), and a ``visible_tables`` group is RESTRICTIVE: it
+never counts as "no rules", so allow-listed callers always hash into their
+own cache-key space.
 """
 
 from __future__ import annotations
@@ -171,6 +221,18 @@ class Policy:
     default_group: str | None = None
     source: str = ""
     hash: str = ""
+    # The dataset-ACL document as authored (canonicalized for hashing); None
+    # when the file uses the hand-written groups shape. Enforcement NEVER
+    # reads this — compiled groups + bindings above are the enforcement
+    # surface; the field exists so hashing can fold the raw vocabulary and
+    # callers can introspect what loaded.
+    datasets: dict | None = None
+    # The admin DESIGNATION (administration plane, orthogonal to grants):
+    # validated subjects + bare key fingerprints from the optional top-level
+    # ``admins`` list, in file order. Empty tuple = no admins designated
+    # (fail-closed: admin_keys.is_admin refuses everyone). Enforcement of
+    # table access NEVER reads this — only the admin API/MCP gate does.
+    admins: tuple[str, ...] = ()
 
     # ------------------------------------------------------------- lookup
     def groups_for(self, subject: str | None, key_fp: str | None) -> tuple[str, ...]:
@@ -194,16 +256,31 @@ class Policy:
         rules COMPOSE with deny-bias: a mask from any group applies; a hidden
         from any group hides; row filters AND together (the intersection —
         each group's restriction is a floor, never a grant).
+
+        With the dataset-ACL vocabulary in play the deny-bias extends to the
+        ALLOW side: if any resolved group carries a non-empty
+        ``visible_tables``, a table is hidden unless some group's globs hit
+        it — default-deny — while an explicit ``hidden_tables`` hit still
+        hides (a block is never undone by a grant). No ``visible_tables``
+        anywhere ⇒ the historical deny-list-only behavior, byte-identical.
         """
         if not groups:
             return TableRule()
         row_filters: list[str] = []
         masks: dict[str, str] = {}
         hidden = False
+        visible = False
+        has_vis = False
         for group in groups:
             spec = self.groups.get(group)
             if not isinstance(spec, dict):
                 continue
+            vis = spec.get("visible_tables") or []
+            if isinstance(vis, list) and vis:
+                # One allow-list anywhere in the resolution flips the whole
+                # composition to default-deny (fail-closed across groups).
+                has_vis = True
+                visible = visible or _glob_hits(vis, table_path, table_name)
             hidden = hidden or _glob_hits(spec.get("hidden_tables") or [], table_path, table_name)
             for pattern, rule in (spec.get("tables") or {}).items():
                 if not isinstance(rule, dict):
@@ -216,6 +293,8 @@ class Policy:
                 for col, mask in (rule.get("column_masks") or {}).items():
                     if isinstance(mask, str):
                         masks[str(col)] = mask
+        if has_vis and not visible:
+            hidden = True
         if hidden:
             # A hidden table has no visible columns or rows — the other
             # fields are moot (the caller must not even see it exists).
@@ -228,12 +307,18 @@ class Policy:
 
     def _compose_empty_check(self, groups: tuple[str, ...]) -> bool:
         """True when EVERY group the caller resolves to carries NO rule for
-        anything (a fully unrestricted composition)."""
+        anything (a fully unrestricted composition).
+
+        A group carrying ``visible_tables`` is RESTRICTIVE even with no other
+        key: it hides everything the globs do not hit. Counting it as "no
+        rules" would return "" from :meth:`effective_hash` and let an
+        allow-listed caller share the UNMASKED cache-key space — a leak, so
+        any visible_tables counts as content here."""
         for g in groups:
             spec = self.groups.get(g)
             if not isinstance(spec, dict):
                 continue
-            if spec.get("tables") or spec.get("hidden_tables"):
+            if spec.get("tables") or spec.get("hidden_tables") or spec.get("visible_tables"):
                 return False
         return True
 
@@ -271,12 +356,21 @@ class Policy:
         # the hash for EVERY caller on any edit; folding the group specs
         # (canonicalized above) changes it only for callers whose rules
         # actually changed. Hidden-table globs are part of the group spec.
+        # The datasets document folds in too: it is the compact authoring
+        # form of exactly those bindings, so two callers under different
+        # assignment sets hash differently while identical sets share.
+        if self.datasets is not None:
+            effective["datasets"] = self.datasets
         return canonical_hash(effective)
 
 
 def _canonicalize_group(spec: dict) -> dict:
     """A group's rules in canonical (sorted, complete) form for hashing."""
-    out: dict = {"tables": {}, "hidden_tables": sorted(str(h) for h in spec.get("hidden_tables") or [])}
+    out: dict = {
+        "tables": {},
+        "hidden_tables": sorted(str(h) for h in spec.get("hidden_tables") or []),
+        "visible_tables": sorted(str(v) for v in spec.get("visible_tables") or []),
+    }
     tables = spec.get("tables") or {}
     for pattern in sorted(tables):
         rule = tables[pattern]
@@ -297,6 +391,154 @@ def _glob_match(pattern: str, value: str) -> bool:
 
 def _glob_hits(patterns: list, *values: str) -> bool:
     return any(_glob_match(str(p), v) for p in patterns for v in values)
+
+
+# ---------------------------------------------------------------------------
+# dataset-ACL document (keys + globs compiled onto the group machinery)
+# ---------------------------------------------------------------------------
+
+_ACL_GLOBAL_GROUP = "_acl_global"
+_KEY_FP_RE = re.compile(r"^sha256:[0-9a-f]{12}$")  # audit.key_fingerprint's exact shape
+
+
+def _compile_datasets(data: dict, origin: str) -> tuple[dict, dict, dict, str, dict]:
+    """Compile the ``datasets`` document onto the EXISTING group machinery.
+
+    Returns ``(groups, subjects, key_fps, default_group, datasets_doc)`` in
+    exactly the shapes ``load_policy``'s hand-written path produces, so the
+    rest of the loader (validation, hashing, Policy) is shape-agnostic and
+    enforcement never learns the second vocabulary existed.
+
+    Layout (mutually exclusive with a hand-written ``groups`` — both present
+    is a load-time refusal)::
+
+        "datasets": {
+          "global":     [globs],                       # -> group _acl_global
+          "assignments": {"<subject>|sha256:<12hex>|key:sha256:<12hex>": [globs]},
+          "blocked":    [globs]                        # -> hidden_tables EVERYWHERE
+        }
+
+    Fail-closed on purpose: every glob list must be a NON-EMPTY list of
+    non-empty strings; every fp-shaped assignment key must match the real
+    fingerprint format (``sha256:`` + 12 lowercase hex, the shape
+    ``mcp_fleet_common.audit.key_fingerprint`` emits) and refuse the file
+    otherwise; an assignment key that collides with another after fp
+    normalization refuses too (the two spellings of one fp must not silently
+    merge two different grants).
+    """
+    doc = data.get("datasets")
+    if not isinstance(doc, dict):
+        raise PolicyError(f"{origin}: 'datasets' must be an object")
+
+    def _globs(value, where: str) -> list[str]:
+        if not isinstance(value, list) or not value:
+            raise PolicyError(f"{origin}: datasets.{where} must be a non-empty list of glob strings")
+        out = []
+        for g in value:
+            if not isinstance(g, str) or not g.strip():
+                raise PolicyError(f"{origin}: datasets.{where} contains a non-string or empty glob")
+            out.append(g.strip())
+        return out
+
+    global_globs = _globs(doc.get("global") or [], "global")
+    blocked_globs = _globs(doc.get("blocked") or [], "blocked") if doc.get("blocked") is not None else []
+    raw_assignments = doc.get("assignments") or {}
+    if not isinstance(raw_assignments, dict):
+        raise PolicyError(f"{origin}: datasets.assignments must be an object of identity -> [globs]")
+
+    generated: dict[str, dict] = {_ACL_GLOBAL_GROUP: {"visible_tables": list(global_globs)}}
+    subjects: dict[str, tuple[str, ...]] = {}
+    key_fps: dict[str, tuple[str, ...]] = {}
+    seen_fps: dict[str, str] = {}
+    seen_subjects: dict[str, str] = {}
+    for i, (raw_key, globs_raw) in enumerate(sorted(raw_assignments.items(), key=lambda kv: str(kv[0]))):
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise PolicyError(f"{origin}: datasets.assignments keys must be non-empty strings")
+        key = raw_key.strip()
+        globs = _globs(globs_raw, f"assignments.{key!r}")
+        group = f"_acl_id_{i}"
+        generated[group] = {"visible_tables": list(globs)}
+        # Two accepted spellings, one binding: the minted bare form
+        # ("sha256:<12hex>") and the self-documenting prefixed one. A key
+        # that LOOKS like a fingerprint attempt (either prefix) but fails
+        # the real format refuses the file — fail-closed, never "just a
+        # weird subject name".
+        fp_body = key[4:] if key.startswith("key:") else key
+        fp_shaped = fp_body.startswith("sha256:") or key.startswith("key:sha256:")
+        if fp_shaped:
+            if not _KEY_FP_RE.match(fp_body):
+                raise PolicyError(
+                    f"{origin}: datasets.assignments key {key!r} looks like a key fingerprint but does not "
+                    "match the real format 'sha256:' + 12 lowercase hex (audit.key_fingerprint)"
+                )
+            fp = fp_body
+            if fp in seen_fps and seen_fps[fp] != key:
+                raise PolicyError(
+                    f"{origin}: datasets.assignments binds {fp!r} twice ({seen_fps[fp]!r} and {key!r} — "
+                    "one fingerprint, one binding)"
+                )
+            seen_fps[fp] = key
+            key_fps[fp] = (_ACL_GLOBAL_GROUP, group)
+        else:
+            if key in seen_subjects:
+                raise PolicyError(
+                    f"{origin}: datasets.assignments binds subject {key!r} twice "
+                    f"({seen_subjects[key]!r} and {raw_key!r} — whitespace-normalized collision)"
+                )
+            seen_subjects[key] = raw_key
+            subjects[key] = (_ACL_GLOBAL_GROUP, group)
+    # Blocked wins over every grant: appended as hidden_tables to EVERY
+    # generated group (deny-bias makes a block un-overridable by any grant,
+    # including the global one).
+    if blocked_globs:
+        for spec in generated.values():
+            spec["hidden_tables"] = list(blocked_globs)
+    return generated, subjects, key_fps, _ACL_GLOBAL_GROUP, doc
+
+
+# ---------------------------------------------------------------------------
+# admin designation (the optional top-level ``admins`` list)
+# ---------------------------------------------------------------------------
+
+
+def _validate_admins(data: dict, origin: str) -> tuple[str, ...]:
+    """Validate the optional top-level ``admins`` list (the admin-designation
+    vocabulary, orthogonal to grants: legal alongside hand-written groups AND
+    the compiled ``datasets`` document — the ONLY mutual exclusion remains
+    datasets-vs-groups).
+
+    Returns the canonical tuple (stripped entries, insertion order kept,
+    ``key:``-prefixed fps normalized to the bare fp). Fail-closed under the
+    assignments' conventions: non-list, non-string/empty entries, and
+    fp-SHAPED-but-malformed entries refuse the file.
+    """
+    raw = data.get("admins")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise PolicyError(f"{origin}: 'admins' must be a list of subjects and/or key fingerprints")
+    # An explicit empty list is legal and means "nobody administers" — the
+    # fail-closed direction (refusing it would leave a previous policy's
+    # admins enforcing while the operator is trying to un-designate them).
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise PolicyError(f"{origin}: 'admins' entries must be non-empty strings")
+        e = entry.strip()
+        # Same two spellings, same fp-shaped-but-malformed refusal as
+        # datasets.assignments (the 2026-09-30 fail-closed rule): a value
+        # that LOOKS like a fingerprint attempt must match the real format
+        # or the file refuses — a typo'd fp never silently becomes a subject.
+        fp_body = e[4:] if e.startswith("key:") else e
+        if fp_body.startswith("sha256:") or e.startswith("key:sha256:"):
+            if not _KEY_FP_RE.match(fp_body):
+                raise PolicyError(
+                    f"{origin}: 'admins' entry {e!r} looks like a key fingerprint but does not match the real "
+                    "format 'sha256:' + 12 lowercase hex (audit.key_fingerprint)"
+                )
+            e = fp_body
+        out.append(e)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -487,12 +729,33 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         raise PolicyError(f"{origin}: could not read: {exc}") from exc
     data = _parse_text(text, origin)
 
-    groups = data.get("groups") or {}
-    if not isinstance(groups, dict):
-        raise PolicyError(f"{origin}: 'groups' must be an object")
+    # The dataset-ACL document: an ALTERNATIVE authoring shape compiled onto
+    # the group machinery below. Mutually exclusive with hand-written groups
+    # (both present is a refusal — one file, one source of truth about who
+    # sees what); when present it REPLACES the groups/subjects/key_fps/
+    # default_group parsed from the file.
+    datasets_doc: dict | None = None
+    if "datasets" in data:
+        if data.get("groups"):
+            raise PolicyError(
+                f"{origin}: 'datasets' and 'groups' are mutually exclusive — "
+                "a file either maps identity with hand-written groups or with the datasets document, never both"
+            )
+        groups, subjects, key_fps, default_group, datasets_doc = _compile_datasets(data, origin)
+    else:
+        groups = data.get("groups") or {}
+        if not isinstance(groups, dict):
+            raise PolicyError(f"{origin}: 'groups' must be an object")
     for name, spec in groups.items():
         if not isinstance(spec, dict):
             raise PolicyError(f"{origin}: group {name!r} must be an object")
+        vis = spec.get("visible_tables")
+        if vis is not None:
+            # The dataset-ACL vocabulary at the GROUP level: same shape rules
+            # as hidden_tables (fail-closed on bad globs), for the
+            # hand-written-groups path and the compiled one alike.
+            if not isinstance(vis, list) or not all(isinstance(g, str) and g.strip() for g in vis):
+                raise PolicyError(f"{origin}: group {name!r}.visible_tables must be a list of non-empty glob strings")
         tables = spec.get("tables") or {}
         if not isinstance(tables, dict):
             raise PolicyError(f"{origin}: group {name!r}.tables must be an object")
@@ -533,15 +796,31 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
             out[str(ident).strip()] = tuple(known)
         return out
 
-    subjects = _bindings("subjects")
-    key_fps = _bindings("key_fps")
-    default_group = data.get("default_group")
-    if default_group is not None:
-        if not isinstance(default_group, str) or not default_group.strip():
-            raise PolicyError(f"{origin}: 'default_group' must be a non-empty string when present")
-        default_group = default_group.strip()
-        if default_group not in groups:
-            raise PolicyError(f"{origin}: default_group {default_group!r} is not a defined group")
+    if datasets_doc is None:
+        subjects = _bindings("subjects")
+        key_fps = _bindings("key_fps")
+        default_group = data.get("default_group")
+        if default_group is not None:
+            if not isinstance(default_group, str) or not default_group.strip():
+                raise PolicyError(f"{origin}: 'default_group' must be a non-empty string when present")
+            default_group = default_group.strip()
+            if default_group not in groups:
+                raise PolicyError(f"{origin}: default_group {default_group!r} is not a defined group")
+    else:
+        # The compiled document owns identity + default_group; the file's
+        # hand-written spelling of either alongside datasets would silently
+        # conflict with the compilation, so it is refused (fail-closed).
+        for extra in ("subjects", "key_fps", "default_group"):
+            if data.get(extra):
+                raise PolicyError(f"{origin}: 'datasets' and {extra!r} are mutually exclusive")
+        subjects = subjects  # compiled above by _compile_datasets
+        key_fps = key_fps
+        default_group = default_group
+
+    # The admin designation: validated INDEPENDENTLY of the authoring shape
+    # (groups or the datasets document — it composes with both; the only
+    # mutual exclusion is datasets-vs-groups). Fail-closed per entry.
+    admins = _validate_admins(data, origin)
 
     pol_hash = canonical_hash(
         {
@@ -549,6 +828,13 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
             "subjects": {k: sorted(v) for k, v in sorted(subjects.items())},
             "key_fps": {k: sorted(v) for k, v in sorted(key_fps.items())},
             "default_group": default_group,
+            # Fold the datasets document: ANY edit to the ACL vocabulary must
+            # change the file hash (the store hot-reloads on mtime; the hash
+            # is what callers derive cache-key spaces from).
+            **({"datasets": datasets_doc} if datasets_doc is not None else {}),
+            # The admins designation folds in too: designating (or
+            # un-designating) an admin is a policy edit and must hot-reload.
+            **({"admins": list(admins)} if admins else {}),
         }
     )
     return Policy(
@@ -558,6 +844,8 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         default_group=default_group,
         source=origin,
         hash=pol_hash,
+        datasets=datasets_doc,
+        admins=admins,
     )
 
 
@@ -640,14 +928,32 @@ class PolicyStore:
             self._policy = fresh
             self._stat = sig
             self._broken_since = None
-        logger.info(
-            "policy loaded: %d group(s), %d subject(s), %d key fp(s), default_group=%s from %s",
-            len(fresh.groups),
-            len(fresh.subjects),
-            len(fresh.key_fps),
-            fresh.default_group or "(none)",
-            path,
-        )
+        if fresh.datasets is not None:
+            ds = fresh.datasets
+            assignments = ds.get("assignments") or {}
+            logger.info(
+                "policy loaded: %d group(s), %d subject(s), %d key fp(s), default_group=%s, "
+                "datasets: global=%d blocked=%d assignments=%d, admins=%d from %s",
+                len(fresh.groups),
+                len(fresh.subjects),
+                len(fresh.key_fps),
+                fresh.default_group or "(none)",
+                len(ds.get("global") or []),
+                len(ds.get("blocked") or []),
+                len(assignments),
+                len(fresh.admins),
+                path,
+            )
+        else:
+            logger.info(
+                "policy loaded: %d group(s), %d subject(s), %d key fp(s), default_group=%s, admins=%d from %s",
+                len(fresh.groups),
+                len(fresh.subjects),
+                len(fresh.key_fps),
+                fresh.default_group or "(none)",
+                len(fresh.admins),
+                path,
+            )
         return fresh
 
     def reset(self) -> None:

@@ -16,11 +16,29 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml server.py webui.py mcp_auth.py ./
-# The read-only web console asset: webui.py serves ui/index.html from /app/ui
+# Layer-ordering fix (2026-09, mirrors the SQLhandler build): dependency
+# wheels live in a layer keyed ONLY on the manifests (pyproject.toml), so a
+# code-only change no longer re-resolves and re-downloads every dependency.
+# The list below is the FULL transitive closure of [project].dependencies —
+# verified against pyproject; keep the two in sync when dependencies change.
+# The local package then installs --no-deps (all deps present by construction).
+COPY pyproject.toml ./
+
+RUN uv pip install --system mcp kubernetes PyYAML starlette uvicorn
+
+# App code is copied after the dependency layer (cheap code-only rebuilds):
+# the web console asset: webui.py serves ui/index.html from /app/ui
 # (it also honors an APPLYGATE_WEBUI_HTML override for out-of-image assets).
+COPY server.py webui.py mcp_auth.py ./
 COPY ui/ ./ui/
-RUN uv pip install --system .
+RUN uv pip install --system --no-deps .
+
+# Sanity gate (build-time, cheap): the local package must import with the
+# dependency closure from the RUN above — catches "dep added to pyproject
+# but not to the RUN" drift in the build log instead of as a first-query
+# ImportError in the pod. server.py imports mcp_auth, so this also covers
+# the whole py-modules list (Wave-6 packaging fix).
+RUN python -c "import server, webui, mcp_auth; from importlib.metadata import version; print('applygate-mcp', version('applygate-mcp'), 'imports clean')"
 
 # Default home of the JSONL audit trail; the Helm chart mounts a PVC (or, if
 # persistence is disabled, an emptyDir) here — the volume wins over this

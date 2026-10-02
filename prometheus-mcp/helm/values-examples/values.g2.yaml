@@ -1,5 +1,5 @@
-# prometheus-mcp — values for the SE-G2 lab cluster
-# (pcai-se-ai-application.hst.rdlabs.hpecorp.net)
+# prometheus-mcp — values for a proxied corporate PCAI site
+# (SITE: your-cluster.example)
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document (PCAI's Helm Values editor replaces the
@@ -27,7 +27,7 @@ deployment:
 # the registry, and IfNotPresent would serve a stale cached digest.
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.5.2
+  tag: v0.6.0
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -101,10 +101,10 @@ resources:
 ezua:
   enabled: true
   # SITE: literal cluster domain
-  domainName: pcai-se-ai-application.hst.rdlabs.hpecorp.net   # informational only — no template reads it
+  domainName: your-cluster.example   # informational only — no template reads it
   virtualService:
     # SITE: literal host — /mcp -> MCP server (9095); / -> web console
-    endpoint: prometheus-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    endpoint: prometheus-mcp.your-cluster.example
     istioGateway: istio-system/ezaf-gateway
     timeout: 660s
   # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the

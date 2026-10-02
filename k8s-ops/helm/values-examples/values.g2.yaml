@@ -1,6 +1,5 @@
-# k8s-mcp (trusted-operator chart) — SE-G2 lab cluster values
-# (values-examples, secret-free). Cluster:
-# pcai-se-ai-application.hst.rdlabs.hpecorp.net.
+# k8s-mcp (trusted-operator chart) — proxied corporate PCAI site values
+# (values-examples, secret-free). SITE: your-cluster.example.
 # FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
 # Paste-ready: this file alone is the full values document (helm deep-merges
 # it over identical chart defaults; PCAI's values editor replaces the chart's
@@ -128,11 +127,11 @@ affinity: {}
 # SITE: literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
 ezua:
   enabled: true
-  domainName: "pcai-se-ai-application.hst.rdlabs.hpecorp.net"   # informational only — no template reads it
+  domainName: "your-cluster.example"   # informational only — no template reads it
   virtualService:
     # SITE: literal host for SE-G2 — unique per release on the shared gateway;
     # doubles as MCP_HOSTNAME (DNS-rebinding pin).
-    endpoint: "k8s-mcp-2-0-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    endpoint: "k8s-mcp-2-0-server.your-cluster.example"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
   # SITE: gateway oauth2 gate OFF (lab trade — the built-in API key is the gate);

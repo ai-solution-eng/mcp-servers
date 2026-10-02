@@ -508,6 +508,7 @@
       <button class="tab" data-tab="schema">Schema</button>
       <button class="tab" data-tab="semantic">Semantic</button>
       <button class="tab" data-tab="inspector">Inspector</button>
+      <button class="tab" data-tab="access">Access control</button>
     </div>
 
     <div id="pane-query" class="pane">
@@ -586,6 +587,73 @@
       </div>
       <div id="insp-error"></div>
       <div id="insp-result"></div>
+    </div>
+
+    <div id="pane-access" class="pane hidden">
+      <div class="hint" style="margin-bottom:10px">Access control — the admin frontend over <code style="font-family:var(--mono)">/api/admin/*</code> (README: Administering from the frontend). The credential is held in this page's memory ONLY — never persisted.</div>
+      <div class="panel">
+        <h2>Admin credential</h2>
+        <div class="insp-field">
+          <label><b>Admin key (X-API-Key)</b><span class="hint"> — sent with every Access-control call; an SSO bearer token works too (sent as Bearer)</span></label>
+          <input type="password" id="adm-key" placeholder="paste the admin key — kept in memory only" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="query-actions">
+          <button id="adm-connect">Connect</button>
+          <button id="adm-forget" class="ghost" title="Clear the credential from this page's memory">Forget</button>
+          <span class="hint">Wrong credential → the server's 401/403 message renders verbatim below; fix the key and reconnect.</span>
+        </div>
+      </div>
+      <div id="adm-error" class="panel" style="display:none;background:var(--err-bg);border-color:var(--err-border);color:var(--err-text)"></div>
+      <div id="adm-body">
+        <div class="panel">
+          <h2>Grants <span class="hint" id="adm-grants-meta"></span></h2>
+          <div class="insp-field">
+            <label><b>Designated admins</b> — subjects / key fingerprints from the policy document's <code style="font-family:var(--mono)">admins:</code> list</label>
+            <div id="adm-admins" class="insp-out" style="max-height:none"></div>
+          </div>
+          <div class="insp-field">
+            <label><b>Assignments</b> — identity → dataset globs (added to <code style="font-family:var(--mono)">global</code>; <code style="font-family:var(--mono)">blocked</code> wins)</label>
+            <div id="adm-assignments" class="insp-out" style="max-height:none"></div>
+          </div>
+          <div class="insp-field">
+            <label><b>Blocked</b> — hidden for everyone, wins over any grant</label>
+            <div id="adm-blocked" class="insp-out" style="max-height:none"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Keys <span class="hint">secret-source keys are read-only — revoke via kubectl (the Secret's lifecycle)</span></h2>
+          <div id="adm-keys"></div>
+        </div>
+        <div class="panel">
+          <h2>Mint a key</h2>
+          <div class="insp-field">
+            <label><b>Label</b></label>
+            <input type="text" id="adm-mint-label" placeholder="e.g. reports-bot" autocomplete="off" />
+          </div>
+          <div class="insp-field">
+            <label><b>Assign globs</b> — comma-separated; empty = global only</label>
+            <input type="text" id="adm-mint-assign" placeholder="workorder/*, reports/*" autocomplete="off" />
+          </div>
+          <div class="query-actions">
+            <button id="adm-mint">Mint</button>
+            <span class="hint">The raw key is shown once, below — it is not recoverable.</span>
+          </div>
+          <div id="adm-minted" style="display:none;margin-top:10px">
+            <div style="color:var(--yellow);font-size:12px;margin-bottom:4px">⚠ Store it now — shown once, never recoverable:</div>
+            <div class="insp-out" style="max-height:none;word-break:break-all" id="adm-minted-key"></div>
+            <div class="query-actions"><button class="copy-btn ghost" id="adm-minted-copy">copy</button></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Policy document <span class="hint" id="adm-policy-hash"></span></h2>
+          <textarea id="adm-policy" spellcheck="false" style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:12px;padding:10px;min-height:220px;resize:vertical;line-height:1.5"></textarea>
+          <div class="query-actions">
+            <button id="adm-policy-save">Save policy</button>
+            <button id="adm-policy-reload" class="ghost" title="Discard edits and reload the served policy document">Reload</button>
+            <span id="adm-policy-err" class="sv-err"></span>
+          </div>
+        </div>
+      </div>
     </div>
   </main>
 </div>
@@ -1047,6 +1115,7 @@ function switchTab(tab) {
   $("pane-inspector").classList.toggle("hidden", tab !== "inspector");
   if (tab === "semantic") loadSemanticPane();
   if (tab === "inspector") loadInspector();
+  if (tab === "access") accessRefresh();
 }
 
 // ---- theme toggle ---------------------------------------------------------
@@ -1474,6 +1543,197 @@ $("dbt-modal-close").onclick = dbtModalClose;
 $("dbt-modal-backdrop").onclick = dbtModalClose;
 $("dbt-allow-virtual").onchange = () => { if (dbtImport.manifest) dbtPreview(); };
 $("dbt-modal-apply").onclick = dbtApply;
+
+// ---- Access control (admin frontend over /api/admin/*) ----------------------
+// The grants/mint/revoke/policy panel. The credential is typed per session and
+// held in a JS variable ONLY — never localStorage/sessionStorage (same posture
+// as the panel's server contract: the raw minted key is shown once, so the
+// admin key must not live in a place a stray XSS could silently read back).
+// Every fetch carries the credential header; the admin-api contract renders
+// server error messages verbatim (401 identity-required, 403 non-admin).
+let adminCredential = "";
+
+function admHeaders(extra) {
+  // Both header spellings are accepted by the admin routes; X-API-Key is the
+  // canonical one for a static admin key (SSO tokens ride Authorization).
+  const h = Object.assign({ "X-API-Key": adminCredential }, extra || {});
+  return h;
+}
+
+function admShowError(msg) {
+  const el = $("adm-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+// Render an "empty" line into one of the detail boxes; rows otherwise.
+function admKV(rows) {
+  return rows.map((r) =>
+    '<div style="padding:2px 0">' + r + "</div>").join("");
+}
+
+function admFp(fp) {
+  // Monospace, middle-truncated: sha256:<6hex>…<4hex> keeps it readable in a
+  // table cell while staying unambiguous (full fp is in the title tooltip).
+  const s = String(fp || "");
+  if (s.length <= 18) return s;
+  return s.slice(0, 11) + "…" + s.slice(-6);
+}
+
+async function accessRefresh() {
+  if (!adminCredential) {
+    $("adm-body").style.display = "none";
+    admShowError("");
+    $("adm-grants-meta").textContent = "";
+    return;
+  }
+  admShowError("");
+  $("adm-body").style.display = "";
+  try {
+    const g = await api("/api/admin/grants", { headers: admHeaders() });
+    admRenderGrants(g);
+    // The same payload carries the dataset doc — prefill the policy editor
+    // from it unless the operator has unsaved edits (dirty flag).
+    if (!$("adm-policy")._dirty) {
+      $("adm-policy").value = g.datasets === null || g.datasets === undefined
+        ? "" : JSON.stringify(g.datasets, null, 2);
+      $("adm-policy")._dirty = false;
+    }
+    $("adm-policy-hash").textContent = g.policy_hash ? ("policy_hash: " + g.policy_hash) : "";
+  } catch (e) {
+    // Non-admin / anonymous: the server's message renders verbatim (the
+    // contract — never paraphrased client-side).
+    $("adm-body").style.display = "none";
+    admShowError(e.message);
+  }
+}
+
+function admRenderGrants(g) {
+  $("adm-grants-meta").textContent = g.groups && g.groups.length
+    ? (g.groups.length + " group(s) defined") : "";
+  const admins = (g.admins && g.admins.length) ? g.admins : ["(none — bootstrap: add the admin's subject or key:<fp> to the policy document's \"admins\" list)"];
+  $("adm-admins").innerHTML = admins.map((a) => "<div>" + esc(String(a)) + "</div>").join("");
+  const asg = g.assignments || {};
+  const asgKeys = Object.keys(asg);
+  $("adm-assignments").innerHTML = asgKeys.length
+    ? admKV(asgKeys.map((k) =>
+        "<b>" + esc(k) + "</b> → " + esc((asg[k] || []).join(", "))))
+    : "<div class='hint' style='padding:2px 0'>(no assignments)</div>";
+  const blocked = g.blocked || [];
+  $("adm-blocked").innerHTML = blocked.length
+    ? admKV(blocked.map((b) => "<span style='color:var(--red)'>" + esc(String(b)) + "</span>"))
+    : "<div class='hint' style='padding:2px 0'>(none)</div>";
+  const keys = g.keys || [];
+  if (!keys.length) {
+    $("adm-keys").innerHTML = '<div class="empty">no keys minted yet — the Secret-sourced admin keys do not appear here until the store reports them</div>';
+    return;
+  }
+  let html = '<table class="grid"><thead><tr><th>label</th><th>fingerprint</th><th>source</th><th>created</th><th>created by</th><th></th></tr></thead><tbody>';
+  for (const k of keys) {
+    const secret = k.source === "secret";
+    html += "<tr>" +
+      "<td title='fp " + esc(k.fp || "") + "'>" + esc(k.label || "?") + "</td>" +
+      "<td title='" + esc(k.fp || "") + "'>" + esc(admFp(k.fp)) + "</td>" +
+      "<td>" + esc(k.source || "?") + (secret ? " (read-only)" : "") + "</td>" +
+      "<td>" + esc(k.created_at || "") + "</td>" +
+      "<td>" + esc(k.created_by || "") + "</td>" +
+      "<td>" + (secret
+        ? "<span class='hint'>via kubectl</span>"
+        : "<button class='mini-del' data-fp='" + esc(k.fp || "") + "' title='Revoke this key (removes it and its assignment from the store)'>✕ revoke</button>") +
+      "</td></tr>";
+  }
+  html += "</tbody></table>";
+  $("adm-keys").innerHTML = html;
+  $("adm-keys").querySelectorAll(".mini-del").forEach((btn) => {
+    btn.onclick = async () => {
+      const fp = btn.dataset.fp;
+      if (!confirm("Revoke key " + (fp || "?") + "? Its assignment is removed with it.")) return;
+      try {
+        const res = await api("/api/admin/keys/" + encodeURIComponent(fp), { method: "DELETE", headers: admHeaders() });
+        toast("Key revoked" + (res && res.assignment_removed ? " (assignment removed too)" : ""));
+        accessRefresh();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    };
+  });
+}
+
+async function admConnect() {
+  adminCredential = ($("adm-key").value || "").trim();
+  if (!adminCredential) { admShowError("Enter the admin key first."); return; }
+  await accessRefresh();
+}
+
+function admForget() {
+  adminCredential = "";
+  $("adm-key").value = "";
+  $("adm-body").style.display = "none";
+  admShowError("");
+  $("adm-grants-meta").textContent = "";
+}
+
+async function admMint() {
+  const label = ($("adm-mint-label").value || "").trim();
+  if (!label) { toast("Label required to mint a key", true); return; }
+  const globs = ($("adm-mint-assign").value || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const body = { label };
+  if (globs.length) body.assign = globs;
+  try {
+    const res = await api("/api/admin/keys", {
+      method: "POST",
+      headers: admHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    $("adm-minted").style.display = "";
+    $("adm-minted-key").textContent = res.key || "";
+    $("adm-mint-label").value = "";
+    $("adm-mint-assign").value = "";
+    accessRefresh();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function admPolicySave() {
+  const err = $("adm-policy-err");
+  err.textContent = "";
+  let doc = null;
+  const text = $("adm-policy").value.trim();
+  if (text) {
+    try { doc = JSON.parse(text); }
+    catch (e) { err.textContent = "Not valid JSON: " + e.message; return; }
+  }
+  try {
+    const res = await api("/api/admin/policy", {
+      method: "PUT",
+      headers: admHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(doc || {}),
+    });
+    $("adm-policy")._dirty = false;
+    $("adm-policy-hash").textContent = "policy_hash: " + (res.policy_hash || "?");
+    toast("Policy saved — hash " + (res.policy_hash || "?").slice(0, 12));
+    accessRefresh();
+  } catch (e) {
+    err.textContent = e.message; // the 400's refusal reason, verbatim
+  }
+}
+
+$("adm-connect").onclick = admConnect;
+$("adm-forget").onclick = admForget;
+$("adm-mint").onclick = admMint;
+$("adm-minted-copy").onclick = () =>
+  navigator.clipboard.writeText($("adm-minted-key").textContent).then(() => toast("Raw key copied — store it now"));
+$("adm-policy-save").onclick = admPolicySave;
+$("adm-policy-reload").onclick = async () => {
+  $("adm-policy")._dirty = false;
+  await accessRefresh();
+};
+$("adm-policy").addEventListener("input", () => { $("adm-policy")._dirty = true; });
+$("adm-key").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); admConnect(); }
+});
 
 // ---- SV editor component ----------------------------------------------------
 // A transparent-text textarea layered over a <pre> the SERVER highlights with

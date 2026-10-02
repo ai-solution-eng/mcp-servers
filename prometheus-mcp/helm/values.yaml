@@ -23,7 +23,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.5.2
+  tag: v0.6.0
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -120,6 +120,43 @@ service:
   port: 9095
   targetPort: 9095
 
+# -- MCP network zone (ADDITIVE, DEFAULT OFF — fleet contract) --------------------
+# Ingress default-deny for the MCP pods, admitting ONLY the listed sources.
+# OFF by default: the default render is byte-identical to the baseline. Enable
+# deliberately per the runbook ("Enabling the network zone" in the README).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # The MCP network zone: client namespaces allowed to call this server
+  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
+  # namespace goes here first; add agentic frontends from the hardened-G2
+  # example. `monitoring` belongs here whenever the chart ships a
+  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
+  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
+  authorizedClients:
+    namespaces: []
+  # Browser/console path stays OPEN (fleet doctrine 2026-09): the zone exists
+  # to stop RANDOM IN-CLUSTER model access — external traffic keeps flowing
+  # through the SSO-gated edge gateway exactly as pre-zone. Only flip to
+  # false as an explicit, per-chart, per-site decision (e.g. exec/mutation
+  # consoles) — never as a class default.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
+  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
+  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
+  # with an empty probeExceptCidrs (the template fails the render).
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
+    # k8s API / Prometheus / internet legitimately per site).
+    enabled: false
+    extraEgress: []
+
 # -- Saved-query persistence (Wave-5 F4 — ADDITIVE, DEFAULT OFF) --------------------
 # `query_save`/`query_list`/`query_delete`/`query_saved` keep user-defined
 # queries in one JSON store. The store's path comes from
@@ -179,6 +216,11 @@ ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
   virtualService:
+    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
+    # ezua.enabled keeps driving every other gate (kyverno, deployment).
+    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
+    # `default` treats an explicit `false` as empty and would return true.
+    enabled: true
     endpoint: "prometheus-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s

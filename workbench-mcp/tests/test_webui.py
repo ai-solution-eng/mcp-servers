@@ -250,8 +250,8 @@ def test_run_via_api_caps_output_and_injects_env(client, root, monkeypatch):
 def test_run_via_api_passthrough_proxy_env(client, monkeypatch):
     # The chart wires HTTP_PROXY/HTTPS_PROXY/NO_PROXY on the pod for pip;
     # run_command must pass them through to child processes.
-    monkeypatch.setenv("HTTP_PROXY", "http://hpeproxy.its.hpecorp.net:8080")
-    monkeypatch.setenv("HTTPS_PROXY", "http://hpeproxy.its.hpecorp.net:8080")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.example:8080")
     monkeypatch.setenv("NO_PROXY", ".cluster.local,localhost")
     client.post("/api/workspaces", json={"name": "ws"})
     r = client.post(
@@ -259,7 +259,7 @@ def test_run_via_api_passthrough_proxy_env(client, monkeypatch):
         json={"command": ["python3", "-c", "import os; print(os.environ['HTTP_PROXY'], '|', os.environ['NO_PROXY'])"]},
     )
     assert r.status_code == 200
-    assert r.json()["stdout"].strip() == "http://hpeproxy.its.hpecorp.net:8080 | .cluster.local,localhost"
+    assert r.json()["stdout"].strip() == "http://proxy.corp.example:8080 | .cluster.local,localhost"
 
 
 def test_run_via_api_workspace_env_overrides_passthrough(client, monkeypatch):
