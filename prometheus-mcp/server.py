@@ -410,7 +410,8 @@ def _fmt_params(params: dict) -> str:
     annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False, idempotent_hint=True),
 )
 async def query_save(name: str, query: str, ctx: Context, params: dict | None = None) -> str:
-    """Save a PromQL expression under a name for later reuse (Wave-5 F4).
+    """Save a PromQL expression under a name for later reuse (distinct from the
+    sqlhandler server's SQL query_save — this one stores PromQL).
 
     Names are sanitized (letters/digits/space/._- ; everything else becomes
     '_'); saving under an existing name overwrites it. ``params`` optionally
@@ -442,8 +443,8 @@ async def query_save(name: str, query: str, ctx: Context, params: dict | None = 
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
 )
 async def query_list(ctx: Context) -> str:
-    """List the saved queries (name, params, expression), newest first
-    (Wave-5 F4). Cheap — no Prometheus traffic.
+    """List the saved queries (name, params, expression), newest first.
+    Cheap — no Prometheus traffic.
 
     Args:
         ctx: MCP context for logging.
@@ -469,7 +470,7 @@ async def query_list(ctx: Context) -> str:
     annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False, destructive_hint=True),
 )
 async def query_delete(name: str, ctx: Context) -> str:
-    """Delete one saved query by name (Wave-5 F4). The name is sanitized
+    """Delete one saved PromQL query by name. The name is sanitized
     the same way query_save sanitizes it, so an approximate spelling still
     matches what was stored.
 
@@ -491,9 +492,9 @@ async def query_delete(name: str, ctx: Context) -> str:
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def query_saved(name: str, ctx: Context, params: dict | None = None, include_hints: bool = True) -> str:
-    """RUN a saved query — through the exact same instant/range paths as
+    """RUN a saved PromQL query — through the exact same instant/range paths as
     prom_query / prom_query_range, so clamps, caps and validation all apply
-    unchanged (Wave-5 F4).
+    unchanged.
 
     The saved ``params`` provide the run defaults (mode/time/start/end/step);
     the ``params`` argument here overrides them per call. No saved mode →

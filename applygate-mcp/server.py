@@ -1292,7 +1292,8 @@ async def get_resource_status(namespace: str, kind: str, name: str) -> str:
     """Read-only status excerpt for one resource — verify what you applied.
     Deployment/StatefulSet: ready vs total replicas; Job: succeeded/failed;
     everything else: phase + conditions. Stays inside the same namespace/kind
-    guardrails as the write tools (this is the write half, not a general reader).
+    guardrails as the apply tools; for general reads outside an apply flow
+    use the k8s-ops server's get_resource instead.
 
     Args:
         namespace: Namespace of the object (must be allowlisted; default-deny otherwise).

@@ -164,6 +164,17 @@ The engine and every MCP/UI surface resolve **one Caller per request** (see the 
 - **Scope stores** — with enforcement ON, the `sqlhandler://query-memory` resource and the saved-query store are OWNER-scoped (a saved SQL template or recorded query can name tables a policy hides); enforcement off keeps them shared byte-identically.
 - **Hot reload** — mtime-polled like the semantic catalog; a file edit changes every affected caller's hash, so old cache entries age out via TTL (no purge needed).
 
+### 3c. Self-service SSO keys + the admin Users view (2026-10)
+
+Users sign in through their **SSO bearer** (OIDC rung — Keycloak) and mint a **long-lived `X-API-KEY`** for MCP clients, bound to their **verified subject** — no admin ticket:
+
+- **`POST /api/admin/keys/self`** — mint. The subject comes from the VERIFIED token claims (never request input); the raw key is returned ONCE; the store keeps the fingerprint + the sha256 the middleware matches. The minted key authenticates on `/mcp` AS the named user (`via="key"` carrying the subject), so **policy grants BY NAME apply** — no relay/header trust involved.
+- **No-wildcard rule** — a self-mint copies the subject's EXISTING `subject:<name>` assignment from the policy document; a user with no grant row cannot mint (403, actionable). A self-mint never CREATES privileges — only carries them into a key.
+- **Revoke-to-rotate** — `GET/DELETE /api/admin/keys/self[/{fp}]` list/revoke the caller's own keys; `security.selfMintMaxKeys` (default 1) caps active keys per subject (minting rotates the oldest out; 0 disables the feature). Env: `SQLHANDLER_SELF_MINT_MAX_KEYS`.
+- **JWT-rung only** — relay/key/browser callers are refused (403 single gate): the self-mint is never reachable through a spoofable or shared credential class.
+- **Admin Users view** — `GET /api/admin/users` (admin-gated) lists every known subject — policy `subject:` grants, self-minted keys, and last-seen from the audit tail (bounded scan) — rendered in the Access-control tab with an inline **grant-by-name** editor: `PUT /api/admin/users/{subject}/grants` writes the subject's policy row (validated whole-document, hot-reloads; empty list revokes all).
+- **Audit** — `selfservice.key_mint` / `selfservice.key_revoke` / `selfservice.key_rotated_out` / `admin.user_grants` JSONL events (fingerprints only, never key material). Tests: `tests/test_selfservice_keys.py`.
+
 ## 4. Observability & ops
 
 - **Prometheus metrics** — `GET /metrics` renders the text exposition (0.0.4) with no extra dependency: `sqlhandler_queries_total{outcome}` (ok/error/timeout/cancelled), `sqlhandler_query_duration_seconds` histogram, `sqlhandler_query_rows_total`, `sqlhandler_cache_{hits,misses}_total{cache}` (describe/profile/dataset), and gauges for table count, process RSS, and the container memory limit.

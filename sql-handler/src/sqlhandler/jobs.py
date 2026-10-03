@@ -39,6 +39,14 @@ Non-negotiable constraints (all shared with the synchronous path):
   `"result_fetched": true`. With the shared store enabled the once-only
   contract holds cluster-wide (an atomic claim file serializes fetches
   across replicas).
+* **Owner-scoped under enforcement** — when policy enforcement is on AND the
+  caller layer resolved a submitter, the job records its `owner` (the SAME
+  `policy.owner_key` derivation the saved-query store uses — jobs.py stores
+  what it is given and never derives identities). `query_status` /
+  `query_result` / `query_cancel` then refuse a different owner with the
+  same unknown-id 404 a bogus id gets (a wrong guess never confirms the job
+  exists); unowned (legacy / enforcement-off) records stay accessible to
+  everyone.
 * **Registry scope** — the registry is in-memory and process-local: a pod
   restart clears it (jobs are not durable by design; resubmit after a
   restart), AND — the non-obvious one — each replica of a scaled-out
@@ -132,15 +140,17 @@ class _JobRecord:
         "fetched_at",
         "job",
         "job_id",
+        "owner",
         "shared_published",
         "timed_out",
         "timeout_message",
         "timer",
     )
 
-    def __init__(self, job: QueryJob, job_id: str):
+    def __init__(self, job: QueryJob, job_id: str, owner: str | None = None):
         self.job = job
         self.job_id = job_id
+        self.owner = owner  # stable owner scope (policy.owner_key) or None (legacy/unowned)
         self.timer: threading.Timer | None = None
         self.timed_out = False
         self.timeout_message: str | None = None
@@ -256,7 +266,7 @@ class _SharedJobStore:
         return self.root / ("cancel-" + job_id)
 
     # ------------------------------------------------------------ publish
-    def publish_running(self, job_id: str, sql: str) -> None:
+    def publish_running(self, job_id: str, sql: str, owner: str | None = None) -> None:
         """Tombstone at submit: foreign replicas see running, not 404."""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
@@ -265,18 +275,17 @@ class _SharedJobStore:
             # fresh run.
             self._cancel_flag_path(job_id).unlink(missing_ok=True)
             self._cleanup()
-            _write_json_atomic(
-                self.root,
-                self._job_path(job_id),
-                {
-                    "job_id": job_id,
-                    "sql": sql,
-                    "state": "running",
-                    "submitted_at_wall": time.time(),
-                    "fetched": False,
-                    "has_result_file": False,
-                },
-            )
+            payload = {
+                "job_id": job_id,
+                "sql": sql,
+                "state": "running",
+                "submitted_at_wall": time.time(),
+                "fetched": False,
+                "has_result_file": False,
+            }
+            if owner is not None:
+                payload["owner"] = owner
+            _write_json_atomic(self.root, self._job_path(job_id), payload)
         except Exception as exc:  # sharing is best-effort
             logger.warning("async job %s tombstone failed in %s: %s", job_id, self.root, exc)
 
@@ -295,6 +304,8 @@ class _SharedJobStore:
             payload = dict(status_payload)
             payload["fetched"] = bool(record.fetched)
             payload["finished_at_wall"] = time.time()
+            if record.owner is not None:
+                payload["owner"] = record.owner
             if arrow is not None and self.save_result:
                 import pyarrow.parquet as pq
 
@@ -501,6 +512,25 @@ class _SharedJobStore:
         self._release_claim(job_id)
 
 
+def _owner_mismatch(record_owner: str | None, owner: str | None, job_id: str) -> bool:
+    """True when `record_owner` is set and `owner` is not the same scope.
+
+    A record with NO owner (legacy / enforcement-off submit) is accessible to
+    everyone — old in-flight jobs must keep working. The caller layer derives
+    `owner` (the policy.owner_key derivation); jobs.py only compares.
+    """
+    return record_owner is not None and record_owner != owner
+
+
+def _refuse_owner(job_id: str) -> JobError:
+    """The 404-shaped ownership refusal: indistinguishable from an unknown id.
+
+    Never "belongs to another caller" — a wrong-guess job_id must not learn
+    that the id exists (the same not-found text an unknown id gets).
+    """
+    return JobError(f"Unknown job id: {job_id}", status=404)
+
+
 class McpJobManager:
     """Process-wide registry of MCP/REST async query jobs (bounded, TTL-evicted).
 
@@ -546,6 +576,7 @@ class McpJobManager:
         params: object | None = None,
         version_as_of: int | None = None,
         caller=None,
+        owner: str | None = None,
     ) -> dict:
         """Validate + start a job; returns `{"job_id", "state"}`.
 
@@ -559,6 +590,11 @@ class McpJobManager:
         `caller` (identity spine) rides the QueryJob (keyword-only) so the
         worker thread — where contextvars do NOT cross — records the outcome
         against the submitter.
+
+        `owner` — the caller's stable owner scope (the policy.owner_key
+        derivation, computed by the CALLER layer and passed in: jobs.py never
+        derives identities). Set ONLY under policy enforcement; None keeps
+        the job unowned, which every caller may access (backward compat).
         """
         if mcp_readonly_enabled():
             # Decision D2 at SUBMIT time: the same parser guard, the same
@@ -609,13 +645,13 @@ class McpJobManager:
                     ),
                     "status": 429,
                 }
-            record = _JobRecord(job, job_id)
+            record = _JobRecord(job, job_id, owner=owner or None)
             self._records[job_id] = record
         self._arm_timeout(record)
         if self._shared is not None:
             # Tombstone FIRST so a foreign replica's very first poll says
             # "running" instead of "Unknown job id" (live-seen failure mode).
-            self._shared.publish_running(job_id, sql)
+            self._shared.publish_running(job_id, sql, owner=record.owner)
             self._spawn_publish_watcher(record)
         return {"job_id": job_id, "state": job.state}
 
@@ -648,7 +684,10 @@ class McpJobManager:
                         # stay in the loop: the interrupt may take a moment
                         # to unroll the query; the next non-running state
                         # breaks out.
-                self.status(record.job_id)  # builds the payload + publishes
+                # The watcher acts FOR the owner (it publishes the owner's
+                # outcome), so it presents the record's own owner scope —
+                # an owned job's gate must never block its own publish.
+                self.status(record.job_id, owner=record.owner)  # builds the payload + publishes
             except Exception:  # best-effort by contract
                 logger.debug("publish watcher for job %s ended", record.job_id, exc_info=True)
 
@@ -697,17 +736,23 @@ class McpJobManager:
             return self._records.get(job_id)
 
     # -------------------------------------------------------------- status
-    def status(self, job_id: str) -> dict:
+    def status(self, job_id: str, owner: str | None = None) -> dict:
         """Status snapshot for one job (no row data).
 
         Lookup order: the local registry first (the owner is authoritative
         while its job runs), then the shared store when configured — so on a
         scaled-out deployment any replica can report a job submitted or
         finished on another one. Neither knows the id: the historical 404.
+
+        `owner` — the caller's owner scope; a record that belongs to a
+        DIFFERENT owner is refused with the same unknown-id 404 (ownership is
+        never confirmed to a non-owner). Unowned records stay open.
         """
         with self._lock:
             record = self._records.get(job_id)
             if record is not None:
+                if _owner_mismatch(record.owner, owner, job_id):
+                    raise _refuse_owner(job_id)
                 if not record.fetched:
                     self._reconcile_shared_locked(record)
                 fetched = record.fetched
@@ -718,6 +763,8 @@ class McpJobManager:
             shared = None
             if record is None and self._shared is not None:
                 shared = self._shared.load(job_id)
+                if shared is not None and _owner_mismatch(shared.get("owner"), owner, job_id):
+                    raise _refuse_owner(job_id)
         if record is None:
             if shared is None:
                 raise JobError(f"Unknown job id: {job_id}", status=404)
@@ -784,7 +831,7 @@ class McpJobManager:
         self._shared.publish(record, payload, arrow=arrow)
 
     # -------------------------------------------------------------- result
-    def take_result(self, job_id: str):
+    def take_result(self, job_id: str, owner: str | None = None):
         """Return the Arrow result ONCE, then free it from memory.
 
         Raises :class:`JobError` for an unknown id (404), a job still
@@ -797,11 +844,18 @@ class McpJobManager:
         replica is served from the shared Parquet sidecar; the fetch is
         claimed atomically so exactly one fetch succeeds cluster-wide, and a
         second fetch — from any replica — gets the same 409.
+
+        `owner` — the caller's owner scope; another owner's job refuses with
+        the unknown-id 404 BEFORE any result can be handed over or the
+        once-only fetch state touched (a wrong caller can neither read the
+        data nor burn the single fetch).
         """
         with self._lock:
             record = self._records.get(job_id)
+            if record is not None and _owner_mismatch(record.owner, owner, job_id):
+                raise _refuse_owner(job_id)
         if record is None:
-            return self._take_shared_result(job_id)
+            return self._take_shared_result(job_id, owner=owner)
         with self._lock:
             if not record.fetched:
                 self._reconcile_shared_locked(record)
@@ -846,13 +900,15 @@ class McpJobManager:
             self._shared.mark_fetched(job_id)
         return arrow
 
-    def _take_shared_result(self, job_id: str):
+    def _take_shared_result(self, job_id: str, owner: str | None = None):
         """Fetch-once path for a job that finished on ANOTHER replica."""
         if self._shared is None:
             raise JobError(f"Unknown job id: {job_id}", status=404)
         payload = self._shared.load(job_id)
         if payload is None:
             raise JobError(f"Unknown job id: {job_id}", status=404)
+        if _owner_mismatch(payload.get("owner"), owner, job_id):
+            raise _refuse_owner(job_id)
         if payload.get("fetched"):
             raise JobError(self._fetched_message(job_id), status=409)
         state = payload.get("state")
@@ -898,7 +954,7 @@ class McpJobManager:
         return f"Job {job_id} was already fetched; results are handed over once. Resubmit the query for a fresh result."
 
     # -------------------------------------------------------------- cancel
-    def cancel(self, job_id: str) -> dict:
+    def cancel(self, job_id: str, owner: str | None = None) -> dict:
         """Cancel a running job; unknown ids raise JobError(404).
 
         The interrupt only reaches a job running on THIS replica (the DuckDB
@@ -906,15 +962,22 @@ class McpJobManager:
         job says so honestly and cancels the shared tombstone, so polls on
         other replicas stop reporting it as running. Cancelling an already
         finished job is a no-op with its current state (historical behavior).
+
+        `owner` — the caller's owner scope; another owner's job refuses with
+        the unknown-id 404 before anything is cancelled or flagged.
         """
         with self._lock:
             record = self._records.get(job_id)
+            if record is not None and _owner_mismatch(record.owner, owner, job_id):
+                raise _refuse_owner(job_id)
         if record is None:
             if self._shared is None:
                 raise JobError(f"Unknown job id: {job_id}", status=404)
             payload = self._shared.load(job_id)
             if payload is None:
                 raise JobError(f"Unknown job id: {job_id}", status=404)
+            if _owner_mismatch(payload.get("owner"), owner, job_id):
+                raise _refuse_owner(job_id)
             # Forward the cancel to the owner THROUGH the shared store: the
             # owner's publish-watcher polls the flag and interrupts DuckDB
             # locally. mark_cancelled still flips the tombstone so polls on
@@ -987,6 +1050,34 @@ class McpJobManager:
                 payload["shared_store"] = str(self._shared.root)
             return payload
 
+    def list_jobs(self, owner: str | None = None, sql_max_chars: int = 120) -> list[dict]:
+        """The CALLER'S OWN tracked jobs, newest last (registry order).
+
+        Owner-scoped: with an `owner` given, only jobs whose record has that
+        owner (unowned records are legacy/shared-state, never another
+        caller's to browse). With NO owner (enforcement off / stdio), ALL
+        tracked jobs — the historical shared-registry posture. Each summary
+        carries id / state / truncated SQL / elapsed; the SQL is cut to
+        `sql_max_chars` (a job's SQL text can name policy-hidden tables, the
+        same reason saved queries are owner-scoped).
+        """
+        with self._lock:
+            records = [r for r in self._records.values() if owner is None or r.owner is None or r.owner == owner]
+        jobs = []
+        for r in records:
+            sql = r.job.sql
+            if len(sql) > sql_max_chars:
+                sql = sql[: sql_max_chars - 1] + "…"
+            jobs.append(
+                {
+                    "job_id": r.job_id,
+                    "state": r.effective_state(),
+                    "sql": sql,
+                    "elapsed_ms": r.job.elapsed_ms,
+                }
+            )
+        return jobs
+
 
 # ---------------------------------------------------------------------------
 # Process-wide manager (shared by the MCP tools and the /api/jobs routes)
@@ -1025,11 +1116,13 @@ def reset_job_manager() -> None:
 # ---------------------------------------------------------------------------
 
 
-def api_job_submit(engine: SqlEngine, body: dict, *, caller=None) -> dict:
+def api_job_submit(engine: SqlEngine, body: dict, *, caller=None, owner=None) -> dict:
     """POST /api/jobs + MCP query_submit — start a read-only query job.
 
     `caller` (identity spine) rides the QueryJob across the thread
-    boundary so the outcome record attributes to the submitter.
+    boundary so the outcome record attributes to the submitter. `owner`
+    (the caller layer's policy.owner_key derivation) scopes the job: only
+    that owner may status/result/cancel it while enforcement is on.
     """
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
@@ -1040,6 +1133,7 @@ def api_job_submit(engine: SqlEngine, body: dict, *, caller=None) -> dict:
         params=body.get("params"),
         version_as_of=body.get("version_as_of"),
         caller=caller,
+        owner=owner,
     )
     if result.get("error"):
         return result  # carries its own "status" for the route wrapper
@@ -1047,16 +1141,21 @@ def api_job_submit(engine: SqlEngine, body: dict, *, caller=None) -> dict:
     return result
 
 
-def api_job_status(job_id: str) -> dict:
+def api_job_status(job_id: str, *, owner=None) -> dict:
     """GET /api/jobs/{id} + MCP query_status."""
-    return job_manager().status(job_id)
+    return job_manager().status(job_id, owner=owner)
 
 
-def api_job_result(job_id: str):
+def api_job_result(job_id: str, *, owner=None):
     """GET /api/jobs/{id}/result + MCP query_result — the Arrow table, once."""
-    return job_manager().take_result(job_id)
+    return job_manager().take_result(job_id, owner=owner)
 
 
-def api_job_cancel(job_id: str) -> dict:
+def api_job_cancel(job_id: str, *, owner=None) -> dict:
     """DELETE /api/jobs/{id} + MCP query_cancel."""
-    return job_manager().cancel(job_id)
+    return job_manager().cancel(job_id, owner=owner)
+
+
+def api_job_list(*, owner=None) -> list[dict]:
+    """MCP query_list_jobs — the CALLER'S OWN tracked jobs (owner-scoped)."""
+    return job_manager().list_jobs(owner=owner)

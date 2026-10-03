@@ -22,7 +22,14 @@ Pinned shapes (do not change — other files compile against them):
 * ``KeyEntry``: {"fp": "sha256:<12hex>", "key_sha256": <full sha256 hex
   of the raw key — REQUIRED, never the raw key itself>, "label": str,
   "created_at": ISO-8601 str, "created_by": str (minting admin's subject
-  or fp), "source": "file"}
+  or fp), "source": "file", "subject": str | absent}
+  — ``subject`` is OPTIONAL and only set by the SELF-MINT path: the SSO
+  subject the key was minted for (verified from the caller's JWT at mint
+  time, never from request input). A subject-bound key authenticates AS
+  that named user (the middleware records it into the identity spine's
+  scope state; the key rung resolves a subject-carrying Caller), so the
+  policy's ``subject:<name>`` assignments apply — admins grant BY NAME.
+  Admin-minted keys have no subject field (they act as the key itself).
 * keys file: {"keys": [KeyEntry...]} — fp-unique; duplicate mint →
   :class:`AdminKeysError`
 * atomic writes ONLY: temp file in the same directory + ``os.replace``
@@ -49,14 +56,13 @@ import logging
 import os
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 logger = logging.getLogger("sqlhandler.admin_keys")
 
 __all__ = [
     "ADMIN_KEYS_FILE_ENV",
     "AdminKeysError",
-    "KeyEntry",
     "add_key",
     "is_admin",
     "keys_file_path",
@@ -192,7 +198,7 @@ def _write(entries: list[dict], environ) -> None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def list_keys(environ: dict[str, str] | None = None) -> list[dict]:
@@ -201,10 +207,15 @@ def list_keys(environ: dict[str, str] | None = None) -> list[dict]:
 
 
 def add_key(raw_key: str, *, label: str, created_by: str,
-            environ: dict[str, str] | None = None) -> dict:
+            environ: dict[str, str] | None = None,
+            subject: str | None = None) -> dict:
     """Persist a minted key's FINGERPRINT (never the raw key) + assignment
     metadata. Returns the KeyEntry. Raises AdminKeysError when the store
-    is disabled, the fp already exists, or the file cannot be written."""
+    is disabled, the fp already exists, or the file cannot be written.
+
+    ``subject`` — the SSO subject a SELF-MINTED key is bound to (verified
+    upstream from the caller's JWT; this layer only records it). Admin
+    mints omit it — their keys act as the key itself, not as a user."""
     path = keys_file_path(environ)
     if path is None:
         raise AdminKeysError("admin keys store not configured")
@@ -228,9 +239,14 @@ def add_key(raw_key: str, *, label: str, created_by: str,
             "created_by": str(created_by),
             "source": "file",
         }
+        if subject:
+            entry["subject"] = str(subject)
         entries.append(entry)
         _write(entries, environ)
-    logger.info("admin key minted: fp=%s label=%r by=%s (raw key never logged)", fp, label, created_by)
+    logger.info(
+        "admin key minted: fp=%s label=%r by=%s subject=%s (raw key never logged)",
+        fp, label, created_by, subject or "-",
+    )
     return dict(entry)
 
 

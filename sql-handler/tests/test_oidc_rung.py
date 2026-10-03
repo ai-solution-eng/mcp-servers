@@ -190,6 +190,7 @@ _OIDC_ENV_NAMES = (
     "SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS",
     "SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS",
     "SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS",
+    "SQLHANDLER_JWKS_FORCE_MIN_INTERVAL",
 )
 
 _GATE_ENV_NAMES = (
@@ -197,6 +198,7 @@ _GATE_ENV_NAMES = (
     "SQLHANDLER_API_KEYS",
     "SQLHANDLER_REQUIRE_IDENTITY",
     "SQLHANDLER_TRUST_BROWSER_HEADERS",
+    "SQLHANDLER_RELAY_HMAC_SECRET",
     "SQLHANDLER_POLICY_ENABLED",
     "SQLHANDLER_POLICY_FILE",
 )
@@ -209,12 +211,17 @@ def _clean_env(monkeypatch):
     for name in _GATE_ENV_NAMES + _OIDC_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     # The oidc module caches the JWKS per process; a test must never inherit
-    # another test's JWKS/negative-cache state (RAG's fixture pattern).
+    # another test's JWKS/negative-cache/FORCED-REFETCH state (RAG's fixture
+    # pattern, extended for the rate limiter + stampede guard).
     oidc._jwks_cache.clear()
     oidc._jwks_negative.clear()
+    oidc._forced_refetch_at.clear()
+    oidc._jwks_fetching.clear()
     yield
     oidc._jwks_cache.clear()
     oidc._jwks_negative.clear()
+    oidc._forced_refetch_at.clear()
+    oidc._jwks_fetching.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -369,6 +376,171 @@ def test_jwks_down_declines_fail_closed(jwks_server, monkeypatch):
     oidc._jwks_negative.clear()
     jwks_server.set_status(200)
     assert oidc.verify_and_decode(token) is not None
+
+
+# ===========================================================================
+# 2b · JWKS fetch hardening: OUT-OF-LOCK fetch + forced-refetch rate limit
+#
+# THE finding: the unknown-kid path (force=True) fetched INSIDE _jwks_lock, so
+# UNAUTHENTICATED garbage tokens with random kids triggered one serialized
+# outbound fetch per request — an unauthenticated amplification/DoS lever.
+# ===========================================================================
+
+
+def test_forced_refetch_rate_limited_per_url(jwks_server, monkeypatch):
+    """N forced refetches inside the window → at most ONE network fetch."""
+    _setup_key(jwks_server)
+    calls = {"n": 0}
+    real = oidc._fetch_jwks
+
+    def counting(url, timeout):
+        calls["n"] += 1
+        return real(url, timeout)
+
+    monkeypatch.setattr(oidc, "_fetch_jwks", counting)
+    oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 1, "the first forced refetch is allowed"
+    for _ in range(5):
+        oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 1, "inside the 60 s window the cache is served WITHOUT fetching"
+
+
+def test_forced_refetch_allowed_again_after_window(jwks_server, monkeypatch):
+    """The rate limit delays rotation pickup, it does not disable it."""
+    _setup_key(jwks_server)
+    calls = {"n": 0}
+    real = oidc._fetch_jwks
+
+    def counting(url, timeout):
+        calls["n"] += 1
+        return real(url, timeout)
+
+    monkeypatch.setattr(oidc, "_fetch_jwks", counting)
+    oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 1
+    # Age the last forced refetch beyond the window (the seam a real clock move
+    # would provide) — the next forced call must reach the network again.
+    oidc._forced_refetch_at[jwks_server.url] -= 61
+    assert oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 2
+
+
+def test_force_min_interval_env_override(jwks_server, monkeypatch):
+    """``SQLHANDLER_JWKS_FORCE_MIN_INTERVAL`` is honoured (re-read per call)."""
+    _setup_key(jwks_server)
+    calls = {"n": 0}
+    real = oidc._fetch_jwks
+
+    def counting(url, timeout):
+        calls["n"] += 1
+        return real(url, timeout)
+
+    monkeypatch.setattr(oidc, "_fetch_jwks", counting)
+    monkeypatch.setenv("SQLHANDLER_JWKS_FORCE_MIN_INTERVAL", "3600")
+    oidc._jwks_keys(jwks_server.url, force=True)
+    oidc._forced_refetch_at[jwks_server.url] -= 61  # would pass at the 60 s default
+    oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 1, "the raised interval is respected"
+
+    # Interval 0 = the escape hatch: every forced call refetches again.
+    oidc._forced_refetch_at[jwks_server.url] -= 61
+    monkeypatch.setenv("SQLHANDLER_JWKS_FORCE_MIN_INTERVAL", "0")
+    oidc._jwks_keys(jwks_server.url, force=True)
+    assert calls["n"] == 2
+
+
+def test_unknown_kid_garbage_tokens_do_not_hammer_jwks(jwks_server, monkeypatch):
+    """END TO END for the finding: repeated UNAUTHENTICATED garbage tokens
+    with random kids cost one TTL fetch + ONE forced refetch, not one fetch
+    per request. (TTL is raised so the normal path is genuinely cached.)"""
+    _setup_key(jwks_server)
+    monkeypatch.setenv("SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS", "3600")
+    calls = {"n": 0}
+    real = oidc._fetch_jwks
+
+    def counting(url, timeout):
+        calls["n"] += 1
+        return real(url, timeout)
+
+    monkeypatch.setattr(oidc, "_fetch_jwks", counting)
+    for i in range(6):
+        attacker = _generate_rsa(f"attacker-kid-{i}")
+        token = _mint(attacker, _claims())
+        assert oidc.verify_and_decode(token) is None, i
+    assert calls["n"] == 2, f"expected 1 TTL fetch + 1 forced refetch, got {calls['n']}"
+
+
+def test_legitimate_rotation_still_picked_up(jwks_server, monkeypatch):
+    """The rate limit must not break its own purpose: a NEW signing kid is
+    still picked up immediately by the unknown-kid forced refetch."""
+    old = _setup_key(jwks_server)
+    monkeypatch.setenv("SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS", "3600")
+    assert oidc.verify_and_decode(_mint(old, _claims())) is not None
+    rotated = _setup_key(jwks_server, "rotated-kid")  # server now serves the new key
+    assert oidc.verify_and_decode(_mint(rotated, _claims())) is not None
+    assert oidc.verify_and_decode(_mint(old, _claims())) is None, "the rotated-away kid is gone"
+
+
+def test_forced_fetch_inside_window_returns_cache_without_network(jwks_server, monkeypatch):
+    """Inside the window the cached keys (or None) come back untouched."""
+    _setup_key(jwks_server)
+    keys = oidc._jwks_keys(jwks_server.url)
+    assert keys and KID in keys
+    oidc._jwks_keys(jwks_server.url, force=True)  # opens the window (records the stamp)
+    monkeypatch.setattr(oidc, "_fetch_jwks", lambda url, timeout: pytest.fail("fetched inside window"))
+    assert oidc._jwks_keys(jwks_server.url, force=True) == keys
+
+
+def test_forced_fetch_inside_window_returns_none_without_network(jwks_server, monkeypatch):
+    """No cache + inside the window → None (fail closed), still no fetch."""
+    monkeypatch.setattr(oidc, "_fetch_jwks", lambda url, timeout: pytest.fail("fetched inside window"))
+    oidc._forced_refetch_at[jwks_server.url] = time.time()  # window already started
+    assert oidc._jwks_keys(jwks_server.url, force=True) is None
+
+
+def test_fetch_runs_outside_lock_and_marker_released(jwks_server, monkeypatch):
+    """The core of the fix: the network fetch happens with _jwks_lock FREE, so
+    a slow IdP cannot serialize unrelated verification behind the lock."""
+    _setup_key(jwks_server)
+    monkeypatch.setenv("SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS", "0")
+    assert oidc._jwks_keys(jwks_server.url)  # prime the cache
+
+    entered, release = threading.Event(), threading.Event()
+    real = oidc._fetch_jwks
+
+    def slow(url, timeout):
+        entered.set()
+        release.wait(5)
+        return real(url, timeout)
+
+    monkeypatch.setattr(oidc, "_fetch_jwks", slow)
+    result: dict = {}
+    worker = threading.Thread(
+        target=lambda: result.setdefault("keys", oidc._jwks_keys(jwks_server.url)), daemon=True
+    )
+    worker.start()
+    try:
+        assert entered.wait(5), "the fetch never started"
+        assert not oidc._jwks_lock.locked(), "the fetch must NOT hold _jwks_lock"
+        start = time.monotonic()
+        assert oidc._jwks_keys(jwks_server.url)  # concurrent caller: served, not queued
+        assert time.monotonic() - start < 2.0, "a concurrent caller must not block on the fetch"
+    finally:
+        release.set()
+        worker.join(5)
+    assert result.get("keys") and KID in result["keys"]
+    assert not oidc._jwks_fetching, "the stampede marker must be released"
+
+
+def test_jwks_keys_called_twice_no_deadlock(jwks_server, monkeypatch):
+    """The literal regression guard: two _jwks_keys calls (the second forced)
+    both return — the old in-lock fetch shape could not deadlock here, but
+    the out-of-lock shape must be proven re-entrant-safe."""
+    _setup_key(jwks_server)
+    monkeypatch.setenv("SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS", "3600")
+    first = oidc._jwks_keys(jwks_server.url)
+    second = oidc._jwks_keys(jwks_server.url, force=True)
+    assert first and second and KID in first and KID in second
 
 
 # ===========================================================================

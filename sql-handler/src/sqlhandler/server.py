@@ -87,7 +87,7 @@ from .jobs import JobError
 from .provider import make_provider
 from .rawfiles import is_raw_format
 from .sqlguard import assert_mcp_readonly, mcp_readonly_enabled
-from .webui import register_ui
+from .webui import _BodyLimitMiddleware, _SecurityHeadersMiddleware, register_ui
 
 logger = logging.getLogger("sqlhandler")
 
@@ -250,11 +250,14 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                 caller=caller,
             ), False
         elif name == "query_status":
-            return query_status(str(args.get("job_id", ""))), False
+            return query_status(str(args.get("job_id", "")), caller=caller), False
         elif name == "query_result":
-            return query_result(str(args.get("job_id", "")), args.get("output_format") or "markdown"), False
+            return (
+                query_result(str(args.get("job_id", "")), args.get("output_format") or "markdown", caller=caller),
+                False,
+            )
         elif name == "query_cancel":
-            return query_cancel(str(args.get("job_id", ""))), False
+            return query_cancel(str(args.get("job_id", "")), caller=caller), False
         elif name == "query_save":
             return query_save(
                 args.get("name"),
@@ -353,8 +356,12 @@ _TOOLS = [
     Tool(
         name="list_tables",
         description=(
-            "List the tables available in the configured data source, plus a live "
-            "inventory of any attached (read-only) external databases."
+            "List every table in the data source — START HERE before any query, "
+            "plus a live inventory of any attached (read-only) external databases. "
+            "Returns lake table names with one-line catalog descriptions when "
+            "present. When this list is long or you have keywords but no table "
+            "name, use search_tables instead; follow with describe_table on a "
+            "candidate."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
@@ -417,17 +424,26 @@ _TOOLS = [
     Tool(
         name="search_tables",
         description=(
-            "Find tables by keyword: matches table names, columns and catalog "
-            "descriptions, ranked best-first (exact/substring terms, then fuzzy "
-            "near-miss names for typos). Use when the table list is long or you "
-            "don't know which table holds what."
+            "Find tables by keyword — the fast entry point when the table list "
+            "is long or you don't know which table holds what. Matches against "
+            "table and column names, human-written semantic-catalog "
+            "descriptions and aliases (business terms like 'work orders'), and "
+            "column documentation — so business-language queries like 'customer "
+            "churn' or 'order amounts' surface the right table even when no "
+            "name matches literally. Ranked best-first: exact/substring hits "
+            "outrank fuzzy near-miss matches for typos. Returns each match "
+            "with its description and matched columns; follow with "
+            "describe_table on the best hit."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords to look for (e.g. 'work order amount').",
+                    "description": (
+                        "Keywords — business terms work ('work order amount', "
+                        "'customer churn'); matches names, aliases, and column docs."
+                    ),
                 },
             },
             "required": ["query"],
@@ -436,16 +452,19 @@ _TOOLS = [
     Tool(
         name="run_sql",
         description=(
-            "Execute a read-only SQL query against the source tables and return results. "
-            "Tables are referenced by folder name (e.g. work_order_header, or schema/name); "
-            "attached external databases (read-only) are referenced as "
-            "<db-alias>.<schema>.<table> and can be joined with lake tables in the same "
-            "query. Aggregations, filters, and joins are pushed into the scan. "
-            "SELECT-only: DDL/DML (INSERT, CREATE, ATTACH, COPY, ...) are rejected "
-            "unless the operator set SQLHANDLER_MCP_READONLY=0. When the write tier is "
-            "enabled (SQLHANDLER_WRITES_ENABLED), ONE scratch-write statement "
-            "(CREATE TABLE AS / INSERT INTO / COPY INTO under <scratch-root>/"
-            "<your-subject>/...) is admitted and a write summary returns in place of rows."
+            "Execute one SQL SELECT against the lake tables and return rows — "
+            "the workhorse for 'run this query / count / aggregate / join / top-N'. "
+            "Read-only: non-SELECT statements (INSERT, CREATE, DROP, ATTACH, COPY, "
+            "PRAGMA, multi-statement scripts) are refused. Reference tables by "
+            "their listed name (e.g. work_order_header, or schema/name); attached "
+            "external databases (see list_tables) are addressed as "
+            "<db-alias>.<schema>.<table> and joinable with lake tables in one "
+            "query. Workflow: list_tables / search_tables -> describe_table / "
+            "profile_table -> this. Estimate an expensive query first with "
+            "explain_query; a query that may outlive the tool-call timeout belongs "
+            "in query_submit. To chart the result, pass the SAME sql to a charting "
+            "tool (e.g. the seaborn MCP plot tool's `sql` argument) — this server "
+            "returns data, not charts."
         ),
         input_schema={
             "type": "object",
@@ -484,9 +503,8 @@ _TOOLS = [
                 "version_as_of": {
                     "type": "integer",
                     "description": (
-                        "Optional historical snapshot for time travel: a Delta snapshot "
-                        "version (nfs/onelake backends) or Iceberg snapshot id. Applies "
-                        "to every versionable table the query touches."
+                        "Time travel: read the table as of a Delta snapshot version "
+                        "(nfs/onelake) or Iceberg snapshot id."
                     ),
                 },
             },
@@ -496,9 +514,13 @@ _TOOLS = [
     Tool(
         name="scan_table",
         description=(
-            "Fetch rows/columns from a table via pyarrow (columnar). Prefer run_sql "
-            "when filters or aggregations can be pushed into the scan; use this to "
-            "sample raw columns or feed a programmatic caller without writing SQL."
+            "Fetch raw rows/columns from one table WITHOUT writing SQL (pyarrow "
+            "scan) — for 'just give me the rows/columns of <table>', or to hand "
+            "exact-dtype Arrow data to a programmatic caller. Prefer run_sql "
+            "whenever filters/aggregations/joins can be pushed into the query "
+            "(they prune the scan). Unlike sample_rows (which adds per-column "
+            "fill/null rates for filter planning), this is the plain row/column "
+            "fetch."
         ),
         input_schema={
             "type": "object",
@@ -566,12 +588,12 @@ _TOOLS = [
     Tool(
         name="sample_rows",
         description=(
-            "Sample actual rows from a table (a bounded head) with per-column "
-            "fill rates (fill %, null counts) — one bounded look at the DATA. "
-            "Schema comes from describe_table and statistics from profile_table; "
-            "use this to see the actual row shape before writing SQL. The scan "
-            "stops early (never reads the whole table for a small sample) and "
-            "is capped by SQLHANDLER_PROFILE_MAX_ROWS."
+            "Preview a table's actual rows plus per-column fill rates (fill %, "
+            "null counts), in one bounded call — the 'what does this data look "
+            "like' step before writing SQL. Use describe_table for types, "
+            "profile_table/column_stats for full statistics — this shows the "
+            "rows themselves. The scan stops early (never reads the whole table "
+            "for a small sample) and is capped by SQLHANDLER_PROFILE_MAX_ROWS."
         ),
         input_schema={
             "type": "object",
@@ -601,17 +623,17 @@ _TOOLS = [
     Tool(
         name="query_submit",
         description=(
-            "Start an async query job and return its job_id immediately — for "
-            "queries that may outlive a tool-call timeout. The read-only guard "
-            "applies at SUBMIT time (DDL is refused, same as run_sql); the job "
-            "runs on the same engine path with the same SQLHANDLER_QUERY_TIMEOUT "
-            "(600s default, watchdog-enforced) and SQLHANDLER_MAX_ROWS cap. "
-            "Poll query_status, then fetch ONCE with query_result. The registry "
-            "is in-memory (a restart clears it) and bounded by SQLHANDLER_MAX_JOBS "
-            "(default 8; beyond the cap the submit is refused). Multi-replica "
-            "deployments: the registry is per-replica — a finished job is only "
-            "fetchable from any replica when the operator sets SQLHANDLER_JOBS_DIR "
-            "to a directory every replica shares (an RWX PVC)."
+            "Start a read-only SQL query as a background job; returns its job_id "
+            "immediately. Use INSTEAD of run_sql when the query may outlive the "
+            "tool-call timeout (big scans, heavy joins). Same read-only guard as "
+            "run_sql, enforced at submit time (DDL refused). Then: poll "
+            "query_status, fetch the finished result ONCE with query_result (a "
+            "second fetch is refused — resubmit instead), and query_cancel to "
+            "stop a running job. Same row caps and audit as run_sql; the "
+            "registry holds at most SQLHANDLER_MAX_JOBS (default 8) jobs and is "
+            "cleared on restart. Multi-replica deployments need the operator's "
+            "SQLHANDLER_JOBS_DIR shared store for cross-replica fetch; under "
+            "policy enforcement jobs are owner-scoped."
         ),
         input_schema={
             "type": "object",
@@ -640,11 +662,12 @@ _TOOLS = [
     Tool(
         name="query_status",
         description=(
-            "Poll an async query job: state (running/done/error/cancelled), "
-            "elapsed_ms, error, and — when done and not yet fetched — the column "
-            "names and row count. No row data; fetch rows with query_result. With "
-            "the SQLHANDLER_JOBS_DIR shared store, any replica can poll any job "
-            "(a running job submitted elsewhere reports running, not unknown)."
+            "Poll an async query job (from query_submit): state "
+            "(running/done/error/cancelled), elapsed_ms, error, and — when done "
+            "and not yet fetched — the column names and row count. No row data; "
+            "fetch rows with query_result. With the operator's SQLHANDLER_JOBS_DIR "
+            "shared store any replica can poll any job; under policy enforcement "
+            "jobs are owner-scoped (another caller's job id reads as unknown)."
         ),
         input_schema={
             "type": "object",
@@ -656,10 +679,12 @@ _TOOLS = [
         name="query_result",
         description=(
             "Fetch a finished async query job's result ONCE (markdown default, "
-            "json, csv, arrow), then the spooled result is freed from memory — a second "
-            "fetch of the same job is refused (resubmit instead). On multi-replica "
-            "deployments (SQLHANDLER_JOBS_DIR shared store) the once-only contract "
-            "holds cluster-wide: a second fetch from ANY replica is refused."
+            "json, csv, arrow) — a second fetch of the same job is refused "
+            "(resubmit instead), so capture the output the first time. On "
+            "multi-replica deployments (SQLHANDLER_JOBS_DIR shared store) the "
+            "once-only contract holds cluster-wide; under policy enforcement "
+            "another caller's job is refused as unknown before any rows are "
+            "handed over."
         ),
         input_schema={
             "type": "object",
@@ -676,7 +701,10 @@ _TOOLS = [
     ),
     Tool(
         name="query_cancel",
-        description="Cancel a running async query job (DuckDB interrupt).",
+        description=(
+            "Cancel a running async query job (DuckDB interrupt). Owner-scoped "
+            "under policy enforcement: another caller's job reads as unknown."
+        ),
         input_schema={
             "type": "object",
             "properties": {"job_id": {"type": "string", "description": "The job id from query_submit."}},
@@ -686,14 +714,13 @@ _TOOLS = [
     Tool(
         name="query_save",
         description=(
-            "Save a parameterized query under a name for reuse: "
-            "query_save(name, sql, params, description). The SQL is validated at "
-            "save time (parsed; SELECT-only while the read-only mode is on) and "
-            "params are stored as BIND parameters ($name / ? placeholders — never "
-            "string-interpolated). WRITES ARE AUTH-GATED: when SQLHANDLER_API_TOKEN "
-            "or MCP_API_KEYS/SQLHANDLER_API_KEYS is configured, an unauthenticated "
-            "save is refused; with no credential configured (single-user-local "
-            "mode) saves are allowed."
+            "Save a parameterized SQL query under a name for reuse with "
+            "query_saved: query_save(name, sql, params, description). The SQL is "
+            "validated at save time (parsed; SELECT-only while the read-only mode "
+            "is on) and params are stored as BIND parameters ($name / ? "
+            "placeholders — never string-interpolated). Saves are auth-gated when "
+            "the deployment has API keys configured; single-user-local mode "
+            "allows them."
         ),
         input_schema={
             "type": "object",
@@ -763,13 +790,13 @@ _TOOLS = [
     Tool(
         name="explain_query",
         description=(
-            "Estimate one read-only query's cost WITHOUT running it: referenced "
+            "Estimate one read-only query's cost WITHOUT running it — use when a "
+            "query looks slow or expensive, before run_sql. Reports referenced "
             "tables with metadata row counts and bytes-to-scan (each labeled "
             "exact/approx/none), the warm/cold band (is the exact result already "
             "in the L1/L2 result cache), and — with include_plan — DuckDB's own "
             "EXPLAIN tree summary (planning only; the query's data path never "
-            "executes). Attached-database queries report confidence none. Use it "
-            "before run_sql to pick the cheap variant of a query."
+            "executes). Attached-database queries report confidence none."
         ),
         input_schema={
             "type": "object",
@@ -803,13 +830,17 @@ _TOOLS = [
     Tool(
         name="ask_data",
         description=(
-            "Plan a natural-language question against the lake WITHOUT executing: "
-            "keyword-searches the tables (top 5), describes the best hit (up to 20 "
-            "columns, + catalog docs), optionally profiles up to 6 of its columns, "
-            "then drafts one candidate SELECT and a suggested follow-up. Output is "
-            "markdown ending in a 'run this with run_sql' footer — execution is "
-            "ALWAYS a separate, explicit run_sql call (the plan/apply separation); "
-            "the execute argument is accepted for symmetry but has no effect."
+            "Turn a plain-language data question into a SQL plan — never executes. "
+            "For 'how many work orders are overdue?' / 'answer this question about "
+            "the data': keyword-searches the tables (top 5), describes the best hit "
+            "(up to 20 columns, + catalog docs), optionally profiles up to 6 of its "
+            "columns, then drafts one candidate SELECT and a suggested follow-up. "
+            "Output is markdown ending in a 'run this with run_sql' footer — "
+            "execution is ALWAYS a separate, explicit run_sql call (the plan/apply "
+            "separation); the execute argument is accepted for symmetry but has no "
+            "effect. If the answer should be a chart, run the draft, then hand the "
+            "same SQL to a charting tool (e.g. the seaborn MCP plot tool's `sql` "
+            "argument)."
         ),
         input_schema={
             "type": "object",
@@ -955,21 +986,25 @@ mcp = Server(
     version=__version__,
     description=("Direct, fast SQL access to columnar data (OneLake/Delta, S3/MinIO/Parquet, Iceberg) as MCP tools."),
     instructions=(
-        "Direct, fast access to columnar data (OneLake/Delta or S3/MinIO/Parquet) "
-        "as an EzPresto replacement. Use list_tables to discover tables, describe_table "
-        "for schema, profile_table for column statistics (value ranges, null %, distinct "
-        "counts — helps write correct filters first try), column_stats for one column's "
-        "top values and quantiles, and run_sql / scan_table to "
-        "query. Prefers predicate filters and column projections to avoid full scans. "
-        "Before running an expensive query, explain_query estimates its cost WITHOUT "
-        "executing it (row counts, bytes-to-scan with confidence labels, warm/cold band); "
-        "for a plain-language question ask_data plans it (search → describe → draft SQL) "
-        "without executing — run the draft with an explicit run_sql call. "
-        "When external databases are attached (see the list_tables output), their tables "
-        "are addressed as <db-alias>.<schema>.<table>, join-able with lake tables in one "
-        "query, and strictly read-only. For queries that may run long, query_submit "
-        "starts an async job (poll query_status, fetch once with query_result, "
-        "query_cancel to stop); query_save/query_saved reuse parameterized queries."
+        "Read-only SQL analytics over columnar lake tables (Delta/Parquet/Iceberg) "
+        "plus attached read-only external databases. Every non-SELECT statement is "
+        "refused. "
+        "Workflow: 1) list_tables (or search_tables for keyword/fuzzy lookup) to "
+        "find real table names — never guess. "
+        "2) describe_table for columns/types; profile_table / column_stats / "
+        "sample_rows for value ranges, null rates, top values — check these BEFORE "
+        "writing WHERE clauses. "
+        "3) run_sql for the query. Estimate expensive queries first with "
+        "explain_query (bytes-to-scan, warm/cold cache, optional EXPLAIN). A query "
+        "that may outlive the tool-call timeout: query_submit, poll query_status, "
+        "fetch ONCE with query_result, query_cancel to stop. "
+        "4) Plain-language questions: ask_data drafts SQL + a follow-up; nothing "
+        "executes — run the draft yourself with an explicit run_sql. "
+        "Charts: this server returns data, not charts — pass the same SQL to a "
+        "charting tool (the seaborn MCP plot tool takes a `sql` argument). "
+        "Time travel: version_as_of (Delta snapshot version / Iceberg snapshot id) "
+        "reads history. Results render as markdown | json | csv | arrow; rows are "
+        "capped by limit / SQLHANDLER_MAX_ROWS (default 1000)."
     ),
     on_list_tools=_handle_list_tools,
     on_call_tool=_handle_call_tool,
@@ -1280,7 +1315,13 @@ def _prewarm(handler: SqlEngine, tables: tuple[str, ...]) -> None:
 
 
 def list_tables(*, caller=None) -> str:
-    """List the tables available in the configured data source.
+    """List every table in the data source — START HERE before any query.
+
+    Returns lake table names with one-line catalog descriptions when present,
+    plus any attached read-only external databases with their fully-qualified
+    <db-alias>.<schema>.<table> names. When this list is long or you have
+    keywords but no table name, use search_tables instead; follow with
+    describe_table on a candidate.
 
     ``caller`` (identity spine): policy-hidden tables are omitted for a
     caller whose groups hide them (byte-identical list when enforcement is
@@ -1414,7 +1455,16 @@ def profile_table(table: str, columns: list[str] | None = None, *, caller=None) 
 
 
 def search_tables(query: str, *, caller=None) -> str:
-    """Keyword search over table names/columns/catalog descriptions."""
+    """Find tables by keyword — the fast entry point when the table list is
+    long or you don't know which table holds what.
+
+    Matches against table and column names, human-written semantic-catalog
+    descriptions and aliases (business terms like 'work orders'), and column
+    documentation — so business-language queries like 'customer churn' or
+    'order amounts' surface the right table even when no name matches
+    literally. Ranked best-first: exact/substring hits outrank fuzzy
+    near-miss matches for typos. Never triggers a per-table schema fetch.
+    """
     try:
         handler = _handler()
         results = handler.search_tables(query, caller=caller)
@@ -1512,7 +1562,14 @@ def run_sql(
     *,
     caller=None,
 ) -> str:
-    """Execute a SQL query against the source tables and return results.
+    """Execute one SQL SELECT against the lake tables and return rows.
+
+    The workhorse for "run this query / count / aggregate / join / top-N".
+    Workflow: list_tables / search_tables -> describe_table / profile_table ->
+    this. Estimate an expensive query first with explain_query; a query that
+    may outlive the tool-call timeout belongs in query_submit. To chart the
+    result, pass the SAME sql to a charting tool (e.g. the seaborn MCP plot
+    tool's ``sql`` argument) — this server returns data, not charts.
 
     Read-only by default (fleet decision D2): the same DuckDB-parser guard
     the web API uses rejects every non-SELECT statement (multi-statement
@@ -1540,6 +1597,9 @@ def run_sql(
             caps the result either way.
         output_format: markdown (default) | json | csv | arrow.
         params: optional bind parameters (named dict or positional list).
+        version_as_of: Optional historical snapshot for time travel: a Delta
+            snapshot version (nfs/onelake) or Iceberg snapshot id, applied to
+            every versionable table the query touches.
     """
     try:
         fmt = _validate_output_format(output_format)
@@ -1606,11 +1666,14 @@ def scan_table(
     *,
     caller=None,
 ) -> str:
-    """Fetch rows/columns from a table via pyarrow (columnar).
+    """Fetch raw rows/columns from one table WITHOUT writing SQL (pyarrow scan).
 
-    Prefer run_sql when filters or aggregations can be pushed into the scan;
-    use this to sample raw columns or feed a programmatic caller without
-    writing SQL.
+    For "just give me the rows/columns of <table>" — no filters, no SQL.
+    Prefer run_sql whenever filters/aggregations/joins can be pushed into the
+    query (they prune the scan); use this for a bounded columnar slice to
+    inspect, or to hand exact-dtype Arrow data to another tool. Unlike
+    sample_rows (which adds per-column fill/null rates for filter planning),
+    this is the plain row/column fetch.
 
     Args:
         table: Table name (schema/name when the source uses schemas).
@@ -1624,6 +1687,8 @@ def scan_table(
             limit is honored exactly; ``SQLHANDLER_MAX_ROWS=0`` (cap
             disabled) resolves the negative/missing case to unlimited.
         output_format: markdown (default) | json | csv | arrow.
+        version_as_of: Optional historical snapshot for time travel: a Delta
+            snapshot version (nfs/onelake) or Iceberg snapshot id.
     """
     try:
         fmt = _validate_output_format(output_format)
@@ -1732,10 +1797,11 @@ def _sample_rows_markdown(s: dict) -> str:
 
 
 def sample_rows(table: str, limit: int = 20, columns: str | None = None, *, caller=None) -> str:
-    """Sample actual rows from a table with per-column fill rates.
+    """Preview a table's actual rows plus per-column fill rates, in one call.
 
-    One bounded look at the data (schema comes from describe_table,
-    statistics from profile_table — this shows the rows themselves). Physical
+    The "what does this data look like" step before writing SQL. Use
+    describe_table for types, profile_table/column_stats for full statistics —
+    this shows the rows themselves. Physical
     tables read via the pyarrow profile-sampler posture (``head`` stops the
     scan early); virtual tables route through the SQL path
     (``SELECT ... LIMIT n``); attached external tables run the LIMIT
@@ -1758,6 +1824,21 @@ def sample_rows(table: str, limit: int = 20, columns: str | None = None, *, call
 # ---------------------------------------------------------------------------
 
 
+def _job_owner(caller) -> str | None:
+    """The caller's owner scope for async query jobs (or None = unowned).
+
+    The SAME derivation the saved-query write gate uses (saved.py):
+    ``policy.owner_key(caller)`` — subject slug or key fingerprint, never a
+    raw key — but only when policy enforcement is ON; enforcement off keeps
+    jobs unowned and every owner-related behavior byte-identical (the
+    historical shared posture). jobs.py stores what it is given and never
+    derives identities itself.
+    """
+    if caller is not None and _policy.policy_enabled():
+        return _policy.owner_key(caller)
+    return None
+
+
 def query_submit(
     sql: str,
     limit: int | None = None,
@@ -1766,43 +1847,70 @@ def query_submit(
     *,
     caller=None,
 ) -> str:
-    """Start a read-only query job; returns JSON with the job_id.
+    """Start a read-only SQL query as a background job; returns JSON with the job_id.
+
+    Use INSTEAD of run_sql when the query may outlive the tool-call timeout
+    (big scans, heavy joins). Then: poll query_status, fetch the finished
+    result ONCE with query_result (a second fetch is refused — resubmit
+    instead), and query_cancel to stop a running job.
 
     The D2 read-only guard runs at SUBMIT time (a DDL submission is refused
     with the same error run_sql raises, before any job starts). The job runs
     on the same engine path as run_sql — same SQLHANDLER_QUERY_TIMEOUT
     (watchdog-enforced), same SQLHANDLER_MAX_ROWS cap, same audit. The
     registry is in-memory and bounded by SQLHANDLER_MAX_JOBS (default 8).
+
+    Under policy enforcement the job is OWNER-SCOPED: only the submitting
+    caller's owner scope may poll/fetch/cancel it; anyone else sees the
+    same unknown-job 404 a bogus id gets.
     """
     result = _jobs.api_job_submit(
         _handler(),
         {"sql": sql, "limit": limit, "params": params, "version_as_of": version_as_of},
         caller=caller,
+        owner=_job_owner(caller),
     )
     if result.get("error"):
         raise JobError(result["error"], status=result.get("status", 429))
     return json.dumps({k: result[k] for k in ("job_id", "state", "note") if k in result})
 
 
-def query_status(job_id: str) -> str:
-    """Poll one query job: state, elapsed, error, columns/n_rows (no rows)."""
-    return json.dumps(_jobs.api_job_status(job_id), default=str)
+def query_status(job_id: str, *, caller=None) -> str:
+    """Poll one query job: state, elapsed, error, columns/n_rows (no rows).
+
+    Owner-scoped under policy enforcement (a foreign caller's job reads as
+    unknown — see query_submit).
+    """
+    return json.dumps(_jobs.api_job_status(job_id, owner=_job_owner(caller)), default=str)
 
 
-def query_result(job_id: str, output_format: str = "markdown") -> str:
+def query_result(job_id: str, output_format: str = "markdown", *, caller=None) -> str:
     """Fetch a finished job's result ONCE (markdown/json/csv); then freed.
 
     A second fetch is refused — the result is released from the registry's
     memory right after the first hand-over. Poll query_status first; a
     running job returns an error telling you to do exactly that.
+    Owner-scoped under policy enforcement (see query_submit).
     """
-    arrow = _jobs.api_job_result(job_id)
+    arrow = _jobs.api_job_result(job_id, owner=_job_owner(caller))
     return _arrow_to_output(arrow, max_rows=None, fmt=_validate_output_format(output_format))
 
 
-def query_cancel(job_id: str) -> str:
-    """Cancel a running query job (DuckDB interrupt, like the web async API)."""
-    return json.dumps(_jobs.api_job_cancel(job_id), default=str)
+def query_cancel(job_id: str, *, caller=None) -> str:
+    """Cancel a running query job (DuckDB interrupt, like the web async API).
+
+    Owner-scoped under policy enforcement (see query_submit).
+    """
+    return json.dumps(_jobs.api_job_cancel(job_id, owner=_job_owner(caller)), default=str)
+
+
+# NOTE on query_list_jobs: jobs.api_job_list() (the owner-scoped listing over
+# the registry) exists and is ready to expose, but the MCP tool is
+# deliberately NOT added yet: test_dispatch_arg_contract.py pins the exact
+# _TOOLS name→required-args map as the enforced contract, and advertising a
+# new tool requires updating that pinned expectation in the same change.
+# Add together when wanted: the tool function, the dispatch elif arm, the
+# _TOOLS Tool(...) and the pinned-map entry.
 
 
 # ---------------------------------------------------------------------------
@@ -2109,14 +2217,17 @@ def _ask_data_markdown(
 
 
 def ask_data(question: str, execute: bool = False) -> str:
-    """Plan one question against the lake: search → describe → draft SQL.
+    """Turn a plain-language data question into a SQL plan — never executes.
 
-    Composes the existing discovery pieces (search_tables, describe_table,
-    optional profile_table) and drafts ONE candidate SQL — WITHOUT executing
-    anything. ``execute`` is accepted for call-site symmetry with run_sql but
-    deliberately has no effect in this slice (execution stays a separate,
-    confirmable ``run_sql`` call — the fleet's applygate plan→apply
-    separation); the footer says exactly that.
+    For "how many work orders are overdue?" / "answer this question about
+    the data": composes the existing discovery pieces (search_tables,
+    describe_table, optional profile_table) and drafts ONE candidate SQL —
+    WITHOUT executing anything. ``execute`` is accepted for call-site
+    symmetry with run_sql but deliberately has no effect in this slice
+    (execution stays a separate, confirmable ``run_sql`` call — the fleet's
+    plan→apply separation); the footer says exactly that. If the answer
+    should be a chart, run the draft, then hand the same SQL to a charting
+    tool (e.g. the seaborn MCP plot tool's ``sql`` argument).
 
     Token-budget discipline (review §2d): candidate tables capped at 5,
     columns described at 20, profiled columns at 6; profiling only the top
@@ -2406,54 +2517,128 @@ def _admin_gate(caller) -> None:
         raise AdminHTTPError(403, _ADMIN_FORBIDDEN)
 
 
-def _admin_presented_key(request) -> str:
-    """The caller's credential from an admin route request ('' when none).
+def _admin_presented_keys(request) -> dict[str, list[str]]:
+    """ALL credential candidates on an admin route request, GROUPED BY KIND
+    — because the kinds have different fallback semantics (see
+    :func:`_admin_resolve_caller`):
 
-    Same header conventions as the /mcp gate and saved.py's mutation gate:
-    ``Authorization: Bearer <key>``, ``X-API-Key``, ``X-API-Token``.
+    ``bearer``  — Authorization: Bearer tokens. AMBIGUOUS by nature: could
+                  be a fleet/minted key OR an OIDC SSO token (oauth2-proxy
+                  forwards one on every authenticated browser request since
+                  the parity flip).
+    ``api_key`` — X-API-Key / X-API-Token. An EXPLICIT key claim: the caller
+                  is asserting 'this is a key'; a wrong key claim is a hard
+                  refusal, never a fallback to the browser session behind it.
+
+    Live-seen (G2 2026-10-01): picking ONE header as 'the' credential let
+    the ambient forwarded SSO token shadow a perfectly valid explicit
+    X-API-Key — the panel 401'd with the correct fleet key in the field.
     """
     if request is None:
-        return ""
+        return {"bearer": [], "api_key": []}
     try:
         headers = request.headers
     except Exception:
-        return ""
+        return {"bearer": [], "api_key": []}
+    out: dict[str, list[str]] = {"bearer": [], "api_key": []}
     auth = headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
+        token = auth[7:].strip()
+        if token:
+            out["bearer"].append(token)
+    for header in ("x-api-key", "x-api-token"):
+        value = (headers.get(header) or "").strip()
+        if value and value not in out["api_key"]:
+            out["api_key"].append(value)
+    return out
 
 
-def _admin_resolve_caller(request, presented: str):
+def _admin_presented_key(request) -> str:
+    """The FIRST credential candidate (compat shim for the single-value
+    call sites/tests) — see :func:`_admin_presented_keys` for the real
+    multi-credential resolution."""
+    candidates = _admin_presented_keys(request)
+    return candidates[0] if candidates else ""
+
+
+def _admin_resolve_caller(request, presented: dict[str, list[str]]):
     """Resolve the Caller for an admin request, or None (anonymous).
 
-    Mirrors _McpApiKeyMiddleware.__call__ on an /api path: /api/* has NO key
-    middleware (pinned by tests/test_require_identity.py — the key gate is a
-    /mcp concept), so the admin surface authenticates the PRESENTED key
-    itself. Resolution order matches the middleware's union exactly:
+    Credential resolution, in order (first hit wins):
 
-    1. a presented static env key (MCP_API_KEYS / SQLHANDLER_API_KEYS,
-       constant-time) → Caller(cls=key, key_fp=sha256-of-presentation);
-    2. a minted store key via ``admin_keys.match_presentation`` (the
+    1. A presented STATIC key (MCP_API_KEYS / SQLHANDLER_API_KEYS,
+       constant-time) → Caller(cls=key, key_fp=sha256-of-presentation).
+    2. A minted store key via ``admin_keys.match_presentation`` (the
        presented key hashed, compared constant-time against each stored
        ``key_sha256``) → Caller(cls=key, key_fp=the stored fp).
+    3. The FULL identity ladder (identity.caller_from_request_state) —
+       gateway-relay attribution, the OIDC bearer-JWT rung, and the
+       oauth2-proxy browser rung. This is what lets an SSO subject in the
+       policy's ``admins`` list administer from the browser with no key at
+       all (the DECISIONS "admins: subjects and/or fingerprints" contract).
+       The relay rung self-guards (attribution-never-authorization: it only
+       resolves over a key-valid request), so step 3 can never ELEVATE an
+       unauthenticated caller — it can only name an already-authenticated
+       one.
 
-    A relay subject header is NOT honored here (attribution-never-
-    authorization — a header without a validated key proves nothing, the
-    same rule the identity spine applies). Everything else → None.
+    A key-shaped presented value that matches nothing in steps 1-2 → None
+    (401), NOT a fallback to step 3 with a fabricated identity: a wrong key
+    must never be redeemed as 'the browser user behind it'. A genuinely
+    keyless request (SSO browser session) skips 1-2 (nothing presented) and
+    resolves at step 3.
+
+    (/api/* has NO key middleware — pinned by tests/test_require_identity.py,
+    the key gate is a /mcp concept — hence the admin surface authenticates
+    the presented credential itself.)
     """
-    if not presented:
+    keys_env = _McpApiKeyMiddleware._keys()
+
+    # 1) Explicit KEY claims first (X-API-Key / X-API-Token): each is tried
+    #    against the static env keys and the minted store. The FIRST
+    #    RECOGNIZED key wins. An UNRECOGNIZED key claim is a hard refusal —
+    #    it never falls through to the identity ladder (a wrong key is never
+    #    redeemed as the browser user behind it; the test pinning this is
+    #    test_unrecognized_key_still_401_not_redeemed_as_browser).
+    for candidate in presented["api_key"]:
+        static = _identity.match_api_key(candidate, keys_env)
+        if static is not None:
+            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
+        try:
+            entry = _admin_keys.match_presentation(candidate)
+        except Exception:
+            entry = None
+        if entry is not None:
+            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
+    if presented["api_key"]:
+        return None  # a wrong explicit key claim — refuse, full stop
+
+    # 2) Bearer tokens: AMBIGUOUS — fleet/minted key OR an OIDC SSO token.
+    #    Try the key interpretation first (steps identical to above); if no
+    #    key claims it, try the identity ladder's JWT rung (which validates
+    #    iss/aud/exp via JWKS and declines silently on failure).
+    for candidate in presented["bearer"]:
+        static = _identity.match_api_key(candidate, keys_env)
+        if static is not None:
+            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
+        try:
+            entry = _admin_keys.match_presentation(candidate)
+        except Exception:
+            entry = None
+        if entry is not None:
+            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
+    if presented["bearer"]:
+        caller = _identity.caller_from_request_state(request)
+        if not getattr(caller, "is_anonymous", True):
+            return caller
+        return None  # a Bearer that is neither a key nor a valid token
+
+    # 3) Nothing presented — the plain SSO-browser case: the full ladder
+    #    (browser rung). ANONYMOUS → None (the 401 contract: a
+    #    credential-less caller must never probe the admins list via 403).
+    caller = _identity.caller_from_request_state(request)
+    if getattr(caller, "is_anonymous", True):
         return None
-    static = _identity.match_api_key(presented, _McpApiKeyMiddleware._keys())
-    if static is not None:
-        return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
-    try:
-        entry = _admin_keys.match_presentation(presented)
-    except Exception:
-        entry = None
-    if entry is not None:
-        return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
-    return None
+    return caller
 
 
 def require_admin(request) -> object:
@@ -2471,7 +2656,7 @@ def require_admin(request) -> object:
       ``admin_keys.is_admin`` — hot-reloaded with the policy file) →
       403 {"error": "admin access required"}.
     """
-    presented = _admin_presented_key(request)
+    presented = _admin_presented_keys(request)
     caller = _admin_resolve_caller(request, presented)
     if caller is None:
         # The message leads with "identity required" (the UI's Access-control
@@ -2600,6 +2785,343 @@ def _admin_grants_payload() -> dict:
         "policy_hash": getattr(pol, "hash", "") or "",
         "keys": entries,
     }
+
+
+def _self_mint_key(caller, label: str, assign: list[str] | None) -> dict:
+    """The SELF-MINT core: an SSO-authenticated user mints a key bound to
+    their own verified subject.
+
+    Hard rules (the security posture of the whole feature):
+    * JWT RUNG ONLY — ``caller.via == "jwt"`` (an SSO bearer token the
+      resolver verified against the IdP's JWKS). The relay rung is
+      EXCLUDED: relay attribution is header-carried and (without the HMAC
+      secret configured) spoofable — a self-mint through it would mint
+      another user's identity. The browser rung is excluded too (headers
+      under a trust flag, not a proof of possession).
+    * The subject comes from the VERIFIED token claims (the resolver's
+      output), NEVER from request input — there is no parameter that could
+      name another user.
+    * NO WILDCARD DEFAULT — unlike the admin mint (assign omitted =
+      ["*"]), a self-mint with no explicit assign records the user's
+      EXISTING subject assignments from the policy; when the policy has
+      none, the mint refuses with an actionable message. A self-mint must
+      never be able to CREATE privileges — only to carry them into a key.
+    * REVOKE-TO-ROTATE — one active self-minted key per subject by
+      default (SQLHANDLER_SELF_MINT_MAX_KEYS, default 1, re-read per
+      call): minting beyond the cap revokes the OLDEST self-minted key
+      for that subject first (a lost key is recovered by minting again,
+      never by an admin ticket).
+    * The raw key is returned ONCE (same contract as the admin mint); the
+      store keeps the fingerprint + the sha256 the middleware matches.
+
+    Raises AdminHTTPError(401/403/409/503) — same envelope as the admin
+    surface so the REST wrapper needs no new error shape.
+    """
+    subject = getattr(caller, "subject", None)
+    if getattr(caller, "via", "") != "jwt":
+        # THE gate (checked before the subject presence so a non-JWT caller
+        # — key class has no subject, relay is spoofable, browser is
+        # trust-flag headers — can never reach the mint logic): only a
+        # VERIFIED SSO bearer may mint.
+        raise AdminHTTPError(
+            403,
+            "self-mint is available only through SSO login (OIDC bearer token) — "
+            "authenticate with your SSO credentials, not an API key, to mint one",
+        )
+    if not subject:
+        raise AdminHTTPError(401, "self-mint requires an authenticated SSO identity (OIDC bearer token)")
+    if _admin_keys.keys_file_path() is None:
+        raise AdminHTTPError(
+            503,
+            "self-mint is not available: the keys store is not configured (SQLHANDLER_ADMIN_KEYS_FILE unset)",
+        )
+    # Per-subject key cap (revoke-to-rotate). The env is re-read per call.
+    try:
+        max_keys = max(1, int(os.environ.get("SQLHANDLER_SELF_MINT_MAX_KEYS", "1").strip() or "1"))
+    except ValueError:
+        max_keys = 1
+    raw = secrets.token_urlsafe(32)
+    from .mcp_fleet_common.audit import key_fingerprint
+
+    fp = key_fingerprint(raw)
+    try:
+        entry = _admin_keys.add_key(
+            raw,
+            label=label or f"self-mint:{subject}",
+            created_by=f"subject:{subject}",
+            subject=subject,
+        )
+    except _admin_keys.AdminKeysError as exc:
+        message = str(exc)
+        status = 409 if "already exists" in message else 503
+        raise AdminHTTPError(status, message) from exc
+    # The assignment: EXPLICIT globs if the caller passed any (they can only
+    # ever repeat what the policy already grants — the policy doc is what
+    # ENFORCES), else the subject's EXISTING policy assignment.
+    try:
+        if assign:
+            _admin_merge_assignment_with_fp(fp, [str(g).strip() for g in assign if str(g).strip()])
+        else:
+            _self_mint_copy_subject_assignment(subject, fp)
+    except AdminHTTPError:
+        try:
+            _admin_keys.remove_key(fp)
+        except Exception:
+            pass
+        raise
+    _self_mint_enforce_cap(subject, max_keys, keep_fp=fp)
+    _audit_admin_event(
+        "selfservice.key_mint", fp=fp, subject=subject, by=f"subject:{subject}",
+        assign=list(assign) if assign else None,
+    )
+    return {
+        "key": raw,  # THE ONE TIME the raw key is returned.
+        "fp": fp,
+        "label": entry.get("label", ""),
+        "subject": subject,
+        "entry": entry,
+    }
+
+
+def _self_mint_copy_subject_assignment(subject: str, fp: str) -> None:
+    """Copy the subject's EXISTING policy assignment onto the new fp.
+
+    Reads the policy file (the authored truth), finds the ``subject:<name>``
+    (or bare-name) row in datasets.assignments, and binds the SAME globs to
+    the new fp — the key carries the user's grants; it never creates them.
+    403 (not 503) when the subject has NO assignment row: the actionable
+    fix belongs to the operator (grant the user by name) or the deployment
+    (a datasets.global default), and the distinction matters to the UI.
+    """
+    path = _policy.policy_file_path()
+    if not path:
+        raise AdminHTTPError(
+            403,
+            "no policy grants exist for your account yet — ask an operator to grant "
+            "your user (subject) access, then mint again",
+        )
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AdminHTTPError(503, f"cannot read the policy file ({path}): {exc}") from exc
+    data = _admin_validate_policy_text(text)
+    doc = data.get("datasets")
+    if not isinstance(doc, dict):
+        raise AdminHTTPError(
+            403,
+            "no per-user grants exist for your account yet (the policy uses the "
+            "group form) — ask an operator to grant your user access",
+        )
+    assignments = doc.get("assignments") or {}
+    globs = assignments.get(f"subject:{subject}") or assignments.get(subject)
+    if not globs:
+        raise AdminHTTPError(
+            403,
+            f"no grants exist for subject '{subject}' yet — ask an operator to grant "
+            "your user access (Access control tab), then mint again",
+        )
+    _admin_merge_assignment_with_fp(fp, [str(g) for g in globs])
+
+
+def _self_mint_enforce_cap(subject: str, max_keys: int, *, keep_fp: str) -> None:
+    """Keep at most max_keys self-minted keys per subject (revoke-to-rotate).
+
+    Revokes the OLDEST self-minted keys beyond the cap (created_at order),
+    never the just-minted one. Best-effort: a failed revoke (unwritable
+    store) logs and continues — over-cap is a hygiene issue, not a security
+    one (every key still carries only the subject's own grants).
+    """
+    try:
+        mine = [
+            e for e in _admin_keys.list_keys()
+            if e.get("subject") == subject and e.get("fp") != keep_fp
+        ]
+        mine.sort(key=lambda e: str(e.get("created_at", "")))
+        excess = mine[: max(0, len(mine) - max_keys + 1)]
+        for e in excess:
+            fp = str(e.get("fp", ""))
+            if fp:
+                _admin_keys.remove_key(fp)
+                _admin_drop_assignment(fp)
+                _audit_admin_event("selfservice.key_rotated_out", fp=fp, subject=subject)
+    except Exception:
+        logging.getLogger("sqlhandler.server").debug(
+            "self-mint cap enforcement skipped", exc_info=True
+        )
+
+
+def _self_revoke_key(caller, fp: str) -> dict:
+    """A user revokes ONE OF THEIR OWN self-minted keys by fingerprint.
+
+    Ownership is verified against the STORE's subject binding (never the
+    caller's word): a subject-bound key may only be revoked by a caller
+    authenticated as the same subject (JWT rung) — or by an admin (the
+    existing admin revoke surface covers those). Unknown/foreign fps get
+    the same 404-shaped answer (no existence leak).
+    """
+    subject = getattr(caller, "subject", None)
+    if not subject or getattr(caller, "via", "") != "jwt":
+        raise AdminHTTPError(403, "self-service revoke requires SSO authentication (OIDC bearer token)")
+    entry = next(
+        (e for e in _admin_keys.list_keys() if e.get("fp") == str(fp or "").strip()),
+        None,
+    )
+    if entry is None or entry.get("subject") != subject:
+        raise AdminHTTPError(404, f"no self-minted key with fingerprint {fp}")
+    _admin_keys.remove_key(str(entry["fp"]))
+    _admin_drop_assignment(str(entry["fp"]))
+    _audit_admin_event("selfservice.key_revoke", fp=str(entry["fp"]), subject=subject)
+    return {"removed": str(entry["fp"])}
+
+
+def _admin_users_payload() -> dict:
+    """The Users-tab view: every subject the system knows, with grants,
+    keys, and last-seen — the admin grants BY NAME from here.
+
+    Subjects come from three unions: policy ``subject:`` assignments (the
+    grants that exist), subject-bound minted keys (the users who hold a
+    key), and the audit log (last-seen activity per subject). Last-seen
+    scans the audit JSONL tail (bounded — the last _USERS_SCAN_LINES
+    lines) for events carrying a subject; never the whole file.
+    """
+    pol = _policy.policy_store().get()
+    datasets_doc = getattr(pol, "datasets", None) or {}
+    raw_assignments = (datasets_doc.get("assignments") if isinstance(datasets_doc, dict) else None) or {}
+
+    users: dict[str, dict] = {}
+
+    def _ensure(name: str) -> dict:
+        return users.setdefault(name, {"subject": name, "grants": [], "keys": [], "last_seen": None})
+
+    # 1) policy assignments — the authoritative grants (name-spelled rows)
+    for ident, globs in raw_assignments.items():
+        ident = str(ident)
+        if ident.startswith("subject:"):
+            _ensure(ident[len("subject:"):])["grants"] = list(globs or [])
+
+    # 2) subject-bound minted keys
+    for e in _admin_keys.list_keys():
+        s = e.get("subject")
+        if not s:
+            continue
+        _ensure(str(s))["keys"].append({
+            "fp": e.get("fp"),
+            "label": e.get("label", ""),
+            "created_at": e.get("created_at"),
+            "source": e.get("source", "file"),
+        })
+
+    # 3) last-seen from the audit tail (bounded scan, best-effort)
+    tail = _audit_subject_last_seen()
+    for name, ts in tail.items():
+        if name in users:
+            users[name]["last_seen"] = ts
+
+    return {
+        "users": sorted(users.values(), key=lambda u: u["subject"]),
+        "admins": list(getattr(pol, "admins", ()) or ()),
+        "policy_hash": getattr(pol, "hash", "") or "",
+    }
+
+
+#: The audit-tail bound for the Users view (last-seen is a convenience, not
+#: a query engine — a bounded read keeps the admin route O(1)-ish on any
+#: log size).
+_USERS_SCAN_LINES = 5000
+
+
+def _audit_subject_last_seen() -> dict[str, str]:
+    """subject -> last ISO ts from the audit log's tail (bounded, silent)."""
+    path = observability.audit_log_path()
+    if not path:
+        return {}
+    last: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()[-_USERS_SCAN_LINES:]
+    except OSError:
+        return {}
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        subject = rec.get("subject")
+        ts = rec.get("ts")
+        if subject and ts and isinstance(subject, str):
+            prev = last.get(subject)
+            if prev is None or str(ts) >= prev:
+                last[subject] = str(ts)
+    return last
+
+
+def _admin_assign_user_grants(caller, subject: str, globs: list) -> dict:
+    """Grant (or replace) one subject's dataset globs BY NAME — the
+    admin-panel Users action.
+
+    Merges ``{f"subject:{subject}": globs}`` into the policy's
+    datasets.assignments, validates the WHOLE document first (a bad merge
+    never lands), and hot-reloads. Empty globs DROPS the subject's row
+    (revoke-all). The subject name is sanitized (no control chars) and the
+    document round-trips through the SAME validation the PUT route uses.
+    """
+    subject = str(subject or "").strip()
+    if not subject or any(c in subject for c in "\r\n\t"):
+        raise AdminHTTPError(400, "provide a valid subject name")
+    if not isinstance(globs, list) or any(not isinstance(g, str) for g in globs):
+        raise AdminHTTPError(400, "'globs' must be a list of dataset glob strings (empty list revokes all)")
+    cleaned = [g.strip() for g in globs if g.strip()]
+    path = _policy.policy_file_path()
+    if not path:
+        raise AdminHTTPError(503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — grants are read-only")
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AdminHTTPError(503, f"cannot read the policy file ({path}): {exc}") from exc
+    data = _admin_validate_policy_text(text)
+    doc = data.get("datasets")
+    if not isinstance(doc, dict):
+        raise AdminHTTPError(503, "grants live in the datasets policy form — this deployment uses the group form")
+    assignments = doc.get("assignments")
+    if not isinstance(assignments, dict):
+        assignments = {}
+        doc["assignments"] = assignments
+    if cleaned:
+        assignments[f"subject:{subject}"] = cleaned
+    else:
+        assignments.pop(f"subject:{subject}", None)
+        assignments.pop(subject, None)
+    _admin_write_policy(json.dumps(data, indent=2))
+    _audit_admin_event(
+        "admin.user_grants", subject=subject, by=_admin_created_by(caller),
+        globs=cleaned or None,
+    )
+    pol = _policy.policy_store().get()
+    return {"subject": subject, "grants": cleaned, "policy_hash": getattr(pol, "hash", "") or ""}
+
+
+def _admin_keys_list_for_subject(caller) -> dict:
+    """The self-service key view: the CALLER'S OWN subject-bound keys.
+
+    JWT-rung only (same posture as the mint). Returns the caller's keys
+    (fp/label/created_at — never any key material) so the UI can offer
+    revoke-to-rotate without an admin.
+    """
+    subject = getattr(caller, "subject", None)
+    if not subject or getattr(caller, "via", "") != "jwt":
+        raise AdminHTTPError(403, "self-service keys require SSO authentication (OIDC bearer token)")
+    mine = [
+        {
+            "fp": e.get("fp"),
+            "label": e.get("label", ""),
+            "created_at": e.get("created_at"),
+        }
+        for e in _admin_keys.list_keys()
+        if e.get("subject") == subject
+    ]
+    return {"subject": subject, "keys": sorted(mine, key=lambda k: str(k.get("created_at", "")))}
 
 
 def _admin_validate_policy_text(text: str) -> dict:
@@ -3030,6 +3552,10 @@ class _McpApiKeyMiddleware:
     #: The scope["state"] slot carrying the matched key's fingerprint.
     KEY_FP_STATE = "sqlhandler.key_fp"
 
+    #: The scope["state"] slot carrying a SUBJECT-BOUND key's subject
+    #: (self-minted keys only — the SSO user the key acts as).
+    KEY_SUBJECT_STATE = "sqlhandler.key_subject"
+
     def __init__(self, app):
         self.app = app
 
@@ -3087,9 +3613,15 @@ class _McpApiKeyMiddleware:
                         return
                     # A store match records the minted fingerprint the SAME
                     # way an env match records the static one (identity
-                    # spine unchanged: key-class caller).
+                    # spine unchanged: key-class caller). A SUBJECT-BOUND
+                    # key (self-minted by an SSO user) additionally records
+                    # its subject: the key rung then resolves a
+                    # subject-carrying Caller and policy grants BY NAME
+                    # apply to the human, not just to the fp.
                     state = scope.setdefault("state", {})
                     state[self.KEY_FP_STATE] = entry.get("fp")
+                    if entry.get("subject"):
+                        state[self.KEY_SUBJECT_STATE] = str(entry["subject"])
                     await self.app(scope, receive, send)
                     return
                 # ADDITIVE identity feed: record WHICH key matched (its
@@ -3306,6 +3838,28 @@ def main(argv: list | None = None) -> None:
             _loop_log.info("Event loop: asyncio (uvloop not installed — add the wheel for the fast loop)")
     else:
         _loop_log.info("Event loop: asyncio (SQLHANDLER_EVENT_LOOP=%s)", _loop_pref)
+    # Engine PRE-WARM (G2 2026-10-01 lesson): fire the cold engine build in a
+    # background thread the moment main() starts — BEFORE uvicorn binds — so
+    # the first readiness probe never races a cold `_handler()` under
+    # `_handler_lock`. Without this, a slow provider init turned the probe
+    # cadence into a self-sustaining 503 cascade (wait_for cancels the WAIT,
+    # not the thread; every subsequent probe blocked on the lock and timed
+    # out) for as long as init took. Pre-warm idempotent: `_handler()` is
+    # lock-guarded and singleton — this thread and the first probe converge
+    # on one build; whoever arrives second blocks on the lock briefly and
+    # gets the finished engine. Failures land in the thread's log line AND
+    # surface normally on the next probe (no swallowed errors).
+    import threading as _threading
+
+    def _prewarm() -> None:
+        try:
+            _handler()
+            _loop_log.info("Engine pre-warm complete — readiness can pass immediately")
+        except Exception as exc:  # the probe path re-raises with the real error
+            _loop_log.warning("Engine pre-warm FAILED (first /ready will carry the real "
+                              "error): %s", exc)
+
+    _threading.Thread(target=_prewarm, name="sqlhandler-prewarm", daemon=True).start()
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -3359,16 +3913,48 @@ def _build_http_app():
             "on",
         ):
             return JSONResponse({"status": "ready"})
+        # Probe cadence is 10s with a 20s timeout (chart readiness values) —
+        # the INIT budget must absorb a cold engine build (env + provider
+        # construction) without racing it: a 2s budget turned every early
+        # probe into a silent timeout CASCADE (asyncio.wait_for cancels the
+        # wait, not the to_thread — init keeps running under _handler_lock,
+        # so each subsequent probe blocks on the lock and times out too,
+        # pegging /ready at 503 for the whole cold-start even though the
+        # process itself was healthy; live-seen on G2 2026-10-01, 13-minute
+        # zero-exception 503 streaks that cleared on their own). 30s also
+        # stays inside the probe's own 20s timeout? No — 30s EXCEEDS it;
+        # that is deliberate: the kubelet probe timing out is FINE (it
+        # retries), what must never happen is the readiness path reporting
+        # a backend outage because engine init was slow. Every failure now
+        # LOGS (all three branches were silent before — the reason string
+        # rode only in the JSON body, which the gateway strips on
+        # empty-endpoint 503s, leaving nothing to debug from).
+        # Two separate budgets with DISTINCT handling (asyncio.wait_for raises
+        # a bare TimeoutError either way — a combined try can't tell which
+        # budget fired, and the distinction is the whole diagnostic value).
         try:
-            engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=2)
+            engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=30)
+        except TimeoutError:
+            logger.warning("readiness: ENGINE INIT timed out after 30s — engine build still "
+                           "grinding in its thread (lock held); later probes will succeed once warm")
+            observability.drift.note_backend(False)
+            return _ready_response(503, "engine init timed out")
+        except Exception as exc:
+            logger.warning("readiness: engine init FAILED: %s", exc)
+            observability.drift.note_backend(False)
+            return _ready_response(503, f"engine init failed: {exc}")
+        try:
             err = await asyncio.wait_for(asyncio.to_thread(engine.provider.check_connection), timeout=15)
         except TimeoutError:
+            logger.warning("readiness: backend check timed out after 15s (endpoint slow/unreachable)")
             observability.drift.note_backend(False)
             return _ready_response(503, "backend check timed out")
         except Exception as exc:
+            logger.warning("readiness: backend check FAILED: %s", exc)
             observability.drift.note_backend(False)
             return _ready_response(503, str(exc))
         if err:
+            logger.warning("readiness: backend check reported: %s", err)
             observability.drift.note_backend(False)
             return _ready_response(503, err)
         observability.drift.note_backend(True)
@@ -3646,7 +4232,7 @@ def _build_http_app():
     # tiny probe bodies fall under min_size and pass through untouched.
     _compression = load_compression_config()
     if _compression.mode == "gzip":
-        app.add_middleware(GZipMiddleware, minimum_size=_compression.min_size)
+        app.add_middleware(GZipMiddleware, minimum_size=_compression.min_size, compresslevel=3)
         _log.info(
             "Response compression ON (gzip, min_size=%d bytes; SQLHANDLER_COMPRESSION / "
             "SQLHANDLER_COMPRESSION_MIN_SIZE). SSE responses are excluded by the middleware "
@@ -3667,6 +4253,17 @@ def _build_http_app():
             )
         else:
             _log.info("Auth gate ON for /metrics (SQLHANDLER_METRICS_AUTH); /ready stays open for kubelet probes.")
+
+    # Request body cap + security headers — added LAST so BOTH are the
+    # OUTERMOST middleware (Starlette LIFO; cross-review finding: every
+    # gate that short-circuits with its own response — ProbesAuth 401,
+    # DriftGate 503, IdentityRequired/ApiToken 401, CORS preflight — sits
+    # OUTSIDE anything added before it, and those were exactly the
+    # responses missing CSP/nosniff/frame-deny). Oversized POST/PUT bodies
+    # are counted and refused as they flow off the wire; per-route bounded
+    # reads stay in webui.py as the inner net.
+    app.add_middleware(_BodyLimitMiddleware)
+    app.add_middleware(_SecurityHeadersMiddleware)
     return app
 
 

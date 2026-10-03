@@ -18,7 +18,7 @@ deployment:
 # Chart.yaml by the release tooling) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.3.0
+  tag: v0.3.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull

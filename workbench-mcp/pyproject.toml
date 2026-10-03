@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workbench-mcp"
-version = "0.2.1"
+version = "0.3.1"
 description = "Workbench MCP Server — persistent per-agent scratch workspaces: files, env, bounded command execution on a PVC"
 requires-python = ">=3.10"
 keywords = ["mcp", "workbench", "workspace", "persistence", "model-context-protocol"]

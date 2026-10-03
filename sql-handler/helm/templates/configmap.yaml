@@ -38,6 +38,13 @@ data:
   # When true, scrapers must present SQLHANDLER_API_TOKEN or an /mcp API key
   # (X-API-Key / X-API-Token / Bearer); /health stays open for probes.
   SQLHANDLER_METRICS_AUTH: {{ ternary "1" "0" .Values.security.metricsAuth | quote }}
+  {{- /* Self-service SSO key minting (security.selfMintMaxKeys). 0 = the
+         mint endpoint refuses for everyone (feature off); N >= 1 = the
+         per-subject active-key cap (revoke-to-rotate). The mint never
+         creates privileges — it copies the subject's existing policy
+         assignment, so granting happens in the policy document (admin
+         Users tab / datasets.assignments), never through the mint. */}}
+  SQLHANDLER_SELF_MINT_MAX_KEYS: {{ .Values.security.selfMintMaxKeys | quote }}
   {{- /* Identity spine + policy-as-code (security.identity / security.policy).
          The trust flag is the operator's AuthorizationPolicy assertion —
          comment rendered so the posture is auditable in the ConfigMap.
@@ -48,6 +55,13 @@ data:
          in deployment.yaml next to the admin-keys volume mount; this
          ConfigMap renders nothing for it. */}}
   SQLHANDLER_TRUST_BROWSER_HEADERS: {{ ternary "1" "0" .Values.security.identity.trustBrowserHeaders | quote }}
+  {{- /* Relay attribution verification (security.identity.relayHmac).
+         EMPTY default = the historical trust-over-key-valid behavior,
+         byte-identical render. The secret itself is NOT rendered here: it
+         rides security.identity.relayHmac.existingSecret as a secretKeyRef
+         in deployment.yaml (same posture as the sharing bearer token) so a
+         rotation never bakes into the ConfigMap. */}}
+  SQLHANDLER_JWKS_FORCE_MIN_INTERVAL: {{ .Values.security.identity.jwksForceMinInterval | quote }}
   {{- if .Values.security.policy.enabled }}
   SQLHANDLER_POLICY_ENABLED: "1"
   {{- if .Values.security.policy.existingConfigMap }}

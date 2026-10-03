@@ -1,6 +1,7 @@
 """Tests for the read-only web UI / JSON API layer (``sqlhandler.webui``)."""
 
 import datetime
+import json
 from decimal import Decimal
 
 import pyarrow as pa
@@ -619,3 +620,565 @@ def test_export_csv_fallback_preserved_for_exotic_types(tmp_path):
     tbl = pa.table({"d": pa.array([None], pa.decimal128(10, 2))})
     out = _arrow_to_csv_bytes(tbl)
     assert out  # fell back rather than raised
+
+
+# ---------------------------------------------------------------------------
+# masking: /api/export and /api/saved-queries/{name}/run honor the caller
+# ---------------------------------------------------------------------------
+
+
+def _masked_policy(tmp_path, monkeypatch):
+    """A REAL policy file (the test_acl_policy.py shape) binding alice to a
+    masked/row-filtered workorder/work_order; returns her Caller."""
+    import json as _json
+
+    from sqlhandler.identity import Caller
+    from sqlhandler.policy import POLICY_ENABLED_ENV, POLICY_FILE_ENV, reset_policy_store
+
+    d = tmp_path / "workorder" / "work_order"
+    d.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array(range(3), pa.int64()),
+                "ssn": ["s0", "s1", "s2"],
+                "kind": ["a", "secret", "a"],
+            }
+        ),
+        str(d / "part.parquet"),
+    )
+    pf = tmp_path / "policy.json"
+    pf.write_text(
+        _json.dumps(
+            {
+                "version": 1,
+                "default_group": "all_disabled",
+                "groups": {
+                    "wo_only": {
+                        "visible_tables": ["workorder/*"],
+                        "tables": {
+                            "workorder/work_order": {
+                                "row_filter": "kind != 'secret'",
+                                "column_masks": {"ssn": "redact"},
+                            }
+                        },
+                    },
+                    "all_disabled": {},
+                },
+                "subjects": {"alice": ["wo_only"]},
+            }
+        )
+    )
+    monkeypatch.setenv(POLICY_ENABLED_ENV, "1")
+    monkeypatch.setenv(POLICY_FILE_ENV, str(pf))
+    reset_policy_store()
+    return Caller(cls="user", subject="alice", via="relay")
+
+
+def test_api_export_masks_like_api_query(engine, tmp_path, monkeypatch):
+    """A policy-restricted caller's EXPORT matches /api/query for the same
+    caller: same row filter, same column mask (export is not a side door)."""
+    alice = _masked_policy(tmp_path, monkeypatch)
+    sql = "SELECT * FROM work_order ORDER BY id"
+    query_payload = api_query(engine, sql, caller=alice)
+    out = webui_module.api_export(engine, {"sql": sql, "format": "csv"}, caller=alice)
+    lines = out["content"].decode().strip().splitlines()
+    assert query_payload["rows"] == [[0, "***", "a"], [2, "***", "a"]]
+    # identical masking in the CSV (the writer's pinned quoting semantics)
+    assert lines[0] == "id,ssn,kind"
+    assert lines[1:] == ['0,"***","a"', '2,"***","a"']
+
+
+def test_api_export_table_branch_masks_too(engine, tmp_path, monkeypatch):
+    """The table-scan branch of the export delegates to the masking views
+    the same way (scan_arrow with the caller)."""
+    from sqlhandler.config import FileConfig
+    from sqlhandler.engine import SqlEngine
+    from sqlhandler.file import FileProvider
+
+    alice = _masked_policy(tmp_path, monkeypatch)
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+    out = webui_module.api_export(eng, {"table": "workorder/work_order", "format": "csv"}, caller=alice)
+    lines = out["content"].decode().strip().splitlines()
+    assert lines[0] == "id,ssn,kind"
+    assert lines[1:] == ['0,"***","a"', '2,"***","a"']
+
+
+def test_export_and_saved_run_engine_calls_carry_the_caller(monkeypatch, tmp_path):
+    """Mechanical spine check: both endpoints pass the /api/query caller
+    into engine.query_duckdb (and export's table branch into scan_arrow)."""
+    from sqlhandler.identity import Caller
+
+    alice = Caller(cls="user", subject="alice", via="relay")
+
+    class SpyEngine:
+        def __init__(self):
+            self.query_callers = []
+            self.scan_callers = []
+
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+            self.query_callers.append(kw.get("caller"))
+            return pa.table({"one": [1]})
+
+        def scan_arrow(self, table, limit=None, **kw):
+            self.scan_callers.append(kw.get("caller"))
+            return pa.table({"a": [1]})
+
+    spy = SpyEngine()
+    webui_module.api_export(spy, {"sql": "SELECT 1 AS one"}, caller=alice)
+    webui_module.api_export(spy, {"table": "t"}, caller=alice)
+    assert spy.query_callers == [alice]
+    assert spy.scan_callers == [alice]
+    # api_query forwards the caller exactly the same way (the baseline the
+    # two endpoints above were missing)
+    seen = []
+
+    class QueryStub:
+        def query_duckdb(self, sql, **kw):
+            seen.append(kw.get("caller"))
+            return pa.table({"one": [1]})
+
+    api_query(QueryStub(), "SELECT 1 AS one", caller=alice)
+    assert seen == [alice]
+
+
+def _ui_request(path: str, payload: bytes = b""):
+    """A bare Starlette Request for one POST (the handlers only read the
+    body + path_params; identity comes from the monkeypatched resolver)."""
+    from starlette.requests import Request
+
+    headers = [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())]
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "headers": headers,
+            "query_string": b"",
+            "path_params": {},
+        },
+        receive,
+    )
+
+
+def test_webui_saved_run_passes_caller_like_api_query(tmp_path, monkeypatch):
+    """The saved-query run route threads the same caller /api/query does into
+    engine.query_duckdb — None (the old behavior) must never reach a masked
+    deployment's engine on this path."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    from sqlhandler.identity import Caller
+    from sqlhandler.policy import reset_policy_store
+    from sqlhandler.saved import saved_query_store
+
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    reset_policy_store()
+
+    class SpyEngine:
+        def __init__(self):
+            self.callers = []
+
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+            self.callers.append(kw.get("caller"))
+            return pa.table({"one": [1]})
+
+    alice = Caller(cls="user", subject="alice", via="relay")
+    spy = SpyEngine()
+    caller_holder = [alice]
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: caller_holder[0], raising=False
+    )
+    app = Starlette()
+    webui_module.register_ui(app, lambda: spy)
+    saved_query_store().save("q", "SELECT 1 AS one")
+    handler = next(
+        r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
+    )
+
+    def make_request():
+        request = _ui_request("/api/saved-queries/q/run", b"{}")
+        request.scope["path_params"] = {"name": "q"}
+        return request
+
+    resp = asyncio.run(handler(make_request()))
+    assert resp.status_code == 200
+    assert spy.callers == [alice]
+
+    # identity resolution failure degrades to exactly what /api/query does:
+    # the same _caller_for None path — threaded as None, never a crash.
+    caller_holder[0] = None
+    spy.callers.clear()
+    resp = asyncio.run(handler(make_request()))
+    assert resp.status_code == 200
+    assert spy.callers == [None]
+
+
+def test_webui_export_route_passes_caller_like_api_query(tmp_path, monkeypatch):
+    """The /api/export route threads the resolved caller into api_export."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    from sqlhandler.identity import Caller
+    from sqlhandler.policy import reset_policy_store
+
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    reset_policy_store()
+
+    class SpyEngine:
+        def __init__(self):
+            self.query_callers = []
+            self.scan_callers = []
+
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+            self.query_callers.append(kw.get("caller"))
+            return pa.table({"a": [1]})
+
+        def scan_arrow(self, table, limit=None, **kw):
+            self.scan_callers.append(kw.get("caller"))
+            return pa.table({"a": [1]})
+
+    alice = Caller(cls="user", subject="alice", via="relay")
+    spy = SpyEngine()
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
+    )
+    app = Starlette()
+    webui_module.register_ui(app, lambda: spy)
+    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/export")
+
+    resp = asyncio.run(handler(_ui_request("/api/export", b'{"sql": "SELECT 1 AS a", "format": "csv"}')))
+    assert resp.status_code == 200
+    assert spy.query_callers == [alice]
+    resp = asyncio.run(handler(_ui_request("/api/export", b'{"table": "t", "format": "csv"}')))
+    assert resp.status_code == 200
+    assert spy.scan_callers == [alice]
+
+
+# ---------------------------------------------------------------------------
+# request-body caps: Content-Length and chunked bodies are bounded (413)
+# ---------------------------------------------------------------------------
+
+
+def test_read_bounded_body_content_length_over_cap_refuses_without_reading():
+    """A declared Content-Length above the cap is refused 413 without one
+    byte being pulled off the wire."""
+    import asyncio
+
+    from sqlhandler.webui import _BODY_READ_MAX_BYTES, _BodyTooLarge, _read_bounded_body
+
+    pulled = []
+
+    class Req:
+        def __init__(self):
+            self.headers = {"content-length": str(_BODY_READ_MAX_BYTES + 1)}
+
+        async def stream(self):
+            pulled.append(1)
+            yield b"x"
+
+    with pytest.raises(_BodyTooLarge):
+        asyncio.run(_read_bounded_body(Req()))
+    assert pulled == []
+
+
+def test_read_bounded_body_chunked_over_cap_refuses_midstream():
+    """An unknown-length (chunked) body cannot buffer past the cap: the read
+    stops and refuses as soon as the accumulated bytes exceed it."""
+    import asyncio
+
+    from sqlhandler.webui import _BODY_READ_MAX_BYTES, _BodyTooLarge, _read_bounded_body
+
+    half = _BODY_READ_MAX_BYTES // 2
+    served = [b"x" * half, b"x" * half, b"x"]  # cap + 1 total
+
+    class Req:
+        def __init__(self):
+            self.headers = {}
+
+        async def stream(self):
+            for chunk in served:
+                yield chunk
+
+    with pytest.raises(_BodyTooLarge):
+        asyncio.run(_read_bounded_body(Req()))
+
+
+def test_read_bounded_body_under_cap_reads_whole_body():
+    import asyncio
+
+    from sqlhandler.webui import _BODY_READ_MAX_BYTES, _read_bounded_body
+
+    class Req:
+        def __init__(self):
+            self.headers = {"content-length": "10"}
+
+        async def stream(self):
+            yield b"0123456789"
+
+    assert asyncio.run(_read_bounded_body(Req())) == b"0123456789"
+    # exactly at the cap is still fine (cap is a ceiling, not a bias)
+    big = b"y" * _BODY_READ_MAX_BYTES
+
+    class ReqAt:
+        def __init__(self):
+            self.headers = {}
+
+        async def stream(self):
+            yield big
+
+    assert asyncio.run(_read_bounded_body(ReqAt())) == big
+
+
+def test_dbt_import_route_413_on_oversized_content_length(tmp_path, monkeypatch):
+    """POST /api/semantic-catalog/import-dbt with a Content-Length above the
+    body cap gets 413 — before any engine work happens."""
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.policy import reset_policy_store
+    from sqlhandler.server import _transport_security
+    from sqlhandler.server import mcp as mcp_server
+    from sqlhandler.webui import _BODY_READ_MAX_BYTES
+
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    reset_policy_store()
+
+    class BoomEngine:
+        def catalog_uploads_enabled(self):
+            raise AssertionError("engine must not be touched for an oversized body")
+
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    webui_module.register_ui(app, lambda: BoomEngine())
+    client = TestClient(app)
+    r = client.post(
+        "/api/semantic-catalog/import-dbt",
+        content=b"{}",
+        headers={"content-length": str(_BODY_READ_MAX_BYTES + 1)},
+    )
+    assert r.status_code == 413
+    assert "too large" in r.json()["error"]
+    # the apply route has the same cap
+    r = client.post(
+        "/api/semantic-catalog/import-dbt/apply",
+        content=b"{}",
+        headers={"content-length": str(_BODY_READ_MAX_BYTES + 1)},
+    )
+    assert r.status_code == 413
+
+
+def test_dbt_import_route_still_parses_json_under_the_cap(tmp_path, monkeypatch):
+    """A normal (small) import body keeps working after the bounded read —
+    parse errors still get the historical 400 message."""
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.policy import reset_policy_store
+    from sqlhandler.server import _transport_security
+    from sqlhandler.server import mcp as mcp_server
+
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    reset_policy_store()
+    eng = _catalog_engine(tmp_path, monkeypatch)
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    webui_module.register_ui(app, lambda: eng)
+    client = TestClient(app)
+
+    manifest = {"version": 1, "nodes": {}, "sources": {}, "macros": {}, "parent_map": {}}
+    r = client.post("/api/semantic-catalog/import-dbt", json={"manifest": manifest})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert client.post("/api/semantic-catalog/import-dbt", content=b"{broken").status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# cross-review fixes (2026-10-02): async-job + saved-query caller threading,
+# systemic body cap, export filename sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_webui_async_query_route_passes_caller(tmp_path, monkeypatch):
+    """POST /api/query/async threads the resolved caller into the QueryJob —
+    an async run is masked exactly like the sync /api/query (the engine's
+    caller=None branch is the TRUSTED internal path, never acceptable for an
+    HTTP caller). Submit-time spy: capture the QueryJob the manager built and
+    assert its private _caller."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    from sqlhandler.identity import Caller
+    from sqlhandler.webui import QueryJobManager
+
+    captured = {}
+    real_submit = QueryJobManager.submit
+
+    def spy_submit(self, engine, sql, limit=None, params=None, version_as_of=None, caller=None):
+        result = real_submit(self, engine, sql, limit=limit, params=params,
+                             version_as_of=version_as_of, caller=caller)
+        qid = result.get("query_id")
+        if qid:
+            job, _ = self._jobs[qid]
+            captured["caller"] = job._caller
+        return result
+
+    monkeypatch.setattr(QueryJobManager, "submit", spy_submit, raising=True)
+    alice = Caller(cls="user", subject="alice", via="relay")
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
+    )
+    app = Starlette()
+
+    class Engine:  # never executed at submit time; the job thread may run it
+        def query_duckdb(self, *a, **k):
+            return pa.table({"one": [1]})
+
+    webui_module.register_ui(app, lambda: Engine())
+    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/query/async")
+    resp = asyncio.run(handler(_ui_request("/api/query/async", b'{"sql": "SELECT 1 AS one"}')))
+    assert resp.status_code == 200
+    assert captured["caller"] == alice
+
+
+def test_webui_jobs_submit_passes_caller_and_owner(tmp_path, monkeypatch):
+    """POST /api/jobs threads caller + owner exactly like the MCP twin."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    from sqlhandler.identity import Caller
+
+    captured = {}
+
+    class SpyManager:
+        def submit(self, engine, sql, limit=None, params=None, version_as_of=None, caller=None, owner=None):
+            captured["caller"] = caller
+            captured["owner"] = owner
+            return {"query_id": "job123", "state": "running"}
+
+    alice = Caller(cls="user", subject="alice", via="relay")
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
+    )
+    # Policy enforcement ON so the owner derivation is active (same gate the
+    # MCP dispatch uses: policy.owner_key under enforcement, None otherwise).
+    monkeypatch.setattr(webui_module._policy, "policy_enabled", lambda: True, raising=False)
+    monkeypatch.setattr(
+        webui_module._policy, "owner_key", lambda c: f"subject:{c.subject}", raising=False
+    )
+    app = Starlette()
+    webui_module.register_ui(app, lambda: object())
+    webui_module._QueryJobManagerSingleton = None  # unused; patch the manager getter below
+    # Patch the manager the route closes over: jobs_submit uses job_manager().
+    import sqlhandler.jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod, "job_manager", lambda: SpyManager(), raising=False)
+    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/jobs")
+    resp = asyncio.run(handler(_ui_request("/api/jobs", b'{"sql": "SELECT 1"}')))
+    assert resp.status_code == 200
+    assert captured["caller"] == alice
+    assert captured["owner"] == "subject:alice"
+
+
+def test_webui_saved_routes_scope_by_caller(tmp_path, monkeypatch):
+    """All four /api/saved-queries handlers thread the caller: an anonymous
+    list no longer returns another subject's private entries, and run/delete
+    are owner-scoped like the MCP twins."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    from sqlhandler.identity import Caller
+    from sqlhandler.policy import reset_policy_store
+    from sqlhandler.saved import saved_query_store
+
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    reset_policy_store()
+
+    alice = Caller(cls="user", subject="alice", via="relay")
+    holder = [alice]
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: holder[0], raising=False
+    )
+    app = Starlette()
+    webui_module.register_ui(app, lambda: object())
+    store = saved_query_store()
+    store.save("q", "SELECT 1 AS one", {"owner": "subject:alice"})
+
+    # Anonymous list: enforcement on + caller None → owner derivation is
+    # None, which saved.list() treats as "see everything" — but alice's
+    # caller MUST scope it to her own entries.
+    list_handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries")
+    resp = asyncio.run(list_handler(_ui_request("/api/saved-queries", b"")))
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["queries"], "alice's caller sees her own entry"
+
+    # Run route: the resolved caller rides the lookup (404 for a foreign
+    # subject's entry is asserted at the saved.py layer; here we pin that
+    # the ROUTE actually forwards a caller — spy on api_saved_run).
+    run_handler = next(
+        r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
+    )
+    seen = {}
+    real_run = webui_module.api_saved_run
+
+    def spy_run(name, body=None, *, caller=None):
+        seen["caller"] = caller
+        return real_run(name, body, caller=caller)
+
+    monkeypatch.setattr(webui_module, "api_saved_run", spy_run, raising=False)
+    request = _ui_request("/api/saved-queries/q/run", b"{}")
+    request.scope["path_params"] = {"name": "q"}
+    asyncio.run(run_handler(request))
+    assert seen["caller"] == alice
+
+
+def test_webui_export_filename_header_is_sanitized(tmp_path, monkeypatch):
+    """A crafted table name cannot inject quotes/CRLF into Content-Disposition."""
+    import asyncio
+
+    from starlette.applications import Starlette
+
+    class SpyEngine:
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+            return pa.table({"a": [1]})
+
+        def scan_arrow(self, table, limit=None, **kw):
+            return pa.table({"a": [1]})
+
+    monkeypatch.setattr(
+        webui_module._identity, "caller_from_request_state", lambda request: None, raising=False
+    )
+    app = Starlette()
+    webui_module.register_ui(app, lambda: SpyEngine())
+    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/export")
+    crafted = 'x".csv\r\nX-Injected: yes'
+    resp = asyncio.run(
+        handler(_ui_request("/api/export", json.dumps({"table": crafted, "format": "csv"}).encode()))
+    )
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    # Security property: the value stays INSIDE the quoted token — no CRLF
+    # (header injection) and no unescaped quote (value breakout). The label
+    # text may survive as filename characters; that is not an injection.
+    assert "\r" not in disposition and "\n" not in disposition
+    inner = disposition[len('attachment; filename="'):-1]
+    assert '"' not in inner and "\\" not in inner

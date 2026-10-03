@@ -948,13 +948,17 @@ async def get_pod_logs(
     since_seconds: int | None = None,
     previous: bool = False,
 ) -> str:
-    """Fetch the log of ONE pod's container (tail-bounded, newest last).
-    previous=true reads the PREVIOUS (crashed) container — the first move
-    when a pod is in CrashLoopBackOff and the current container has nothing
-    to say. Output is length-capped.
+    """Fetch the log of ONE pod's container in a known namespace (tail-bounded,
+    newest last) — e.g. "show pod X's recent logs". Same job as the k8s-ops
+    server's get_pod_logs (note the different parameter names: ``pod`` /
+    ``tail_lines`` here); either works for a single pod, but this one REQUIRES
+    the namespace explicitly. To grep a pattern across ALL pods of a namespace
+    instead of reading one, use search_logs. previous=true reads the PREVIOUS
+    (crashed) container — the first move when a pod is in CrashLoopBackOff and
+    the current container has nothing to say. Output is length-capped.
 
     Args:
-        namespace: Kubernetes namespace of the pod.
+        namespace: Kubernetes namespace of the pod (required — no default).
         pod: Pod name (discover with list_log_sources).
         container: Container name; empty = the pod's first (default) container.
         tail_lines: How many trailing lines to fetch (server-capped by
@@ -1165,18 +1169,24 @@ async def search_logs(
     container: str = "",
     max_total_lines: int = 300,
 ) -> str:
-    """Fan-out regex search over the pods of one namespace: fetch the tail of
-    each pod (timestamps on), keep matching lines, prefix each with
-    'podname/container: ' provenance, merge, and sort chronologically by the
-    embedded RFC3339 timestamp (untimestamped lines last). Pods are fetched in
-    parallel (bounded semaphore, LOGSEARCH_FETCH_CONCURRENCY) and the global
-    line budget is enforced DURING the fan-out: once max_total_lines matches
-    are in hand the search stops pulling further pods (reported in
-    'pods_skipped_budget', with 'truncated' true) instead of fetching
-    everything and slicing afterwards. A pod straddling the stop point counts
-    in BOTH 'pods_searched' (it was read) and 'pods_skipped_budget' (its
-    remaining matches were dropped). Lines longer than
-    LOGSEARCH_MAX_LINE_CHARS are cut with an explicit ' ...[truncated N
+    """Find matching log lines across ALL pods of one namespace when you don't
+    know which pod (or line) holds the problem — e.g. "find the error in the
+    logs", "who is throwing NullPointerException?". For one known pod's plain
+    tail use get_pod_logs; for "which pod matches most?" use count_matches
+    first; for result sets too big for the context window, export_matches
+    writes the matches to a file.
+
+    How it works: fetch the tail of each pod (timestamps on), keep matching
+    lines, prefix each with 'podname/container: ' provenance, merge, and sort
+    chronologically by the embedded RFC3339 timestamp (untimestamped lines
+    last). Pods are fetched in parallel (bounded semaphore,
+    LOGSEARCH_FETCH_CONCURRENCY) and the global line budget is enforced DURING
+    the fan-out: once max_total_lines matches are in hand the search stops
+    pulling further pods (reported in 'pods_skipped_budget', with 'truncated'
+    true) instead of fetching everything and slicing afterwards. A pod
+    straddling the stop point counts in BOTH 'pods_searched' (it was read) and
+    'pods_skipped_budget' (its remaining matches were dropped). Lines longer
+    than LOGSEARCH_MAX_LINE_CHARS are cut with an explicit ' ...[truncated N
     chars]' marker. Empty matches are a normal empty result, not an error.
 
     Args:

@@ -15,7 +15,9 @@ Run:  python -m pytest tests/test_identity.py -v
 
 import asyncio
 import hashlib
+import hmac
 import json
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -25,6 +27,7 @@ from sqlhandler.identity import (
     CALLER_CLASS_BROWSER,
     CALLER_CLASS_KEY,
     CALLER_CLASS_USER,
+    RELAY_HMAC_SECRET_ENV,
     TRUST_BROWSER_HEADERS_ENV,
     Caller,
     match_api_key,
@@ -36,16 +39,44 @@ from sqlhandler.server import (
 )
 
 
-def _resolve_through_stack(monkeypatch, keys: str | None, headers: list[tuple[bytes, bytes]]):
+def _sig(secret: str, ts: str, subject: str, cls: str) -> str:
+    """The gateway's signature over identity.py's canonical string."""
+    msg = f"{ts}\n{subject}\n{cls}"
+    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _signed(secret: str, subject: str, cls: str = "user", ts: str | None = None) -> list[tuple[bytes, bytes]]:
+    """The (ts, sig) headers a correctly-signing gateway would stamp."""
+    stamp = ts if ts is not None else str(int(time.time()))
+    return [
+        (b"x-mcp-caller-ts", stamp.encode("latin-1")),
+        (b"x-mcp-caller-sig", _sig(secret, stamp, subject, cls).encode("latin-1")),
+    ]
+
+
+def _resolve_through_stack(
+    monkeypatch,
+    keys: str | None,
+    headers: list[tuple[bytes, bytes]],
+    secret: str | None = None,
+):
     """Run one request through the REAL middleware order (key gate outer →
     identity inner) and return the resolved Caller + the inner scope state.
-    This is the ladder exactly as production runs it."""
+    This is the ladder exactly as production runs it.
+
+    ``secret`` pins SQLHANDLER_RELAY_HMAC_SECRET for the request (None = the
+    legacy, signature-less posture every pre-existing test asserts).
+    """
 
     if keys is not None:
         monkeypatch.setenv("MCP_API_KEYS", keys)
     else:
         monkeypatch.delenv("MCP_API_KEYS", raising=False)
         monkeypatch.delenv("SQLHANDLER_API_KEYS", raising=False)
+    if secret is not None:
+        monkeypatch.setenv(RELAY_HMAC_SECRET_ENV, secret)
+    else:
+        monkeypatch.delenv(RELAY_HMAC_SECRET_ENV, raising=False)
     captured: list = []
 
     async def inner(scope, receive, send):
@@ -69,7 +100,7 @@ def _resolve_through_stack(monkeypatch, keys: str | None, headers: list[tuple[by
 
 @pytest.fixture()
 def app(monkeypatch):
-    for var in ("MCP_API_KEYS", "SQLHANDLER_API_KEYS", TRUST_BROWSER_HEADERS_ENV):
+    for var in ("MCP_API_KEYS", "SQLHANDLER_API_KEYS", TRUST_BROWSER_HEADERS_ENV, RELAY_HMAC_SECRET_ENV):
         monkeypatch.delenv(var, raising=False)
     with TestClient(_build_http_app()) as client:
         yield client
@@ -212,6 +243,237 @@ def test_relay_class_header_sanitized(app, monkeypatch):
     )
     assert c.subject == "alice"
     assert c.cls in ("user", "browser", "key", "anonymous")
+
+
+# ---------------------------------------------------------------------------
+# rung 1b — HMAC-VERIFIED relay attribution (opt-in via SQLHANDLER_RELAY_HMAC_SECRET)
+#
+# THE finding: key_valid proves a KEY matched, not that the GATEWAY wrote the
+# attribution header — so without a proof any key holder could claim any
+# subject, admins included. The secret-bearing deployment requires the
+# signature; the secret-less deployment is byte-identical to the legacy trust.
+# ---------------------------------------------------------------------------
+
+SECRET = "relay-shared-secret-1"
+
+
+def test_relay_signature_headers_helper():
+    """The helper reads the two proof headers (or None when either is absent)."""
+    scope = {"headers": [(b"x-mcp-caller-ts", b"1700000000"), (b"x-mcp-caller-sig", b"deadbeef")]}
+    assert identity.relay_signature_headers(scope) == ("1700000000", "deadbeef")
+    assert identity.relay_signature_headers({"headers": [(b"x-mcp-caller-ts", b"1")]}) is None
+    assert identity.relay_signature_headers({"headers": [(b"x-mcp-caller-sig", b"s")]}) is None
+    assert identity.relay_signature_headers({"headers": []}) is None
+
+
+def test_relay_sig_valid_pure_function():
+    """The unit-testable seam: canonical `ts\\nsubject\\ncls`, hex digest."""
+    ts = str(int(time.time()))
+    good = _sig(SECRET, ts, "alice", "user")
+    assert identity._relay_sig_valid(SECRET, ts, "alice", "user", good)
+    # Any component change invalidates it (binding to ALL THREE fields).
+    assert not identity._relay_sig_valid(SECRET, ts, "admin", "user", good)
+    assert not identity._relay_sig_valid(SECRET, ts, "alice", "browser", good)
+    assert not identity._relay_sig_valid("other-secret", ts, "alice", "user", good)
+    # Malformed inputs fail closed rather than raising.
+    assert not identity._relay_sig_valid("", ts, "alice", "user", good)
+    assert not identity._relay_sig_valid(SECRET, "not-a-number", "alice", "user", good)
+    assert not identity._relay_sig_valid(SECRET, ts, "alice", "user", "")
+    # A non-finite timestamp must never slip past the replay window
+    # (float("nan") compares False against every bound without this guard).
+    for bogus in ("nan", "inf", "-inf"):
+        assert not identity._relay_sig_valid(SECRET, bogus, "alice", "user",
+                                             _sig(SECRET, bogus, "alice", "user")), bogus
+
+
+def test_relay_signed_subject_accepted_under_secret(app, monkeypatch):
+    """The gateway's valid signature resolves the relay rung as before."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+            *_signed(SECRET, "alice"),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == CALLER_CLASS_USER
+    assert c.subject == "alice"
+    assert c.via == "relay"
+    assert c.key_fp == identity.key_fp("k1")
+
+
+def test_relay_wrong_signature_rejected(app, monkeypatch):
+    """A key holder claiming someone ELSE's subject: signature mismatch →
+    the ladder falls through to the pseudonymous key rung (not anonymous)."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"admin-user"),
+            (b"x-mcp-caller-class", b"user"),
+            (b"x-mcp-caller-ts", str(int(time.time())).encode()),
+            (b"x-mcp-caller-sig", b"0" * 64),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == CALLER_CLASS_KEY, "forged attribution never resolves the relay rung"
+    assert c.subject is None
+    assert c.key_fp == identity.key_fp("k1")
+
+
+def test_relay_signature_of_different_subject_rejected(app, monkeypatch):
+    """Even a GENUINE signature is bound to its subject+class: replaying a
+    valid alice signature on a request claiming `admin` must fail."""
+    ts = str(int(time.time()))
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"admin"),
+            (b"x-mcp-caller-class", b"user"),
+            (b"x-mcp-caller-ts", ts.encode()),
+            (b"x-mcp-caller-sig", _sig(SECRET, ts, "alice", "user").encode()),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == CALLER_CLASS_KEY and c.subject is None
+
+
+def test_relay_stale_timestamp_rejected(app, monkeypatch):
+    """Replay window: a signature older than 300 s is refused."""
+    stale = str(int(time.time()) - 301)
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+            *_signed(SECRET, "alice", ts=stale),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == CALLER_CLASS_KEY, "stale proof is not a proof"
+
+
+def test_relay_fresh_timestamp_within_skew_accepted(app, monkeypatch):
+    """Just inside the window (299 s old) still verifies — the boundary is
+    the documented 300 s, not something stricter."""
+    fresh = str(int(time.time()) - 299)
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+            *_signed(SECRET, "alice", ts=fresh),
+        ],
+        secret=SECRET,
+    )
+    assert c.via == "relay" and c.subject == "alice"
+
+
+def test_relay_missing_sig_headers_when_secret_set(app, monkeypatch):
+    """Secret set + NO proof headers at all: None (the regression this fix
+    exists for — the bare header is no longer self-attributing)."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == CALLER_CLASS_KEY and c.subject is None
+
+
+def test_relay_incomplete_proof_headers_when_secret_set(app, monkeypatch):
+    """BOTH headers are required — a lone sig (or lone ts) is refused."""
+    ts = str(int(time.time()))
+    for partial in ([(b"x-mcp-caller-sig", _sig(SECRET, ts, "alice", "user").encode())],
+                    [(b"x-mcp-caller-ts", ts.encode())]):
+        c, _state = _resolve_through_stack(
+            monkeypatch,
+            "k1",
+            [
+                (b"x-api-key", b"k1"),
+                (b"x-mcp-caller-subject", b"alice"),
+                (b"x-mcp-caller-class", b"user"),
+                *partial,
+            ],
+            secret=SECRET,
+        )
+        assert c.cls == CALLER_CLASS_KEY and c.subject is None, partial
+
+
+def test_relay_secret_unset_trusts_header_unchanged(app, monkeypatch):
+    """BACKWARD COMPATIBILITY (the hard constraint): with the secret UNSET,
+    today's behavior is preserved exactly — bare relay headers over a valid
+    key resolve the relay rung with no signature anywhere."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+        ],
+        secret=None,
+    )
+    assert c.cls == CALLER_CLASS_USER and c.subject == "alice" and c.via == "relay"
+    assert identity.relay_hmac_secret({"OTHER": "1"}) == ""
+    monkeypatch.setenv(RELAY_HMAC_SECRET_ENV, "   ")
+    assert identity.relay_hmac_secret() == "", "blank secret = unset (legacy trust)"
+
+
+def test_relay_sig_ignored_when_secret_unset(app, monkeypatch):
+    """A garbage signature is HARMLESS without the secret (never inspected)."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-api-key", b"k1"),
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-sig", b"garbage"),
+            (b"x-mcp-caller-ts", b"nonsense"),
+        ],
+        secret=None,
+    )
+    assert c.via == "relay" and c.subject == "alice"
+
+
+def test_relay_verified_signature_still_key_gated(app, monkeypatch):
+    """Signature verification does NOT replace the key gate — attribution is
+    never authorization: a correctly-signed header keyless stays anonymous."""
+    c, _state = _resolve_through_stack(
+        monkeypatch,
+        "k1",
+        [
+            (b"x-mcp-caller-subject", b"alice"),
+            (b"x-mcp-caller-class", b"user"),
+            *_signed(SECRET, "alice"),
+        ],
+        secret=SECRET,
+    )
+    assert c.cls == "anonymous" and c.subject is None
+
+
+def test_relay_header_names_exported():
+    """The header constants are part of the module's public surface."""
+    assert identity.HEADER_CALLER_SIG == "X-MCP-Caller-Sig"
+    assert identity.HEADER_CALLER_TS == "X-MCP-Caller-Ts"
+    assert identity.RELAY_HMAC_SECRET_ENV == "SQLHANDLER_RELAY_HMAC_SECRET"
+    for name in ("HEADER_CALLER_SIG", "HEADER_CALLER_TS", "RELAY_HMAC_SECRET_ENV",
+                 "resolve_relay_caller", "relay_signature_headers"):
+        assert name in identity.__all__, name
 
 
 # ---------------------------------------------------------------------------

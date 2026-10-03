@@ -81,7 +81,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.0.0
+  tag: v3.3.2
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -555,6 +555,26 @@ security:
     # api-keys Secret, OIDC, or a gateway-fronted identity) — on with no
     # credential source 401s everyone (fail closed).
     requireIdentity: false
+    # HMAC-verified relay attribution (SQLHANDLER_RELAY_HMAC_SECRET).
+    # EMPTY (default) = the relay rung behaves exactly as before: the
+    # attribution header is trusted over a key-valid request. SET = the rung
+    # ONLY accepts X-MCP-Caller-Subject accompanied by a matching
+    # X-MCP-Caller-Sig / X-MCP-Caller-Ts proof (HMAC-SHA256 over
+    # "<ts>\n<subject>\n<class>", ±300 s skew) — a key holder can no longer
+    # claim another subject (including an admin). Secret from
+    # security.identity.relayHmac.existingSecret when set; a literal
+    # .secret is dev/test-only (the server re-reads the env per request, so
+    # a rotation is a pod restart only when rendered via env).
+    relayHmac:
+      secret: ""
+      existingSecret: ""
+      existingSecretKey: "relay-hmac-secret"
+    # Minimum seconds between FORCED JWKS refetches (unknown-kid JWT path),
+    # per URL (SQLHANDLER_JWKS_FORCE_MIN_INTERVAL). Caps the one-outbound-
+    # fetch-per-request amplification an unauthenticated caller could drive
+    # at the IdP through /mcp with garbage kid tokens. Key rotation is
+    # unaffected (the normal TTL path still refetches on schedule).
+    jwksForceMinInterval: 60
   # Resource-server JWT verification (SSO bearer rung, fleet decision
   # 2026-09-30): users present their SSO bearer token and SQLhandler verifies
   # it against the issuer's JWKS. NO client secret, NO redirect URIs — this
@@ -621,6 +641,15 @@ security:
   # on but NO credential source configured, /metrics 401s for everyone
   # (fail closed, loud startup warning).
   metricsAuth: false
+  # Self-service SSO key minting (SQLHANDLER_SELF_MINT_MAX_KEYS). Users who
+  # sign in with an SSO bearer (OIDC rung) can mint a long-lived X-API-KEY
+  # bound to their VERIFIED subject — the key acts as the named user (policy
+  # grants BY NAME apply). 0 DISABLES self-minting entirely; N >= 1 keeps at
+  # most N active self-minted keys per subject (minting rotates the oldest
+  # out — revoke-to-rotate, a lost key never needs an admin ticket). A
+  # self-mint NEVER creates privileges: it copies the subject's EXISTING
+  # policy assignment (a subject with no grant row cannot mint).
+  selfMintMaxKeys: 1
   # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
   # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
   # Egress is NOT restricted (the server must reach AAD/OneLake/S3).

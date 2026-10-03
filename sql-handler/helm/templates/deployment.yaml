@@ -208,6 +208,22 @@ spec:
               value: {{ .Values.security.oidc.fetchTimeoutSeconds | default "" | quote }}
             - name: SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS
               value: {{ .Values.security.oidc.clockSkewSeconds | default "" | quote }}
+            {{- /* Relay attribution verification (security.identity.relayHmac.*).
+                   EMPTY default = the relay rung trusts attribution over a
+                   key-valid request exactly as before (byte-identical
+                   render). SET = attribution requires a valid
+                   X-MCP-Caller-Sig/X-MCP-Caller-Ts HMAC proof. The secret is
+                   a secretKeyRef (never ConfigMap-rendered) so rotation
+                   stays out of the audited config surface. */}}
+            - name: SQLHANDLER_RELAY_HMAC_SECRET
+              {{- if .Values.security.identity.relayHmac.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.identity.relayHmac.existingSecret }}
+                  key: {{ .Values.security.identity.relayHmac.existingSecretKey }}
+              {{- else }}
+              value: {{ .Values.security.identity.relayHmac.secret | default "" | quote }}
+              {{- end }}
             {{- if .Values.semanticCatalog.store.enabled }}
             # Upload store on the shared PVC (values: semanticCatalog.store):
             # UI/API uploads become cross-pod + durable and still hot-reload.
@@ -300,13 +316,31 @@ spec:
             - name: tmp
               mountPath: /tmp
             {{- end }}
+            {{- if $needCatalog }}
+            {{- /* Directory mount, NOT subPath: the kubelet only propagates
+                   ConfigMap edits into non-subPath mounts, and the engine
+                   hot-reloads on mtime — so a catalog edit reaches the pod
+                   without a restart.
+                   ORDER MATTERS: this mounts the PARENT dir
+                   (/etc/sqlhandler). It MUST come before any mount whose
+                   path is a CHILD of it (the policy mount below) — kubelet
+                   binds volumeMounts in list order, and a parent-dir bind
+                   landing AFTER a child bind shadows it (live-seen
+                   2026-10-01: policy mounted before the parent produced an
+                   empty /etc/sqlhandler/policy). */}}
+            - name: semantic-catalog
+              mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
+              readOnly: true
+            {{- end }}
             {{- if $needPolicy }}
             {{- /* The policy ConfigMap as a DIRECTORY mount (never subPath):
                    the kubelet only propagates ConfigMap edits into
                    non-subPath mounts and PolicyStore hot-reloads on mtime —
                    a grant edit reaches every replica without a restart.
                    Without this mount the env var names a file that never
-                   changes (grants stale until rollout). */}}
+                   changes (grants stale until rollout). Child of the
+                   semantic-catalog parent mount — MUST follow it (see the
+                   order comment above). */}}
             - name: policy
               mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}
               readOnly: true
@@ -315,15 +349,6 @@ spec:
             - name: data
               mountPath: {{ .Values.nfs.mount.mountPath | default "/data" | quote }}
               readOnly: {{ .Values.nfs.mount.readOnly }}
-            {{- end }}
-            {{- if $needCatalog }}
-            {{- /* Directory mount, NOT subPath: the kubelet only propagates
-                   ConfigMap edits into non-subPath mounts, and the engine
-                   hot-reloads on mtime — so a catalog edit reaches the pod
-                   without a restart. */}}
-            - name: semantic-catalog
-              mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
-              readOnly: true
             {{- end }}
             {{- if $needStore }}
             {{- /* Read-write on purpose: the upload API writes the store file

@@ -13,7 +13,9 @@ Resolution ladder (the final OAuth posture, DECISIONS.md "OAuth REVISION"):
    — accepted ONLY on a request that presented a valid /mcp key. Attribution-
    never-authorization: the gateway stamps the header on already-authorized
    calls, so a leaked header without a key resolves to the key-fingerprint rung
-   at worst.
+   at worst. Key validity alone proves a key matched — NOT that the gateway
+   wrote the header — so an OPT-IN HMAC binds the attribution to the gateway
+   (``SQLHANDLER_RELAY_HMAC_SECRET``; unset = legacy trust, unchanged).
 3. **OIDC bearer JWT** — an ``Authorization: Bearer`` value that (a) has the
    three-segment JWT shape and (b) does NOT match a configured static key
    is verified RS256-only against the operator's JWKS
@@ -51,9 +53,12 @@ slot.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+import math
 import os
+import time
 from dataclasses import dataclass, field
 
 from .mcp_fleet_common.audit import CALLER_CONTEXT, key_fingerprint
@@ -74,7 +79,11 @@ __all__ = [
     "HEADER_BROWSER_GROUPS",
     "HEADER_BROWSER_USER",
     "HEADER_CALLER_CLASS",
+    "HEADER_CALLER_SIG",
     "HEADER_CALLER_SUBJECT",
+    "HEADER_CALLER_TS",
+    "RELAY_HMAC_SECRET_ENV",
+    "RELAY_SIG_MAX_SKEW_SECONDS",
     "TRUST_BROWSER_HEADERS_ENV",
     "Caller",
     "anonymous_caller",
@@ -84,6 +93,8 @@ __all__ = [
     "class_for_subject_kind",
     "key_fp",
     "match_api_key",
+    "relay_hmac_secret",
+    "relay_signature_headers",
     "resolve_bearer_jwt",
     "resolve_browser_caller",
     "resolve_relay_caller",
@@ -97,6 +108,21 @@ __all__ = [
 HEADER_CALLER_SUBJECT = "X-MCP-Caller-Subject"
 #: Optional companion label (``user`` | ``browser`` | ``token`` | ``key-bound``).
 HEADER_CALLER_CLASS = "X-MCP-Caller-Class"
+#: OPT-IN attribution proof: the gateway's HMAC-SHA256 (hex) over
+#: ``"{ts}\n{subject}\n{cls}"``. Present only when the deployment configured
+#: the shared secret below; ignored (never required) without it.
+HEADER_CALLER_SIG = "X-MCP-Caller-Sig"
+#: Unix-seconds timestamp covered by the signature (replay window, ±300 s).
+HEADER_CALLER_TS = "X-MCP-Caller-Ts"
+
+#: The relay-attribution HMAC secret (env, re-read per call). UNSET = the
+#: legacy posture: the relay headers are trusted on any key-valid request
+#: (backward compatible, exactly today's behavior). SET = the headers are
+#: honored ONLY with a valid signature, so a key holder can no longer claim
+#: another subject (in particular an admin subject).
+RELAY_HMAC_SECRET_ENV = "SQLHANDLER_RELAY_HMAC_SECRET"
+#: Max |now - ts| accepted for a relay signature (replay window).
+RELAY_SIG_MAX_SKEW_SECONDS = 300
 
 #: oauth2-proxy trusted headers (browser rung) — same convention the gateway's
 #: identity module uses (X-Auth-Request-User, groups via X-Forwarded-Groups).
@@ -223,11 +249,74 @@ def _sanitize_subject(value: str, cap: int = 200) -> str:
     return cleaned[:cap].strip()
 
 
+def relay_hmac_secret(environ: dict[str, str] | None = None) -> str:
+    """The configured relay-attribution HMAC secret ('' when unset/blank).
+
+    Re-read per call (the fleet convention) so enabling verification — or
+    rotating the secret — needs no restart.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(RELAY_HMAC_SECRET_ENV, "").strip()
+
+
+def relay_signature_headers(scope) -> tuple[str, str] | None:
+    """The relay attribution's ``(ts, sig)`` proof, or None when either is absent.
+
+    Both headers are read from the same ASGI scope the subject/class headers
+    come from; the returned values are the RAW (un-stripped-of-nothing) header
+    values — the signature covers the already-sanitized subject and the mapped
+    class label, which the caller computes identically on both sides.
+    """
+    ts = _header(scope, HEADER_CALLER_TS)
+    sig = _header(scope, HEADER_CALLER_SIG)
+    if not ts or not sig:
+        return None
+    return ts, sig
+
+
+def _relay_sig_valid(secret: str, ts: str, subject: str, cls: str, sig: str) -> bool:
+    """Constant-time check of one relay attribution signature (pure).
+
+    Verifies ``HMAC-SHA256(secret, f"{ts}\\n{subject}\\n{cls}")`` (lowercase
+    hex) with :func:`hmac.compare_digest`, and refuses a timestamp outside
+    the ±:data:`RELAY_SIG_MAX_SKEW_SECONDS` replay window. An unset/blank
+    *secret*, a non-numeric timestamp, or any malformed input returns False
+    (fail closed) — this is the seam the unit tests drive directly, with no
+    HTTP machinery.
+    """
+    if not secret or not ts or not sig:
+        return False
+    try:
+        sent_at = float(ts)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(sent_at) or abs(time.time() - sent_at) > RELAY_SIG_MAX_SKEW_SECONDS:
+        return False
+    message = f"{ts}\n{subject}\n{cls}"
+    expected = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    try:
+        return hmac.compare_digest(expected, sig)
+    except TypeError:
+        # compare_digest refuses non-ASCII str — and header bytes decode
+        # latin-1, so a binary-garbage signature header is reachable input.
+        # Malformed input must FAIL CLOSED, not 500 the request.
+        return False
+
+
 def resolve_relay_caller(scope, key_valid: bool) -> Caller | None:
     """Rung 1: the relay's attribution headers over a KEY-VALID request.
 
     Returns None when the request has no valid key (spoofing refusal — the
     header is then never trusted) or carries no subject header.
+
+    KEY VALIDITY IS NECESSARY BUT NOT SUFFICIENT: any key holder could
+    otherwise claim ANY subject (including an admin subject — ``admin_keys``
+    checks ``subject in pol.admins``). When ``SQLHANDLER_RELAY_HMAC_SECRET``
+    is set, the attribution must therefore also carry a valid
+    ``X-MCP-Caller-Sig`` / ``X-MCP-Caller-Ts`` pair; a missing, stale or
+    wrong signature resolves to None (the ladder falls through to the
+    key-fingerprint rung). With the secret UNSET the behavior is exactly the
+    historical one (backward compatible).
     """
     if not key_valid:
         return None
@@ -235,6 +324,12 @@ def resolve_relay_caller(scope, key_valid: bool) -> Caller | None:
     if not subject:
         return None
     cls = class_for_subject_kind(_header(scope, HEADER_CALLER_CLASS))
+    secret = relay_hmac_secret()
+    if secret:
+        proof = relay_signature_headers(scope)
+        if proof is None or not _relay_sig_valid(secret, proof[0], subject, cls, proof[1]):
+            logger.debug("relay attribution rejected: missing or invalid signature")
+            return None
     return Caller(cls=cls, subject=subject, key_fp=None, via="relay")
 
 
@@ -316,7 +411,6 @@ def resolve_bearer_jwt(scope) -> Caller | None:
 def _static_keys() -> list[str]:
     """The configured static keys, read lazily to avoid an import cycle with
     server.py (the middleware module owns the env names)."""
-    global _static_keys_fn
     fn = _static_keys_fn
     if fn is None:
         return []
@@ -328,7 +422,7 @@ def _static_keys() -> list[str]:
 
 #: Injected by server.py at import time (``identity.set_static_keys_source(
 #: _McpApiKeyMiddleware._keys)``) — avoids importing server from identity.
-_static_keys_fn: "callable | None" = None
+_static_keys_fn: callable | None = None
 
 
 def set_static_keys_source(fn) -> None:
@@ -376,6 +470,16 @@ def caller_from_scope(scope) -> Caller:
             via="browser",
         )
     if key_valid:
+        # A SUBJECT-BOUND key (self-minted by an SSO user; the middleware
+        # records the subject the store verified at mint time) resolves to
+        # a subject-carrying caller: policy grants BY NAME apply to the
+        # human. The class stays "key" (audit/metrics vocabulary) but the
+        # subject rides — an authenticated attribution, never spoofable,
+        # because the subject came from the STORE (mint-time-verified),
+        # not from any request header.
+        bound_subject = str(state.get("sqlhandler.key_subject") or "").strip()
+        if bound_subject:
+            return Caller(cls=CALLER_CLASS_KEY, subject=bound_subject, key_fp=key_fpr, via="key")
         return Caller(cls=CALLER_CLASS_KEY, subject=None, key_fp=key_fpr, via="key")
     return anonymous_caller(via="anonymous")
 

@@ -1,6 +1,10 @@
 # SQLhandler MCP server — direct SQL access to columnar data (MCP server).
-# NOTE: pin the base image by digest for production builds; this tag moves.
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# Base image pinned BY DIGEST (tag python3.12-bookworm-slim, digest captured
+# 2026-10-02). To move the base: resolve the tag's digest and update BOTH
+# lines — `docker buildx imagetools inspect ghcr.io/astral-sh/uv:python3.12-bookworm-slim`
+# or the registry API. A digest pin is the only thing that stops a rebuild
+# from silently shipping a different Python/uv.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -28,19 +32,34 @@ WORKDIR ${APP_HOME}
 # + sqlalchemy are the [iceberg] extra. The local package then installs
 # --no-deps (its dependencies are all present by construction). The build
 # requires network (pip).
+# Deps layer keyed on requirements-deps.txt (generated from pyproject by
+# bump_version.sh — deps + [iceberg] extra, WITHOUT the package's own
+# version). History of this layer's cache key:
+#   v1: COPY pyproject.toml README.md  — README doc edits re-downloaded
+#       ~600 MB of wheels (live-seen: the ACL/admin README wave, three
+#       consecutive builds);
+#   v2: COPY pyproject.toml            — fixed README busts, but a VERSION
+#       bump also rewrites pyproject → every release rebuilt AND re-pushed
+#       the full wheel layer (live-seen: v3.1.1's 78s export + 69s push);
+#   v3 (this): the deps manifest changes ONLY when dependencies change —
+#       a version-only release leaves the ~600 MB layer cached AND
+#       un-pushed (registry reuses the blob; release push drops to the
+#       ~1 MB src layers). The single source of truth stays pyproject:
+#       bump_version.sh regenerates the manifest from it at bump time, and
+#       a drift-guard test refuses a manifest that diverges.
+COPY requirements-deps.lock.txt ./
+
+RUN uv pip install --system -r requirements-deps.lock.txt
+
 COPY pyproject.toml README.md ./
-
-RUN uv pip install --system \
-        pyarrow duckdb deltalake mcp orjson uvloop azure-identity azure-storage-file-datalake pandas tabulate uvicorn starlette pyyaml pygments \
-        "pyiceberg[pyarrow]>=0.10" "sqlalchemy>=2.0"
-
 COPY src ./src
 RUN uv pip install --system --no-deps -e .
 
 # Sanity gate (build-time, cheap): the local package must import with zero
 # dependency resolution — catches "dep added to pyproject but not to the
-# RUN above" drift immediately, in the build log, instead of as a first-query
-# ImportError in the pod.
+# manifest" drift immediately, in the build log, instead of as a first-query
+# ImportError in the pod. (Paired with tests/test_deps_manifest.py, which
+# refuses a manifest whose dep set diverges from pyproject.)
 RUN python -c "import sqlhandler; print('sqlhandler', sqlhandler.__version__, 'imports clean')"
 
 # Preinstall the external-database scanner extensions (SQLHANDLER_ATTACH):

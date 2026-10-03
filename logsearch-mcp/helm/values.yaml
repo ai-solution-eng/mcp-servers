@@ -17,7 +17,7 @@ deployment:
 # -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.2.1
+  tag: v0.3.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull

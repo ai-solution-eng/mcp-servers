@@ -23,7 +23,7 @@ image:
   # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
   # tags) — a stale default is how an "old MCP + new sidecar" pod happens.
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.4.0
+  tag: v1.5.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the

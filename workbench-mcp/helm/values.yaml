@@ -21,7 +21,7 @@ image:
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how an "old MCP server" pod happens.
-  tag: v0.2.1
+  tag: v0.3.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull

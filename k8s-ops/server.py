@@ -676,8 +676,9 @@ async def get_resource(
     namespace: str = "",
     output: str = "yaml",
 ) -> str:
-    """Get any Kubernetes resource by type and optional name/namespace.
-    Works with built-in and custom resources (CRDs).
+    """Get the raw object (yaml/json) for any Kubernetes resource by type and
+    optional name/namespace — works with built-in and custom resources (CRDs).
+    For events, conditions, and diagnostics use describe_resource instead.
     Examples:
       get_resource("pods", namespace="default")
       get_resource("pods", name="my-pod", namespace="default")
@@ -890,8 +891,22 @@ async def get_pod_logs(
     tail: int = 100,
     previous: bool = False,
 ) -> str:
-    """Get logs from a pod. Specify container for multi-container pods.
-    Set previous=True to get logs from the previous crashed container."""
+    """Fetch the recent log tail of ONE known pod's container — the quick
+    single-pod read (e.g. "tail pod X's logs", "what did it print before
+    crashing?"). To search a pattern across MANY pods in a namespace, use
+    the logsearch server's search_logs instead.
+
+    Args:
+        pod_name: Name of the pod (find with list_pods).
+        namespace: Namespace of the pod. Defaults to "default" — pass it
+            explicitly unless the pod really lives in default.
+        container: Container name for multi-container pods; empty = the first
+            (default) container.
+        tail: How many trailing lines to return (default 100).
+        previous: True to read the PREVIOUS (crashed) container instead of the
+            running one — the first move for a CrashLoopBackOff pod whose
+            current container has nothing to say.
+    """
     violation = namespace_violation(namespace)
     if violation:
         return f"Error: {violation}"
@@ -2247,17 +2262,11 @@ if _exec_enabled():
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def run_kubectl(command: str) -> str:
-    """Run a read-only kubectl command. This is the most flexible tool.
-    Examples:
-      run_kubectl("get pods -n default -o wide")
-      run_kubectl("get inferenceservices -A")
-      run_kubectl("get events -n ml-ns --sort-by=.lastTimestamp")
-      run_kubectl("top pods -n default")
-      run_kubectl("get nodes -o json")
-      run_kubectl("logs deploy/my-app -n default --tail=50")
-      run_kubectl("get crd")
-      run_kubectl("get virtualservices -A")
-      run_kubectl("get destinationrules -n istio-system")
+    """Run a read-only kubectl command — for what the dedicated tools don't
+    cover (raw -o json/custom-columns output, top, explain, api-resources,
+    arbitrary CRD gets). Prefer the purpose-built tools first:
+    get_resource/describe_resource for objects, triage for a namespace
+    health summary, get_pod_logs for logs, get_events for events.
     Only read verbs are allowed: get, describe, logs, top, explain,
     api-resources, api-versions, cluster-info, version, auth, events.
     Everything else (apply, delete, run, exec, port-forward, proxy, ...) is

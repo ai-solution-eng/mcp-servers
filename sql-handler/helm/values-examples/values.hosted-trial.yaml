@@ -87,7 +87,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.0.0
+  tag: v3.3.2
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent

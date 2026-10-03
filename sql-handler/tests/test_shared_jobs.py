@@ -68,14 +68,14 @@ def _shared_store(tmp_path, monkeypatch):
     jobs_module.reset_job_manager()
 
 
-def _wait_done(mgr, job_id, timeout=10.0):
+def _wait_done(mgr, job_id, timeout=10.0, owner=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        payload = mgr.status(job_id)
+        payload = mgr.status(job_id, owner=owner)
         if payload["state"] != "running":
             return payload
         time.sleep(0.02)
-    return mgr.status(job_id)
+    return mgr.status(job_id, owner=owner)
 
 
 # ------------------------------------------------------------------ lifecycle
@@ -299,6 +299,70 @@ def test_stats_reports_shared_store(tmp_path):
     _wait_done(mgr, job_id)
     assert mgr.stats()["shared_store"] == str(mgr.shared_store.root)
 
+
+# --------------------------------------------------- ownership across replicas
+
+# Owner scoping must hold CLUSTER-WIDE: the owner scope rides the shared
+# tombstone and the finished record, so a foreign replica enforces the same
+# unknown-id refusal the owner replica does (a scaled-out deployment must
+# not turn ownership into a fetch-anywhere hole).
+
+
+def test_shared_record_carries_owner_and_foreign_replica_enforces(tmp_path):
+    eng = _make_engine(tmp_path)
+    owner = McpJobManager()
+    job_id = owner.submit(eng, "SELECT * FROM work_order WHERE kind = 'a'", owner="subject:alice")["job_id"]
+
+    # the tombstone records the owner scope for the cluster
+    tomb = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    assert tomb["owner"] == "subject:alice"
+    _wait_done(owner, job_id, owner="subject:alice")
+    done = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    assert done["owner"] == "subject:alice"
+
+    foreign = McpJobManager()
+    # alice can poll + fetch from the foreign replica exactly as before
+    status = foreign.status(job_id, owner="subject:alice")
+    assert status["state"] == "done"
+    arrow = foreign.take_result(job_id, owner="subject:alice")
+    assert arrow.num_rows == 3
+    # mallory (any replica) gets the unknown-id 404, never the data
+    with pytest.raises(JobError, match="Unknown job id"):
+        foreign.status(job_id, owner="subject:mallory")
+    with pytest.raises(JobError, match="Unknown job id"):
+        foreign.take_result(job_id, owner="subject:mallory")
+    with pytest.raises(JobError, match="Unknown job id"):
+        foreign.cancel(job_id, owner="subject:mallory")
+
+
+def test_foreign_cancel_of_running_owned_job_refused(tmp_path, monkeypatch):
+    """A cross-owner cancel cannot flag the shared store either: the
+    refusal happens before flag_cancel/mark_cancelled touch anything."""
+    _patch_register(monkeypatch, sleep=1.0)
+    eng = _make_engine(tmp_path)
+    owner = McpJobManager()
+    job_id = owner.submit(eng, "SELECT * FROM work_order", owner="subject:alice")["job_id"]
+    time.sleep(0.1)
+    foreign = McpJobManager()
+    with pytest.raises(JobError, match="Unknown job id"):
+        foreign.cancel(job_id, owner="subject:mallory")
+    # the shared tombstone is untouched — still "running", not cancelled
+    tomb = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    assert tomb["state"] == "running"
+    owner.cancel(job_id, owner="subject:alice")
+
+
+def test_shared_unowned_job_stays_shared(tmp_path):
+    """Legacy/unowned records in the shared store remain accessible from any
+    replica (backward compat — old in-flight jobs must not break)."""
+    eng = _make_engine(tmp_path)
+    owner = McpJobManager()
+    job_id = owner.submit(eng, "SELECT * FROM work_order")["job_id"]  # no owner
+    assert "owner" not in json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    _wait_done(owner, job_id)
+    foreign = McpJobManager()
+    assert foreign.status(job_id, owner="subject:anyone")["state"] == "done"
+    assert foreign.take_result(job_id, owner="subject:anyone").num_rows == 5
 
 
 # ------------------------------------------------------- cross-replica cancel

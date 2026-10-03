@@ -218,8 +218,11 @@ async def plot(
     include_png: bool = False,
     sample_rows: int = 10,
 ) -> str:
-    """Create one statistical chart from SQL, a URL, or inline rows.
+    """Create one statistical chart when the user asks to plot, chart, or
+    visualize data (e.g. "histogram of response times", "boxplot latency by
+    region").
 
+    Data source — pick ONE:
     Preferred: pass `sql` (read-only SELECT run via sqlhandler) so row data
     never round-trips through the model; or `data_url` (https JSON/CSV).
     Inline `data` is fine only for tiny datasets (<200 rows).
@@ -235,6 +238,9 @@ async def plot(
     kde; comparison across categories→box/violin/bar/count; composition→pie;
     many-numeric overview→pair or correlation_heatmap; small multiples→facet
     (row/col).
+
+    Unsure which kind or columns fit? Call `describe` on the same source
+    first — it profiles columns/dtypes/cardinality and creates no chart.
     """
     try:
         req = PlotRequest(
@@ -262,12 +268,14 @@ async def describe(
     data: list[dict[str, Any]] | None = None,
     sample_rows: int = 10,
 ) -> str:
-    """Profile a dataset before plotting: columns, dtypes, missing values,
-    cardinality, numeric summaries, and a small sample.
+    """Profile a dataset — call this before plotting, or whenever the user asks
+    "what does this data look like / summarize the columns": columns, dtypes,
+    missing values, cardinality, numeric summaries, and a small sample.
+    Creates no chart.
 
     Same data-source selection as `plot` (sql preferred, then data_url,
-    then inline data). Use this to choose the right chart kind and columns;
-    it creates no chart.
+    then inline data). Use the result to pick the right chart kind and the
+    x/y/hue columns, then call `plot`.
     """
     try:
         req = DescribeRequest(sql=sql, data_url=data_url, data=data, sample_rows=sample_rows)

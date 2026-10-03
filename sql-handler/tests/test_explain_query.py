@@ -187,6 +187,13 @@ def test_warm_band_l2_hit(tmp_path, monkeypatch):
     root = tmp_path / "a"
     eng = _make_engine(root)
     eng.query_duckdb(QUERY)
+    # Async write-out is ON by default (SQLHANDLER_L2_WRITE_ASYNC): the
+    # sidecar is queued, not yet on disk — under a loaded runner the worker
+    # can lose the race with the assertion (~1/6 full-suite runs). Flush
+    # before the cross-engine read so the test is deterministic (the same
+    # drain drop_for_table uses; a no-op when async never started).
+    if eng._l2_cache is not None:
+        eng._l2_cache.flush_async_stores(timeout=10.0)
     # Same provider fixture, fresh in-memory state: the "second replica".
     eng2 = SqlEngine(CountingProvider(root), cache_ttl=0, cache_dir=None)
     r = eng2.explain_query(QUERY)

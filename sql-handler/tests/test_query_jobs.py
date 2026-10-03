@@ -15,8 +15,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from sqlhandler import jobs as jobs_module
+from sqlhandler import policy as policy_module
 from sqlhandler import server
 from sqlhandler.engine import LakehouseError, SqlEngine
+from sqlhandler.identity import Caller
 from sqlhandler.jobs import JobError, McpJobManager
 from sqlhandler.provider import TableInfo
 
@@ -64,8 +66,12 @@ def _patch_register(monkeypatch, sleep=None):
 def _fresh_manager(monkeypatch):
     """Every test starts with a clean, env-fresh job registry."""
     monkeypatch.delenv("SQLHANDLER_MAX_JOBS", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    policy_module.reset_policy_store()
     jobs_module.reset_job_manager()
     yield
+    policy_module.reset_policy_store()
     jobs_module.reset_job_manager()
 
 
@@ -466,3 +472,250 @@ def test_rest_jobs_cap_refusal_429(tmp_path, monkeypatch):
     assert r.status_code == 429
     assert "SQLHANDLER_MAX_JOBS" in r.json()["error"]
     client.delete(f"/api/jobs/{first['job_id']}", headers=auth)
+
+
+# ------------------------------------------------------- ownership scoping
+
+# The verified finding: an async job had NO owner — anyone with a job_id
+# could read the result (destructively: fetch is once-only) or cancel
+# someone else's job. Under policy enforcement the job now records the
+# submitter's owner scope (the SAME policy.owner_key derivation the
+# saved-query store uses) and foreign callers get the unknown-id 404 —
+# indistinguishable from a bogus id, so a wrong guess learns nothing.
+
+
+ALICE = Caller(cls="user", subject="alice", key_fp=None, via="relay")
+MALLORY = Caller(cls="user", subject="mallory", key_fp=None, via="relay")
+KEY_CALLER = Caller(cls="key", subject=None, key_fp="sha256:dddddddddddd", via="key")
+
+
+@pytest.fixture()
+def enforcement_on(tmp_path, monkeypatch):
+    """Policy enforcement ON with a minimal allow-everything policy."""
+    pf = tmp_path / "policy.json"
+    pf.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "default_group": "open",
+                "groups": {"open": {"visible_tables": ["workorder/*"]}},
+            }
+        )
+    )
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(pf))
+    policy_module.reset_policy_store()
+    yield pf
+    policy_module.reset_policy_store()
+
+
+def test_owned_job_readable_by_owner_not_by_other(tmp_path, enforcement_on):
+    """Owner-submitted job: the owner polls/fetches; a different caller's
+    status/result/cancel all get the 404-shaped unknown-id refusal."""
+    eng = _make_engine(tmp_path)
+    mgr = McpJobManager()
+    submitted = mgr.submit(eng, "SELECT * FROM work_order WHERE kind = 'a'", owner="subject:alice")
+    job_id = submitted["job_id"]
+
+    # the owner's own flow is untouched
+    status = _wait_done_owner(mgr, job_id, "subject:alice")
+    assert status["state"] == "done"
+    assert status["n_rows"] == 3
+    arrow = mgr.take_result(job_id, owner="subject:alice")
+    assert arrow.num_rows == 3
+
+    # a different subject cannot even see it exists
+    for call in (
+        lambda: mgr.status(job_id, owner="subject:mallory"),
+        lambda: mgr.take_result(job_id, owner="subject:mallory"),
+        lambda: mgr.cancel(job_id, owner="subject:mallory"),
+    ):
+        with pytest.raises(JobError, match="Unknown job id") as exc:
+            call()
+        assert exc.value.status == 404
+
+
+def _wait_done_owner(mgr, job_id, owner, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = mgr.status(job_id, owner=owner)
+        if payload["state"] != "running":
+            return payload
+        time.sleep(0.02)
+    return mgr.status(job_id, owner=owner)
+
+
+def test_owned_job_cross_owner_cannot_cancel_or_burn_fetch(tmp_path, enforcement_on, monkeypatch):
+    """The cross-owner refusals happen BEFORE any effect: a foreign cancel
+    leaves the job running, and a foreign fetch does not consume the
+    once-only hand-over."""
+    _patch_register(monkeypatch, sleep=1.0)
+    eng = _make_engine(tmp_path)
+    mgr = McpJobManager()
+    job_id = mgr.submit(eng, "SELECT * FROM work_order", owner="subject:alice")["job_id"]
+    time.sleep(0.1)
+
+    with pytest.raises(JobError, match="Unknown job id"):
+        mgr.cancel(job_id, owner="subject:mallory")
+    with pytest.raises(JobError, match="Unknown job id"):
+        mgr.take_result(job_id, owner="subject:mallory")
+    # neither side-effect happened: still running, result still unfetched
+    assert mgr.status(job_id, owner="subject:alice")["state"] == "running"
+    mgr.cancel(job_id, owner="subject:alice")
+    assert _wait_done_owner(mgr, job_id, "subject:alice")["state"] == "cancelled"
+
+
+def test_legacy_unowned_record_still_accessible(tmp_path, enforcement_on):
+    """Backward compat: an owner=None record (submitted before enforcement
+    was on, or by the REST layer with no resolved caller) is accessible to
+    every caller — old in-flight jobs must not break."""
+    eng = _make_engine(tmp_path)
+    mgr = McpJobManager()
+    job_id = mgr.submit(eng, "SELECT * FROM work_order WHERE kind = 'b'")["job_id"]  # no owner
+    assert mgr._records[job_id].owner is None
+
+    status = _wait_done(mgr, job_id)
+    assert status["state"] == "done"
+    # alice, mallory, a key-fp caller and an unowned poll all read it
+    assert mgr.status(job_id, owner="subject:alice")["n_rows"] == 2
+    assert mgr.status(job_id, owner="subject:mallory")["state"] == "done"
+    assert mgr.status(job_id, owner="key:sha256:dddddddddddd")["result_fetched"] is False
+    arrow = mgr.take_result(job_id, owner="subject:mallory")
+    assert arrow.num_rows == 2
+
+
+def test_owner_scope_uses_full_key_not_prefix(tmp_path, enforcement_on):
+    """The comparison is exact equality on the owner scope: a caller whose
+    key fingerprint merely shares a prefix with the owner's cannot read."""
+    eng = _make_engine(tmp_path)
+    mgr = McpJobManager()
+    job_id = mgr.submit(eng, "SELECT * FROM work_order", owner="key:sha256:dddddddddddd")["job_id"]
+    _wait_done_owner(mgr, job_id, "key:sha256:dddddddddddd")
+    with pytest.raises(JobError, match="Unknown job id"):
+        mgr.status(job_id, owner="key:sha256:ddddddddddX")
+
+
+def test_enforcement_off_derives_no_owner(tmp_path, monkeypatch):
+    """Enforcement OFF (the default): the server layer derives NO owner
+    (byte-identical shared behavior), and jobs.py itself stores whatever it
+    is given — never deriving or filtering identities on its own."""
+    from sqlhandler.server import _job_owner
+
+    eng = _make_engine(tmp_path)
+    mgr = jobs_module.job_manager()  # the singleton query_submit submits into
+    # the caller layer (what query_submit actually passes) derives nothing:
+    assert _job_owner(ALICE) is None
+    # a submit through the MCP tool therefore records no owner...
+    monkeypatch.setattr(server, "_handler", lambda: eng)
+    job_id = json.loads(server.query_submit("SELECT * FROM work_order"))["job_id"]
+    assert mgr._records[job_id].owner is None
+    status = _wait_done(mgr, job_id)
+    assert status["state"] == "done"
+    assert mgr.take_result(job_id, owner="subject:mallory").num_rows == 5
+    # ...while a DIRECT jobs.py caller may still store an explicit owner
+    # (store-what's-given contract; jobs.py never derives one itself):
+    other = mgr.submit(eng, "SELECT * FROM work_order", owner="subject:alice")
+    assert mgr._records[other["job_id"]].owner == "subject:alice"
+    mgr.cancel(other["job_id"], owner="subject:alice")
+
+
+def test_list_jobs_owner_scoped(tmp_path, enforcement_on):
+    """list_jobs: an owner sees only its OWN jobs (with truncated SQL);
+    nobody's list ever includes another owner's jobs."""
+    eng = _make_engine(tmp_path)
+    mgr = McpJobManager()
+    long_sql = "SELECT * FROM work_order WHERE kind = '" + "x" * 200 + "'"
+    alice_1 = mgr.submit(eng, "SELECT * FROM work_order WHERE kind = 'a'", owner="subject:alice")["job_id"]
+    alice_2 = mgr.submit(eng, long_sql, owner="subject:alice")["job_id"]
+    mallory_1 = mgr.submit(eng, "SELECT count(*) AS n FROM work_order", owner="subject:mallory")["job_id"]
+    unowned = mgr.submit(eng, "SELECT 1")["job_id"]  # legacy/unowned
+
+    alice_jobs = {j["job_id"]: j for j in mgr.list_jobs(owner="subject:alice")}
+    # alice sees her OWN jobs plus the unowned (legacy/shared-state) record —
+    # never another owner's: mallory_1 is absent from her list.
+    assert set(alice_jobs) == {alice_1, alice_2, unowned}
+    assert mallory_1 not in alice_jobs
+    assert all(j["state"] in ("running", "done") for j in alice_jobs.values())
+    assert all(len(j["sql"]) <= 120 for j in alice_jobs.values())
+    assert alice_jobs[alice_2]["sql"].endswith("…")
+
+    mallory_ids = {j["job_id"] for j in mgr.list_jobs(owner="subject:mallory")}
+    assert mallory_ids == {mallory_1, unowned}
+    assert alice_1 not in mallory_ids and alice_2 not in mallory_ids
+    # enforcement off / no owner scope: everything tracked (shared posture)
+    assert {j["job_id"] for j in mgr.list_jobs()} == {alice_1, alice_2, mallory_1, unowned}
+
+
+def test_mcp_dispatch_owner_scoped_end_to_end(tmp_path, enforcement_on, monkeypatch):
+    """The full MCP path: the dispatch resolves the caller, derives the SAME
+    owner scope as the saved-query gate, and the four handlers enforce it —
+    alice's job is invisible to mallory's tool calls, legible to alice's."""
+    eng = _make_engine(tmp_path)
+    monkeypatch.setattr(server, "_handler", lambda: eng)
+
+    def _dispatch(name, args, caller):
+        # Mirror _dispatch_tool's caller resolution without HTTP machinery.
+        import sqlhandler.server as srv
+
+        original = srv._identity.caller_from_request_state
+        monkeypatch.setattr(srv._identity, "caller_from_request_state", lambda request: caller)
+        try:
+            return srv._dispatch_tool(name, args)
+        finally:
+            monkeypatch.setattr(srv._identity, "caller_from_request_state", original)
+
+    text, is_error = _dispatch("query_submit", {"sql": "SELECT * FROM work_order WHERE kind = 'a'"}, ALICE)
+    assert is_error is False
+    job_id = json.loads(text)["job_id"]
+
+    # owner reads it
+    text, is_error = _dispatch("query_status", {"job_id": job_id}, ALICE)
+    assert is_error is False
+    assert json.loads(text)["sql"] == "SELECT * FROM work_order WHERE kind = 'a'"
+
+    # a different caller gets the unknown-id shape (an error result, not a leak)
+    text, is_error = _dispatch("query_status", {"job_id": job_id}, MALLORY)
+    assert is_error is True
+    assert "Unknown job id" in text
+    text, is_error = _dispatch("query_result", {"job_id": job_id}, MALLORY)
+    assert is_error is True and "Unknown job id" in text
+    text, is_error = _dispatch("query_cancel", {"job_id": job_id}, MALLORY)
+    assert is_error is True and "Unknown job id" in text
+
+    # alice can still complete the flow
+    for _ in range(200):
+        if json.loads(server.query_status(job_id, caller=ALICE))["state"] != "running":
+            break
+        time.sleep(0.02)
+    text, is_error = _dispatch("query_result", {"job_id": job_id, "output_format": "json"}, ALICE)
+    assert is_error is False
+    assert json.loads(text)["n_rows"] == 3
+    # the once-only hand-over was NOT burned by mallory's refused fetch
+    text, is_error = _dispatch("query_result", {"job_id": job_id}, ALICE)
+    assert is_error is True and "already fetched" in text
+
+
+def test_mcp_dispatch_stdio_unowned_jobs_shared(tmp_path, monkeypatch):
+    """No enforcement + no caller (stdio): the four handlers keep the
+    historical shared behavior (dispatch passes owner=None; nothing owned)."""
+    eng = _make_engine(tmp_path)
+    monkeypatch.setattr(server, "_handler", lambda: eng)
+    job_id = json.loads(server.query_submit("SELECT * FROM work_order WHERE kind = 'b'"))["job_id"]
+    for _ in range(200):
+        if json.loads(server.query_status(job_id))["state"] != "running":
+            break
+        time.sleep(0.02)
+    text, is_error = server._dispatch_tool("query_status", {"job_id": job_id})
+    assert is_error is False and json.loads(text)["n_rows"] == 2
+    text, is_error = server._dispatch_tool("query_result", {"job_id": job_id, "output_format": "json"})
+    assert is_error is False and json.loads(text)["n_rows"] == 2
+
+
+def test_owner_key_derivation_matches_saved_query_gate(enforcement_on):
+    """server._job_owner IS the saved-query derivation: subject first, else
+    key fingerprint, and None whenever enforcement is off."""
+    from sqlhandler.server import _job_owner
+
+    assert _job_owner(ALICE) == policy_module.owner_key(ALICE) == "subject:alice"
+    assert _job_owner(KEY_CALLER) == policy_module.owner_key(KEY_CALLER)
+    assert _job_owner(None) is None

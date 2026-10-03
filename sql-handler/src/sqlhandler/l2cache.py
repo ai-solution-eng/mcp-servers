@@ -10,9 +10,13 @@ same pattern for GENERAL query results, behind the memory LRU:
 
 * **Artifact** — ``<dir>/<key[:16]>.parquet`` (zstd) + ``<dir>/<key[:16]>.json``
   sidecar carrying ``{"key": <sha256 hex>, "created": <epoch>, "rows": n,
-  "bytes": n}``. The sidecar's full ``key`` guards against a hash-prefix
-  collision AND against a foreign file occupying the name; the parquet is
-  trusted only when its sidecar matches the exact key asked for.
+  "bytes": n, "tables": [...]}``. The sidecar's full ``key`` guards against a
+  hash-prefix collision AND against a foreign file occupying the name; the
+  parquet is trusted only when its sidecar matches the exact key asked for.
+  ``tables`` — written when the caller passes the referenced table
+  identifiers to :meth:`store` — is what the write-tier eviction
+  (:meth:`drop_for_table`) matches on; sidecars without it are "unknown"
+  and get the conservative legacy treatment on a drop.
 * **Atomicity** — both files publish via temp file + ``os.replace``, so
   concurrent replicas materializing the same key simultaneously are always
   reading a complete file (last writer wins; both results are valid — the
@@ -51,6 +55,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .fastrender import dumps as _fast_json_dumps
 
@@ -96,6 +101,23 @@ def _env_float(name: str, default: float) -> float:
         return max(float(raw), 0.0) if raw else default
     except ValueError:
         return default
+
+
+def _normalize_table_ident(ident: str) -> str:
+    """Normalized form of a table identifier for drop-time matching.
+
+    Strips any ``scheme://host`` prefix (so a sidecar's recorded path form
+    and a drop's canonical filesystem form meet), strips surrounding and
+    trailing slashes, and casefolds — names in this repo's providers are
+    compared case-insensitively. Empty input normalizes to "" (filtered by
+    the caller).
+    """
+    text = str(ident).strip()
+    if "://" in text:
+        # urlsplit separates netloc from path: abfs://fs/shop/sales -> shop/sales
+        parsed = urlsplit(text)
+        text = parsed.path
+    return text.strip("/").rstrip("/").casefold()
 
 
 class L2ResultCache:
@@ -220,30 +242,99 @@ class L2ResultCache:
         The write tier's complement of snapshot-token invalidation: a
         scratch CTAS drop-create RESETS the Delta log to version 0, so the
         key's ``<source>/<path>=<version>`` token can REGRESS and a cached
-        entry for the OLD content stays "fresh". A write therefore walks the
-        sidecars (small JSON stats) and — because the stored key is the
-        final sha256 hex with the parts hashed away — matches on the SQL
-        text the ENGINE remembers... which the sidecar does not carry. So
-        the honest L2 eviction is TTL-conservative: entries are dropped by
-        KEY when the engine hands us the exact stale keys, and by AGE when
-        it cannot (this call, sidecar-only: drop entries older than the
-        table's write moment). Returns the dropped count. Never raises.
+        entry for the OLD content stays "fresh". The stored key is the
+        final sha256 hex with the parts hashed away, so path-matching
+        stored keys is impossible; instead entries recorded their
+        referenced-table identifiers at STORE time (the sidecar's
+        ``tables`` list — the engine passes the ``_referenced_tables``
+        forms through the store API), and THIS call matches the written
+        table's identifiers against those lists.
+
+        Matching is normalized: a sidecar ``tables`` entry or a drop
+        identifier is compared case-insensitively after stripping any
+        ``scheme://host`` prefix and surrounding slashes, so path- and
+        name-form identifiers meet. Only entries whose ``tables`` list
+        contains a dropped identifier are removed — entries for OTHER
+        tables (and legacy sidecars with no ``tables`` key) SURVIVE a
+        selective drop.
+
+        Fallback (the conservative legacy behavior, kept for sidecars
+        without ``tables``): when a drop matched nothing AND at least one
+        unknown-tables entry exists, those unknown entries are wiped — an
+        unknown entry may be the written table's, and serving stale
+        results is worse than recomputing. Known non-matching entries
+        survive even the fallback (their recorded tables provably exclude
+        the dropped table — wiping them would re-create the over-eviction
+        this method exists to fix). The fallback is logged (WARNING with
+        the wiped count) and self-heals, since post-wipe entries carry
+        ``tables`` again.
+
+        Returns the dropped count. Never raises.
         """
         dropped = 0
         try:
-            for sidecar in Path(self._dir).glob("*.json"):
+            # Quiesce the async write-out FIRST (cross-review fix): an
+            # entry still sitting in the queue is invisible to the on-disk
+            # scan below, and the worker would publish it AFTER this drop —
+            # resurrecting a pre-write result (stale rows until TTL). Drain
+            # is bounded (worker keeps serving; queue-full stores fall back
+            # to the synchronous path so no deadlock).
+            try:
+                self.flush_async_stores(timeout=5.0)
+            except Exception:
+                logger.debug("L2 drop_for_table flush_async_stores failed", exc_info=True)
+            wanted = {
+                _normalize_table_ident(table_path),
+                _normalize_table_ident(table_name or ""),
+            } - {""}
+            sidecars = list(Path(self._dir).glob("*.json"))
+            unknown: list[Path] = []
+            victims: list[str] = []
+            for sidecar in sidecars:
                 try:
                     meta = json.loads(sidecar.read_text(encoding="utf-8"))
                 except Exception:
+                    continue  # corrupt sidecar — the sweep/lazy paths own it
+                tables = meta.get("tables")
+                if not isinstance(tables, list):
+                    unknown.append(sidecar)
                     continue
-                self._remove(str(meta.get("key", "")))
-                dropped += 1
+                sidecar_idents = {_normalize_table_ident(str(t)) for t in tables} - {""}
+                if wanted & sidecar_idents:
+                    key = str(meta.get("key", ""))
+                    if key:
+                        victims.append(key)
+            if victims:
+                for key in victims:
+                    self._remove(key)
+                    dropped += 1
+            elif unknown:
+                # Nothing matched selectively, but entries whose referenced
+                # tables are unknown exist — one of them may be the written
+                # table's. Wipe the UNKNOWN entries (conservative: serving a
+                # stale result is worse than recomputing) — known
+                # non-matching entries survive, they provably don't reference
+                # the dropped table. Say so: a silent wipe of a shared cache
+                # is exactly the failure this method used to be.
+                logger.warning(
+                    "L2 drop_for_table(%s): no sidecar recorded a matching table; "
+                    "wiping %d unknown-tables (legacy) entries as the fallback",
+                    table_path,
+                    len(unknown),
+                )
+                for sidecar in unknown:
+                    try:
+                        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    self._remove(str(meta.get("key", "")))
+                    dropped += 1
         except Exception:
             logger.debug("L2 drop_for_table failed for %s", table_path, exc_info=True)
         return dropped
 
     # -------------------------------------------------- async write-out
-    def async_store(self, key: str, table) -> bool:
+    def async_store(self, key: str, table, tables: list[str] | None = None) -> bool:
         """Hand a result to the background publisher (the write-through).
 
         Returns True when queued, False when the write falls back to the
@@ -253,12 +344,14 @@ class L2ResultCache:
         in the computing replica's L1, and L1 eviction dropping the last
         reference only means the worker loses a race it can lose anyway
         (a replica crash mid-publish) — the artifact write itself holds
-        its own reference while serializing.
+        its own reference while serializing. ``tables`` (referenced-table
+        identifiers for the write-tier eviction) rides in the queue item
+        and reaches the sidecar via :meth:`store`.
         """
         if self._write_queue is None:
             return False
         try:
-            self._write_queue.put_nowait((key, table))
+            self._write_queue.put_nowait((key, table, tables))
             return True
         except queue.Full:
             with self._lock:
@@ -277,9 +370,12 @@ class L2ResultCache:
 
     def _write_loop(self) -> None:
         while True:
-            key, table = self._write_queue.get()
+            key, table, tables = self._write_queue.get()
             try:
-                self.store(key, table)
+                if tables is None:
+                    self.store(key, table)  # historical call shape (no tables known)
+                else:
+                    self.store(key, table, tables=tables)
             except Exception:  # store() never raises, but never trust a loop to die
                 logger.debug("L2 async write-out failed for key %s…", key[:16], exc_info=True)
             finally:
@@ -300,15 +396,35 @@ class L2ResultCache:
         return not self._write_queue.unfinished_tasks
 
     # ------------------------------------------------------------- store
-    def store(self, key: str, table) -> None:
+    def store(self, key: str, table, tables: list[str] | None = None) -> None:
         """Publish one result as parquet + sidecar (best-effort, never raises).
 
         Byte caps are the ENGINE's decision (it knows the env-tuned min/max
         and its own L1 already saw the size); by the time a table arrives
         here it is within bounds.
+
+        ``tables`` — the referenced-table identifiers the engine computed
+        for this result's SQL (``TableInfo.path`` / ``name`` forms) — is
+        recorded in the sidecar when given so a write-tier
+        :meth:`drop_for_table` can match entries SELECTIVELY; entries
+        stored without it are "unknown" and get the conservative legacy
+        treatment on a drop. When ``tables`` is None (e.g. the engine's
+        L1-warm republish of an L2 hit, which has no SQL in hand) an
+        existing sidecar's ``tables`` list is carried forward — same key
+        means the same SQL identity (the key embeds it), so the carried
+        list is exactly the entry's own. Old sidecars (pre-``tables``)
+        read identically: the key is the default and unknown-tables
+        entries are simply left alone by a selective drop.
         """
         import pyarrow.parquet as pq
 
+        if tables is None:
+            try:
+                carried = self._read_sidecar(key).get("tables")
+                if isinstance(carried, list) and carried:
+                    tables = [str(t) for t in carried]
+            except Exception:
+                pass  # no readable existing sidecar — store without tables
         path = self._artifact(key)
         tmp_path: str | None = None
         try:
@@ -326,6 +442,9 @@ class L2ResultCache:
                 "rows": table.num_rows,
                 "bytes": table.nbytes,
             }
+            if tables:
+                # Dedup + sorted for stable sidecars; only truthy entries.
+                meta["tables"] = sorted({str(t) for t in tables if t})
             fd, tmp_meta = tempfile.mkstemp(
                 dir=str(path.parent), prefix=path.name + ".", suffix=".meta.tmp"
             )
@@ -510,26 +629,62 @@ class L2JsonCache:
         payload = entry.get("payload")
         return payload if isinstance(payload, dict) else None
 
-    def put(self, key: str, payload: dict) -> None:
-        """Publish one dict (best-effort, never raises)."""
+    def put(self, key: str, payload: dict, tables: list[str] | None = None) -> None:
+        """Publish one dict (best-effort, never raises).
+
+        ``tables`` — referenced-table identifiers recorded in the sidecar so
+        the write tier's ``drop_for_table`` can evict selectively (same
+        contract as the table tier's store); the profile/column_stats tier
+        shares the CTAS-version-regression hole the result tier fixed.
+        """
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             return  # no shared dir — the tier is inert, never a failure
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), prefix=f"{key[:16]}.", suffix=".tmp")
         try:
-            os.write(
-                fd,
-                _fast_json_dumps(
-                    {"key": key, "created": time.time(), "payload": payload}, default=str
-                ).encode("utf-8"),
-            )
+            entry = {"key": key, "created": time.time(), "payload": payload}
+            if tables:
+                entry["tables"] = sorted({str(t) for t in tables})
+            os.write(fd, _fast_json_dumps(entry, default=str).encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self._path(key))
         with self._lock:
             self.writes += 1
+
+    def drop_for_table(self, table_path: str, table_name: str | None = None) -> int:
+        """Evict entries whose recorded ``tables`` include the written table.
+
+        Mirrors the table tier's selective semantics (normalized matching;
+        unknown/legacy sidecars are left alone — they age out via TTL, and
+        serving a possibly-stale PROFILE is far less dangerous than serving
+        stale QUERY RESULTS, so no conservative wipe here). Never raises;
+        returns the dropped count.
+        """
+        dropped = 0
+        try:
+            wanted = {
+                _normalize_table_ident(table_path),
+                _normalize_table_ident(table_name or ""),
+            } - {""}
+            if not wanted:
+                return 0
+            for sidecar in list(self._dir.glob("*.json")):
+                try:
+                    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                tables = meta.get("tables")
+                if not isinstance(tables, list):
+                    continue
+                if any(_normalize_table_ident(str(t)) in wanted for t in tables):
+                    self.remove(str(meta.get("key", "")))
+                    dropped += 1
+        except Exception:
+            logger.debug("L2 meta drop_for_table failed for %s", table_path, exc_info=True)
+        return dropped
 
     def remove(self, key: str) -> None:
         try:

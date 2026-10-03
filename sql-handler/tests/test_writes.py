@@ -19,7 +19,9 @@ The contract (DECISIONS.md + review §4):
 * Audit event:"write" + sqlhandler_writes_total{backend,outcome} additive.
 """
 
+import hashlib
 import json
+import re
 import threading
 
 import pyarrow as pa
@@ -31,6 +33,21 @@ from sqlhandler.config import FileConfig
 from sqlhandler.engine import LakehouseError, SqlEngine
 from sqlhandler.file import FileProvider
 from sqlhandler.identity import ANONYMOUS, Caller
+
+# --------------------------------------------------------- subject slug
+# alice's collision-proof scratch slug: the write tier namespaces every
+# caller under ``<normalized-subject>_<sha256(raw-subject)[:12]>`` (see
+# writes.subject_slug), and the engine lists/exposes scratch tables as
+# ``<slug>_<name>`` qualified DuckDB names. f-string it into scratch paths
+# and read-back queries.
+ALICE_SLUG = writes.subject_slug(Caller(cls="user", subject="alice", via="relay"))
+
+
+def _slug_digest(subject: str) -> str:
+    """The documented digest formula (sha256 over the RAW subject) — pinned
+    here independently of writes.py's private helper."""
+    return hashlib.sha256(subject.encode("utf-8")).hexdigest()[:12]
+
 
 # --------------------------------------------------------------- fixtures
 
@@ -192,9 +209,67 @@ def test_subject_slug_rules():
     # fingerprint-class callers: NO write capability (rotating pseudonym)
     keyfp = Caller(cls="key", key_fp="sha256:abcd1234ef56", via="key")
     assert writes.subject_slug(keyfp) is None
-    # attributed subjects slug + sanitize
-    assert writes.subject_slug(Caller(cls="user", subject="Alice Smith", via="relay")) == "alice-smith"
-    assert writes.subject_slug(Caller(cls="browser", subject="../etc/passwd", via="browser")) == "etc-passwd"
+    # attributed subjects slug + sanitize, then get the collision digest
+    # (the join is `_`: the engine surfaces scratch as <slug>_<name> DuckDB
+    # identifiers — a hyphen join would need quoting the register path
+    # cannot resolve; the digest itself provides the collision-proofing)
+    assert writes.subject_slug(Caller(cls="user", subject="Alice Smith", via="relay")) == (
+        f"alice-smith_{_slug_digest('Alice Smith')}"
+    )
+    assert writes.subject_slug(Caller(cls="browser", subject="../etc/passwd", via="browser")) == (
+        f"etc-passwd_{_slug_digest('../etc/passwd')}"
+    )
+
+
+def test_subject_slug_digest_matches_spec():
+    """The digest is sha256(RAW subject)[:12] — verifiable without the module."""
+    import hashlib as _h
+
+    for subject in ("alice", "Alice.", "Alice Smith", "../etc/passwd", "a" * 200):
+        slug = writes.subject_slug(Caller(cls="user", subject=subject, via="relay"))
+        assert slug == f"{_SLUG_RE_FOLD(subject)[:48]}_{_h.sha256(subject.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _SLUG_RE_FOLD(subject: str) -> str:
+    """The normalization half of subject_slug (mirror of the spec)."""
+    return writes._SLUG_RE.sub("-", subject.lower()).strip("-.")
+
+
+def test_subject_slug_collisions_refused():
+    """THE identity-isolation fix: subjects whose NORMALIZED forms collide
+    must never share a scratch namespace — case-folding, punctuation and
+    prefix differences all diverge via the RAW-subject digest."""
+    subjects = ["Alice.", "alice", "ALICE", "Alice Smith", "alice-smith", "alice.smith"]
+    slugs = {}
+    for s in subjects:
+        slug = writes.subject_slug(Caller(cls="user", subject=s, via="relay"))
+        assert slug not in slugs.values(), f"COLLISION: {s!r} vs {slugs}"
+        slugs[s] = slug
+    # case/punctuation-only differences: identical normalized segment,
+    # guaranteed-different digest
+    assert _SLUG_RE_FOLD("Alice.") == _SLUG_RE_FOLD("alice") == "alice"
+    assert slugs["Alice."] != slugs["alice"]
+    assert _SLUG_RE_FOLD("Alice Smith") == _SLUG_RE_FOLD("alice-smith") == "alice-smith"
+    assert slugs["Alice Smith"] != slugs["alice-smith"]
+
+
+def test_subject_slug_length_cap():
+    """Long subjects stay under the 64-char namespace cap."""
+    for subject in ("a" * 64, "b" * 65, "x" * 200, "word " * 30):
+        slug = writes.subject_slug(Caller(cls="user", subject=subject, via="relay"))
+        assert slug is not None and 1 <= len(slug) <= 64, slug
+        assert slug == slug.strip("-.")  # hygiene survives truncation
+
+
+def test_subject_slug_stable_and_charclass():
+    """Same subject -> same slug (a caller's namespace never drifts); the
+    slug stays inside the scratch-safe character class."""
+    for subject in ("Alice Smith", "../etc/passwd", "ops+svc@example.com", "Ünïcode-user"):
+        c = Caller(cls="user", subject=subject, via="relay")
+        assert writes.subject_slug(c) == writes.subject_slug(c)
+        slug = writes.subject_slug(c)
+        assert re.fullmatch(r"[a-z0-9._-]+", slug), slug  # _SLUG_RE's class
+        assert slug == slug.strip("-.")
 
 
 def test_anonymous_write_refused(monkeypatch, tmp_path):
@@ -216,7 +291,7 @@ def test_target_scoped_under_subject_namespace(monkeypatch, tmp_path):
     _eng, alice, scratch_root = _delta_engine(tmp_path, monkeypatch)
     backend, canonical, _uri = writes.resolve_write_target("reports.daily", alice)
     assert backend == "delta"
-    assert canonical == f"{scratch_root}/alice/reports/daily"
+    assert canonical == f"{scratch_root}/{ALICE_SLUG}/reports/daily"
 
 
 def test_target_traversal_refused(monkeypatch, tmp_path):
@@ -230,11 +305,25 @@ def test_target_traversal_refused(monkeypatch, tmp_path):
 
 
 def test_sibling_slug_not_aliased(monkeypatch, tmp_path):
-    """<root>/alice must never match <root>/alice2 — trailing-slash prefix."""
+    """<root>/<alice-slug> must never match <root>/<alice-slug>2 —
+    trailing-slash prefix."""
     monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=/srv/scratch")
     alice = Caller(cls="user", subject="alice", via="relay")
     _b, canonical, _u = writes.resolve_write_target("t", alice)
-    assert canonical == "/srv/scratch/alice/t"
+    assert canonical == f"/srv/scratch/{ALICE_SLUG}/t"
+
+
+def test_sibling_subject_never_shares_namespace(monkeypatch, tmp_path):
+    """Two subjects differing only by case/punctuation resolve into two
+    DISTINCT subject-scoped roots (the identity-isolation fix, through the
+    full resolve path rather than the slug function alone)."""
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=/srv/scratch")
+    roots = {}
+    for subject in ("Alice.", "alice", "Alice Smith", "alice-smith"):
+        caller = Caller(cls="user", subject=subject, via="relay")
+        _n, _prefix, subject_prefix = writes.subject_scoped_root(caller)
+        roots[subject] = subject_prefix
+    assert len(set(roots.values())) == len(roots), roots
 
 
 # ------------------------------------------------------------- lease/locks
@@ -296,14 +385,14 @@ def test_delta_ctas_roundtrip(monkeypatch, tmp_path):
         "CREATE TABLE daily AS SELECT id, amount FROM work_order WHERE id > 1", caller=alice
     )
     row = summary.to_pydict()
-    assert row["target"][0] == f"{scratch_root}/alice/daily"
+    assert row["target"][0] == f"{scratch_root}/{ALICE_SLUG}/daily"
     assert row["backend"][0] == "delta"
     assert row["rows_written"][0] == 2
-    assert (scratch_root / "alice" / "daily" / "_delta_log").is_dir()
+    assert (scratch_root / ALICE_SLUG / "daily" / "_delta_log").is_dir()
 
-    infos = [t for t in eng.list_tables() if t.name == "daily" and t.schema == "alice"]
+    infos = [t for t in eng.list_tables() if t.name == "daily" and t.schema == ALICE_SLUG]
     assert infos and infos[0].format == "delta"
-    res = eng.query_duckdb("SELECT id, amount FROM alice_daily ORDER BY id")
+    res = eng.query_duckdb(f"SELECT id, amount FROM {ALICE_SLUG}_daily ORDER BY id")
     assert res.to_pydict() == {"id": [2, 3], "amount": [20.0, 30.0]}
 
 
@@ -312,9 +401,9 @@ def test_delta_ctas_rerun_replaces(monkeypatch, tmp_path):
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     eng.execute_write("CREATE TABLE t AS SELECT id, amount FROM work_order", caller=alice)
     eng.execute_write("CREATE TABLE t AS SELECT id FROM work_order", caller=alice)
-    res = eng.query_duckdb("SELECT count(*) AS n FROM alice_t")
+    res = eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_t")
     assert res.to_pydict() == {"n": [3]}
-    schema_cols = [f.name for f in eng._open_dataset(eng._resolve("alice/t")).schema]
+    schema_cols = [f.name for f in eng._open_dataset(eng._resolve(f"{ALICE_SLUG}/t")).schema]
     assert schema_cols == ["id"]
 
 
@@ -324,7 +413,7 @@ def test_delta_insert_appends(monkeypatch, tmp_path):
     eng.execute_write(
         "INSERT INTO t SELECT CAST(id + 10 AS BIGINT) AS id FROM work_order", caller=alice
     )
-    res = eng.query_duckdb("SELECT count(*) AS n, max(id) AS mx FROM alice_t")
+    res = eng.query_duckdb(f"SELECT count(*) AS n, max(id) AS mx FROM {ALICE_SLUG}_t")
     assert res.to_pydict() == {"n": [6], "mx": [13]}
 
 
@@ -347,9 +436,9 @@ def test_read_after_write_never_stale(monkeypatch, tmp_path):
     keys its own eviction)."""
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     eng.execute_write("CREATE TABLE t AS SELECT id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT count(*) AS n FROM alice_t").to_pydict() == {"n": [3]}
+    assert eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_t").to_pydict() == {"n": [3]}
     eng.execute_write("CREATE TABLE t AS SELECT id + 100 AS id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT count(*) AS n, min(id) AS mn FROM alice_t").to_pydict() == {
+    assert eng.query_duckdb(f"SELECT count(*) AS n, min(id) AS mn FROM {ALICE_SLUG}_t").to_pydict() == {
         "n": [3],
         "mn": [101],
     }
@@ -372,9 +461,9 @@ def test_read_after_insert_append_never_stale(monkeypatch, tmp_path):
     the normal mechanism)."""
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     eng.execute_write("CREATE TABLE t AS SELECT id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT count(*) AS n FROM alice_t").to_pydict() == {"n": [3]}
+    assert eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_t").to_pydict() == {"n": [3]}
     eng.execute_write("INSERT INTO t SELECT CAST(id + 10 AS BIGINT) AS id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT count(*) AS n FROM alice_t").to_pydict() == {"n": [6]}
+    assert eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_t").to_pydict() == {"n": [6]}
 
 
 def test_write_evicts_l2_entries_for_target(monkeypatch, tmp_path):
@@ -390,11 +479,11 @@ def test_write_evicts_l2_entries_for_target(monkeypatch, tmp_path):
     eng.execute_write("CREATE TABLE t AS SELECT id FROM work_order", caller=alice)
     # a non-count read (the count fastpath bypasses the caches by design)
     # gets cached into L1+L2
-    assert eng.query_duckdb("SELECT id FROM alice_t ORDER BY id").to_pydict()["id"] == [1, 2, 3]
+    assert eng.query_duckdb(f"SELECT id FROM {ALICE_SLUG}_t ORDER BY id").to_pydict()["id"] == [1, 2, 3]
     assert eng._l2_cache.stats()["writes"] >= 1
     # the write must evict the L2 entry for the written table
     eng.execute_write("CREATE TABLE t AS SELECT id + 100 AS id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT id FROM alice_t ORDER BY id").to_pydict()["id"] == [101, 102, 103]
+    assert eng.query_duckdb(f"SELECT id FROM {ALICE_SLUG}_t ORDER BY id").to_pydict()["id"] == [101, 102, 103]
 
 
 def test_write_summary_via_run_sql(monkeypatch, tmp_path):
@@ -403,27 +492,46 @@ def test_write_summary_via_run_sql(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_handler", lambda: eng)
     out = server.run_sql("CREATE TABLE s1 AS SELECT id FROM work_order", caller=alice)
     assert "Write complete." in out
-    assert f"{scratch_root}/alice/s1" in out
+    assert f"{scratch_root}/{ALICE_SLUG}/s1" in out
     assert "delta" in out
 
 
 def test_write_target_collision_with_source_refused(monkeypatch, tmp_path):
     """Write targets are ALWAYS outside the covered source tables: a target
-    resolving ONTO a source table's location refuses."""
+    resolving ONTO a source table's location refuses.
+
+    The subject slug is digest-collision-proofed now, so a caller cannot
+    name-craft their namespace onto a source dir anymore (that used to be
+    the easy trigger: subject "workorder" -> slug "workorder"). The
+    invariant survives: the collision refusal fires when a target resolves
+    onto a source table's location — laid out here under the caller's OWN
+    namespace with a zero-length source file, the exact shape the engine
+    snapshots and refuses."""
     from deltalake import write_deltalake
 
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
-    # point the scratch ROOT at the provider root: subject slug + name can
-    # then resolve onto the source table's location
+    # point the scratch ROOT at the provider root; the subject's OWN scratch
+    # namespace then overlaps the provider root's directory listing
     monkeypatch.setenv(
         "SQLHANDLER_WRITE_SCRATCH_ROOTS", f"main={tmp_path}"
     )
-    workorder_caller = Caller(cls="user", subject="workorder", via="relay")
+    alice_slug = writes.subject_slug(alice)
+    # a source table at <root>/<slug>/work_order — inside alice's namespace
+    src = tmp_path / alice_slug / "work_order"
+    src.mkdir(parents=True)
+    write_deltalake(str(src), pa.table({"id": pa.array([9], type=pa.int64())}), mode="overwrite")
+    eng._write_tier_source_paths = None  # re-snapshot (fixture wrote a source)
     with pytest.raises(LakehouseError, match="resolves onto a configured source"):
-        eng.execute_write("CREATE TABLE work_order AS SELECT id FROM work_order", caller=workorder_caller)
-    # the benign same-name-different-location case still works
-    eng.execute_write("CREATE TABLE work_order AS SELECT id FROM work_order", caller=alice)
-    assert eng.query_duckdb("SELECT count(*) AS n FROM alice_work_order").to_pydict() == {"n": [3]}
+        eng.execute_write(
+            "CREATE TABLE work_order AS SELECT id FROM workorder_work_order", caller=alice
+        )
+    # a DIFFERENT name under the same namespace is not a source location and
+    # writes fine (the refusal is location-exact, not name-based); the SELECT
+    # reads the fixture's source table (3 rows)
+    eng.execute_write(
+        "CREATE TABLE work_order2 AS SELECT id FROM workorder_work_order", caller=alice
+    )
+    assert eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_work_order2").to_pydict() == {"n": [3]}
     del write_deltalake
 
 
@@ -449,7 +557,7 @@ def test_write_source_query_policy_masked(monkeypatch, tmp_path):
     reset_policy_store()
     try:
         eng.execute_write("CREATE TABLE masked AS SELECT id, amount FROM work_order", caller=alice)
-        res = eng.query_duckdb("SELECT id, amount FROM alice_masked ORDER BY id")
+        res = eng.query_duckdb(f"SELECT id, amount FROM {ALICE_SLUG}_masked ORDER BY id")
         pd = res.to_pydict()
         assert pd["amount"] == ["***", "***", "***"]  # masked in the WRITE too (redact = '***')
     finally:
@@ -517,7 +625,7 @@ def test_audit_write_lines_and_metrics(monkeypatch, tmp_path):
     eng.execute_write("CREATE TABLE m1 AS SELECT id FROM work_order", caller=alice)
     lines = [json.loads(l) for l in open(tmp_path / "audit.jsonl")]
     write_lines = [l for l in lines if l["event"] == "write"]
-    assert write_lines and write_lines[0]["target"] == f"{scratch_root}/alice/m1"
+    assert write_lines and write_lines[0]["target"] == f"{scratch_root}/{ALICE_SLUG}/m1"
     assert write_lines[0]["backend"] == "delta"
     assert write_lines[0]["n_rows"] == 3
     assert write_lines[0]["caller"]["subject"] == "alice"

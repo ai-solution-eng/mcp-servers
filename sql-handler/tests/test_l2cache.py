@@ -846,3 +846,211 @@ def test_preview_shared_across_engines(tmp_path, monkeypatch):
     r2 = b.query_duckdb(sql)
     assert r2.to_pylist() == r1.to_pylist()
     assert b._l2_cache.stats()["hits"] == 1  # served from the SHARED dir
+
+
+# ------------------------------------------- selective drop_for_table (2026-10)
+
+# The write tier's eviction used to wipe the ENTIRE shared cache on every
+# scratch write (every sidecar removed). Now sidecars record their
+# referenced tables at store time ("tables") and drop_for_table removes
+# only the written table's entries; legacy sidecars without "tables" are
+# "unknown" and trigger the conservative full-wipe fallback ONLY when the
+# selective drop matched nothing.
+
+
+def _mk_table(**overrides):
+    defaults = {"name": "sales", "schema": "shop", "format": "parquet"}
+    defaults.update(overrides)
+    return TableInfo(**defaults)
+
+
+def _write_sidecar(l2_dir: Path, key: str, tables=None, created=None) -> None:
+    """Publish a minimal VALID pair (sidecar + parquet) directly on disk."""
+    table = pa.table({"a": pa.array([1, 2, 3], type=pa.int64())})
+    pq.write_table(table, str(l2_dir / f"{key[:16]}.parquet"))
+    meta = {"key": key, "created": created if created is not None else time.time()}
+    if tables is not None:
+        meta["tables"] = tables
+    (l2_dir / f"{key[:16]}.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_store_records_referenced_tables_in_sidecar(tmp_path, monkeypatch):
+    """Store time: the engine passes the referenced-table idents through the
+    store API, and the sidecar carries them as a sorted, deduped list."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    a.query_duckdb(QUERY)
+    key = a._result_cache_key(QUERY, None, None, None, None)
+    meta = json.loads((Path(l2) / f"{key[:16]}.json").read_text(encoding="utf-8"))
+    assert meta["key"] == key
+    assert "sales" in meta["tables"]
+    assert "shop/sales" in meta["tables"]
+    assert "shop_sales" in meta["tables"]
+    assert meta["tables"] == sorted(set(meta["tables"]))
+
+
+def test_store_without_tables_keeps_existing_sidecar_tables(tmp_path):
+    """The L1-warm republish (no SQL in hand) must not ERASE a good sidecar's
+    tables list — same key, same SQL identity, so the list carries forward."""
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    key = "a" * 64
+    _write_sidecar(l2, key, tables=["shop/sales"])
+    cache = L2ResultCache(str(l2), ttl=3600)
+    cache.store(key, pa.table({"a": pa.array([1], type=pa.int64())}))
+    meta = json.loads((l2 / f"{key[:16]}.json").read_text(encoding="utf-8"))
+    assert meta["tables"] == ["shop/sales"]
+
+
+def test_drop_for_table_removes_only_matching_entries(tmp_path):
+    """Two entries referencing DIFFERENT tables + one legacy entry: dropping
+    table X removes only X's entry; the other table's and the legacy
+    sidecar both survive (no more full-cache wipe)."""
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    key_x = "1" * 64
+    key_y = "2" * 64
+    key_legacy = "3" * 64
+    _write_sidecar(l2, key_x, tables=["shop/inventory", "inventory"])  # NOT the dropped table
+    _write_sidecar(l2, key_y, tables=["shop/sales", "sales"])  # the dropped table
+    _write_sidecar(l2, key_legacy)  # pre-"tables" sidecar: unknown
+    cache = L2ResultCache(str(l2), ttl=3600)
+    dropped = cache.drop_for_table("shop/sales", "sales")
+    assert dropped == 1
+    assert (l2 / f"{key_x[:16]}.json").exists()  # different table → survives
+    assert (l2 / f"{key_x[:16]}.parquet").exists()
+    assert not (l2 / f"{key_y[:16]}.json").exists()  # matched → gone
+    assert not (l2 / f"{key_y[:16]}.parquet").exists()
+    assert (l2 / f"{key_legacy[:16]}.json").exists()  # legacy → survives too
+    assert (l2 / f"{key_legacy[:16]}.parquet").exists()
+
+
+def test_drop_for_table_matches_normalized_identifiers(tmp_path):
+    """Scheme/host/slash/case differences all meet: the SAME table recorded
+    in path form matches a drop carrying the scheme-qualified form, and a
+    bare-name drop matches case-insensitively. (Matching is exact compare
+    after normalization — the engine always records AND drops the bare
+    name, which is the bridge across differently-shaped paths.)"""
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    key_a = "4" * 64
+    key_b = "5" * 64
+    _write_sidecar(l2, key_a, tables=["abfs://fs@acct/shop/sales", "shop/sales", "sales"])
+    _write_sidecar(l2, key_b, tables=["shop/inventory"])
+    cache = L2ResultCache(str(l2), ttl=3600)
+    # scheme/host stripped, slashes trimmed, casefolded on both sides
+    assert cache.drop_for_table("abfs://fs@acct/scratch/shop/Sales/", "SALES") == 1
+    assert not (l2 / f"{key_a[:16]}.json").exists()
+    assert (l2 / f"{key_b[:16]}.json").exists()
+    # and the plain logical-path drop form matches a scheme-qualified record
+    _write_sidecar(l2, key_a, tables=["abfs://fs@acct/shop/sales"])
+    assert cache.drop_for_table("shop/Sales", "sales") == 1
+    assert not (l2 / f"{key_a[:16]}.json").exists()
+
+
+def test_drop_for_table_falls_back_on_unknown_only(tmp_path, caplog):
+    """Fallback: nothing matched selectively BUT a legacy (tables-less)
+    sidecar exists — the UNKNOWN entries are wiped (one may be the
+    written table's), the WARNING names the wiped count, and known
+    non-matching entries survive even the fallback."""
+    import logging as _logging
+
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    key_x = "6" * 64
+    key_legacy = "7" * 64
+    _write_sidecar(l2, key_x, tables=["shop/inventory"])  # known, does NOT match
+    _write_sidecar(l2, key_legacy)  # unknown tables
+    cache = L2ResultCache(str(l2), ttl=3600)
+    with caplog.at_level(_logging.WARNING, logger="sqlhandler.l2cache"):
+        dropped = cache.drop_for_table("shop/sales", "sales")
+    assert dropped == 1  # only the unknown entry was wiped
+    assert not (l2 / f"{key_legacy[:16]}.json").exists()
+    assert not (l2 / f"{key_legacy[:16]}.parquet").exists()
+    assert (l2 / f"{key_x[:16]}.json").exists()  # known non-match survives
+    warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("unknown-tables (legacy) entries" in r.getMessage() and "1" in r.getMessage() for r in warnings)
+
+
+def test_drop_for_table_no_fallback_when_nothing_unknown(tmp_path):
+    """A selective drop that matches nothing with NO legacy sidecars present
+    must NOT wipe: every entry is known and simply doesn't reference the
+    dropped table."""
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    key_y = "8" * 64
+    _write_sidecar(l2, key_y, tables=["shop/sales"])
+    cache = L2ResultCache(str(l2), ttl=3600)
+    assert cache.drop_for_table("shop/inventory", "inventory") == 0
+    assert (l2 / f"{key_y[:16]}.json").exists()
+    assert (l2 / f"{key_y[:16]}.parquet").exists()
+
+
+def test_drop_for_table_store_drop_lookup_flow(tmp_path, monkeypatch):
+    """The end-to-end cache-correctness flow: engine stores an entry for
+    table X, drop_for_table(X) removes it, the next lookup misses."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    a = _make_engine(l2, root, monkeypatch)
+    a.query_duckdb(QUERY)
+    key = a._result_cache_key(QUERY, None, None, None, None)
+    assert L2ResultCache(l2, ttl=3600).lookup(key) is not None  # stored
+    assert a._l2_cache.drop_for_table("shop/sales", "sales") == 1
+    assert not (Path(l2) / f"{key[:16]}.json").exists()
+    assert L2ResultCache(l2, ttl=3600).lookup(key) is None  # miss
+    assert not (Path(l2) / f"{key[:16]}.parquet").exists()  # pair removed
+
+
+def test_drop_for_table_never_raises_on_garbage(tmp_path):
+    """Corrupt sidecars, a missing dir, and empty identifiers: still returns
+    a count, still never raises (the accelerator, never a dependency)."""
+    l2 = tmp_path / "l2"
+    l2.mkdir()
+    (l2 / "corrupt.json").write_text("{not json", encoding="utf-8")
+    (l2 / "nokey.json").write_text(json.dumps({"tables": ["shop/sales"]}), encoding="utf-8")
+    cache = L2ResultCache(str(l2), ttl=3600)
+    assert cache.drop_for_table("shop/sales", "sales") == 0
+    assert cache.drop_for_table("", "") == 0
+    empty = L2ResultCache(str(tmp_path / "never-created"), ttl=3600)
+    assert empty.drop_for_table("shop/sales", "sales") == 0
+
+
+def test_engine_write_evicts_only_written_table_l2(tmp_path, monkeypatch):
+    """The integration the fix exists for: a write to table B must NOT
+    destroy replica-shared entries for table A (the pre-fix behavior
+    wiped the whole shared dir on every scratch write)."""
+    root = tmp_path / "data"
+    _seed_table(root)
+    # a second, physically distinct table the engine can list
+    inv = root / "shop" / "inventory"
+    inv.mkdir(parents=True, exist_ok=True)
+    n = 40000
+    pq.write_table(
+        pa.table({"sku": pa.array(range(n), type=pa.int64())}),
+        inv / "part.parquet",
+    )
+    l2 = str(tmp_path / "l2")
+    # TABLES + inventory: the FakeProvider must list both, so both register.
+    monkeypatch.setattr(
+        "test_l2cache.TABLES",
+        [
+            TableInfo(name="sales", schema="shop", format="parquet"),
+            TableInfo(name="inventory", schema="shop", format="parquet"),
+        ],
+    )
+    a = _make_engine(l2, root, monkeypatch)
+    r_a = a.query_duckdb(QUERY)  # references sales
+    a.query_duckdb("SELECT sku FROM inventory WHERE sku > 10")  # references inventory
+    assert a._l2_cache.stats()["writes"] == 2
+    key_a = a._result_cache_key(QUERY, None, None, None, None)
+    key_b = a._result_cache_key("SELECT sku FROM inventory WHERE sku > 10", None, None, None, None)
+    # a scratch write to inventory evicts ITS entry only
+    a._evict_result_cache_for_write("duckdb", str(root / "scratch" / "inventory"))
+    assert a._l2_cache.stats()["writes"] == 2  # no full wipe happened
+    assert (Path(l2) / f"{key_a[:16]}.json").exists()  # sales entry SURVIVES
+    assert not (Path(l2) / f"{key_b[:16]}.json").exists()  # inventory entry gone
+    assert L2ResultCache(l2, ttl=3600).lookup(key_a) is not None
+    assert L2ResultCache(l2, ttl=3600).lookup(key_a).to_pylist() == r_a.to_pylist()

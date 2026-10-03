@@ -527,14 +527,41 @@ def _duckdb_fs_lockdown(con) -> None:
     raw = os.environ.get("SQLHANDLER_DUCKDB_FILE_ACCESS", "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return
-    try:
-        con.execute("SET disabled_filesystems='LocalFileSystem'")
-        con.execute("SET autoinstall_known_extensions=false")
-        con.execute("SET autoload_known_extensions=false")
-    except Exception:  # older DuckDB without a knob: fail open rather than break queries
-        logger.debug("DuckDB filesystem lockdown partially unavailable", exc_info=True)
+    # Each knob applied INDEPENDENTLY: one unknown/renamed knob (a DuckDB
+    # upgrade) must not silently skip the others. Failures are WARNING-level
+    # (a DEBUG-only "partially unavailable" previously hid a fail-open
+    # posture at the default log level). Deliberately no current_setting()
+    # read-back verification: DuckDB does not reliably reflect every knob
+    # (disabled_filesystems reads back as '' even when enforced — verified),
+    # so a false "not effective" warning would cry wolf on every connection.
+    failed: list[str] = []
+    for name, stmt in (
+        ("disabled_filesystems", "SET disabled_filesystems='LocalFileSystem'"),
+        ("autoinstall_known_extensions", "SET autoinstall_known_extensions=false"),
+        ("autoload_known_extensions", "SET autoload_known_extensions=false"),
+    ):
+        try:
+            con.execute(stmt)
+        except Exception as exc:  # older DuckDB without a knob
+            failed.append(f"{name} ({type(exc).__name__})")
+    if failed:
+        # Once per process (the posture is per-DuckDB-build, not
+        # per-connection): _duckdb_fs_lockdown runs on EVERY fresh
+        # duckdb.connect() (10+ call sites), so an undeduped WARNING here
+        # floods the log on every query after a DuckDB upgrade renames a
+        # knob. Same dedup discipline as _budget_logged below.
+        global _lockdown_warned
+        if not _lockdown_warned:
+            _lockdown_warned = True
+            logger.warning(
+                "DuckDB filesystem lockdown INCOMPLETE (further occurrences suppressed): %s — "
+                "file/network access via DuckDB built-ins may be possible. This is a fail-OPEN "
+                "posture; upgrade DuckDB or set SQLHANDLER_DUCKDB_FILE_ACCESS=1 explicitly if intended.",
+                "; ".join(failed),
+            )
 
 
+_lockdown_warned = False
 _budget_logged = False
 
 
@@ -2565,7 +2592,12 @@ class SqlEngine:
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
         if shared_key is not None:
-            self._l2_meta.put(shared_key, result)
+            # tables recorded for write-tier eviction (the profile/colstats
+            # tier shares the CTAS version-regression hole the result tier
+            # fixed — cross-review finding).
+            self._l2_meta.put(
+                shared_key, result, tables=[info.name, info.path, info.qualified_name]
+            )
         return result
 
     @staticmethod
@@ -2788,7 +2820,12 @@ class SqlEngine:
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
         if shared_key is not None:
-            self._l2_meta.put(shared_key, result)
+            # tables recorded for write-tier eviction (the profile/colstats
+            # tier shares the CTAS version-regression hole the result tier
+            # fixed — cross-review finding).
+            self._l2_meta.put(
+                shared_key, result, tables=[info.name, info.path, info.qualified_name]
+            )
         return result
 
     def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:
@@ -3820,6 +3857,17 @@ class SqlEngine:
                 self._l2_cache.drop_for_table(table_path, table_name)
             except Exception:
                 logger.debug("L2 write-eviction failed for %s", table_path, exc_info=True)
+            # The shared PROFILE/COLUMN_STATS tier lives under the same L2
+            # dir (meta/ subdirectory) and keys embed the same snapshot
+            # token — a drop-create resets Delta to v0, making post-write
+            # keys equal pre-write keys, so it needs its own eviction pass
+            # (cross-review finding; without it a stale profile/colstats
+            # survives a scratch write until TTL).
+            if self._l2_meta is not None:
+                try:
+                    self._l2_meta.drop_for_table(table_path, table_name)
+                except Exception:
+                    logger.debug("L2 meta write-eviction failed for %s", table_path, exc_info=True)
 
     def _evict_dataset_cache_for(self, canonical_path: str) -> None:
         """Drop cached dataset handles for the written table (any version).
@@ -4207,15 +4255,29 @@ class SqlEngine:
         so a write's post-write eviction cannot path-match stored keys
         without this side map. Bounded with the cache itself (entries are
         dropped when their key is).
+
+        The L2 sidecar additionally records the referenced tables (the
+        same ``_referenced_tables`` identity the key embeds, passed as the
+        store API's ``tables`` parameter) so the write tier's
+        ``drop_for_table`` can evict SELECTIVELY — only the written
+        table's entries — instead of wiping the shared cache. Entries
+        stored without SQL (the L1-warm republish) carry the existing
+        sidecar's tables forward in the L2 store.
         """
         nbytes = table.nbytes
         if self._result_cache_max_bytes > 0 and nbytes > self._result_cache_max_bytes:
             return
         with self._lock:
             while self._result_cache and self._result_cache_bytes + nbytes > self._result_cache_max_bytes:
-                _, evicted = self._result_cache.popitem(last=False)
-                if self._result_cache_sql:
-                    self._result_cache_sql.popitem(last=False)
+                evicted_key, evicted = self._result_cache.popitem(last=False)
+                # Pop the side map BY KEY (never popitem): the two dicts are
+                # NOT in lockstep — the L2-warm republish stores with
+                # sql=None (no map entry) and an expired-lookup delete
+                # removes a cache entry without its map entry — so a blind
+                # map popitem could evict a DIFFERENT key's sql and leave a
+                # live cached entry unmapped, invisible to write-eviction
+                # (stale rows after a scratch write).
+                self._result_cache_sql.pop(evicted_key, None)
                 self._result_cache_bytes -= evicted[1].nbytes
             self._result_cache[key] = (time.time(), table)
             self._result_cache_bytes += nbytes
@@ -4227,14 +4289,36 @@ class SqlEngine:
         # other replicas pick the artifact up when it lands. async_store
         # returns False (→ the synchronous publish below) when the worker is
         # off or the queue is full, preserving the historical behavior.
+        tables = self._cache_table_idents(sql)
         floor = self._l2_min_bytes if l2_min_bytes is None else l2_min_bytes
         if (
             self._l2_cache is not None
             and floor <= nbytes
             and (self._l2_max_bytes <= 0 or nbytes <= self._l2_max_bytes)
-            and not self._l2_cache.async_store(key, table)
+            and not self._l2_cache.async_store(key, table, tables)
         ):
-            self._l2_cache.store(key, table)
+            self._l2_cache.store(key, table, tables)
+
+    def _cache_table_idents(self, sql: str | None) -> list[str] | None:
+        """Referenced-table identifiers to record in an L2 sidecar.
+
+        The same ``_referenced_tables`` list ``_result_cache_key`` embeds
+        in the key — each table's bare name, logical path, and qualified
+        form — so the write tier's ``drop_for_table`` (which knows the
+        written table's path and name) can match entries by table instead
+        of wiping the whole shared cache. None when the caller had no SQL
+        (the L1-warm republish: the L2 store keeps the existing sidecar's
+        tables) or resolution fails — best-effort, never a query failure.
+        """
+        if not sql:
+            return None
+        try:
+            idents: set[str] = set()
+            for info in self._referenced_tables(sql):
+                idents.update({info.name, info.path, info.qualified_name})
+            return sorted(idents) or None
+        except Exception:
+            return None
 
     def _referenced_tables(self, sql: str) -> list[TableInfo]:
         """Return the tables referenced by a SQL query.

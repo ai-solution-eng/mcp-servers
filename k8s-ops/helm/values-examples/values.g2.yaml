@@ -26,7 +26,7 @@ image:
   # tags) — a stale default is how an "old MCP + new chart" pod happens.
   # SITE: pinned at chart 1.1.0.
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v1.1.0
+  tag: v1.1.1
   pullPolicy: IfNotPresent
 
 # SITE: private-GHCR pull secret — omit ([]) when the package is public.

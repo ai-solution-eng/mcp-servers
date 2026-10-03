@@ -13,9 +13,15 @@ byte-for-byte in behavior:
 * the JWKS is fetched with stdlib urllib, TLS verification ALWAYS ON
   (``REMOTE_CA_BUNDLE`` may point at a platform CA bundle — a dedicated SSL
   context trusts it, never disables verification), cached under a lock with
-  a TTL; a failed fetch arms a 60 s negative cache so a down IdP cannot be
-  hammered per request; an unknown ``kid`` forces ONE immediate refetch so
-  signing-key rotation is picked up without waiting out the TTL;
+  a TTL; the fetch itself happens OUTSIDE the lock (a module-level
+  ``_jwks_fetching`` set keeps concurrent callers from stampeding, and
+  nobody holds the lock across a network round-trip); a failed fetch arms a
+  60 s negative cache so a down IdP cannot be hammered per request; an
+  unknown ``kid`` forces ONE immediate refetch so signing-key rotation is
+  picked up without waiting out the TTL — RATE LIMITED to at most one forced
+  refetch per ``SQLHANDLER_JWKS_FORCE_MIN_INTERVAL`` seconds per URL
+  (default 60), so unauthenticated garbage tokens with random ``kid``\\ s
+  cannot drive one serialized outbound fetch per request;
 * in-cluster proxy isolation: ``*.svc`` / ``*.svc.cluster.local`` /
   ``*.local`` / ``localhost`` JWKS hosts bypass any ambient proxy;
 * every failure returns ``None`` (fail-closed) and logs a short reason code
@@ -34,6 +40,7 @@ restart — the fleet grep should find both spellings in this one docstring):
 * ``RAG_OIDC_JWKS_REFRESH_SECONDS``  -> ``SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS``
 * ``RAG_OIDC_FETCH_TIMEOUT_SECONDS`` -> ``SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS``
 * ``RAG_OIDC_CLOCK_SKEW_SECONDS``    -> ``SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS``
+* (no RAG counterpart)                ``SQLHANDLER_JWKS_FORCE_MIN_INTERVAL``
 
 RAG-only concepts deliberately NOT carried over (SQLhandler has no per-user
 dataset registry to consult): ``RAG_OIDC_OBSERVED_TTL`` and the
@@ -71,12 +78,17 @@ JWKS_URL_ENV = "SQLHANDLER_OIDC_JWKS_URL"
 JWKS_REFRESH_ENV = "SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS"
 FETCH_TIMEOUT_ENV = "SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS"
 CLOCK_SKEW_ENV = "SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS"
+FORCE_MIN_INTERVAL_ENV = "SQLHANDLER_JWKS_FORCE_MIN_INTERVAL"
 
 DEFAULT_AUDIENCE = "ua"
 DEFAULT_IDENTITY_CLAIM = "preferred_username"
 DEFAULT_JWKS_REFRESH = 3600.0
 DEFAULT_FETCH_TIMEOUT = 3.0
 DEFAULT_CLOCK_SKEW = 60.0
+#: Min seconds between two FORCED (unknown-kid) refetches of one JWKS URL.
+#: The unknown-kid path is reachable with UNAUTHENTICATED garbage tokens, so
+#: without this floor any client could drive one outbound fetch per request.
+DEFAULT_FORCE_MIN_INTERVAL = 60.0
 
 # The identity-claim fallback chain's last resort (stable, unique, opaque).
 _FALLBACK_CLAIM = "sub"
@@ -203,11 +215,17 @@ def _jwks_url() -> str:
 
 
 # JWKS cache (per JWKS URL): stamp -> keys, plus a negative cache so a down
-# IdP cannot be hammered per request. Fetches happen under the lock —
-# serialized (bounded by the fetch timeout) instead of thundering-herd.
+# IdP cannot be hammered per request. The LOCK protects the cache dicts only —
+# the network fetch runs OUTSIDE it, so a slow/hostile IdP can never serialize
+# every request behind one in-flight fetch. ``_jwks_fetching`` records the URLs
+# with a fetch in flight so concurrent callers do not stampede (single-process
+# semantics, like the caches themselves); ``_forced_refetch_at`` rate-limits
+# the unknown-kid force path per URL.
 _jwks_lock = threading.Lock()
 _jwks_cache: dict[str, tuple[float, dict[str, tuple[int, int]]]] = {}
 _jwks_negative: dict[str, float] = {}
+_jwks_fetching: set[str] = set()
+_forced_refetch_at: dict[str, float] = {}
 
 
 def _fetch_jwks(url: str, timeout: float) -> dict[str, tuple[int, int]]:
@@ -270,13 +288,28 @@ def _jwks_keys(url: str, *, force: bool = False) -> dict[str, tuple[int, int]] |
     """``{kid: (n, e)}`` from the TTL-cached JWKS (fetch when stale/forced).
 
     ``force=True`` is the unknown-``kid`` rotation path: ONE immediate
-    refetch. A failed fetch (network/parse) arms the negative cache —
-    forced or not, ``None`` comes back until the backoff elapses, so a down
-    IdP sees at most one attempt per backoff window per replica.
+    refetch — RATE LIMITED to at most one per ``url`` per
+    ``SQLHANDLER_JWKS_FORCE_MIN_INTERVAL`` seconds (default 60), because an
+    UNAUTHENTICATED garbage token with a random ``kid`` reaches this path;
+    inside the window the cached keys are returned as-is (or None when there
+    are none) WITHOUT touching the network. A failed fetch (network/parse)
+    arms the negative cache — forced or not, ``None`` comes back until the
+    backoff elapses, so a down IdP sees at most one attempt per backoff
+    window per replica. The fetch runs OUTSIDE ``_jwks_lock`` (a
+    ``_jwks_fetching`` marker prevents concurrent stampedes), so a slow IdP
+    cannot serialize unrelated requests behind the lock.
     """
     ttl = _env_float(JWKS_REFRESH_ENV, DEFAULT_JWKS_REFRESH)
     timeout = _env_float(FETCH_TIMEOUT_ENV, DEFAULT_FETCH_TIMEOUT)
     now = time.time()
+    if force:
+        min_interval = _env_float(FORCE_MIN_INTERVAL_ENV, DEFAULT_FORCE_MIN_INTERVAL)
+        with _jwks_lock:
+            last = _forced_refetch_at.get(url)
+            if last is not None and (now - last) < min_interval:
+                cached = _jwks_cache.get(url)
+                return cached[1] if cached else None
+            _forced_refetch_at[url] = now
     with _jwks_lock:
         cached = _jwks_cache.get(url)
         if not force and cached and (now - cached[0]) < ttl:
@@ -284,19 +317,32 @@ def _jwks_keys(url: str, *, force: bool = False) -> dict[str, tuple[int, int]] |
         negative_until = _jwks_negative.get(url)
         if negative_until and now < negative_until:
             return None
+        if url in _jwks_fetching:
+            # Another thread is already fetching: never block on it — serve
+            # the stale copy (or None) rather than queue behind a timeout.
+            return cached[1] if cached else None
+        _jwks_fetching.add(url)
+    try:
         try:
-            keys = _fetch_jwks(url, timeout)
+            keys = _fetch_jwks(url, timeout)  # network, OUTSIDE the lock
         except Exception as exc:  # network/parse failure — fail closed, back off
-            _jwks_negative[url] = time.time() + _NEGATIVE_TTL
+            with _jwks_lock:
+                _jwks_negative[url] = time.time() + _NEGATIVE_TTL
             logger.warning(
                 "OIDC JWKS fetch failed (%s: %s) — JWT verification is briefly unavailable",
                 type(exc).__name__,
                 exc,
             )
             return None
-        _jwks_negative.pop(url, None)
-        _jwks_cache[url] = (time.time(), keys)
+        with _jwks_lock:
+            _jwks_negative.pop(url, None)
+            _jwks_cache[url] = (time.time(), keys)
         return keys
+    finally:
+        # Always release the stampede marker (even on a BaseException), so a
+        # single aborted fetch can never wedge the guard permanently.
+        with _jwks_lock:
+            _jwks_fetching.discard(url)
 
 
 def _verify_rs256(signing_input: bytes, signature: bytes, key: tuple[int, int]) -> bool:

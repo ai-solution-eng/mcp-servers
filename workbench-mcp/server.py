@@ -938,7 +938,12 @@ async def workspace_delete(name: str, confirm: bool = False) -> str:
     annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
 )
 async def write_file(workspace: str, path: str, content: str) -> str:
-    """Write a UTF-8 text file inside the workspace (parents auto-created).
+    """Write a UTF-8 text file into a persistent workbench workspace (parents
+    auto-created).  Choose this over a plain session write tool when the file
+    must outlive the conversation — workspaces are PVC-backed and survive pod
+    restarts — or when a workbench run_command, or another fleet server via
+    WORKBENCH_SHARED_PATHS, needs to read it next.  For throwaway scratch
+    files that only this session touches, a session write tool is fine.
 
     Paths are workspace-relative; traversal and symlink escapes are refused.
     """
@@ -982,7 +987,9 @@ async def delete_file(workspace: str, path: str, confirm: bool = False) -> str:
     annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False),
 )
 async def set_env(workspace: str, key: str, value: str) -> str:
-    """Persist an env var for this workspace; run_command injects it."""
+    """Persist an env var for this workspace — it survives pod restarts (stored
+    with the workspace, not the session) and run_command injects it into every
+    child process it runs in this workspace."""
     return json.dumps(await asyncio.to_thread(_env_set, workspace, key, value))
 
 
@@ -1000,14 +1007,17 @@ async def get_env(workspace: str, key: str) -> str:
     annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
 )
 async def run_command(workspace: str, command: list[str], timeout_s: int | None = None) -> str:
-    """Run an argv command inside the workspace (cwd = workspace root).
+    """Run an argv command inside the workspace (cwd = workspace root) — the
+    audited, workspace-persistent way to run git/tar/grep-style tools on
+    workspace files (every run is audit-logged with the caller's identity,
+    and the workspace's persisted env vars are injected).
 
     argv-list only — no shell interpolation.  argv[0] must be allow-listed
     (WORKBENCH_EXEC_ALLOWLIST) and not deny-listed; the allowlist resolves
     against the server's own PATH (a workspace PATH override reaches only
     the child environment).  Workspace isolation: argv may not reference
-    files outside this workspace (WORKBENCH_SHARED_PATHS excepted).  The
-    persisted workspace env is injected; output is capped; audit-logged.
+    files outside this workspace (WORKBENCH_SHARED_PATHS excepted).  Output
+    is capped.
 
     Exec policy (fleet decision D18): the DEFAULT allowlist is narrow argv
     tools only — ls, cat, head, tail, grep, find, wc, du, df, mkdir, touch,

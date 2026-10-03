@@ -78,6 +78,7 @@ Envs (all re-read per call, the fleet convention):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -350,6 +351,31 @@ def _insert_payload_select(statement: str) -> str:
 
 _SLUG_RE = re.compile(r"[^a-z0-9._-]+")
 
+#: Length of the human-recognizable normalized-slug segment (before the
+#: collision digest). 48 + 1 join char + 12 digest hex chars = 61, under the
+#: 64-char cap with headroom.
+_SLUG_PREFIX_LEN = 48
+
+#: The collision-proofing digest: first 12 hex chars of sha256 over the RAW
+#: (pre-normalization) subject — twelve hex chars, so two subjects that
+#: normalize to the same slug (`Alice.` vs `alice`, `Alice Smith` vs
+#: `alice-smith`, two subjects sharing a 64-char prefix) can never share a
+#: scratch namespace. Twelve hex chars = 48 bits; the birthday-collision
+#: probability among n subjects is ~n^2/2^49 — negligible for any real user
+#: population, and a collision additionally requires an identical normalized
+#: prefix too.
+_SLUG_DIGEST_LEN = 12
+
+
+def _slug_digest(raw_subject: str) -> str:
+    """sha256 over the RAW (pre-normalization) subject, first 12 hex chars.
+
+    The digest is what makes the slug collision-proof: subjects that
+    normalize identically still hash differently. Pure and deterministic —
+    the same subject always yields the same slug.
+    """
+    return hashlib.sha256(raw_subject.encode("utf-8")).hexdigest()[:_SLUG_DIGEST_LEN]
+
 
 def subject_slug(caller) -> str | None:
     """The caller's scratch-namespace slug: their ATTRIBUTED subject.
@@ -360,14 +386,36 @@ def subject_slug(caller) -> str | None:
     rotation, and the review's rule is "anonymous keys get NO write
     capability, ever" — a rotating root would strand scratch data the next
     day. Returns None for everything that must not write.
+
+    Collision-proof shape: ``<normalized[:48]>_<sha256(raw)[:12]>`` (61
+    chars max). The normalized segment (lowercased, non-``[a-z0-9._-]``
+    runs folded to ``-``) keeps it human-recognizable; the digest is taken
+    over the RAW pre-normalization subject, so distinct subjects can never
+    collapse onto one namespace however similar their normalized forms are
+    (``Alice.`` vs ``alice``, ``Alice Smith`` vs ``alice-smith``, two
+    subjects sharing a 64-char prefix).
+
+    The join is ``_`` (not ``-``) because the engine surfaces a scratch
+    namespace to DuckDB as the ``<slug>_<name>`` qualified identifier: a
+    hyphen there would need quoting, and the ``con.register`` path stores
+    the quoted form literally — the documented ``FROM <slug>_<name>``
+    read-back would break for every subject (verified against the current
+    engine; a `_safe_ident`/register fix is engine-owned, not writes.py's).
+
+    Stable per subject (a pure function of the subject string), so a
+    caller's namespace does not drift between calls. Hygiene
+    (``.strip("-.")``) runs on the FINAL string so neither segment can
+    leave a leading/trailing ``-``/``.``.
     """
     if caller is None:
         return None
     subject = getattr(caller, "subject", None)
     if not subject:
         return None
-    slug = _SLUG_RE.sub("-", subject.strip().lower()).strip("-.")
-    return slug[:64] or None
+    slug = _SLUG_RE.sub("-", subject.lower()).strip("-.")
+    digest = _slug_digest(subject)
+    final = f"{slug[:_SLUG_PREFIX_LEN]}_{digest}".strip("-.")
+    return final[:64] or None
 
 
 def subject_scoped_root(caller, environ: dict[str, str] | None = None) -> tuple[str, str, str]:

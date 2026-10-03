@@ -40,7 +40,7 @@ readiness:
   driftGate: false            # optional fail-fast for new scans while degraded
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.0.0
+  tag: v3.3.2
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3
@@ -478,7 +478,11 @@ cache:
   listAsyncRefresh: true
   duckdbMemoryFraction: '0.6'
   spillDir: /tmp/sqlhandler-duckdb-spill
-  cacheDir: /tmp/sqlhandler-cache
+  # Disk-warm metadata cache (table list, describes, usage counts that drive
+  # the startup prewarm). /tmp = emptyDir: every restart forgot the list AND
+  # the usage counts, so usage-driven prewarm had nothing to warm and the
+  # first query per table paid a cold describe. PVC-backed keeps all of it.
+  cacheDir: /var/lib/sqlhandler-catalog/metadata-cache
   virtualCacheDir: /var/lib/sqlhandler-catalog
   virtualCacheTtl: 3600
   virtualCacheSort: true
@@ -503,8 +507,15 @@ cache:
     writeAsync: true
   blockCache:
     enabled: true
-    dir: ''
-    blockSize: '8388608'
+    # PVC-backed (RWX catalog volume) so the cache SURVIVES restarts and is
+    # shared across replicas — the /tmp emptyDir default wiped it on every
+    # rollout and charged the first query per table the full cold S3 scan
+    # (~12-16 s on the 50-col torture table). NFS-warm reads are slower than
+    # node-local /tmp was (~2.5 s vs 0.16 s on the same preview), so block
+    # size drops to 1 MiB: a 50-column preview first-touch then over-fetches
+    # ~50 MB of blocks instead of ~50 x 8 MiB (~400 MB).
+    dir: /var/lib/sqlhandler-catalog/block-cache
+    blockSize: '1048576'
     maxBytes: '1073741824'
     includeLocal: false
 # -- Saved-query store (query_save / query_list / query_delete / query_saved) --

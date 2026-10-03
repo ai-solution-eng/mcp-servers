@@ -591,10 +591,25 @@
 
     <div id="pane-access" class="pane hidden">
       <div class="hint" style="margin-bottom:10px">Access control — the admin frontend over <code style="font-family:var(--mono)">/api/admin/*</code> (README: Administering from the frontend). The credential is held in this page's memory ONLY — never persisted.</div>
+      <div class="panel" id="sso-mint-card">
+        <h2>Your API key <span class="hint" id="sso-mint-status"></span></h2>
+        <div class="hint" style="margin-bottom:8px">Signed in via SSO? Mint a long-lived <b>X-API-KEY</b> for MCP clients (bound to your account — it acts as you, with exactly your grants). The raw key is shown once.</div>
+        <div class="query-actions">
+          <button id="sso-mint">Mint my key</button>
+          <button id="sso-keys-list" class="ghost">My keys</button>
+          <span class="hint">Minting again rotates: the oldest key is retired (server default: one active key).</span>
+        </div>
+        <div id="sso-minted" style="display:none;margin-top:10px">
+          <div style="color:var(--yellow);font-size:12px;margin-bottom:4px">⚠ Store it now — shown once, never recoverable:</div>
+          <div class="insp-out" style="max-height:none;word-break:break-all" id="sso-minted-key"></div>
+          <div class="query-actions"><button class="copy-btn ghost" id="sso-minted-copy">copy</button></div>
+        </div>
+        <div id="sso-keys" style="display:none;margin-top:10px"></div>
+      </div>
       <div class="panel">
         <h2>Admin credential</h2>
         <div class="insp-field">
-          <label><b>Admin key (X-API-Key)</b><span class="hint"> — sent with every Access-control call; an SSO bearer token works too (sent as Bearer)</span></label>
+          <label><b>Admin key (X-API-Key)</b><span class="hint"> — sent with every Access-control call. LEAVE EMPTY when signed in via SSO (the browser session is the credential — your Keycloak subject must be in the policy's admins list)</span></label>
           <input type="password" id="adm-key" placeholder="paste the admin key — kept in memory only" autocomplete="off" spellcheck="false" />
         </div>
         <div class="query-actions">
@@ -623,6 +638,11 @@
         <div class="panel">
           <h2>Keys <span class="hint">secret-source keys are read-only — revoke via kubectl (the Secret's lifecycle)</span></h2>
           <div id="adm-keys"></div>
+        </div>
+        <div class="panel">
+          <h2>Users <span class="hint" id="adm-users-meta"></span></h2>
+          <div class="hint" style="margin-bottom:8px">Every subject the system knows — from policy grants, self-minted keys, and recent activity (audit tail). Grant BY NAME: writes the subject's row into the policy document (hot-reloads immediately). Users sign in via SSO and mint their own key bound to their subject — no admin action needed after the grant.</div>
+          <div id="adm-users"></div>
         </div>
         <div class="panel">
           <h2>Mint a key</h2>
@@ -1113,6 +1133,7 @@ function switchTab(tab) {
   $("pane-schema").classList.toggle("hidden", tab !== "schema");
   $("pane-semantic").classList.toggle("hidden", tab !== "semantic");
   $("pane-inspector").classList.toggle("hidden", tab !== "inspector");
+  $("pane-access").classList.toggle("hidden", tab !== "access");
   if (tab === "semantic") loadSemanticPane();
   if (tab === "inspector") loadInspector();
   if (tab === "access") accessRefresh();
@@ -1734,6 +1755,119 @@ $("adm-policy").addEventListener("input", () => { $("adm-policy")._dirty = true;
 $("adm-key").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); admConnect(); }
 });
+
+// ---- Self-service SSO key minting (the user's own long-lived X-API-KEY) ----
+// The browser's SSO session (Keycloak bearer, already held by the page's
+// fetches) is the credential: POST /api/admin/keys/self with NO X-API-Key —
+// the server verifies the JWT and binds the key to the VERIFIED subject.
+// The card is visible to everyone; the server's 403 ("SSO only") renders in
+// the toast for key-class visitors — same verbatim-error contract as admin.
+
+async function ssoMint() {
+  $("sso-mint-status").textContent = "";
+  try {
+    const res = await api("/api/admin/keys/self", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    $("sso-minted").style.display = "";
+    $("sso-minted-key").textContent = res.key || "";
+    $("sso-mint-status").textContent = "bound to " + (res.subject || "your account");
+    toast("Key minted for " + (res.subject || "your account"));
+  } catch (e) {
+    $("sso-minted").style.display = "none";
+    toast(e.message, true); // the server's 403/503 verbatim
+  }
+}
+
+async function ssoKeysList() {
+  try {
+    const res = await api("/api/admin/keys/self");
+    const keys = res.keys || [];
+    const box = $("sso-keys");
+    box.style.display = "";
+    box.innerHTML = keys.length
+      ? '<table class="grid"><thead><tr><th>label</th><th>fingerprint</th><th>created</th><th></th></tr></thead><tbody>' +
+        keys.map((k) =>
+          "<tr><td>" + esc(k.label || "?") + "</td>" +
+          "<td title='" + esc(k.fp || "") + "'>" + esc(admFp(k.fp)) + "</td>" +
+          "<td>" + esc(k.created_at || "") + "</td>" +
+          "<td><button class='mini-del' data-fp='" + esc(k.fp || "") + "'>✕ revoke</button></td></tr>").join("") +
+        "</tbody></table>"
+      : '<div class="hint">no active self-minted keys</div>';
+    box.querySelectorAll(".mini-del").forEach((btn) => {
+      btn.onclick = async () => {
+        if (!confirm("Revoke this key? MCP clients using it will stop working.")) return;
+        try {
+          await api("/api/admin/keys/self/" + encodeURIComponent(btn.dataset.fp), { method: "DELETE" });
+          toast("Key revoked");
+          ssoKeysList();
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("sso-mint").onclick = ssoMint;
+$("sso-keys-list").onclick = ssoKeysList;
+$("sso-minted-copy").onclick = () =>
+  navigator.clipboard.writeText($("sso-minted-key").textContent).then(() => toast("Raw key copied — store it now"));
+
+// ---- Users (admin): every known subject, grant BY NAME ---------------------
+
+async function admLoadUsers() {
+  const box = $("adm-users");
+  if (!adminCredential) { box.innerHTML = ""; return; }
+  try {
+    const res = await api("/api/admin/users", { headers: admHeaders() });
+    const users = res.users || [];
+    $("adm-users-meta").textContent = users.length + " subject(s)";
+    if (!users.length) {
+      box.innerHTML = '<div class="empty">no subjects yet — users appear here after an operator grant or their first SSO key mint</div>';
+      return;
+    }
+    const admins = new Set(res.admins || []);
+    let html = '<table class="grid"><thead><tr><th>subject</th><th>grants (dataset globs)</th><th>keys</th><th>last seen</th><th></th></tr></thead><tbody>';
+    for (const u of users) {
+      html += "<tr>" +
+        "<td><b>" + esc(u.subject) + "</b>" + (admins.has(u.subject) || admins.has("subject:" + u.subject) ? " <span style='color:var(--yellow)' title='designated admin'>★</span>" : "") + "</td>" +
+        "<td><input type='text' class='adm-grants-in' data-subject='" + esc(u.subject) + "' value=\"" + esc((u.grants || []).join(", ")) + "\" style='width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:11px;padding:4px 6px' placeholder='workorder/*, reports/*' /></td>" +
+        "<td>" + (u.keys && u.keys.length ? u.keys.length + " <span class='hint'>active</span>" : "<span class='hint'>none</span>") + "</td>" +
+        "<td>" + esc(u.last_seen || "—") + "</td>" +
+        "<td><button class='adm-grants-save mini-del' data-subject='" + esc(u.subject) + "' style='color:var(--text)'>save</button></td>" +
+        "</tr>";
+    }
+    html += "</tbody></table>";
+    box.innerHTML = html;
+    box.querySelectorAll(".adm-grants-save").forEach((btn) => {
+      btn.onclick = async () => {
+        const subject = btn.dataset.subject;
+        const input = box.querySelector(".adm-grants-in[data-subject='" + CSS.escape(subject) + "']");
+        const globs = (input.value || "").split(",").map((s) => s.trim()).filter(Boolean);
+        try {
+          await api("/api/admin/users/" + encodeURIComponent(subject) + "/grants", {
+            method: "PUT",
+            headers: admHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ globs }),
+          });
+          toast("Grants saved for " + subject + (globs.length ? "" : " (revoked all)"));
+          accessRefresh(); // the assignments panel reflects the same write
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+  } catch (e) {
+    box.innerHTML = "";
+  }
+}
+
+const _accessRefreshWithUsers = accessRefresh;
+accessRefresh = async function () {
+  await _accessRefreshWithUsers();
+  if (adminCredential) await admLoadUsers();
+};
 
 // ---- SV editor component ----------------------------------------------------
 // A transparent-text textarea layered over a <pre> the SERVER highlights with
