@@ -17,7 +17,7 @@ deployment:
 # -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.3.1
+  tag: v0.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -95,6 +95,27 @@ logsearch:
 apiKey:
   existingSecret: logsearch-mcp-apikey
   existingSecretKey: api-keys
+
+# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts, for
+# in-cluster callers that address the server by its service DNS name instead of
+# the public FQDN (e.g. a peer MCP →
+# http://other-mcp.<ns>.svc.cluster.local:9101/mcp). Joined into
+# MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the `host:*`
+# form to accept any port. The pinned public FQDN (ezua.virtualService.endpoint,
+# rendered as MCP_HOSTNAME when ezua is enabled) and loopback are always
+# allowed; without this knob behaviour is unchanged (fleet pattern: K8S-MCP).
+# List of strings.
+#
+# NOTE — the chart AUTO-INCLUDES this release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
+# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
+# endpoint pinned or extraAllowedHosts non-empty): the LLM-gateway relay
+# arrives with Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>,
+# and without that entry every relay hop gets 421 Misdirected Request. This
+# key only lists hosts BEYOND that; a site setting extraAllowedHosts never
+# loses the own-svc entry (the chart prepends it):
+extraAllowedHosts: []
 
 # -- Service exposure ---------------------------------------------------------------------
 service:

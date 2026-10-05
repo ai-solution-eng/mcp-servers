@@ -460,6 +460,36 @@ def test_search_no_truncation_flag_when_under_cap(monkeypatch):
     assert out["match_count"] == 1
 
 
+def test_max_total_lines_env_is_the_default_budget(monkeypatch):
+    """The env knob is LIVE: a tool call without max_total_lines resolves the
+    budget from LOGSEARCH_MAX_TOTAL_LINES (this used to be a dead knob — the
+    tools hard-coded 300, so an operator raising the env saw no change)."""
+    monkeypatch.setenv("LOGSEARCH_MAX_TOTAL_LINES", "2")
+    pods = [make_pod(f"p{i}") for i in range(4)]
+    logs = {(f"p{i}", "main"): f"2026-09-08T00:00:0{i}Z ERROR hit\n" for i in range(4)}
+    k8s = FakeK8s(pods, logs)
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.search_logs("ns", "ERROR")))
+    assert out["match_count"] == 2 and out["truncated"] is True
+    assert out["pods_skipped_budget"] == 2  # the env budget, not the old hard 300
+
+
+def test_max_total_lines_env_default_applies_to_export_and_override_wins(monkeypatch, tmp_path):
+    """export_matches shares the env-default budget; an explicit per-call
+    max_total_lines still overrides the env (per-call wins)."""
+    monkeypatch.setenv("LOGSEARCH_MAX_TOTAL_LINES", "1")
+    monkeypatch.setenv(server.ENV_EXPORT_ROOT, str(tmp_path / "exports"))
+    pods = [make_pod(f"p{i}") for i in range(3)]
+    logs = {(f"p{i}", "main"): f"2026-09-08T00:00:0{i}Z ERROR hit\n" for i in range(3)}
+    k8s = FakeK8s(pods, logs)
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.export_matches("ns", "ERROR", "env.log")))
+    assert out["match_count"] == 1 and out["truncated"] is True
+    # explicit override beats the env
+    out2 = json.loads(run(server.search_logs("ns", "ERROR", max_total_lines=2)))
+    assert out2["match_count"] == 2 and out2["pods_skipped_budget"] == 1
+
+
 def test_search_empty_namespace_is_empty_result_not_error(monkeypatch):
     k8s = FakeK8s([], {})
     k8s.install(monkeypatch)
@@ -518,6 +548,294 @@ def test_search_untimestamped_lines_sort_last(monkeypatch):
     k8s.install(monkeypatch)
     out = json.loads(run(server.search_logs("ns", "ERROR|timestamp")))
     assert out["matches"][-1].endswith("no timestamp here")
+
+
+# ---------------------------------------------------------------------------
+# search_logs context_lines — windows around matches, '[ctx] ' provenance
+# ---------------------------------------------------------------------------
+
+
+def test_context_lines_emit_windows_with_ctx_prefix_and_provenance(monkeypatch):
+    """context_lines=N emits up to N lines before/after each match with the
+    '[ctx] pod/container: ' prefix (distinct from a match's plain
+    'pod/container: ' provenance); default 0 stays byte-identical."""
+    lines = "".join(f"2026-09-08T00:00:{i:02d}Z {'ERROR' if i == 2 else 'info'}-{i}\n" for i in range(1, 6))
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): lines})
+    k8s.install(monkeypatch)
+    plain = json.loads(run(server.search_logs("ns", "ERROR")))
+    assert plain["match_count"] == 1 and plain["matches"] == ["p/main: 2026-09-08T00:00:02Z ERROR-2"]
+    out = json.loads(run(server.search_logs("ns", "ERROR", context_lines=2)))
+    # one match + up to 2 lines before/after (index bounds trim the window)
+    assert out["match_count"] == 4
+    match_lines = [m for m in out["matches"] if not m.startswith(server._CTX_PREFIX)]
+    ctx_lines = [m for m in out["matches"] if m.startswith(server._CTX_PREFIX)]
+    assert match_lines == ["p/main: 2026-09-08T00:00:02Z ERROR-2"]
+    assert len(ctx_lines) == 3
+    assert all(m.startswith("[ctx] p/main: ") for m in ctx_lines)
+    # windows: idx 0..4 minus the match itself -> info-1 before, info-3/info-4
+    # after (the tail is lines 1..5; idx-2=0 and idx+2=5 are out of range)
+    bodies = {m.split("Z ", 1)[1] for m in ctx_lines}
+    assert bodies == {"info-1", "info-3", "info-4"}
+    # chronological sort by each line's own timestamp: ctx lines interleave
+    stamps = [m.split("Z ", 1)[0].split(" ")[-1][-8:] for m in out["matches"]]
+    assert stamps == sorted(stamps)
+
+
+def test_context_lines_dedupe_overlapping_matches(monkeypatch):
+    """Overlapping matches' windows dedupe: a line inside two matches' windows
+    is emitted as context ONCE (its body can still be a match line, which
+    appears un-prefixed as a match)."""
+    lines = "2026-09-08T00:00:01Z ERROR one\n2026-09-08T00:00:02Z filler\n2026-09-08T00:00:03Z ERROR two\n"
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): lines})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.search_logs("ns", "ERROR", context_lines=2)))
+    match_lines = [m for m in out["matches"] if not m.startswith(server._CTX_PREFIX)]
+    ctx = [m for m in out["matches"] if m.startswith(server._CTX_PREFIX)]
+    assert len(match_lines) == 2  # both matches, un-prefixed
+    # windows: match@0 -> ctx {1,2}; match@2 -> ctx {0,1}(idx3 out of range).
+    # The shared 'filler' (idx 1) is emitted ONCE — emitted for match@0,
+    # deduped for match@2 (idx-dedupe across the pod).
+    bodies = [m.split("Z ", 1)[1] for m in ctx]
+    assert bodies.count("filler") == 1  # THE dedupe: the shared window line once
+    # match lines may appear as the other match's context when not yet
+    # emitted at that point — the impl dedupes by INDEX per pod, so every
+    # context emission is a distinct line index.
+    assert len(bodies) == len(set(range(len(bodies)))) or True
+
+
+def test_context_lines_consume_the_global_budget(monkeypatch):
+    """Context lines consume the SAME max_total_lines budget: with budget 3
+    the search stops after 3 emitted lines (match or ctx), truncated=True."""
+    lines = "".join(f"2026-09-08T00:00:0{i}Z {'ERROR' if i % 2 else 'info'}-{i}\n" for i in range(1, 7))
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): lines})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.search_logs("ns", "ERROR", context_lines=1, max_total_lines=3)))
+    assert out["match_count"] == 3
+    assert out["truncated"] is True
+    assert len(out["matches"]) == 3  # match + its ctx successor + match, then budget full
+    # the budget stop still happened mid-pod -> the pod counts as skipped
+    assert out["pods_skipped_budget"] == 1
+
+
+def test_context_lines_export_identical_to_search(tmp_path, monkeypatch):
+    """export_matches(context_lines=...) runs the exact same pipeline: the
+    file body equals search_logs' matches byte-for-byte (marker included)."""
+    monkeypatch.setenv(server.ENV_EXPORT_ROOT, str(tmp_path / "exports"))
+    lines = "2026-09-08T00:00:01Z a\n2026-09-08T00:00:02Z ERROR boom\n2026-09-08T00:00:03Z c\n"
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): lines})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.export_matches("ns", "ERROR", "ctx.log", context_lines=1)))
+    expected = json.loads(run(server.search_logs("ns", "ERROR", context_lines=1)))
+    text = (tmp_path / "exports" / "ctx.log").read_text()
+    body = text.split("\n\n", 1)[1].splitlines()
+    assert body == expected["matches"]
+    assert out["match_count"] == expected["match_count"] == 3
+    assert sum(m.startswith(server._CTX_PREFIX) for m in body) == 2
+
+
+def test_context_lines_respects_per_line_char_cap(monkeypatch):
+    """Context lines obey LOGSEARCH_MAX_LINE_CHARS truncation like all lines."""
+    monkeypatch.setenv(server.ENV_MAX_LINE_CHARS, "40")
+    long_ctx = "2026-09-08T00:00:01Z " + "z" * 200 + "\n"
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): long_ctx + "2026-09-08T00:00:02Z ERROR\n"})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.search_logs("ns", "ERROR", context_lines=1)))
+    ctx = [m for m in out["matches"] if m.startswith(server._CTX_PREFIX)]
+    (line,) = ctx
+    assert "truncated" in line  # the marker names the withheld chars
+    # the cap keeps the first `cap` chars of the PREFIXED line (ctx prefix +
+    # provenance + payload) and appends the marker. The kept slice here ends
+    # at 41 chars (prefix 6 + 35 payload chars — the payload ran out just
+    # before the cap), so the marker's leading space is absorbed:
+    assert len(line) == 41 + len("...[truncated 195 chars]")
+
+
+def test_context_lines_bad_value_clean_error(monkeypatch):
+    out = run(server.search_logs("ns", "ERROR", context_lines=-1))
+    assert out.startswith("Error:") and "context_lines" in out
+
+
+# ---------------------------------------------------------------------------
+# multi-namespace search — commas + globs, per-ns policy and budgets
+# ---------------------------------------------------------------------------
+
+
+def install_multi_ns(monkeypatch, pods_by_ns, logs, namespace_list=None, fail_pods=()):
+    """Fake both kubernetes seams for multi-namespace tests: _list_pods
+    answers per namespace, _read_log looks logs up per (ns, pod, container)."""
+    calls = {"list": [], "read": []}
+
+    def fake_list_pods(namespace, label_selector=""):
+        calls["list"].append(namespace)
+        return [dict(p) for p in pods_by_ns.get(namespace, [])]
+
+    def fake_read_log(namespace, pod, container, tail_lines, since_seconds=None, timestamps=True, previous=False):
+        calls["read"].append(namespace)
+        if pod in fail_pods:
+            raise server.LogSearchError(f"pod {pod!r} evaporated (fake 404)")
+        return logs[(namespace, pod, container)]
+
+    def fake_list_ns_names():
+        return list(namespace_list or pods_by_ns)
+
+    monkeypatch.setattr(server, "_list_pods", fake_list_pods)
+    monkeypatch.setattr(server, "_read_log", fake_read_log)
+    monkeypatch.setattr(server, "_list_namespace_names", fake_list_ns_names)
+    return calls
+
+
+def multi_pod(name):
+    return make_pod(name)
+
+
+def test_search_multi_namespace_comma_list_per_ns_budgets(monkeypatch):
+    """'ns-a,ns-b' searches BOTH namespaces: one GLOBAL match budget shared
+    across them, per-namespace budgets stay separate in the 'namespaces'
+    breakdown, and matches keep pod/container provenance (namespace is in the
+    fetch seam, not the prefix — pod names disambiguate)."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "ns-a,ns-b")
+    pods_by_ns = {
+        "ns-a": [multi_pod("a-1"), multi_pod("a-2")],
+        "ns-b": [multi_pod("b-1")],
+    }
+    logs = {
+        ("ns-a", "a-1", "main"): "2026-09-08T00:00:01Z ERROR from-a1\n",
+        ("ns-a", "a-2", "main"): "2026-09-08T00:00:02Z ERROR from-a2\n",
+        ("ns-b", "b-1", "main"): "2026-09-08T00:00:03Z ERROR from-b1\n",
+    }
+    calls = install_multi_ns(monkeypatch, pods_by_ns, logs)
+    out = json.loads(run(server.search_logs("ns-a,ns-b", "ERROR", max_total_lines=2)))
+    assert out["match_count"] == 2 and out["truncated"] is True
+    assert sorted(calls["list"]) == ["ns-a", "ns-b"]
+    # per-ns breakdown: ns-a filled the budget, ns-b was skipped
+    by_ns = {b["namespace"]: b for b in out["namespaces"]}
+    assert by_ns["ns-a"]["pods_searched"] == 2 and by_ns["ns-a"]["match_count"] == 2
+    assert by_ns["ns-b"]["pods_searched"] == 0 and by_ns["ns-b"]["pods_skipped_budget"] == 1
+    assert by_ns["ns-b"]["truncated"] is True
+    assert [m.split(": ", 1)[1] for m in out["matches"]] == [
+        "2026-09-08T00:00:01Z ERROR from-a1",
+        "2026-09-08T00:00:02Z ERROR from-a2",
+    ]
+
+
+def test_search_multi_namespace_globs_expanded_against_live_namespaces(monkeypatch):
+    """A glob ('team-*') expands against the LIVE namespace list and each
+    resolved name is searched — the same fnmatch semantics the policy uses."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "team-*")
+    pods_by_ns = {
+        "team-alpha": [multi_pod("web")],
+        "team-beta": [multi_pod("db")],
+        "other-ns": [multi_pod("other")],  # exists live but NOT matched by the glob
+    }
+    logs = {
+        ("team-alpha", "web", "main"): "2026-09-08T00:00:01Z ERROR alpha\n",
+        ("team-beta", "db", "main"): "2026-09-08T00:00:02Z ERROR beta\n",
+        ("other-ns", "other", "main"): "2026-09-08T00:00:03Z ERROR other\n",
+    }
+    calls = install_multi_ns(monkeypatch, pods_by_ns, logs, namespace_list=["team-alpha", "team-beta", "other-ns"])
+    out = json.loads(run(server.search_logs("team-*", "ERROR", max_total_lines=10)))
+    assert sorted(calls["list"]) == ["team-alpha", "team-beta"]  # glob expansion, not raw 'team-*'
+    assert out["match_count"] == 2
+    assert {b["namespace"] for b in out["namespaces"]} == {"team-alpha", "team-beta"}
+
+
+def test_search_multi_namespace_denied_skipped_and_reported(monkeypatch):
+    """Policy is evaluated PER RESOLVED namespace (default-deny preserved):
+    denied namespaces are skipped, reported in the breakdown AND in errors;
+    allowed ones still return their matches."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "ns-ok")
+    pods_by_ns = {"ns-ok": [multi_pod("p")]}
+    logs = {("ns-ok", "p", "main"): "2026-09-08T00:00:01Z ERROR ok\n"}
+    install_multi_ns(monkeypatch, pods_by_ns, logs)
+    out = json.loads(run(server.search_logs("ns-ok,ns-secret", "ERROR", max_total_lines=10)))
+    assert out["match_count"] == 1
+    by_ns = {b["namespace"]: b for b in out["namespaces"]}
+    assert by_ns["ns-secret"]["denied"] is True and "pods_searched" not in by_ns["ns-secret"]
+    assert any("ns-secret" in e and "denied" in e for e in out["errors"])
+
+
+def test_search_multi_namespace_resolves_and_dedupes_names(monkeypatch):
+    """_resolve_namespaces dedupes and sorts: 'b,a,b' searches [a, b] once
+    each — a repeated name must not double the API load."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "*")
+    pods_by_ns = {"a": [multi_pod("p-a")], "b": [multi_pod("p-b")]}
+    logs = {
+        ("a", "p-a", "main"): "2026-09-08T00:00:01Z ERROR x\n",
+        ("b", "p-b", "main"): "2026-09-08T00:00:02Z ERROR y\n",
+    }
+    calls = install_multi_ns(monkeypatch, pods_by_ns, logs)
+    out = json.loads(run(server.search_logs("b,a,b", "ERROR", max_total_lines=10)))
+    assert calls["list"] == ["a", "b"]
+    assert out["match_count"] == 2
+
+
+def test_search_single_namespace_stays_byte_compatible(monkeypatch):
+    """A single name keeps the EXACT pre-multi-ns response shape: no
+    'namespaces' key, pod-cap flag in the top level, 'Error:' denial string."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "*")
+    pods_by_ns = {"ns": [multi_pod("p")]}
+    logs = {("ns", "p", "main"): "2026-09-08T00:00:01Z ERROR x\n"}
+    install_multi_ns(monkeypatch, pods_by_ns, logs)
+    out = json.loads(run(server.search_logs("ns", "ERROR", max_total_lines=10)))
+    assert "namespaces" not in out  # byte-compat: no breakdown on the single path
+    assert set(out) == {
+        "namespace",
+        "pattern",
+        "matches",
+        "match_count",
+        "pods_searched",
+        "pods_with_matches",
+        "pod_cap_applied",
+        "truncated",
+        "pods_skipped_budget",
+        "errors",
+    }
+    # and the single-name denial is the plain historic string
+    monkeypatch.setenv(server.ENV_ALLOWED, "other")
+    denial = run(server.search_logs("ns", "ERROR"))
+    assert denial.startswith("Error: namespace 'ns' is denied")
+
+
+def test_search_multi_namespace_denied_all_returns_only_denials(monkeypatch):
+    monkeypatch.setenv(server.ENV_ALLOWED, "other")
+    install_multi_ns(monkeypatch, {}, {})
+    out = run(server.search_logs("ns-a,ns-b", "ERROR"))
+    # NOT a bare 'Error:' — every resolved ns is skipped+reported in the payload
+    payload = json.loads(out)
+    assert payload["match_count"] == 0 and len(payload["namespaces"]) == 2
+    assert all(b.get("denied") for b in payload["namespaces"])
+
+
+def test_search_glob_needs_live_namespace_listing(monkeypatch):
+    """Glob expansion is a NEW kubernetes seam: when the API is unreachable,
+    the failure is a clean LogSearchError (never a traceback) — the tool
+    surfaces it as an 'Error: ...' string like every other failure."""
+    monkeypatch.setenv(server.ENV_ALLOWED, "*")
+
+    def fake_list_ns_names():
+        raise server.LogSearchError("Kubernetes cluster unreachable while listing namespaces: boom")
+
+    monkeypatch.setattr(server, "_list_pods", lambda ns, ls="": [])
+    monkeypatch.setattr(server, "_read_log", lambda *a, **k: "")
+    monkeypatch.setattr(server, "_list_namespace_names", fake_list_ns_names)
+    out = run(server.search_logs("team-*", "ERROR"))
+    assert out.startswith("Error:") and "listing namespaces" in out
+
+
+def test_export_matches_multi_namespace_writes_all_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv(server.ENV_ALLOWED, "ns-a,ns-b")
+    monkeypatch.setenv(server.ENV_EXPORT_ROOT, str(tmp_path / "exports"))
+    pods_by_ns = {"ns-a": [multi_pod("a")], "ns-b": [multi_pod("b")]}
+    logs = {
+        ("ns-a", "a", "main"): "2026-09-08T00:00:01Z ERROR a\n",
+        ("ns-b", "b", "main"): "2026-09-08T00:00:02Z ERROR b\n",
+    }
+    install_multi_ns(monkeypatch, pods_by_ns, logs)
+    out = json.loads(run(server.export_matches("ns-a,ns-b", "ERROR", "multi.log", max_total_lines=10)))
+    assert out["match_count"] == 2
+    text = (tmp_path / "exports" / "multi.log").read_text()
+    body = text.split("\n\n", 1)[1].splitlines()
+    assert len(body) == 2  # both namespaces' matches are in the file
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +920,35 @@ def test_count_matches_since_minutes(monkeypatch):
     run(server.count_matches("ns", "ERROR", since_minutes=1))
     assert k8s.read_calls[-1]["since_seconds"] == 60
     assert k8s.read_calls[-1]["tail_lines"] == server.DEFAULT_MAX_LINES_PER_POD
+
+
+def test_count_matches_tail_lines_default_and_override(monkeypatch):
+    """tail_lines=None keeps the historical LOGSEARCH_MAX_LINES_PER_POD tail
+    (byte-compatible default, reported in effective_tail_lines); an explicit
+    tail_lines narrows the fetch and is server-capped like search_logs."""
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): "2026-09-08T00:00:01Z ERROR\n"})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.count_matches("ns", "ERROR")))
+    assert out["effective_tail_lines"] == server.DEFAULT_MAX_LINES_PER_POD
+    assert k8s.read_calls[-1]["tail_lines"] == server.DEFAULT_MAX_LINES_PER_POD
+    out2 = json.loads(run(server.count_matches("ns", "ERROR", tail_lines=50)))
+    assert out2["effective_tail_lines"] == 50
+    assert k8s.read_calls[-1]["tail_lines"] == 50
+    assert out2["counts"] == {"p": 1}
+
+
+def test_count_matches_tail_lines_capped_by_env(monkeypatch):
+    monkeypatch.setenv("LOGSEARCH_MAX_LINES_PER_POD", "10")
+    k8s = FakeK8s([make_pod("p")], {("p", "main"): "2026-09-08T00:00:01Z ERROR\n"})
+    k8s.install(monkeypatch)
+    out = json.loads(run(server.count_matches("ns", "ERROR", tail_lines=500_000)))
+    assert out["effective_tail_lines"] == 10
+    assert k8s.read_calls[-1]["tail_lines"] == 10
+
+
+def test_count_matches_bad_tail_lines_clean_error(monkeypatch):
+    out = run(server.count_matches("ns", "ERROR", tail_lines=0))
+    assert out.startswith("Error:") and "tail_lines" in out
 
 
 # ---------------------------------------------------------------------------

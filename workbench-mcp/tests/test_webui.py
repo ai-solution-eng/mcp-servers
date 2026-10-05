@@ -7,6 +7,7 @@ caps, argv allowlist, confirm gates, audit) still applies through the UI.
 Follows the prometheus-mcp tests/test_webui.py pattern.
 """
 
+import json
 import re
 
 import pytest
@@ -184,6 +185,23 @@ def test_file_write_cap_enforced_through_api(client, monkeypatch):
     assert r.status_code == 400 and "cap is 10" in r.json()["error"]
 
 
+def test_file_write_append_via_api(client, root, monkeypatch):
+    """The console API exposes the same append chunking path as the MCP tool
+    (same cumulative cap — the UI gets no new powers)."""
+    monkeypatch.setenv("WORKBENCH_MAX_FILE_BYTES", "100")
+    client.post("/api/workspaces", json={"name": "ws"})
+    r = client.post(ws_url("ws", "/file"), json={"path": "log.txt", "content": "a" * 60})
+    assert r.status_code == 200 and r.json()["written"] is True
+    r = client.post(ws_url("ws", "/file"), json={"path": "log.txt", "content": "b" * 40, "append": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["appended"] is True and body["total_bytes"] == 100
+    assert (root / "ws" / "log.txt").read_text() == "a" * 60 + "b" * 40
+    # cumulative cap applies through the API too
+    r = client.post(ws_url("ws", "/file"), json={"path": "log.txt", "content": "c", "append": True})
+    assert r.status_code == 400 and "cumulative" in r.json()["error"]
+
+
 # ---------------------------------------------------------------------------
 # env store
 # ---------------------------------------------------------------------------
@@ -308,6 +326,20 @@ def test_audit_tail_skips_torn_lines(client, root):
     assert all(isinstance(e, dict) for e in data["events"])  # torn line skipped
 
 
+def test_audit_tail_spans_rotation(client, root):
+    """After a rotation the tail includes BOTH generations: the events that
+    scrolled into .audit.jsonl.1 are still visible (provenance entry first)."""
+    client.post("/api/workspaces", json={"name": "ws"})
+    (root / ".audit.jsonl.1").write_text(
+        json.dumps({"ts": "t", "event": "run_command", "workspace": "ws"}) + "\n"
+    )
+    data = client.get("/api/audit").json()
+    kinds = [e["event"] for e in data["events"]]
+    assert "run_command" in kinds and "workspace_create" in kinds
+    # .1's line sorts BEFORE the active generation's lines
+    assert kinds.index("run_command") < kinds.index("workspace_create")
+
+
 # ---------------------------------------------------------------------------
 # server wiring + gating
 # ---------------------------------------------------------------------------
@@ -326,9 +358,17 @@ def test_ui_disabled_removes_ui_routes_but_mcp_keeps_working(monkeypatch, root):
     assert "/" not in paths and "/ui" not in paths
     assert not any(p.startswith("/api/") for p in paths if p)
     assert {"/mcp", "/health", "/healthz"} <= paths
-    # /mcp still serves tools through the full stateless wire
+    # /mcp still serves tools through the full stateless wire.  Dev mode
+    # (no MCP_HOSTNAME/MCP_EXTRA_ALLOWED_HOSTS) keeps the SDK's implicit
+    # transport security, which auto-enables loopback-only Host checking on a
+    # 127.0.0.1-bound app — send a loopback Host explicitly (a real dev
+    # client hitting http://127.0.0.1:9103/mcp does exactly this).
     with TestClient(app) as c:
-        r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "tools/list", "id": 1})
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+            headers={"Host": "127.0.0.1:9103"},
+        )
         assert r.status_code == 200
         names = {t["name"] for t in r.json()["result"]["tools"]}
         assert "run_command" in names and "workspace_create" in names

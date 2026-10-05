@@ -86,3 +86,27 @@ def test_chart_default_matches_server_default():
     server_names = {b.strip() for b in server._DEFAULT_ALLOW.split(",")}
     assert "python3" not in chart_names and "pip" not in chart_names and "pip3" not in chart_names
     assert chart_names == server_names, "chart and server defaults diverged"
+
+
+def test_readme_allowlist_row_matches_server_default():
+    """README's WORKBENCH_EXEC_ALLOWLIST default cell must list the real
+    _DEFAULT_ALLOW (it silently drifted back to python3/pip once — the
+    pre-D18 text outlived the code change).  Cheap render-consistency check
+    so it cannot rot again: parse the row, compare name sets."""
+    readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    m = re.search(r"^\|\s*`WORKBENCH_EXEC_ALLOWLIST`\s*\|\s*([^|]+)\|", readme.read_text(), re.MULTILINE)
+    assert m, "WORKBENCH_EXEC_ALLOWLIST row missing from README config table"
+    cell = m.group(1)
+    # Strip the operator note and formatting; only the comma-separated
+    # binary names before the note are the documented default.
+    documented = {
+        b.strip()
+        for b in re.split(r",(?![^*(]*\))", cell.split("*(")[0].replace("`", "").replace("*", ""))
+        if b.strip()
+    }
+    server_names = {b.strip() for b in server._DEFAULT_ALLOW.split(",")}
+    assert documented == server_names, (
+        f"README allowlist default {sorted(documented)} != server default "
+        f"{sorted(server_names)} — fix the README config-table row "
+        "(keep the '(no interpreters — D18; operators re-add explicitly)' note)"
+    )

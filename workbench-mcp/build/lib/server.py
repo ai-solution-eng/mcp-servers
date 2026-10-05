@@ -67,7 +67,9 @@ from mcp_fleet_common import metrics as _fleet_common_metrics
 # in the tests) is untouched; the one behavior delta is documented in
 # mcp_fleet_common/metrics.py: unknown tool names count under the
 # "unknown" label (bounded cardinality) instead of the raw probed name.
-mcp_metrics = _fleet_common_metrics.bind_app_metrics(metric_prefix="workbench_mcp", display_name="workbench-mcp")
+mcp_metrics = _fleet_common_metrics.bind_app_metrics(
+    metric_prefix="workbench_mcp", display_name="workbench-mcp"
+)
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -99,15 +101,10 @@ _DEFAULT_DENY = "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
 # passing them through leaks nothing and weakens nothing; the per-workspace
 # env store still overrides them per workspace (its entries win).
 _PROXY_PASSTHROUGH = (
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "NO_PROXY",
-    "no_proxy",
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "PIP_CERT",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "NO_PROXY", "no_proxy",
+    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT",
 )
 
 
@@ -167,7 +164,9 @@ def _shared_roots() -> tuple[Path, ...]:
         if not part:
             continue
         if not part.startswith("/"):
-            logger.warning("WORKBENCH_SHARED_PATHS entry %r is not an absolute path — ignored", part)
+            logger.warning(
+                "WORKBENCH_SHARED_PATHS entry %r is not an absolute path — ignored", part
+            )
             continue
         roots.append(Path(part).resolve())
     return tuple(roots)
@@ -233,7 +232,9 @@ def _templates() -> dict[str, dict]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.warning("WORKBENCH_TEMPLATES is not valid JSON (%s) — no templates configured", exc)
+        logger.warning(
+            "WORKBENCH_TEMPLATES is not valid JSON (%s) — no templates configured", exc
+        )
         return {}
     if not isinstance(data, dict):
         logger.warning(
@@ -262,7 +263,9 @@ def _template_cleaned(tname: str, spec) -> dict | None:
         return None
     extra_raw = spec.get("extra_allowed", [])
     if not isinstance(extra_raw, list) or not all(isinstance(b, str) for b in extra_raw):
-        logger.warning("%s.extra_allowed must be a list of strings — template skipped", where)
+        logger.warning(
+            "%s.extra_allowed must be a list of strings — template skipped", where
+        )
         return None
     extra_allowed: list[str] = []
     for binname in extra_raw:
@@ -280,13 +283,20 @@ def _template_cleaned(tname: str, spec) -> dict | None:
         extra_allowed.append(binname)
     setup_raw = spec.get("canned_setup", [])
     if not isinstance(setup_raw, list):
-        logger.warning("%s.canned_setup must be a list of argv lists — template skipped", where)
+        logger.warning(
+            "%s.canned_setup must be a list of argv lists — template skipped", where
+        )
         return None
     canned_setup: list[list[str]] = []
     for i, argv in enumerate(setup_raw):
-        if not isinstance(argv, list) or not argv or not all(isinstance(tok, str) and tok for tok in argv):
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(tok, str) and tok for tok in argv)
+        ):
             logger.warning(
-                "%s.canned_setup[%d] must be a non-empty list of string argv tokens — template skipped",
+                "%s.canned_setup[%d] must be a non-empty list of string argv "
+                "tokens — template skipped",
                 where,
                 i,
             )
@@ -395,10 +405,14 @@ def _audit(event: dict) -> None:
 
 def _ws_dir(name: str) -> Path:
     if not _WS_NAME.match(name):
-        raise WorkbenchError(f"invalid workspace name {name!r}: must match {_WS_NAME.pattern}")
+        raise WorkbenchError(
+            f"invalid workspace name {name!r}: must match {_WS_NAME.pattern}"
+        )
     ws = _root() / name
     if not ws.is_dir():
-        raise WorkbenchError(f"workspace {name!r} does not exist (create it with workspace_create)")
+        raise WorkbenchError(
+            f"workspace {name!r} does not exist (create it with workspace_create)"
+        )
     return ws
 
 
@@ -454,7 +468,9 @@ def _env_load(ws: Path) -> dict[str, str]:
 
 def _ws_create(name: str, template: str | None = None) -> dict:
     if not _WS_NAME.match(name):
-        raise WorkbenchError(f"invalid workspace name {name!r}: must match {_WS_NAME.pattern}")
+        raise WorkbenchError(
+            f"invalid workspace name {name!r}: must match {_WS_NAME.pattern}"
+        )
     ws = _root() / name
     if ws.exists():
         raise WorkbenchError(f"workspace {name!r} already exists")
@@ -489,7 +505,9 @@ def _ws_create(name: str, template: str | None = None) -> dict:
     # _ws_extra_allowed), so a workspace command editing this file can at
     # most point the workspace at a DIFFERENT operator-defined template.
     meta = {"template": template, "description": spec["description"]}
-    _template_meta_path(ws).write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    _template_meta_path(ws).write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     result["template"] = template
     # Canned setup, INSIDE the new workspace, through the exact run_command
     # machinery (D7 confinement, server-PATH allowlist resolution, caps,
@@ -508,20 +526,10 @@ def _ws_create(name: str, template: str | None = None) -> dict:
                 audit_event="workspace_template_setup",
                 audit_extra={"template": template, "setup_index": i},
             )
-            setup.append(
-                {
-                    k: out[k]
-                    for k in (
-                        "argv",
-                        "exit_code",
-                        "timed_out",
-                        "duration_ms",
-                        "stdout",
-                        "stderr",
-                        "truncated",
-                    )
-                }
-            )
+            setup.append({k: out[k] for k in (
+                "argv", "exit_code", "timed_out", "duration_ms",
+                "stdout", "stderr", "truncated",
+            )})
             if out["exit_code"] != 0 or out["timed_out"]:
                 setup_ok = False
         except WorkbenchError as exc:
@@ -571,7 +579,9 @@ def _ws_list() -> list[dict]:
 
 def _ws_delete(name: str, confirm: bool) -> dict:
     if not confirm:
-        raise WorkbenchError("refusing to delete: pass confirm=true (destructive, irreversible)")
+        raise WorkbenchError(
+            "refusing to delete: pass confirm=true (destructive, irreversible)"
+        )
     ws = _ws_dir(name)
     shutil.rmtree(ws)
     _audit({"event": "workspace_delete", "workspace": name})
@@ -597,7 +607,9 @@ def _file_read(ws_name: str, rel: str, max_bytes: int) -> dict:
     ws = _ws_dir(ws_name)
     target = _safe_join(ws, rel)
     if max_bytes < 0:
-        raise WorkbenchError(f"max_bytes must be >= 0 (got {max_bytes}) — the read cap cannot be negative")
+        raise WorkbenchError(
+            f"max_bytes must be >= 0 (got {max_bytes}) — the read cap cannot be negative"
+        )
     if not target.is_file():
         raise WorkbenchError(f"no such file: {rel!r} in workspace {ws_name!r}")
     # Stream the requested slice: open + read(max_bytes) only ever pulls the
@@ -612,7 +624,10 @@ def _file_read(ws_name: str, rel: str, max_bytes: int) -> dict:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise WorkbenchError(f"{rel!r} is not valid UTF-8 text ({exc}); this server reads text files only") from exc
+        raise WorkbenchError(
+            f"{rel!r} is not valid UTF-8 text ({exc}); this server reads text "
+            "files only"
+        ) from exc
     return {
         "workspace": ws_name,
         "path": rel,
@@ -654,7 +669,9 @@ def _file_list(ws_name: str, rel: str) -> dict:
 
 def _file_delete(ws_name: str, rel: str, confirm: bool) -> dict:
     if not confirm:
-        raise WorkbenchError("refusing to delete: pass confirm=true (destructive, irreversible)")
+        raise WorkbenchError(
+            "refusing to delete: pass confirm=true (destructive, irreversible)"
+        )
     ws = _ws_dir(ws_name)
     target = _safe_join(ws, rel)
     if target == ws.resolve():
@@ -745,7 +762,10 @@ def _assert_argv_confined(ws_name: str, ws: Path, command: list[str]) -> None:
         for cand in _argv_path_candidates(token):
             outside = _argv_escape_target(ws, cand)
             if outside is not None:
-                reason = f"argument {token!r} references {str(outside)!r} outside workspace {ws_name!r}"
+                reason = (
+                    f"argument {token!r} references {str(outside)!r} outside "
+                    f"workspace {ws_name!r}"
+                )
                 _audit(
                     {
                         "event": "run_command_refused",
@@ -772,7 +792,9 @@ def _run_command(
     audit_extra: dict | None = None,
 ) -> dict:
     ws = _ws_dir(ws_name)
-    if not command or not isinstance(command, list) or not all(isinstance(a, str) for a in command):
+    if not command or not isinstance(command, list) or not all(
+        isinstance(a, str) for a in command
+    ):
         raise WorkbenchError("command must be a non-empty list of string argv tokens")
     # D7 BEFORE anything else: cross-workspace references are refused (and
     # audited) regardless of the allowlist verdict.
@@ -1090,7 +1112,9 @@ def _build_http_app():
     # The probe pair comes from the shared package (Wave-6 G1 pilot): the
     # same two routes, the same JSONResponse body — {"status": "ok",
     # "server": "workbench-mcp"} — the probes stay public and key-free.
-    routes = list(fleet_health.health_routes({"status": "ok", "server": "workbench-mcp"}))
+    routes = list(
+        fleet_health.health_routes({"status": "ok", "server": "workbench-mcp"})
+    )
     if _metrics_enabled():
         # Prometheus self-metrics (Wave-3 C3, ADDITIVE, default OFF): per-tool
         # request counters ONLY — no arguments, file names, workspace names,
@@ -1154,10 +1178,7 @@ def main() -> None:
     # gateway, which enforces origin policy.
     logger.info(
         "Workbench MCP streamable-http endpoint: http://%s:%s/mcp (root=%s, shared_paths=%s)",
-        args.host,
-        args.port,
-        _root(),
-        [str(p) for p in _shared_roots()] or "none",
+        args.host, args.port, _root(), [str(p) for p in _shared_roots()] or "none",
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

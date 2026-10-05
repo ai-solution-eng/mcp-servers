@@ -1,0 +1,8 @@
+pyproject.toml
+server.py
+ddgs_lite_mcp.egg-info/PKG-INFO
+ddgs_lite_mcp.egg-info/SOURCES.txt
+ddgs_lite_mcp.egg-info/dependency_links.txt
+ddgs_lite_mcp.egg-info/entry_points.txt
+ddgs_lite_mcp.egg-info/requires.txt
+ddgs_lite_mcp.egg-info/top_level.txt

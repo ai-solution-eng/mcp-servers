@@ -14,8 +14,10 @@ Tools (all read-only, all return a JSON string):
   list_log_sources  pods + containers in one namespace, with restart counts
                     and age — the discovery call before searching
   get_pod_logs      raw log fetch for ONE pod (tail/since/previous-container)
-  search_logs       regex search across every pod in a namespace, merged
-                    chronologically with "pod/container: " provenance
+  search_logs       regex search across every pod in a namespace (or several:
+                    comma-separated names / fnmatch globs, policy-checked per
+                    resolved namespace), merged chronologically with
+                    "pod/container: " provenance
   count_matches     per-pod match counts for one pattern, sorted descending
   export_matches    the EXACT search_logs pipeline, with the matched lines
                     written to <LOGSEARCH_EXPORT_ROOT>/<dest_name> — the one
@@ -34,8 +36,8 @@ caps in tests without reimporting):
                                 over the allowed list
   LOGSEARCH_MAX_PODS            max pods per fan-out search (default 50)
   LOGSEARCH_MAX_LINES_PER_POD   max tail lines fetched per pod (default 1000)
-  LOGSEARCH_MAX_TOTAL_LINES     default cap on merged search matches
-                                (default 300)
+  LOGSEARCH_MAX_TOTAL_LINES     default cap on merged search matches when a
+                                tool call omits max_total_lines (default 300)
   LOGSEARCH_MAX_LINE_CHARS      per-line char cap on search output lines
                                 (default 2000; overlong lines are cut with
                                 an explicit "...[truncated N chars]" marker)
@@ -71,7 +73,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp.server import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 import mcp_auth
@@ -189,6 +190,62 @@ def _namespace_allowed(ns: str) -> bool:
 def _ns_denied_error(ns: str) -> str:
     """Self-describing denial: names the env vars an operator must change."""
     return f"Error: namespace {ns!r} is denied by this server's namespace policy ({_ENV_POLICY_HINT})."
+
+
+def _resolve_namespaces(namespace: str) -> list[str] | None:
+    """Resolve the namespace parameter to a deduplicated, sorted list of
+    concrete namespace names.
+
+    Accepted shapes (the same fnmatch semantics `_namespace_allowed` matches
+    with — fnmatchcase, so policy and selection agree by construction):
+      * a single name ('team-a') — the historic, byte-compatible shape;
+      * comma-separated exact names ('team-a,team-b');
+      * shell-style globs ('team-*' or 'team-a,team-b-*') — expanded against
+        the LIVE namespace list from the Kubernetes API (the K8S-MCP
+        _expand_allowed precedent), so a glob can never match a namespace
+        that does not exist and policy evaluation stays per-resolved-name.
+    Returns None only when the raw argument is empty.
+    """
+    parts = [part.strip() for part in namespace.split(",") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) == 1 and not any(ch in parts[0] for ch in "*?"):
+        return [parts[0]]
+    exact = [p for p in parts if not any(ch in p for ch in "*?")]
+    globs = [p for p in parts if any(ch in p for ch in "*?")]
+    if not globs:
+        return sorted(set(exact))
+    live = _list_namespace_names()  # raises LogSearchError on API failure
+    matched = {ns for ns in live if any(fnmatch.fnmatchcase(ns, pattern) for pattern in globs)}
+    return sorted(set(exact) | matched)
+
+
+def _list_namespace_names() -> list[str]:
+    """All live namespace names (the glob-expansion source). A new kubernetes
+    seam alongside _list_pods/_read_log — lazy import, monkeypatchable in
+    tests. A namespace the API cannot LIST (RBAC 403) degrades the glob to
+    an empty match set with a self-describing error naming the fix."""
+    from kubernetes.client.rest import ApiException
+
+    api = _get_core_v1_api()
+    try:
+        resp = api.list_namespace()
+    except ApiException as e:
+        status = getattr(e, "status", None)
+        if status == 403:
+            raise LogSearchError(
+                "cannot expand namespace globs: listing namespaces is forbidden "
+                "for this server's service account (403) — use comma-separated "
+                "EXACT namespace names instead of globs, or grant the "
+                "'namespaces' list verb (see helm/templates/rbac.yaml)."
+            ) from e
+        raise LogSearchError(
+            f"Kubernetes API error listing namespaces while resolving "
+            f"namespace globs (status {status}): {getattr(e, 'reason', '') or e}"
+        ) from e
+    except Exception as e:
+        raise LogSearchError(f"Kubernetes cluster unreachable while listing namespaces: {type(e).__name__}: {e}") from e
+    return [ns.metadata.name for ns in (resp.items or [])]
 
 
 _ENV_POLICY_HINT = (
@@ -365,7 +422,20 @@ print(
     file=sys.stderr,
 )
 
-_mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+# Host-header (DNS-rebinding) protection — the FLEET-shared helper
+# (pcai_utils/mcp_auth.transport_security_from_env, the K8S-MCP reference
+# semantics, extracted 2026-10 so every streamable-HTTP server behaves
+# identically):
+#   * NEITHER MCP_HOSTNAME nor MCP_EXTRA_ALLOWED_HOSTS set (local dev) → None:
+#     the SDK's implicit loopback-only protection applies untouched.
+#   * Either set (any gateway-fronted deployment) → protection explicitly ON
+#     with the Host allowlist = pinned public FQDN + in-cluster svc-DNS extras
+#     + loopback; allowed_origins stays the https-only browser form of the
+#     pinned FQDN. Replaces the old hand-rolled
+#     TransportSecuritySettings(enable_dns_rebinding_protection=False) — the
+#     chart wires BOTH env vars (mcpHostname / extraAllowedHosts values) in
+#     the SAME change (the mcp_auth CHART CONTRACT).
+_mcp_transport_security = mcp_auth.transport_security_from_env()
 
 # API-key auth (fleet pattern, shared module pcai_utils/mcp_auth.py) —
 # MANDATORY per fleet decision 2026-09 (chart fails loud without the Secret).
@@ -841,6 +911,12 @@ _SKIP = object()
 # much of the line was withheld.
 _LINE_TRUNCATION_MARKER = " ...[truncated {} chars]"
 
+# Prepended to a CONTEXT line emitted by search_logs(context_lines=N) —
+# visually distinct from a match ('[ctx] ' in front of the usual
+# 'pod/container: ' provenance) so a caller can tell the two apart at a
+# glance, without changing the provenance format the tools advertise.
+_CTX_PREFIX = "[ctx] "
+
 
 def _cap_line(line: str, cap: int) -> str:
     """Per-line char cap on search output: keep the first `cap` characters and
@@ -1031,14 +1107,45 @@ async def _search_logs_impl(
     tail_lines: int = 200,
     case_insensitive: bool = True,
     container: str = "",
-    max_total_lines: int = 300,
+    max_total_lines: int | None = None,
+    context_lines: int = 0,
 ) -> str:
     """THE search pipeline (Wave-5 F3): every caller — the search_logs MCP
     tool AND export_matches — goes through this exact function, so caps, the
     ReDoS screen, and the namespace policy can never diverge between the two.
-    Returns the search_logs JSON payload, or an 'Error: ...' string."""
-    if not _namespace_allowed(namespace):
+    max_total_lines=None resolves to LOGSEARCH_MAX_TOTAL_LINES (the env knob,
+    300 by default). namespace accepts a single name (unchanged), comma-
+    separated exact names, or fnmatch globs — each resolved namespace is
+    policy-checked PER NAMESPACE (denied ones are skipped and reported) and
+    searched with its own pod cap and line budget; the result carries a
+    per-namespace breakdown in 'namespaces'. Returns the search_logs JSON
+    payload, or 'Error: ...'."""
+    # -- namespace resolution ------------------------------------------------
+    # A single name (the historic shape) takes the byte-compatible path: one
+    # policy check, one 'namespace' field, no 'namespaces' breakdown.
+    try:
+        ns_names = _resolve_namespaces(namespace)
+    except LogSearchError as e:
+        return f"Error: {e}"
+    if ns_names is None:
         return _ns_denied_error(namespace)
+    if len(ns_names) == 1:
+        single_ns = ns_names[0]
+        if not _namespace_allowed(single_ns):
+            return _ns_denied_error(single_ns)
+        return await _search_single_namespace(
+            single_ns,
+            pattern,
+            label_selector=label_selector,
+            pod_regex=pod_regex,
+            since_minutes=since_minutes,
+            tail_lines=tail_lines,
+            case_insensitive=case_insensitive,
+            container=container,
+            budget=budget_of(max_total_lines),
+            context_lines=context_lines,
+        )
+    # -- multi-namespace fan-out ---------------------------------------------
     try:
         rx = _compile_regex(pattern, flags=re.IGNORECASE if case_insensitive else 0)
         pod_rx = _compile_regex(pod_regex, what="pod_regex") if pod_regex else None
@@ -1047,8 +1154,179 @@ async def _search_logs_impl(
         return f"Error: {e}"
     if tail_lines <= 0:
         return "Error: tail_lines must be > 0."
-    if max_total_lines <= 0:
+    budget = _default_max_total_lines() if max_total_lines is None else max_total_lines
+    if budget <= 0:
         return "Error: max_total_lines must be > 0."
+    if context_lines < 0:
+        return "Error: context_lines must be >= 0."
+    effective_tail = min(tail_lines, _max_lines_per_pod())
+
+    breakdown: list[dict] = []
+    matches: list[str] = []
+    errors: list[str] = []
+    pods_searched = 0
+    pods_with_matches = 0
+    pods_skipped_budget = 0
+    truncated = False
+    # Policy is evaluated PER RESOLVED namespace (default-deny preserved):
+    # denied namespaces are skipped and reported, never silently merged.
+    allowed_ns = [ns for ns in ns_names if _namespace_allowed(ns)]
+    denied_ns = [ns for ns in ns_names if not _namespace_allowed(ns)]
+    # Deterministic order: resolved names first (sorted, deduped by
+    # _resolve_namespaces), then the per-namespace fan-out.
+    for ns in allowed_ns:
+        try:
+            pods = await asyncio.to_thread(_list_pods, ns, label_selector)
+        except Exception as e:
+            return _err("pod listing", e)
+        cap = _max_pods()
+        ns_pod_cap_applied = len(pods) > cap
+        pods = pods[:cap]
+        if pod_rx is not None:
+            pods = [p for p in pods if pod_rx.search(p["name"])]
+        pods.sort(key=lambda p: p["name"])
+
+        line_cap = _max_line_chars()
+        concurrency = _fetch_concurrency()
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _fetch(pod_name: str, target_container: str | None, _ns: str = ns):
+            if target_container is None:
+                return _SKIP
+            async with semaphore:
+                return await asyncio.to_thread(
+                    _read_log,
+                    _ns,
+                    pod_name,
+                    target_container,
+                    effective_tail,
+                    since_seconds,
+                    True,
+                    False,
+                )
+
+        ns_pods_searched = 0
+        ns_pods_with_matches = 0
+        ns_pods_skipped = 0
+        ns_matches_before = len(matches)
+        ns_truncated = False
+        for start in range(0, len(pods), concurrency):
+            if len(matches) >= budget:
+                truncated = True
+                ns_truncated = True
+                ns_pods_skipped += len(pods) - start
+                break
+            wave = [(p, _pick_container(p, container)) for p in pods[start : start + concurrency]]
+            results = await asyncio.gather(*(_fetch(p["name"], t) for p, t in wave), return_exceptions=True)
+            for (pod, target_container), result in zip(wave, results):
+                if len(matches) >= budget:
+                    truncated = True
+                    ns_truncated = True
+                    ns_pods_skipped += 1
+                    continue
+                if target_container is None:
+                    continue
+                if isinstance(result, BaseException):
+                    if isinstance(result, LogSearchError):
+                        errors.append(f"{ns}/{pod['name']}: {result}")
+                        continue
+                    raise result
+                ns_pods_searched += 1
+                prefix = f"{pod['name']}/{target_container}: "
+                pod_has_match = False
+                lines = result.splitlines()
+                emitted_ctx: set[int] = set()
+                for idx, line in enumerate(lines):
+                    if not rx.search(line):
+                        continue
+                    if len(matches) >= budget:
+                        truncated = True
+                        ns_truncated = True
+                        ns_pods_skipped += 1
+                        break
+                    matches.append(_cap_line(prefix + line, line_cap))
+                    if not pod_has_match:
+                        pod_has_match = True
+                        ns_pods_with_matches += 1
+                    for ctx_idx in range(max(0, idx - context_lines), min(len(lines), idx + context_lines + 1)):
+                        if ctx_idx == idx or ctx_idx in emitted_ctx:
+                            continue
+                        if len(matches) >= budget:
+                            break
+                        emitted_ctx.add(ctx_idx)
+                        matches.append(_cap_line(_CTX_PREFIX + prefix + lines[ctx_idx], line_cap))
+            if ns_truncated:
+                break
+        pods_searched += ns_pods_searched
+        pods_with_matches += ns_pods_with_matches
+        pods_skipped_budget += ns_pods_skipped
+        breakdown.append(
+            {
+                "namespace": ns,
+                "pods_searched": ns_pods_searched,
+                "pods_with_matches": ns_pods_with_matches,
+                "pods_skipped_budget": ns_pods_skipped,
+                "pod_cap_applied": ns_pod_cap_applied,
+                "match_count": len(matches) - ns_matches_before,
+                "truncated": ns_truncated,
+            }
+        )
+        if truncated:
+            break
+    for ns in denied_ns:
+        breakdown.append({"namespace": ns, "denied": True})
+        errors.append(f"{ns}: {_ns_denied_error(ns)}")
+    matches.sort(key=_rfc3339_sort_key)
+    return json.dumps(
+        {
+            "namespace": namespace,
+            "namespaces": breakdown,
+            "pattern": pattern,
+            "matches": matches,
+            "match_count": len(matches),
+            "pods_searched": pods_searched,
+            "pods_with_matches": pods_with_matches,
+            "pod_cap_applied": False,
+            "truncated": truncated,
+            "pods_skipped_budget": pods_skipped_budget,
+            "errors": errors,
+        }
+    )
+
+
+def budget_of(max_total_lines: int | None) -> int:
+    """The shared budget resolution: an explicit per-call value wins, None
+    falls back to the LOGSEARCH_MAX_TOTAL_LINES env default."""
+    return _default_max_total_lines() if max_total_lines is None else max_total_lines
+
+
+async def _search_single_namespace(
+    namespace: str,
+    pattern: str,
+    *,
+    label_selector: str,
+    pod_regex: str,
+    since_minutes: float | None,
+    tail_lines: int,
+    case_insensitive: bool,
+    container: str,
+    budget: int,
+    context_lines: int,
+) -> str:
+    """The single-namespace search — byte-compatible with the pre-multi-ns
+    pipeline (same JSON keys, same budget stop semantics)."""
+    try:
+        rx = _compile_regex(pattern, flags=re.IGNORECASE if case_insensitive else 0)
+        pod_rx = _compile_regex(pod_regex, what="pod_regex") if pod_regex else None
+        since_seconds = _since_seconds_from_minutes(since_minutes)
+    except LogSearchError as e:
+        return f"Error: {e}"
+    if tail_lines <= 0:
+        return "Error: tail_lines must be > 0."
+    if budget <= 0:
+        return "Error: max_total_lines must be > 0."
+    if context_lines < 0:
+        return "Error: context_lines must be >= 0."
     effective_tail = min(tail_lines, _max_lines_per_pod())
 
     try:
@@ -1094,7 +1372,7 @@ async def _search_logs_impl(
     pods_skipped_budget = 0
     truncated = False
     for start in range(0, len(pods), concurrency):
-        if len(matches) >= max_total_lines:
+        if len(matches) >= budget:
             # Budget already full from an earlier wave: never schedule these
             # pods — the pull stops before the fetch, not after it.
             truncated = True
@@ -1122,10 +1400,19 @@ async def _search_logs_impl(
             pods_searched += 1
             prefix = f"{pod['name']}/{target_container}: "
             pod_has_match = False
-            for line in result.splitlines():
+            lines = result.splitlines()
+            # Context windows (context_lines > 0): for each match, the up-to-N
+            # lines before/after join the SAME budget and dedupe across
+            # overlapping matches. Emitted per-pod immediately after each
+            # match's window in pod order; the final chronological sort keys
+            # on each line's own RFC3339 timestamp, so context lines interleave
+            # by their timestamps (a context line without one sorts last with
+            # the other untimestamped lines, deterministically).
+            emitted_ctx: set[int] = set()
+            for idx, line in enumerate(lines):
                 if not rx.search(line):
                     continue
-                if len(matches) >= max_total_lines:
+                if len(matches) >= budget:
                     # Global line budget reached mid-fan-out: stop pulling.
                     truncated = True
                     pods_skipped_budget += 1
@@ -1134,6 +1421,16 @@ async def _search_logs_impl(
                 if not pod_has_match:
                     pod_has_match = True
                     pods_with_matches += 1
+                for ctx_idx in range(max(0, idx - context_lines), min(len(lines), idx + context_lines + 1)):
+                    if ctx_idx == idx or ctx_idx in emitted_ctx:
+                        continue
+                    if len(matches) >= budget:
+                        # Context lines consume the SAME budget as matches —
+                        # once full, remaining context is dropped (counted in
+                        # the same pods_skipped_budget accounting above).
+                        break
+                    emitted_ctx.add(ctx_idx)
+                    matches.append(_cap_line(_CTX_PREFIX + prefix + lines[ctx_idx], line_cap))
         if truncated:
             break
 
@@ -1167,14 +1464,26 @@ async def search_logs(
     tail_lines: int = 200,
     case_insensitive: bool = True,
     container: str = "",
-    max_total_lines: int = 300,
+    max_total_lines: int | None = None,
+    context_lines: int = 0,
 ) -> str:
-    """Find matching log lines across ALL pods of one namespace when you don't
-    know which pod (or line) holds the problem — e.g. "find the error in the
-    logs", "who is throwing NullPointerException?". For one known pod's plain
-    tail use get_pod_logs; for "which pod matches most?" use count_matches
-    first; for result sets too big for the context window, export_matches
-    writes the matches to a file.
+    """Find matching log lines across ALL pods of one namespace — or SEVERAL:
+    namespace accepts a single name, comma-separated exact names
+    ('ns-a,ns-b'), or fnmatch globs ('team-*', expanded against the live
+    namespace list) — when you don't know which pod (or line) holds the
+    problem — e.g. "find the error in the logs", "who is throwing
+    NullPointerException?". For one known pod's plain tail use get_pod_logs;
+    for "which pod matches most?" use count_matches first; for result sets
+    too big for the context window, export_matches writes the matches to a
+    file.
+
+    Multi-namespace calls are policy-checked PER RESOLVED namespace
+    (default-deny preserved): a denied namespace is skipped and reported (in
+    the 'namespaces' breakdown and 'errors'), never silently merged, and each
+    namespace is searched with its own pod cap and its own slice of the global
+    max_total_lines budget (per-namespace pods_searched / pods_skipped_budget
+    are reported in 'namespaces'). A SINGLE name keeps the historic
+    byte-compatible response shape (no 'namespaces' key).
 
     How it works: fetch the tail of each pod (timestamps on), keep matching
     lines, prefix each with 'podname/container: ' provenance, merge, and sort
@@ -1190,7 +1499,8 @@ async def search_logs(
     chars]' marker. Empty matches are a normal empty result, not an error.
 
     Args:
-        namespace: Kubernetes namespace to search.
+        namespace: Kubernetes namespace to search — one name, comma-separated
+            names, or a glob; the namespace policy applies per resolved name.
         pattern: Python regex to match against log lines, e.g. 'Traceback|ERROR'.
         label_selector: Optional pod label selector, e.g. 'app=myapp'.
         pod_regex: Optional regex narrowing WHICH pods to search by name.
@@ -1200,7 +1510,15 @@ async def search_logs(
         case_insensitive: Match pattern case-insensitively (default true).
         container: Restrict to one container name; empty = each pod's first
             (default) container.
-        max_total_lines: Cap on merged matches returned (default 300).
+        max_total_lines: Cap on merged matches returned; None (the default)
+            = LOGSEARCH_MAX_TOTAL_LINES (the env sets the default; the
+            per-call value still overrides it).
+        context_lines: Optional: for each match, also emit up to this many
+            lines before/after it, prefixed '[ctx] podname/container: '
+            (distinct from a match's plain provenance). Context lines are
+            deduped across overlapping matches and consume the SAME
+            max_total_lines budget as matches; they sort by their own
+            embedded timestamp like every other line.
     """
     return await _search_logs_impl(
         namespace,
@@ -1212,6 +1530,7 @@ async def search_logs(
         case_insensitive=case_insensitive,
         container=container,
         max_total_lines=max_total_lines,
+        context_lines=context_lines,
     )
 
 
@@ -1341,7 +1660,8 @@ async def export_matches(
     tail_lines: int = 200,
     case_insensitive: bool = True,
     container: str = "",
-    max_total_lines: int = 300,
+    max_total_lines: int | None = None,
+    context_lines: int = 0,
 ) -> str:
     """Run the search_logs pipeline and write the matched lines to
     `<LOGSEARCH_EXPORT_ROOT>/<dest_name>` — for result sets too big for a
@@ -1361,7 +1681,9 @@ async def export_matches(
     file is the artifact).
 
     Args:
-        namespace: Kubernetes namespace to search.
+        namespace: Kubernetes namespace to search — one name, comma-separated
+            names, or a glob (same per-namespace policy semantics as
+            search_logs; a single name keeps the byte-compatible shape).
         pattern: Python regex to match against log lines, e.g. 'Traceback|ERROR'.
         dest_name: Bare file name for the export (no separators/'..'; lands
             directly under LOGSEARCH_EXPORT_ROOT).
@@ -1373,8 +1695,12 @@ async def export_matches(
         case_insensitive: Match pattern case-insensitively (default true).
         container: Restrict to one container name; empty = each pod's first
             (default) container.
-        max_total_lines: Cap on merged matches written (default 300 — the
-            same budget search_logs enforces during the fan-out).
+        max_total_lines: Cap on merged matches written; None (the default) =
+            LOGSEARCH_MAX_TOTAL_LINES (the env sets the default — the same
+            budget search_logs enforces during the fan-out).
+        context_lines: Optional, same semantics as search_logs: up to this
+            many '[ctx] '-prefixed lines before/after each match, budget-
+            counted and deduped.
     """
     root = _export_root()
     if root is None:
@@ -1394,6 +1720,7 @@ async def export_matches(
         case_insensitive=case_insensitive,
         container=container,
         max_total_lines=max_total_lines,
+        context_lines=context_lines,
     )
     if raw.startswith("Error"):
         return raw
@@ -1447,11 +1774,15 @@ async def count_matches(
     label_selector: str = "",
     since_minutes: float | None = None,
     case_insensitive: bool = True,
+    tail_lines: int | None = None,
 ) -> str:
     """Per-pod match counts for one pattern across a namespace, sorted
     descending — the 'where is this error coming from?' call before reading
-    full logs. Counts run over the last LOGSEARCH_MAX_LINES_PER_POD lines of
-    each pod's default container, fetched in parallel (bounded semaphore,
+    full logs. Counts run over the effective tail of each pod's default
+    container — min(tail_lines, LOGSEARCH_MAX_LINES_PER_POD); with tail_lines
+    unset (the default) the effective tail is LOGSEARCH_MAX_LINES_PER_POD
+    itself (1000 by default, reported in the response's
+    'effective_tail_lines') — fetched in parallel (bounded semaphore,
     LOGSEARCH_FETCH_CONCURRENCY).
 
     Args:
@@ -1460,6 +1791,8 @@ async def count_matches(
         label_selector: Optional pod label selector, e.g. 'app=myapp'.
         since_minutes: Optional: only fetch logs newer than this many minutes.
         case_insensitive: Match pattern case-insensitively (default true).
+        tail_lines: Optional: trailing lines fetched per pod, server-capped by
+            LOGSEARCH_MAX_LINES_PER_POD (default: the cap itself, 1000).
     """
     if not _namespace_allowed(namespace):
         return _ns_denied_error(namespace)
@@ -1468,6 +1801,9 @@ async def count_matches(
         since_seconds = _since_seconds_from_minutes(since_minutes)
     except LogSearchError as e:
         return f"Error: {e}"
+    if tail_lines is not None and tail_lines <= 0:
+        return "Error: tail_lines must be > 0 when given."
+    effective_tail = _max_lines_per_pod() if tail_lines is None else min(tail_lines, _max_lines_per_pod())
 
     try:
         pods = await asyncio.to_thread(_list_pods, namespace, label_selector)
@@ -1491,7 +1827,7 @@ async def count_matches(
                 namespace,
                 pod_name,
                 target_container,
-                _max_lines_per_pod(),
+                effective_tail,
                 since_seconds,
                 True,
                 False,
@@ -1522,6 +1858,7 @@ async def count_matches(
             "namespace": namespace,
             "pattern": pattern,
             "counts": ranked,
+            "effective_tail_lines": effective_tail,
             "pods_searched": pods_searched,
             "pods_with_matches": sum(1 for v in ranked.values() if v > 0),
             "total_matches": sum(ranked.values()),

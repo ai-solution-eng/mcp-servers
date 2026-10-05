@@ -174,6 +174,15 @@ def _write(entries: list[dict], environ) -> None:
     if path is None:  # defensive; callers check first
         raise AdminKeysError("admin keys store not configured")
     directory = os.path.dirname(os.path.abspath(path)) or "."
+    # The store self-initializes: the file AND its directory are created on
+    # the first write (live 2026-10-05 — the chart's claim mode points the
+    # store at a fresh subdir of the catalog PVC; a missing directory made
+    # the first mint fail with "No such file or directory" for the temp
+    # file). exist_ok: a concurrent mint racing the mkdir is fine.
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        raise AdminKeysError(f"could not create the admin keys store directory {directory}: {exc}") from exc
     fd, tmp = tempfile.mkstemp(prefix=".admin-keys-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -206,9 +215,9 @@ def list_keys(environ: dict[str, str] | None = None) -> list[dict]:
     return _load(environ)
 
 
-def add_key(raw_key: str, *, label: str, created_by: str,
-            environ: dict[str, str] | None = None,
-            subject: str | None = None) -> dict:
+def add_key(
+    raw_key: str, *, label: str, created_by: str, environ: dict[str, str] | None = None, subject: str | None = None
+) -> dict:
     """Persist a minted key's FINGERPRINT (never the raw key) + assignment
     metadata. Returns the KeyEntry. Raises AdminKeysError when the store
     is disabled, the fp already exists, or the file cannot be written.
@@ -245,7 +254,10 @@ def add_key(raw_key: str, *, label: str, created_by: str,
         _write(entries, environ)
     logger.info(
         "admin key minted: fp=%s label=%r by=%s subject=%s (raw key never logged)",
-        fp, label, created_by, subject or "-",
+        fp,
+        label,
+        created_by,
+        subject or "-",
     )
     return dict(entry)
 
@@ -317,7 +329,14 @@ def is_admin(caller) -> bool:
     if getattr(caller, "is_anonymous", False) or caller is None:
         return False
     subject = getattr(caller, "subject", None)
-    if subject and subject in pol.admins:
-        return True
+    if subject:
+        # BOTH subject spellings match: the bare name AND the
+        # 'subject:<name>' prefixed form (the datasets.assignments
+        # canonical spelling — the grant-by-name UI and the docs' examples
+        # write the prefix; live 2026-10-05 the prefixed spelling in
+        # admins never matched a bare Caller.subject, silently failing
+        # every subject-designated admin).
+        if subject in pol.admins or f"subject:{subject}" in pol.admins:
+            return True
     fp = getattr(caller, "key_fp", None)
     return bool(fp) and fp in pol.admins

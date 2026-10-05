@@ -23,7 +23,7 @@ image:
   # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
   # tags) — a stale default is how an "old MCP + new sidecar" pod happens.
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.5.1
+  tag: v1.7.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -93,7 +93,7 @@ browser:
   enabled: true
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.4.0
+    tag: v1.6.1
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -149,6 +149,8 @@ ezua:
   virtualService:
     # SITE: literal host for the lab site. Root of this host serves the normal
     # SearXNG web page; /mcp is routed to the MCP server (streamable-http + SSE).
+    # Doubles as MCP_HOSTNAME — the DNS-rebinding Host pin (read once at
+    # server startup; changing it requires a restart).
     endpoint: "searxng-mcp.<cluster-domain>"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
@@ -161,6 +163,19 @@ ezua:
 apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
+
+# EXTRA in-cluster MCP callers (svc DNS) — DNS-rebinding allowlist additions,
+# joined into MCP_EXTRA_ALLOWED_HOSTS (entries verbatim or `host:*`). The
+# pinned public FQDN and loopback are always allowed; [] = behaviour
+# unchanged. The chart AUTO-prepends the release's own service DNS
+# (searxng-mcp-service.<ns>.svc.cluster.local:*) whenever transport security
+# is active — the gateway relay's Host header — so this list is for hosts
+# BEYOND that. Note: in-cluster callers on this site reach the service on
+# port 9090 — MCP_HOSTNAME alone does NOT cover them (they send no Host
+# matching the pinned FQDN).
+extraAllowedHosts: []
+# extraAllowedHosts:
+#   - searxng-mcp-service.<release-namespace>.svc.cluster.local:*
 
 # Observability (Wave-3+): per-tool counters + ServiceMonitor.
 metrics:

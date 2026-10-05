@@ -1043,9 +1043,7 @@ class SqlEngine:
         # dir discipline as the result L2, artifacts under <dir>/meta/. On
         # when the L2 dir is configured; SQLHANDLER_L2_METADATA=0 opts out.
         self._l2_meta: L2JsonCache | None = (
-            L2JsonCache(l2_cfg["dir"], ttl=l2_cfg["ttl"])
-            if l2_cfg is not None and metadata_shared_enabled()
-            else None
+            L2JsonCache(l2_cfg["dir"], ttl=l2_cfg["ttl"]) if l2_cfg is not None and metadata_shared_enabled() else None
         )
         self._l2_min_bytes = l2_cfg["min_bytes"] if l2_cfg else 0
         self._l2_max_bytes = l2_cfg["max_bytes"] if l2_cfg else 0
@@ -2595,9 +2593,7 @@ class SqlEngine:
             # tables recorded for write-tier eviction (the profile/colstats
             # tier shares the CTAS version-regression hole the result tier
             # fixed — cross-review finding).
-            self._l2_meta.put(
-                shared_key, result, tables=[info.name, info.path, info.qualified_name]
-            )
+            self._l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
         return result
 
     @staticmethod
@@ -2823,9 +2819,7 @@ class SqlEngine:
             # tables recorded for write-tier eviction (the profile/colstats
             # tier shares the CTAS version-regression hole the result tier
             # fixed — cross-review finding).
-            self._l2_meta.put(
-                shared_key, result, tables=[info.name, info.path, info.qualified_name]
-            )
+            self._l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
         return result
 
     def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:
@@ -3436,18 +3430,60 @@ class SqlEngine:
             if cached is not None:
                 self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
                 return cached
-        if _preview_fastpath_enabled() and not params and version_as_of is None and limit is None:
+        if _preview_fastpath_enabled() and not params and version_as_of is None:
+            # CANONICAL PREVIEW REUSE (live 2026-10-05, twice over): (a)
+            # LIMIT 99/98/97 produced three distinct keys AND — under the
+            # 256 KiB L2 floor — never reached the shared tier; (b) the
+            # Query tab (transport limit=100) and the Inspector (transport
+            # limit=None) cached the SAME SQL under two keys because
+            # repr(limit) is a key part. For a bare preview — SELECT cols
+            # FROM t LIMIT n with NO ORDER BY — the SQL contract fixes only
+            # the COUNT, never WHICH rows, so ONE canonical entry per shape
+            # (LIMIT-free key, biggest-result-wins) serves every row-count
+            # request from every surface: lookups slice to the ask. Safety:
+            # the same shape guard as the fast path (_is_bare_preview —
+            # anything decorated (WHERE/ORDER/...) returns None here and
+            # the normal path runs exactly as before).
+            parsed = self._is_bare_preview(sql)
+            if parsed is not None:
+                _table_name, sql_limit = parsed
+                # The EFFECTIVE ask: the SQL's own LIMIT is query semantics;
+                # the API limit is a transport cap on top. min() of both
+                # (then the row cap) — exactly what the normal path's
+                # eff=min(...) computes.
+                eff_ask = min(sql_limit, limit) if limit is not None else sql_limit
+                if row_cap is not None and row_cap > 0:
+                    eff_ask = min(eff_ask, row_cap)
+                elif _max_rows() > 0:
+                    eff_ask = min(eff_ask, _max_rows())
+                reuse = self._preview_supersede_lookup(
+                    sql, _table_name, eff_ask, row_cap, version_as_of, caller=effective_caller
+                )
+                if reuse is not None:
+                    self._record_outcome(sql, 0.0, reuse.num_rows, state="ok", caller=effective_caller)
+                    return reuse
             fast = self._preview_fastpath(sql, version_as_of)
             if fast is not None:
                 cap = _max_rows()
                 eff_cap = row_cap if row_cap is not None else cap
+                # The API limit is a transport cap HERE as well: a slice to
+                # it after the row-group read (the normal path's eff=min(...)
+                # semantics, applied to the fast path's result).
+                if limit is not None and limit >= 0:
+                    eff_cap = min(eff_cap, limit) if eff_cap > 0 else limit
                 if fast.num_rows > eff_cap > 0:
                     fast = fast.slice(0, eff_cap)
-                self._record_outcome(sql, (time.monotonic() - t0) * 1000, fast.num_rows, state="ok", caller=effective_caller)
+                self._record_outcome(
+                    sql, (time.monotonic() - t0) * 1000, fast.num_rows, state="ok", caller=effective_caller
+                )
+                # CANONICAL store (biggest-wins) — this replaces the
+                # per-limit store: every surface shares the one entry.
+                self._preview_canonical_store(sql, fast, version_as_of, caller=effective_caller)
                 if cache_key is not None:
-                    # Floor 0: a preview's recompute is an object-store read,
-                    # so even a small result is worth publishing for the
-                    # other replicas (and for this one after a restart).
+                    # The EXACT requested key still gets its own entry (L1
+                    # warmth for identical repeat calls; L2 floor-0 like
+                    # every preview) — the canonical entry is the shared
+                    # backstop, this is the fast lane.
                     self._result_cache_store(cache_key, fast, sql=sql, l2_min_bytes=0)
                 return fast
         timeout = _query_timeout()
@@ -3984,9 +4020,7 @@ class SqlEngine:
             piece = piece.strip()
             if piece == "*":
                 continue
-            if not piece or not re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", piece
-            ):
+            if not piece or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", piece):
                 return None
         try:
             table = m.group("table")
@@ -4155,6 +4189,117 @@ class SqlEngine:
             return hashlib.sha256("\x1f".join(str(p) for p in full).encode()).hexdigest()
         except Exception:
             return None
+
+    def _preview_supersede_lookup(
+        self,
+        sql: str,
+        table: str,
+        want: int,
+        row_cap: int | None,
+        version_as_of: int | None,
+        caller=None,
+    ) -> pa.Table | None:
+        """The CANONICAL preview entry for this shape, sliced to ``want`` rows.
+
+        Supersedes the per-limit ladder probe (live 2026-10-05: LIMIT
+        99/98/97 each produced a distinct key AND — under the 256 KiB L2
+        floor — never reached the shared tier at all; then the Query tab vs
+        the Inspector proved the same SQL cached TWICE, because the UI
+        always sends a transport ``limit`` while the inspector sends none
+        and ``repr(limit)`` is a key part).
+
+        The canonical key strips the trailing LIMIT token entirely: the SQL
+        contract for LIMIT without ORDER BY fixes only the COUNT, never
+        WHICH rows, so one entry per (normalized projection, table,
+        snapshot versions, policy hash) serves EVERY row-count request —
+        sliced to the caller's ask. Store side keeps the BIGGEST result
+        seen for the shape (a smaller result never displaces it); lookups
+        slice down. A short entry (small table) is COMPLETE: returned
+        as-is for any want ≥ its size.
+
+        Fail-closed everywhere: any exception → None (the caller's fast
+        path takes over; this is an accelerator, never a requirement).
+        """
+        try:
+            cap = row_cap if row_cap is not None else _max_rows()
+            if cap > 0 and want >= cap:
+                return None  # the request already wants the whole cap
+            key = self._preview_canonical_key(sql, version_as_of, caller=caller)
+            if key is None:
+                return None
+            table_ = self._result_cache_lookup(key)
+            if table_ is None:
+                return None
+            # Slice ONLY when the entry has at least the asked count. A
+            # SHORTER entry might be a complete small table — or an
+            # incomplete preview of a bigger one; we cannot tell cheaply,
+            # so decline (execute + canonical-store upgrades the entry:
+            # biggest-wins makes the next bigger want hit or complete).
+            if table_.num_rows >= want:
+                return table_.slice(0, want)
+            return None
+        except Exception:
+            logger.debug("preview supersede lookup failed; falling through", exc_info=True)
+            return None
+
+    def _preview_strip_limit(self, sql: str) -> str | None:
+        """``sql`` with its trailing bare LIMIT clause REMOVED — the
+        canonical preview key's SQL part.
+
+        Only the bare-preview shape is rewritten (the caller has already
+        matched it via _is_bare_preview, so the regex WILL match here — the
+        None return is pure defense). Byte-preserving outside the LIMIT
+        clause: the rest of the statement feeds the key verbatim
+        (whitespace-normalized like every key).
+        """
+        m = self._PREVIEW_RE.match(sql)
+        if not m:
+            return None
+        return (sql[: m.start("limit")]).rstrip().rstrip(";").rstrip()
+
+    def _preview_canonical_key(
+        self,
+        sql: str,
+        version_as_of: int | None,
+        caller=None,
+    ) -> str | None:
+        """The LIMIT-free canonical cache key for a bare-preview shape.
+
+        Same identity machinery as :meth:`_result_cache_key` (normalized
+        SQL, no params, no transport limit — the LIMIT clause itself is
+        STRIPPED from the SQL part — snapshot versions, policy hash), so
+        every row-count request over the same shape shares one entry: the
+        inspector's ``limit=None`` and the Query tab's ``limit=100`` hit
+        the SAME key, and LIMIT 99/98/97 stop being three separate caches.
+
+        Reuses :meth:`_result_cache_key` by passing the stripped SQL with
+        ``limit=None`` — the transport parts it embeds are then constant
+        across every caller.
+        """
+        stripped = self._preview_strip_limit(sql)
+        if stripped is None:
+            return None
+        return self._result_cache_key(stripped, None, None, None, version_as_of, caller=caller)
+
+    def _preview_canonical_store(self, sql: str, table_: pa.Table, version_as_of: int | None, caller=None) -> None:
+        """Store/upgrade the CANONICAL preview entry: the BIGGEST result seen
+        for the shape wins (a smaller result never displaces a bigger one).
+
+        L1 always (subject to the cache's own cap); L2 under the preview
+        floor-0 rule (a preview's recompute is an object-store read, so
+        even a small result is worth publishing). Best-effort: failures
+        never raise — the caller already HAS its result.
+        """
+        try:
+            key = self._preview_canonical_key(sql, version_as_of, caller=caller)
+            if key is None:
+                return
+            existing = self._result_cache_lookup(key)
+            if existing is not None and existing.num_rows >= table_.num_rows:
+                return  # the canonical entry is already at least this big
+            self._result_cache_store(key, table_, sql=None, l2_min_bytes=0)
+        except Exception:
+            logger.debug("preview canonical store failed; ignoring", exc_info=True)
 
     def _result_cache_key(
         self,

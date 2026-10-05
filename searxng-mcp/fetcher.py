@@ -19,6 +19,13 @@ Fetch phase (getting the HTML):
    the page, then feeds the resulting DOM through the same extraction
    chain below.
 
+TLS against intercepting egress (corporate proxies): ``FETCH_CA_BUNDLE``
+points at a combined PEM bundle (public roots + the proxy's CA) that is
+passed as ``verify=`` to both HTTP rungs; ``FETCH_TLS_INSECURE_FALLBACK=1``
+additionally retries a certificate-verification failure once with
+verification disabled and marks the output (never for HTTP/DNS/policy
+failures).
+
 Redirects are NOT followed blindly: the httpx2 client is created with
 ``follow_redirects=False`` and a manual hop loop re-validates every
 ``Location`` (scheme, resolved IPs, pin) before the next request, up to
@@ -56,6 +63,7 @@ import asyncio
 import json
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin
@@ -141,6 +149,39 @@ def env_proxies() -> dict[str, str] | None:
     return {"http": p, "https": p} if p else None
 
 
+def resolve_ca_bundle() -> str | None:
+    """Explicit CA-bundle path for fetch TLS verification, or None.
+
+    ``FETCH_CA_BUNDLE`` is the knob: point it at a PEM bundle for egress
+    paths with TLS interception (corporate proxies — Zscaler et al. —
+    re-sign every certificate, so the default bundles can never verify).
+    The bundle must carry the FULL trust set (public roots + the proxy's
+    CA); the chart's init container builds exactly that. ``SSL_CERT_FILE``
+    / ``CURL_CA_BUNDLE`` / ``REQUESTS_CA_BUNDLE`` are deliberately NOT read
+    here — httpx2 and curl_cffi honor those env vars natively, and
+    re-handling them in code would double-apply and surprise operators.
+    """
+    path = os.getenv("FETCH_CA_BUNDLE", "").strip()
+    return path or None
+
+
+# Certificate-VERIFICATION failures only — the signature of an intercepted /
+# untrusted egress path, not of a dead site. Kept narrow on purpose: the
+# insecure fallback must never swallow DNS failures, HTTP errors, or
+# SSRF-policy refusals.
+CERT_ERROR_RE = re.compile(
+    r"certificate verify"
+    r"|CERTIFICATE_VERIFY_FAILED"
+    r"|SSLCertVerificationError"
+    r"|CertificateVerifyError"
+    r"|CERT_AUTHORITY_INVALID"
+    r"|unable to get local issuer"
+    r"|self[- ]signed certificate"
+    r"|curl: \(60\)",
+    re.IGNORECASE,
+)
+
+
 def extract_via_trafilatura(html: str, url: str) -> str | None:
     """Best-quality extraction; returns markdown or None."""
     try:
@@ -203,6 +244,11 @@ class FetchOutcome:
     screenshot_omitted: str | None = None  # why a requested screenshot is absent
     body_truncated: bool = False
     policy_error: str | None = None  # SSRF-policy rejection (deterministic -> cacheable)
+    # Provenance notes, cached WITH the outcome: a cache replay must keep
+    # the notes of the fetch that actually ran (and never leak another
+    # fetch's notes — cache hits skip the ladder where they are reset).
+    tls_note: str | None = None
+    browser_note: str | None = None
 
 
 class FetchResultCache:
@@ -293,6 +339,8 @@ class WebContentFetcher:
         requests_per_minute: int = 20,
         timeout: float = 30.0,
         verify_tls: bool = True,
+        ca_bundle: str | None = None,
+        insecure_tls_fallback: bool | None = None,
         browser: BrowserClient | None = None,
         cache_ttl_seconds: float | None = None,
         max_body_bytes: int | None = None,
@@ -304,12 +352,27 @@ class WebContentFetcher:
         self.last_policy_error: str | None = None  # SSRF rejection (last fetch)
         self.body_truncated: bool = False  # response-body cap hit on the last fetch
         self.browser_note: str | None = None  # why the browser rung failed, if it did
+        self.tls_note: str | None = None  # set when a fetch skipped verification
         # Headless-browser client, created lazily on first escalation so a
         # plain install (no playwright, no sidecar) never pays for it.
         # Tests inject a stub here.
         self._browser = browser
         self.timeout = timeout
         self.verify_tls = verify_tls
+        # Corporate-egress CA (TLS-intercepting proxies). A path wins over
+        # the verify_tls boolean and is passed as ``verify=`` to BOTH http
+        # rungs; the bundle must contain the full trust set (public roots +
+        # the proxy's CA) because OpenSSL replaces the default store with it.
+        self.ca_bundle = (ca_bundle if ca_bundle is not None else resolve_ca_bundle()) or None
+        # Last-resort resilience for TLS-intercepting egress: when a rung
+        # fails on a certificate error specifically and this is enabled, the
+        # rung retries ONCE with verification disabled and the tool output
+        # says so (tls_note). Default OFF — flip on per site when the CA
+        # bundle may lag the proxy's CA rotation (Zscaler rotates roots).
+        if insecure_tls_fallback is None:
+            raw = os.getenv("FETCH_TLS_INSECURE_FALLBACK", "0").strip().lower()
+            insecure_tls_fallback = raw in ("1", "true", "yes", "on")
+        self.insecure_tls_fallback = bool(insecure_tls_fallback)
         # Quick wins (fleet audit §3.4): response caps + TTL result cache.
         self.max_body_bytes = (
             max_body_bytes if max_body_bytes is not None else _env_int("SEARXNG_FETCH_MAX_BODY_BYTES", 5_000_000)
@@ -331,22 +394,60 @@ class WebContentFetcher:
                 ttl = 300.0
         self.result_cache = FetchResultCache(ttl_seconds=ttl)
 
-    def _make_client(self, *, pinned: bool) -> httpx2.AsyncClient:
+    def _make_client(self, *, pinned: bool, verify: bool | str | None = None) -> httpx2.AsyncClient:
         """One short-lived client per logical fetch.
 
         ``pinned=True`` (default when no proxy env is set) connects to the
         policy-validated IP directly — proxies are bypassed on purpose, the
         URL rewrite IS the DNS-rebinding pin. ``pinned=False`` (a proxy is
         configured) keeps trust_env so corporate-egress deployments keep
-        working; the proxy then performs egress DNS.
+        working; the proxy then performs egress DNS. ``verify`` overrides
+        the default trust setting for the insecure-fallback retry (False)
+        only; the default is an explicit SSL context when a CA bundle is
+        configured (see _bundle_ssl_context), else the verify_tls boolean.
         """
+        if verify is None:
+            verify = self._bundle_ssl_context() or self.verify_tls
         return httpx2.AsyncClient(
             timeout=httpx2.Timeout(self.timeout),
             follow_redirects=False,  # manual hop loop re-validates every Location
             trust_env=not pinned,
             headers=FETCH_HEADERS,
-            verify=self.verify_tls,
+            verify=verify,
         )
+
+    def _bundle_ssl_context(self) -> ssl.SSLContext | None:
+        """SSL context used when an explicit CA bundle is configured.
+
+        ``ssl.create_default_context()`` on Python 3.13+ enables X.509-strict
+        checking, which rejects legacy-but-valid corporate roots: the 2014
+        Zscaler Root CA carries ``basicConstraints`` WITHOUT the critical
+        marker, so OpenSSL 3.6 refuses the whole intercepted chain ("Basic
+        Constraints of CA cert not marked critical") even though every
+        signature is valid. A configured bundle is an explicit operator
+        trust decision — build the context here (OS defaults + certifi +
+        the bundle) and clear ONLY the strict-encoding flag; signature,
+        validity-window and hostname verification still fully apply. The
+        context path also works when no proxy env is set (where httpx2's
+        SSL_CERT_FILE trust_env branch would be skipped). Returns None when
+        no bundle is configured — the default path is untouched.
+        """
+        if not self.ca_bundle:
+            return None
+        context = ssl.create_default_context()
+        try:
+            # The bundle may be proxy-CA-only; layer the public roots in so
+            # non-intercepted sites keep verifying against a full store.
+            import certifi
+
+            context.load_verify_locations(cafile=certifi.where())
+        except Exception:
+            pass
+        context.load_verify_locations(cafile=self.ca_bundle)
+        strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict:
+            context.verify_flags &= ~strict
+        return context
 
     @property
     def browser(self) -> BrowserClient:
@@ -358,7 +459,7 @@ class WebContentFetcher:
         if self._browser is not None:
             await self._browser.aclose()
 
-    async def _get_html(self, url: str) -> str | None:
+    async def _get_html(self, url: str, *, insecure: bool = False) -> str | None:
         """Plain HTTP GET returning the raw HTML, or None on any failure.
 
         Every hop is validated against the SSRF policy (scheme, resolved
@@ -370,7 +471,9 @@ class WebContentFetcher:
         terminal, the ladder never escalates it). Records the failure
         reason on self.last_fetch_error so the tool's error output can say
         WHY (status code / exception / policy) instead of a bare "could not
-        access".
+        access". ``insecure=True`` is the internal certificate-error retry
+        (FETCH_TLS_INSECURE_FALLBACK): verification disabled, and never
+        retried again.
         """
         current = url
         for hop in range(self.max_redirect_hops + 1):
@@ -380,7 +483,7 @@ class WebContentFetcher:
                 self.last_fetch_error = str(e)
                 self.last_policy_error = str(e)
                 return None
-            client = self._make_client(pinned=pinned.pin_active)
+            client = self._make_client(pinned=pinned.pin_active, verify=False if insecure else None)
             try:
                 request = client.build_request(
                     "GET",
@@ -415,6 +518,21 @@ class WebContentFetcher:
                 return body
             except Exception as e:
                 self.last_fetch_error = f"{type(e).__name__}: {e}"[:200]
+                # Certificate errors are the signature of TLS interception
+                # with an untrusted CA, not of a dead site — the one
+                # last-resort retry (never for DNS/HTTP/policy failures).
+                if (
+                    not insecure
+                    and self.insecure_tls_fallback
+                    and CERT_ERROR_RE.search(self.last_fetch_error)
+                ):
+                    retried = await self._get_html(url, insecure=True)
+                    if retried is not None:
+                        self.tls_note = (
+                            "TLS verification failed; the fetch retried once with "
+                            "verification disabled (FETCH_TLS_INSECURE_FALLBACK)"
+                        )
+                        return retried
                 return None
             finally:
                 await client.aclose()
@@ -451,15 +569,22 @@ class WebContentFetcher:
         Redirects are followed manually (``allow_redirects=False``) with the
         same per-hop policy re-validation as the plain rung; libcurl does
         its own name resolution, so no IP pin here — every hop's target is
-        still deny-checked before the request.
+        still deny-checked before the request. ``insecure=True`` is the
+        internal certificate-error retry (FETCH_TLS_INSECURE_FALLBACK):
+        verification disabled, never retried again.
         """
 
-        def _sync() -> str | None:
+        def _sync(insecure: bool = False) -> str | None:
             try:
                 from curl_cffi import requests as curl_requests
             except ImportError:
                 self.last_fetch_error = "curl_cffi backend unavailable (not installed)"
                 return None
+            # The impersonated rung honors the same trust settings as the
+            # plain rung: an explicit CA bundle, else the verify_tls boolean.
+            # (curl_cffi defaults to its own bundled CAs and never saw
+            # verify_tls before — the rung silently ignored it.)
+            verify: bool | str = False if insecure else (self.ca_bundle or self.verify_tls)
             current = url
             for hop in range(self.max_redirect_hops + 1):
                 try:
@@ -475,9 +600,22 @@ class WebContentFetcher:
                         timeout=30.0,
                         proxies=env_proxies(),
                         allow_redirects=False,
+                        verify=verify,
                     )
                 except Exception as e:
                     self.last_fetch_error = f"curl_cffi {type(e).__name__}: {e}"[:200]
+                    if (
+                        not insecure
+                        and self.insecure_tls_fallback
+                        and CERT_ERROR_RE.search(self.last_fetch_error)
+                    ):
+                        retried = _sync(insecure=True)
+                        if retried is not None:
+                            self.tls_note = (
+                                "TLS verification failed; the fetch retried once with "
+                                "verification disabled (FETCH_TLS_INSECURE_FALLBACK)"
+                            )
+                            return retried
                     return None
                 if r.status_code in REDIRECT_STATUS_CODES and r.headers.get("location"):
                     if hop >= self.max_redirect_hops:
@@ -567,6 +705,10 @@ class WebContentFetcher:
             return f"Error: {outcome.policy_error}"
 
         text, source = outcome.text, outcome.source
+        # Notes travel WITH the outcome (see FetchOutcome): mirror them onto
+        # the fetcher for the meta block — accurate on cache hits too.
+        self.tls_note = outcome.tls_note
+        self.browser_note = outcome.browser_note
         if text is None:
             # The policy verdict is reported verbatim whenever one exists —
             # a later rung's backend complaint (e.g. "curl_cffi backend
@@ -591,7 +733,8 @@ class WebContentFetcher:
 
         total = len(text)
         text = text[start_index : start_index + max_length]
-        truncated = start_index + max_length < total
+        shown = len(text)  # the CONTENT slice — the screenshot appended below
+        truncated = start_index + max_length < total  # must not inflate the meta
 
         # ---- screenshot, INSIDE the pagination contract: served once, with
         # the first page only, and size-capped. Previously it was appended
@@ -614,7 +757,7 @@ class WebContentFetcher:
                 "\n\n---\n[Screenshot: shipped with the first page only — re-fetch with start_index=0 to receive it]"
             )
 
-        meta = f"\n\n---\n[Content info: Showing characters {start_index}-{start_index + len(text)} of {total} total"
+        meta = f"\n\n---\n[Content info: Showing characters {start_index}-{start_index + shown} of {total} total"
         if truncated:
             meta += f". Use start_index={start_index + max_length} to see more"
         meta += f" (via {source})]"
@@ -624,6 +767,13 @@ class WebContentFetcher:
                 f"{self.max_body_bytes} bytes (SEARXNG_FETCH_MAX_BODY_BYTES); "
                 "extraction ran on partial content]"
             )
+        if self.tls_note:
+            meta += f"\n[Note: {self.tls_note}]"
+        if self.browser_note:
+            # The browser rung is best-effort — when it was skipped or
+            # failed, say WHY on the success path too (a silently-missing
+            # screenshot cost a live debugging session its first hour).
+            meta += f"\n[Note: headless browser not used: {self.browser_note}]"
 
         await ctx.info(f"Extracted {len(text)} characters from {url}")
         return text + meta
@@ -637,6 +787,8 @@ class WebContentFetcher:
         outcome = FetchOutcome()
         self.body_truncated = False
         self.last_policy_error = None
+        self.tls_note = None
+        self.browser_note = None  # fresh per fetch — never surface a stale reason
         loop = asyncio.get_running_loop()
         is_wiki_url = bool(WIKIPEDIA_URL_RE.match(url))
 
@@ -709,6 +861,8 @@ class WebContentFetcher:
                         outcome.screenshot_b64 = self._cap_screenshot(shot, outcome)
 
         outcome.body_truncated = self.body_truncated
+        outcome.tls_note = self.tls_note
+        outcome.browser_note = self.browser_note
         # A per-hop policy rejection (redirect into blocked space) is the
         # definitive answer — surface it instead of the generic error.
         if outcome.text is None and self.last_policy_error:

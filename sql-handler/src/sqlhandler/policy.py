@@ -227,6 +227,13 @@ class Policy:
     # surface; the field exists so hashing can fold the raw vocabulary and
     # callers can introspect what loaded.
     datasets: dict | None = None
+    # The AUTHORED document as parsed (either form — datasets doc OR the
+    # hand-written groups shape). The grants payload serves it so the UI
+    # policy editor prefills for BOTH forms (the datasets field alone is
+    # None for groups-form policies, which prefilled an empty editor — and
+    # a Save of that empty editor wiped the file). Hash-neutral: hashing
+    # folds the compiled fields, not this mirror.
+    authored: dict | None = None
     # The admin DESIGNATION (administration plane, orthogonal to grants):
     # validated subjects + bare key fingerprints from the optional top-level
     # ``admins`` list, in file order. Empty tuple = no admins designated

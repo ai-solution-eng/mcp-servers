@@ -412,3 +412,71 @@ def warn_if_open(server_label: str, env_names=("MCP_API_KEYS",)) -> bool:
     print("shared or gateway-exposed deployment.")
     print(line)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Transport security (DNS-rebinding Host allowlist) — the K8S-MCP fleet
+# reference semantics, extracted 2026-10 so every streamable-HTTP server
+# shares one implementation instead of five hand-rolled
+# `TransportSecuritySettings(enable_dns_rebinding_protection=False)` lines.
+# ---------------------------------------------------------------------------
+
+HOSTNAME_ENV = "MCP_HOSTNAME"  # pinned public FQDN clients use to reach us
+
+EXTRA_ALLOWED_HOSTS_ENV = (
+    "MCP_EXTRA_ALLOWED_HOSTS"  # in-cluster svc-DNS Host allowlist additions
+)
+
+
+def parse_extra_allowed_hosts(raw: str) -> list:
+    """Parse ``MCP_EXTRA_ALLOWED_HOSTS`` into Host-header allowlist additions.
+
+    Comma-separated entries for in-cluster callers that address the server by
+    its service DNS name instead of the public FQDN (e.g.
+    ``http://<name>-service.<ns>.svc.cluster.local:9090/mcp``). The SDK's
+    transport security matches entries verbatim, or the ``host:*`` form to
+    accept any port. Order kept, surrounding whitespace and empties dropped,
+    duplicates deduplicated.
+    """
+    hosts: list = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if entry and entry not in hosts:
+            hosts.append(entry)
+    return hosts
+
+
+def transport_security_from_env():
+    """TransportSecuritySettings for the streamable-HTTP MCP app, or None.
+
+    K8S-MCP's fleet-reference semantics:
+
+    * With NEITHER ``MCP_HOSTNAME`` nor ``MCP_EXTRA_ALLOWED_HOSTS`` set
+      (local dev), returns None — the SDK's implicit loopback-only
+      protection applies untouched.
+    * With either set, protection is explicitly ON and the Host allowlist
+      is: the pinned public FQDN (when set) + the extra in-cluster hosts +
+      loopback. ``allowed_origins`` stays the https-only browser form of
+      the pinned FQDN (in-cluster callers send no Origin header).
+
+    CHART CONTRACT: a server adopting this helper must wire both env vars
+    from its chart (``mcpHostname`` / ``extraAllowedHosts`` values) in the
+    SAME change, or in-cluster service-DNS callers start getting 421s.
+
+    Lazy SDK import on purpose — this module stays stdlib-only at import
+    time (see the module docstring); every consumer is an MCP server and
+    already has the SDK.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    mcp_hostname = os.environ.get(HOSTNAME_ENV, "").strip()
+    extra_hosts = parse_extra_allowed_hosts(os.environ.get(EXTRA_ALLOWED_HOSTS_ENV, ""))
+    if not mcp_hostname and not extra_hosts:
+        return None
+    allowed_hosts = ([mcp_hostname] if mcp_hostname else []) + extra_hosts
+    allowed_hosts += ["localhost:*", "127.0.0.1:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=([f"https://{mcp_hostname}"] if mcp_hostname else []),
+    )

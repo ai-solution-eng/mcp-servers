@@ -16,7 +16,14 @@ Tools:
                       confirm_apply=True (call plan_apply first)
   delete_resource     delete one allowlisted resource — refuses unless
                       confirm_delete=True
+  plan_delete         the delete DRY-RUN: same fence chain as
+                      delete_resource, surfaces the object's current state
+                      as the verdict — NEVER deletes (plan → human review →
+                      delete_resource with confirm_delete=True)
   get_resource_status read-only status excerpt (verify what you applied)
+  verify_audit_chain  verify the hash chain of THIS server's own configured
+                      audit file — parameter-free (the path is server
+                      configuration; also at GET /api/audit/verify)
 
 Guardrail stack (checked on EVERY write, in this order):
   1. DNS-1123 hygiene    — namespace (label) and resource names (subdomain)
@@ -94,7 +101,6 @@ from typing import Any
 
 import yaml
 from mcp.server import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 import mcp_auth
@@ -339,6 +345,97 @@ def _kind_api_version(kind: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# RBAC ↔ registry mismatch hints (read-only: the tool NEVER extends RBAC).
+#
+# The kind registry is the ADMISSION vocabulary — it admits more kinds than
+# the helm chart's Role grants (rbac.yaml mirrors only the default allowlist;
+# the one-time bootstrap manifest is what enables writes into other
+# namespaces). So an allowlisted kind can still yield an API-403: the policy
+# passes but the ServiceAccount lacks the resource/verb. The hint maps that
+# 403 back to the operator action (extend the chart Role / the bootstrap
+# manifest) — it is pure text, never an RBAC change.
+# ---------------------------------------------------------------------------
+
+_KIND_TO_PLURAL = {
+    "ConfigMap": "configmaps",
+    "Service": "services",
+    "ServiceAccount": "serviceaccounts",
+    "Pod": "pods",
+    "PersistentVolumeClaim": "persistentvolumeclaims",
+    "ReplicationController": "replicationcontrollers",
+    "LimitRange": "limitranges",
+    "ResourceQuota": "resourcequotas",
+    "Endpoints": "endpoints",
+    "EndpointSlice": "endpointslices",
+    "Event": "events",
+    "Binding": "bindings",
+    "Deployment": "deployments",
+    "StatefulSet": "statefulsets",
+    "DaemonSet": "daemonsets",
+    "ReplicaSet": "replicasets",
+    "ControllerRevision": "controllerrevisions",
+    "Job": "jobs",
+    "CronJob": "cronjobs",
+    "Ingress": "ingresses",
+    "NetworkPolicy": "networkpolicies",
+    "PodDisruptionBudget": "poddisruptionbudgets",
+    "HorizontalPodAutoscaler": "horizontalpodautoscalers",
+    "VerticalPodAutoscaler": "verticalpodautoscalers",
+    "Role": "roles",
+    "RoleBinding": "rolebindings",
+    "Lease": "leases",
+}
+
+# The resource surface the shipped RBAC actually grants (helm/templates/
+# rbac.yaml — and the same list in the one-time bootstrap manifest): a 403
+# on one of these kinds is NOT a registry-vs-RBAC mismatch (something else
+# is wrong — wrong namespace bootstrap, expired binding), so no hint.
+_RBAC_GRANTED_KINDS = frozenset(
+    {
+        "ConfigMap",
+        "Service",
+        "ServiceAccount",
+        "Pod",
+        "Deployment",
+        "StatefulSet",
+        "DaemonSet",
+        "ReplicaSet",
+        "Job",
+        "CronJob",
+        "Ingress",
+        "NetworkPolicy",
+        "PodDisruptionBudget",
+        "HorizontalPodAutoscaler",
+    }
+)
+
+
+def rbac_hint_for(kind: str, verb: str) -> str | None:
+    """Operator-actionable hint for an API-403 on a kind whose plural RBAC
+    does NOT already grant — i.e. exactly the registry-vs-RBAC mismatch —
+    else None. Pure function: kind registry → plural resource name + the
+    exact manifests an operator extends (the chart Role in the release
+    namespace, or the one-time bootstrap Role for other namespaces). It
+    NEVER changes RBAC. Kinds the shipped RBAC already grants (the chart
+    Role's resource list) and gate-refused kinds (Secret, cluster-scoped —
+    they never reach an API call) return None: no hint where there is no
+    mismatch.
+    """
+    plural = _KIND_TO_PLURAL.get(kind)
+    if not plural:
+        return None
+    if kind in _RBAC_GRANTED_KINDS:
+        return None
+    return (
+        f"the kind registry admitting '{kind}' does not imply cluster RBAC grants it: the "
+        f"ServiceAccount got HTTP 403 {verb}ing {plural} ({_kind_api_version(kind)}). RBAC is the "
+        "one-time bootstrap manifest's job, never this tool's: extend the chart Role "
+        "(helm/templates/rbac.yaml) in the release namespace or the bootstrap manifest "
+        "(helm/local/rbac-bootstrap.se-g2.yaml) for other namespaces — the server never extends RBAC itself."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manifest parsing / hygiene
 # ---------------------------------------------------------------------------
 
@@ -540,12 +637,19 @@ def _manifest_sha256(manifest: str) -> str:
     return hashlib.sha256(manifest.encode("utf-8")).hexdigest()
 
 
-def _record_plan(namespace: str, sha: str) -> None:
+def _record_plan(namespace: str, sha: str) -> bool:
+    """Record the latest plan sha for `namespace`. Returns True when this
+    plan SUPERSEDED a different recorded one (D11 visibility: the plan_apply
+    response then carries `superseded_plan: true` so an agent can see its
+    older planned bytes are no longer the ones apply_manifest binds to).
+    Semantics unchanged — the latest plan per namespace always wins."""
     with _plan_session_lock:
+        previous = _plan_session.get(namespace)
         _plan_session[namespace] = {
             "sha256": sha,
             "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }
+    return bool(previous and previous["sha256"] != sha)
 
 
 def _planned_sha(namespace: str) -> str | None:
@@ -975,8 +1079,54 @@ def _refused(tool: str, namespace: str, kind: str, name: str, dry_run: bool, mes
     return json.dumps({"ok": False, "refused": True, "error": message}, indent=2)
 
 
-def _per_doc(kind: str, doc: dict, ok: bool, message: str) -> dict:
-    return {"kind": kind, "name": doc.get("metadata", {}).get("name", ""), "ok": ok, "message": message}
+def _refused_with_hint(tool: str, namespace: str, message: str) -> str:
+    """A refusal that carries the D11 recovery hint (the kind/name fields
+    are not yet known — the binding gate fires before per-doc iteration)."""
+    _audit(tool, namespace, "", "", False, "refused")
+    return json.dumps(
+        {
+            "ok": False,
+            "refused": True,
+            "error": message,
+            "hint": "re-run plan_apply on the exact bytes you intend to apply",
+        },
+        indent=2,
+    )
+
+
+def _per_doc(kind: str, doc: dict, ok: bool, message: str, **extra) -> dict:
+    """Per-doc verdict; `extra` carries the structured failure fields
+    (reason/status/rbac_hint) additively — consumers reading the four base
+    keys are unaffected."""
+    entry = {"kind": kind, "name": doc.get("metadata", {}).get("name", ""), "ok": ok, "message": message}
+    if extra:
+        entry.update(extra)
+    return entry
+
+
+def _api_exception_fields(kind: str, exc: Exception) -> dict:
+    """Structured fields for an ApiException-shaped seam failure.
+
+    Adds `reason` ("api_error") plus the HTTP `status` when the exception
+    exposes one — and on a 403 for an ADMITTED kind, the operator-actionable
+    RBAC hint (`rbac_hint_for`). Additive only: the human `error` string the
+    callers build stays byte-identical to the pre-hardening text. Non-Api
+    failures (proxy errors, DNS, ...) get the reason alone — no fabricated
+    status. Duck-typed on `status` (kubernetes.client.ApiException and its
+    DynamicClient look-alikes) rather than an import-time `isinstance`: the
+    kubernetes package is a LAZY seam here (absent from the fleet unit-test
+    venv), so a hard import would break collection.
+    """
+    fields = {"reason": "api_error"}
+    status = getattr(exc, "status", None)
+    # bool slips isinstance(x, int) in Python — an HTTP status is never a bool.
+    if isinstance(status, int) and not isinstance(status, bool):
+        fields["status"] = status
+        if status == 403:
+            hint = rbac_hint_for(kind, "access") if kind in _KIND_REGISTRY else None
+            if hint:
+                fields["rbac_hint"] = hint
+    return fields
 
 
 def _plan_apply_sync(namespace: str, manifest: str, force: bool) -> str:
@@ -1008,29 +1158,42 @@ def _plan_apply_sync(namespace: str, manifest: str, force: bool) -> str:
             results.append(_per_doc(kind, doc, False, str(exc)))
             _audit("plan_apply", namespace, kind, name, True, "refused")
         except Exception as exc:
-            results.append(_per_doc(kind, doc, False, f"{type(exc).__name__}: {exc}"))
+            # Structured failure: reason + HTTP status + (403-only) the RBAC
+            # hint ride alongside the message, whose text stays
+            # "ApiException: ..." exactly as before (duck-typed in
+            # _api_exception_fields — no hard kubernetes import here).
+            message = f"{type(exc).__name__}: {exc}"
+            results.append(_per_doc(kind, doc, False, message, **_api_exception_fields(kind, exc)))
             _audit("plan_apply", namespace, kind, name, True, "failed")
     # The plan happened — its sha is what apply_manifest (D11) binds to.
-    _record_plan(namespace, manifest_sha)
-    return json.dumps(
-        {
-            "ok": all(r["ok"] for r in results),
-            "dry_run": True,
-            # force is accepted for call-site symmetry but NEVER affects the
-            # plan: no flag can turn a plan into a mutation.
-            "force": bool(force),
-            "note": "plan_apply is ALWAYS a dry-run (dry_run=All) — call apply_manifest with confirm_apply=true to mutate",
-            "namespace": namespace,
-            "manifest_sha256": manifest_sha,
-            "documents": results,
-            "summary": {
-                "total": len(results),
-                "ok": sum(1 for r in results if r["ok"]),
-                "failed": sum(1 for r in results if not r["ok"]),
-            },
+    superseded = _record_plan(namespace, manifest_sha)
+    result = {
+        "ok": all(r["ok"] for r in results),
+        "dry_run": True,
+        # force is accepted for call-site symmetry but NEVER affects the
+        # plan: no flag can turn a plan into a mutation.
+        "force": bool(force),
+        "note": "plan_apply is ALWAYS a dry-run (dry_run=All) — call apply_manifest with confirm_apply=true to mutate",
+        "namespace": namespace,
+        "manifest_sha256": manifest_sha,
+        "documents": results,
+        "summary": {
+            "total": len(results),
+            "ok": sum(1 for r in results if r["ok"]),
+            "failed": sum(1 for r in results if not r["ok"]),
         },
-        indent=2,
-    )
+    }
+    if superseded:
+        # D11 supersession visibility (additive): a DIFFERENT sha256 was
+        # already recorded for this namespace — the older planned bytes are
+        # no longer the ones apply_manifest binds to. "latest plan wins"
+        # semantics are unchanged; this only makes the supersession visible.
+        result["superseded_plan"] = True
+        result["note"] = (
+            "plan_apply is ALWAYS a dry-run (dry_run=All) — call apply_manifest with confirm_apply=true to mutate. "
+            "A newer plan_apply supersedes older planned bytes; apply_manifest binds to the latest plan only."
+        )
+    return json.dumps(result, indent=2)
 
 
 def _apply_sync(namespace: str, manifest: str, confirm_apply: bool, plan_sha256: str = "") -> str:
@@ -1057,7 +1220,10 @@ def _apply_sync(namespace: str, manifest: str, confirm_apply: bool, plan_sha256:
     # D11 plan binding (default deny — see _check_plan_binding / README).
     action, binding_message, mode = _check_plan_binding(namespace, manifest, plan_sha256)
     if action == "refuse":
-        return _refused("apply_manifest", namespace, "", "", False, binding_message)
+        # Tamper-refusal hint (additive): the D11 binding is to the LATEST
+        # plan only — re-planning the intended bytes is the remedy. The
+        # refusal is audit-logged exactly as before.
+        return _refused_with_hint("apply_manifest", namespace, binding_message)
     if action == "apply-warn":
         print(f"[plan-binding] WARNING: {binding_message}", file=sys.stderr)
     # The binding label reflects the MODE that let this apply through:
@@ -1088,7 +1254,12 @@ def _apply_sync(namespace: str, manifest: str, confirm_apply: bool, plan_sha256:
             results.append(_per_doc(kind, doc, False, str(exc)))
             _audit("apply_manifest", namespace, kind, name, False, "refused", dict(audit_extra))
         except Exception as exc:
-            results.append(_per_doc(kind, doc, False, f"{type(exc).__name__}: {exc}"))
+            # Structured failure: reason + HTTP status + (403-only) the RBAC
+            # hint ride alongside the message, whose text stays
+            # "ApiException: ..." exactly as before (duck-typed in
+            # _api_exception_fields — no hard kubernetes import here).
+            message = f"{type(exc).__name__}: {exc}"
+            results.append(_per_doc(kind, doc, False, message, **_api_exception_fields(kind, exc)))
             _audit("apply_manifest", namespace, kind, name, False, "failed", dict(audit_extra))
     return json.dumps(
         {
@@ -1133,9 +1304,91 @@ def _delete_sync(namespace: str, kind: str, name: str, confirm_delete: bool) -> 
         _delete(namespace, kind, name)
     except Exception as exc:
         _audit("delete_resource", namespace, kind, name, False, "failed")
-        return json.dumps({"ok": False, "error": f"delete failed: {type(exc).__name__}: {exc}"}, indent=2)
+        # Additive error normalization: the legacy `error` string is kept
+        # byte-identical (tests + the webui render it verbatim); the
+        # structured fields (`reason`, HTTP `status`, and on a 403 the
+        # RBAC hint) are what dashboards/tests can assert on instead of
+        # string-matching. `refused: false` separates an API failure from
+        # a guardrail refusal (`refused: true`).
+        return json.dumps(
+            {
+                "ok": False,
+                "refused": False,
+                "error": f"delete failed: {type(exc).__name__}: {exc}",
+                **_api_exception_fields(kind, exc),
+            },
+            indent=2,
+        )
     _audit("delete_resource", namespace, kind, name, False, "deleted")
     return json.dumps({"ok": True, "deleted": {"kind": kind, "name": name, "namespace": namespace}}, indent=2)
+
+
+def _plan_delete_sync(namespace: str, kind: str, name: str) -> str:
+    """plan_delete — the delete dry-run: the SAME fence chain as
+    delete_resource, WITHOUT the confirm gate (nothing is deleted, so there
+    is nothing to confirm) and WITHOUT the seam delete call. An existing
+    object's current status is surfaced so a human can review exactly what
+    a following delete_resource(confirm_delete=True) would remove.
+
+    Flow: plan_delete → human review of the verdict → delete_resource with
+    confirm_delete=True. plan_delete NEVER deletes — there is no flag that
+    can turn this plan into a mutation.
+    """
+    # 1-3: the identical fence as delete_resource (confirm is deliberately
+    # absent — a plan is never a mutation). Refusals keep the tool's own
+    # name in the audit trail, so the trail shows "planning was refused"
+    # rather than implying a delete was attempted.
+    bad_target = _validate_target(namespace, name)
+    if bad_target:
+        return _refused("plan_delete", namespace, kind, name, True, bad_target)
+    ok, reason = _namespace_allowed(namespace)
+    if not ok:
+        return _refused("plan_delete", namespace, kind, name, True, reason)
+    try:
+        _check_kind(kind)
+    except _Refusal as exc:
+        return _refused("plan_delete", namespace, kind, name, True, str(exc))
+    # 4: existence + current state — the exact seam get_resource_status
+    # reads through, so the verdict describes the SAME view a reviewer gets
+    # from get_resource_status.
+    try:
+        obj = _get_status(namespace, kind, name)
+    except Exception as exc:
+        # A 404 is the expected not-found verdict, not a tool failure —
+        # the plan simply reports that a delete would have nothing to
+        # remove. Other failures (403, DNS, proxy) are structured like
+        # the other tools'.
+        message = f"{type(exc).__name__}: {exc}"
+        fields = _api_exception_fields(kind, exc)
+        if fields.get("status") == 404:
+            _audit("plan_delete", namespace, kind, name, True, "planned")
+            return json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "would_delete": {"kind": kind, "name": name, "namespace": namespace},
+                    "exists": False,
+                    "current_state": None,
+                    "message": "nothing to delete — the object does not exist (status lookup returned 404)",
+                    "reason": fields["reason"],
+                    "status": fields["status"],
+                },
+                indent=2,
+            )
+        _audit("plan_delete", namespace, kind, name, True, "failed")
+        return json.dumps({"ok": False, "error": f"plan_delete failed: {message}", **fields}, indent=2)
+    _audit("plan_delete", namespace, kind, name, True, "planned")
+    return json.dumps(
+        {
+            "ok": True,
+            "dry_run": True,
+            "would_delete": {"kind": kind, "name": name, "namespace": namespace},
+            "exists": True,
+            "current_state": _shape_status(kind, obj),
+            "note": "plan_delete NEVER deletes — after review call delete_resource with confirm_delete=true",
+        },
+        indent=2,
+    )
 
 
 def _shape_status(kind: str, obj: dict) -> dict:
@@ -1307,11 +1560,81 @@ async def get_resource_status(namespace: str, kind: str, name: str) -> str:
         return json.dumps({"ok": False, "error": f"get_resource_status failed: {type(e).__name__}: {e}"}, indent=2)
 
 
+@mcp.tool(
+    title="Plan Delete (always dry-run)",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+async def plan_delete(namespace: str, kind: str, name: str) -> str:
+    """Plan a delete — ALWAYS a dry-run: NEVER deletes anything. The most
+    destructive verb gets the same plan-then-confirm discipline as apply:
+    run the SAME fence chain as delete_resource (namespace policy
+    default-deny, kind allowlist, Secret hard-refusal, cluster-scoped
+    refusal), then surface the object's CURRENT state (the exact view
+    get_resource_status renders) as the delete verdict.
+
+    The intended flow for a human-reviewed destructive change:
+      plan_delete → human review of the verdict → delete_resource with
+      confirm_delete=True. There is no flag that turns plan_delete into a
+      mutation; only delete_resource (confirm-gated, audit-logged) deletes.
+
+    Args:
+        namespace: Namespace of the object (must be allowlisted; default-deny otherwise).
+        kind: Resource kind (allowlist + Secret/cluster-scoped refusals apply).
+        name: Object name.
+    """
+    try:
+        return await asyncio.to_thread(_plan_delete_sync, namespace, kind, name)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return json.dumps({"ok": False, "error": f"plan_delete failed: {type(e).__name__}: {e}"}, indent=2)
+
+
+@mcp.tool(
+    name="verify_audit_chain",
+    title="Verify Audit Chain",
+    annotations=ToolAnnotations(read_only_hint=True),
+)
+async def verify_audit_chain_tool() -> str:
+    """Verify the hash chain of THIS server's own configured audit file
+    (APPLYGATE_AUDIT_FILE, default /data/audit.jsonl) — the executable form
+    of the README procedure, without needing kubectl exec. Takes NO
+    parameters by design: the audit path is server configuration, and any
+    client-supplied path is refused (same discipline as the /api/audit
+    console endpoint). Returns
+    {"ok", "file", "exists", "entries", "legacy_entries", "first_bad_line", "error"}.
+    """
+    try:
+        return await asyncio.to_thread(_verify_audit_chain_sync)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return json.dumps({"ok": False, "error": f"verify_audit_chain failed: {type(e).__name__}: {e}"}, indent=2)
+
+
+def _verify_audit_chain_sync() -> str:
+    """Sync body of the verify_audit_chain MCP tool: the trail path comes
+    ONLY from server configuration — never from the caller. A client that
+    somehow smuggles a path parameter gets the same refusal discipline the
+    /api/audit console endpoint applies (400-shaped structured refusal)."""
+    path = os.environ.get("APPLYGATE_AUDIT_FILE") or DEFAULT_AUDIT_FILE
+    return json.dumps(verify_audit_chain(path), indent=2)
+
+
 # ---------------------------------------------------------------------------
 # HTTP transport (MCP 2.0 stateless)
 # ---------------------------------------------------------------------------
 
-_mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+def _mcp_transport_security():
+    """DNS-rebinding protection follows the fleet-shared helper (mcp_auth.
+    transport_security_from_env): None (dev mode — the SDK's implicit
+    loopback protection applies untouched) when NEITHER MCP_HOSTNAME nor
+    MCP_EXTRA_ALLOWED_HOSTS is set; with either set, protection is
+    explicitly ON with a Host allowlist of the pinned FQDN + extra
+    in-cluster hosts + loopback. Read at CALL time like every other env
+    knob (the tests build the app per test); the chart wires both env vars
+    (mcpHostname / extraAllowedHosts values) in the same change — the
+    helper's chart contract."""
+    return mcp_auth.transport_security_from_env()
 
 
 # ─── API-key authentication (fleet pattern, shared module: pcai_utils/mcp_auth.py) ───
@@ -1407,7 +1730,7 @@ def _build_http_app():
     http_app = mcp.streamable_http_app(
         json_response=True,
         stateless_http=True,
-        transport_security=_mcp_transport_security,
+        transport_security=_mcp_transport_security(),
     )
     routes = [
         Route("/health", health),

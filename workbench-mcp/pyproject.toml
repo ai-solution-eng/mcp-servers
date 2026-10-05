@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workbench-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Workbench MCP Server — persistent per-agent scratch workspaces: files, env, bounded command execution on a PVC"
 requires-python = ">=3.10"
 keywords = ["mcp", "workbench", "workspace", "persistence", "model-context-protocol"]
@@ -13,6 +13,12 @@ dependencies = [
     "mcp>=2.0.0",
     "starlette>=0.37.0",
     "uvicorn>=0.27.0",
+    # Sandbox-exec v1: the official client, LAZY-imported only inside the
+    # sandbox exec path (_k8s_list_pods / _k8s_exec_stream) — the test suite
+    # and stdio-dev mode never import it. Keep the RUN `uv pip install`
+    # line in the Dockerfile in sync (it is the image's manifest-keyed
+    # dependency layer — see the Dockerfile comment).
+    "kubernetes>=29.0.0",
 ]
 
 [project.scripts]

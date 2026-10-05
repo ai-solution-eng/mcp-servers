@@ -9,8 +9,8 @@ description: >-
   store, and bounded argv command execution with audit, behind the PCAI
   Istio gateway.
 type: application
-version: 0.3.1
-appVersion: "v0.3.1"
+version: 0.4.0
+appVersion: "v0.4.0"
 keywords:
   - mcp
   - workbench

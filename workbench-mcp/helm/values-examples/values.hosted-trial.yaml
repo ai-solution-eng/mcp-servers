@@ -18,7 +18,7 @@ deployment:
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  tag: v0.3.1
+  tag: v0.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -47,6 +47,13 @@ workbench:
   # Per-command timeout bounds (seconds).
   execTimeoutDefault: 60
   execTimeoutMax: 600
+  # Dedicated run_command pool width (default 4): a saturated pool
+  # returns a structured busy response without executing (no queue).
+  execMaxConcurrency: 4
+  # Audit-JSONL rotation threshold (bytes; default 100 MiB): the active
+  # .audit.jsonl renames to .audit.jsonl.1 (single generation) and a
+  # fresh file starts with an audit_rotated provenance entry.
+  auditMaxBytes: 104857600
   # write_file cap (bytes, 8 MiB).
   maxFileBytes: 8388608
   # stdout/stderr cap per run_command (bytes, 200 KiB).
@@ -54,9 +61,47 @@ workbench:
   # Max entries per list_files response.
   maxListEntries: 500
   logLevel: INFO
+  # sandbox_exec tool (v1, opt-in): python file execution in the
+  # no-network executor pool — OFF here; flip with executors.enabled.
+  sandboxExec: false
+  sandboxLabel: "app=workbench-exec"
+  sandboxContainer: python
+  sandboxTimeoutS: 120
+  sandboxMaxOutputChars: 50000
   # Workspace templates (Wave-5 F3) — SITE: chart default ({} = the
   # workspace_create tool's template parameter is refused; nothing renders).
   templates: {}
+
+# -- Sandbox executor pool (sandbox-exec v1) ------------------------------------------------------
+# No-network python executor pods for the sandbox_run tool: same image as the
+# server (stdlib-only needs), deny-all NetworkPolicy, no SA token, non-root,
+# caps dropped, seccomp, read-only rootfs, no GPU resource request, and NO
+# tolerations (control-plane taints self-exclude). The MCP tool refuses until
+# BOTH executors.enabled AND workbench.sandboxExec are true.
+executors:
+  enabled: false
+  appName: workbench-exec
+  containerName: python
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  replicas: 2
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+# -- In-cluster host allowlist (DNS-rebinding additions; K8S-MCP pattern) ---
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts for
+# in-cluster callers addressing the server by service DNS instead of the
+# public FQDN. Joined into MCP_EXTRA_ALLOWED_HOSTS (matched verbatim or as
+# `host:*`). The pinned public FQDN (ezua.virtualService.endpoint, wired as
+# MCP_HOSTNAME when ezua is enabled) and loopback are always allowed; with
+# neither key set the SDK's implicit dev-mode protection applies (unchanged).
+# The chart AUTO-prepends the release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) whenever transport
+# security is active — the gateway relay's Host header — so this list is
+# for hosts BEYOND that.
+extraAllowedHosts: []
 
 # -- Per-key proxy wiring --------------------------------------------------------------------------
 # SITE: off unless the trial cluster sits behind a corporate proxy — a

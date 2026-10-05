@@ -26,10 +26,9 @@ already name them), no lifespan coupling.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Union
+from typing import Callable, Mapping, Union
 
-__all__ = ["DEFAULT_HEALTHZ_PATH", "DEFAULT_HEALTH_PATH", "health_routes"]
+__all__ = ["health_routes", "DEFAULT_HEALTH_PATH", "DEFAULT_HEALTHZ_PATH"]
 
 DEFAULT_HEALTH_PATH = "/health"
 DEFAULT_HEALTHZ_PATH = "/healthz"

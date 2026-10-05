@@ -47,7 +47,7 @@ import os
 import re
 from dataclasses import dataclass
 
-__all__ = ["EMPTY_ALLOWS_ALL_VALUES", "NamespacePolicy", "PolicyDecision"]
+__all__ = ["NamespacePolicy", "PolicyDecision", "EMPTY_ALLOWS_ALL_VALUES"]
 
 #: The truthy spellings the D8 escape hatch accepts (logsearch's list).
 EMPTY_ALLOWS_ALL_VALUES = ("1", "true", "yes", "on")
@@ -118,7 +118,8 @@ class NamespacePolicy:
             if fnmatch.fnmatchcase(ns, pattern):
                 return PolicyDecision(
                     False,
-                    f"namespace {ns!r} matches {self.blocked_env} pattern {pattern!r} — the blocklist always wins",
+                    f"namespace {ns!r} matches {self.blocked_env} pattern {pattern!r} — "
+                    "the blocklist always wins",
                 )
         allowed = _env_csv(self.allowed_env)
         if not allowed:
@@ -185,7 +186,8 @@ def parse_ns_patterns(raw: str) -> tuple[str, ...]:
             continue
         if not DNS_LABEL_GLOB_RE.fullmatch(pattern):
             raise ValueError(
-                f"invalid namespace pattern {pattern!r} in {raw!r}: use lowercase DNS labels with optional * / ? globs"
+                f"invalid namespace pattern {pattern!r} in {raw!r}: use "
+                "lowercase DNS labels with optional * / ? globs"
             )
         patterns.append(pattern)
     return tuple(patterns)

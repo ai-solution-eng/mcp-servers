@@ -27,12 +27,18 @@ editor, alerts & rules) at `/`.
   alerts with severity, labels, and annotations; `prom_rules` shows the exact
   condition and threshold behind each alert.
 - Humans need the same data without writing PromQL: the web console at `/`
-  provides a dashboard, a per-GPU/NVLink fleet view (DCGM), a query editor
-  with charts, and an alerts & rules browser — over the same client and caps
-  as the tools.
+  provides a dashboard, a per-GPU/NVLink fleet view (DCGM), a per-node CPU
+  & memory capacity view, a query editor with charts, and an alerts & rules
+  browser — over the same client and caps as the tools.
 - GPU fleet visibility: the GPU tab groups each node's GPUs into NVLink
   islands, detected from the hardware by an optional DaemonSet (or pinned
   explicitly via `gpuNvlinkDomains`).
+- Capacity planning: the Nodes tab shows each node's CPU cores and memory as
+  three bars — requested / limited / active — against that node's
+  allocatable track, plus per-node 3h trends and a sortable table. The GPU
+  nodes are selected by default (auto-detected from the nvidia GPU
+  allocatable); `nodeFilter` (values) or the browser filter input change
+  the selection (`all` = every node).
 
 ## Tools
 
@@ -45,7 +51,7 @@ All tools are read-only and talk to one Prometheus instance.
 | `prom_series` | Which series exist for a selector with their label sets — discovery before querying. |
 | `prom_label_values` | Values of one label (e.g. list pods/namespaces reporting a metric), optionally restricted by a selector. |
 | `prom_alerts` | Currently firing/pending alerts with severity, labels, annotations, age. |
-| `prom_rules` | Alerting/recording rules with expressions, filterable by state and name. |
+| `prom_rules` | Alerting/recording rules with expressions, filterable by state and name. Capped at `max_rules` (default 50) with a `…[truncated N more rules]` footer — a kube-prometheus-stack ships hundreds of rules and rendering every expr unbounded floods the context; narrow with `state`/`search` instead of paging. |
 | `query_save` | Save a query (+ optional run params) under a name (Wave-5). |
 | `query_list` | List saved queries — name, params, expression; no Prometheus traffic. |
 | `query_delete` | Remove one saved query by name. |
@@ -66,8 +72,43 @@ boot and pushes the detected islands to the pushgateway for the GPU tab; it
 fails soft — a node without a working driver mount never breaks the page.
 HTTP surface: `/mcp` (MCP streamable-HTTP), `/health` + `/healthz`, the web
 console at `/` + `/api/*` (always served — this chart has no webui toggle),
-and an optional gateway-level auth gate (`ezua.authorizationPolicy`,
-off by default).
+an optional **API-key gate on `/mcp`** (see "API-key auth" below), and an
+optional gateway-level auth gate (`ezua.authorizationPolicy`, off by
+default).
+
+## API-key auth — OPTIONAL (fleet pattern)
+
+`/mcp` requires an API key **only when** `PROMETHEUS_API_KEYS` (or the
+fleet-universal `MCP_API_KEYS` — either var works, key sets are unioned) is
+configured. Default values leave both unset = the server runs **open**, with
+a loud startup warning naming the env vars (optional-by-design fleet
+decision 2026-09: this is a read-only observation surface fronted by the
+SSO-gated edge gateway). The gate scopes to the `/mcp` prefix ONLY:
+`/health`, `/healthz`, the web console, its `/api/*` routes, and the
+opt-in `/metrics` stay key-free — kubelet probes and the ServiceMonitor
+scrape never need a key.
+
+The chart never inlines a key — pre-deploy the Secret, then point the
+values at it (no pod restart needed; the server re-reads the env per
+request):
+
+```bash
+kubectl -n prometheus-mcp create secret generic prometheus-mcp-apikey \
+  --from-literal="api-keys=$(openssl rand -hex 32)"
+helm upgrade prometheus-mcp helm/ -n prometheus-mcp --reuse-values \
+  --set apiKey.existingSecret=prometheus-mcp-apikey
+```
+
+Keys are a comma-separated list (`api-keys=new,old`) — that is the rotation
+mechanism (append → move clients → drop the old, no downtime).
+
+**Migrating from the no-key posture:** nothing to do to keep current
+behavior — with no Secret referenced, the server keeps running open with
+the warning. To tighten a deployment, create + reference the Secret as
+above; in-cluster callers (LLM gateway, DSH) then present the key in
+`Authorization: Bearer …` or `X-API-Key` (update those clients' configs in
+the same change). Saved-query storage itself has no auth layer of its own —
+the gate is transport-level on `/mcp` only.
 
 ## Deploy on PCAI (HPE Private Cloud AI)
 
@@ -132,6 +173,7 @@ forgets every saved query. Sub-keys:
 | `persistence.size` | `1Gi` | PVC storage request. |
 | `persistence.storageClass` | `""` | Empty = cluster default StorageClass. |
 | `persistence.accessModes` | `[ReadWriteOnce]` | `replicaCount > 1` with a RWO class strands extra replicas Pending — flip to a RWX class (gl4f-filesystem RWX on G2) or keep 1 replica (the fleet default). |
+| `persistence.shared` | `false` | **Per-replica honesty:** the store is per-replica — `replicaCount > 1` fragments stores (each replica keeps its own memory/file) and the server cannot know its own replica count. Set `true` ONLY when the store is genuinely shared across replicas (single replica, or a RWX volume every replica mounts); it renders `PROMETHEUS_SAVED_QUERIES_SHARED=1` and silences the per-replica warning `query_save` otherwise attaches to its result. It is a declaration about the deployment, **not** concurrency control — there is no cross-process locking (a multi-writer JSON store would lose updates silently). |
 
 ### Standard Kubernetes knobs
 
@@ -233,7 +275,12 @@ A small name→{query, params} store:
   tool result says so ("in-memory only for this session — set
   PROMETHEUS_SAVED_QUERIES_PATH to persist"). Set → a **durable JSON file**
   at that path. The store is per-process (each replica keeps its own; the
-  file is per-replica state, not a shared multi-writer database).
+  file is per-replica state, not a shared multi-writer database). A
+  multi-replica deployment therefore fragments stores — the server says so
+  honestly: every `query_save` result carries a `Storage:` line
+  (`shared=false` + the store path) plus a warning naming
+  `PROMETHEUS_SAVED_QUERIES_SHARED` (see the chart's `persistence.shared`
+  above) until the deployment declares the store genuinely shared.
 - **Writes are atomic** — every mutation writes a temp file in the same
   directory, fsyncs, then `os.replace`s it over the target. A failed write
   (disk full, …) rolls the store back and leaves the previous file

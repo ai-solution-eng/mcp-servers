@@ -50,5 +50,18 @@ networkPolicy:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []
 
+# -- Transport security (DNS-rebinding protection) ----------------------------------
+# This profile is zone-hardened: in-cluster callers arrive through the
+# network zone, so list the EXTRA svc-DNS names they actually use (verbatim
+# or host:*; loopback is always allowed) — the chart AUTO-prepends the
+# release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the first allowlist
+# entry. Set mcpHostname to the same host the ezua VirtualService serves so
+# gateway-fronted requests keep their Host header accepted (unset there →
+# 421).
+mcpHostname: applygate-mcp.${DOMAIN_NAME}
+extraAllowedHosts:
+  - applygate-mcp.*.svc.cluster.local
+
 # The VirtualService STAYS rendered (fleet doctrine 2026-09): external/browser
 # traffic keeps flowing through the SSO-gated edge gateway exactly as pre-zone.

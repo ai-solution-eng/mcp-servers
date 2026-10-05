@@ -50,8 +50,7 @@ import threading
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 try:  # preferred backend: the real prometheus_client, when the env has it
-    from prometheus_client import CollectorRegistry
-    from prometheus_client import Counter as _PromCounter
+    from prometheus_client import CollectorRegistry, Counter as _PromCounter
 
     _HAVE_PROMETHEUS_CLIENT = True
 except ImportError:  # dependency-free fallback, same 0.0.4 text exposition
@@ -84,7 +83,9 @@ class _MiniCounter:
             f"# TYPE {self._name} counter",
         ]
         for labelvalues, value in values:
-            labels = ",".join(f'{name}="{val}"' for name, val in zip(self._labelnames, labelvalues))
+            labels = ",".join(
+                f'{name}="{val}"' for name, val in zip(self._labelnames, labelvalues)
+            )
             lines.append(f"{self._name}{{{labels}}} {value}")
         return "\n".join(lines) + "\n"
 
@@ -193,7 +194,9 @@ def _result_is_error(result, error_result) -> bool:
     try:
         return bool(error_result(result))
     except Exception:  # a broken predicate must never break a tool call
-        logging.getLogger("mcp-fleet-common.metrics").debug("metrics error_result predicate failed", exc_info=True)
+        logging.getLogger("mcp-fleet-common.metrics").debug(
+            "metrics error_result predicate failed", exc_info=True
+        )
         return False
 
 
@@ -260,7 +263,9 @@ def instrument(
     async def counted_call_tool(name, arguments=None, context=None):
         label = resolve_label(name)
         try:
-            result = await original(name, arguments if arguments is not None else {}, context)
+            result = await original(
+                name, arguments if arguments is not None else {}, context
+            )
         except BaseException:
             metrics.inc(label, "error")
             raise
@@ -296,7 +301,9 @@ class AppMetrics:
         self.CONTENT_TYPE = CONTENT_TYPE
         self._HAVE_PROMETHEUS_CLIENT = _HAVE_PROMETHEUS_CLIENT
         self._MiniCounter = _MiniCounter
-        self.METRICS = Metrics(metric_prefix=metric_prefix, display_name=display_name)
+        self.METRICS = Metrics(
+            metric_prefix=metric_prefix, display_name=display_name
+        )
 
     def instrument(self, mcp_server, *, error_result=None) -> None:
         instrument(mcp_server, self.METRICS, error_result=error_result)

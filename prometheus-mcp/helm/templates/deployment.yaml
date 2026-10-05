@@ -32,6 +32,48 @@ spec:
             # (the v0.1.0 release queried a hostname that was literally that).
             - name: PROM_URL
               value: {{ .Values.prometheusUrl | quote }}
+            {{- if .Values.apiKey.existingSecret }}
+            # OPTIONAL MCP API-key auth (fleet decision 2026-09, searxng
+            # pattern): wired ONLY when the values point at a pre-deployed
+            # Secret; unset → /mcp runs open with a loud startup warning
+            # (gateway-fronted deployments). The server scopes the gate to
+            # /mcp only — /health, /healthz, the console and /api/* stay
+            # key-free, so probes and the ServiceMonitor scrape are
+            # unaffected. The key is ALWAYS out-of-band (the chart never
+            # creates the Secret and never inlines a key).
+            - name: PROMETHEUS_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            {{- end }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection;
+            # K8S-MCP fleet pattern). With neither this AND
+            # extraAllowedHosts set, the server leaves the SDK's implicit
+            # loopback-only protection untouched (local-dev behavior).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (ezua endpoint pinned or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
             {{- with .Values.gpuNvlinkDomains }}
             # GPU-tab NVLink island grouping (see values.yaml). Accepts the
             # JSON string the server parses or a native YAML list — both
@@ -43,6 +85,13 @@ spec:
               {{- else }}
               value: {{ . | toJson | quote }}
               {{- end }}
+            {{- end }}
+            {{- with .Values.nodeFilter }}
+            # Nodes-tab default selection (see values.yaml): a node-name
+            # regex; "all" shows every node. Omitted when empty so the
+            # server default (auto-detected GPU nodes) applies.
+            - name: PROM_UI_NODE_FILTER
+              value: {{ . | quote }}
             {{- end }}
             {{- if .Values.metrics.enabled }}
             # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
@@ -63,6 +112,15 @@ spec:
             # crash-safe; nothing else in this server writes to the volume).
             - name: PROMETHEUS_SAVED_QUERIES_PATH
               value: {{ printf "%s/%s" .Values.persistence.mountPath .Values.persistence.savedQueriesFile | quote }}
+            {{- if .Values.persistence.shared }}
+            # Per-replica honesty: the operator declared the store genuinely
+            # shared across replicas (single replica, or RWX volume mounted
+            # by every replica) — silences the per-replica warning that
+            # query_save otherwise attaches. It is a declaration, NOT
+            # concurrency control (no cross-process locking exists).
+            - name: PROMETHEUS_SAVED_QUERIES_SHARED
+              value: "1"
+            {{- end }}
             {{- end }}
           startupProbe:
             httpGet:

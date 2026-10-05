@@ -74,7 +74,7 @@ spec:
             - name: K8S_MCP_BLOCKED_NAMESPACES
               value: {{ .Values.namespaces.blocked | quote }}
             {{- if .Values.listing.maxItems }}
-            # Cluster-wide list cap (server default 500 when unset; a
+            # Cluster-wide list cap (server default 100 when unset; a
             # truncation marker naming the env appears when the cap bites).
             - name: K8S_MCP_MAX_LIST_ITEMS
               value: {{ .Values.listing.maxItems | quote }}
@@ -84,6 +84,18 @@ spec:
             # default 8 when unset).
             - name: K8S_MCP_LIST_CONCURRENCY
               value: {{ .Values.listing.concurrency | quote }}
+            {{- end }}
+            {{- if .Values.listing.maxEvents }}
+            # Event cap for get_events / triage warnings (server default 100
+            # when unset).
+            - name: K8S_MCP_MAX_EVENTS
+              value: {{ .Values.listing.maxEvents | quote }}
+            {{- end }}
+            {{- if .Values.listing.maxNsRewrite }}
+            # Per-namespace rewrite limit for whitelisted -A queries (server
+            # default 20 when unset).
+            - name: K8S_MCP_MAX_NS_REWRITE
+              value: {{ .Values.listing.maxNsRewrite | quote }}
             {{- end }}
             {{- if .Values.clients.existingSecret }}
             - name: K8S_MCP_CLIENTS

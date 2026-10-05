@@ -20,7 +20,7 @@ deployment:
 # pullPolicy stays Always on purpose (see helm/values.yaml).
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.6.1
+  tag: v0.7.0
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -65,6 +65,9 @@ service:
 # SITE: flip to true so user-saved queries survive pod updates; the chart
 # default (in-memory store) forgets them on every reschedule. replicaCount > 1
 # with a RWO class strands extra replicas Pending — RWX class or 1 replica.
+# shared (default false) declares the store genuinely shared across replicas
+# (silences the per-replica warning in query_save results) — keep false for
+# multi-replica stores that are NOT shared: fragmented stores should stay loud.
 persistence:
   enabled: false
   mountPath: /data
@@ -73,6 +76,7 @@ persistence:
   accessModes:
     - ReadWriteOnce
   savedQueriesFile: saved-queries.json
+  shared: false
 
 # -- Resources --------------------------------------------------------------------------------
 resources:

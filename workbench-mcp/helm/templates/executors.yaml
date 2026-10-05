@@ -1,0 +1,220 @@
+{{- if .Values.executors.enabled }}
+# workbench-exec — the sandbox-exec v1 executor pool (ADDITIVE, DEFAULT OFF).
+#
+# A separate always-running Deployment in the SAME namespace running the SAME
+# image as the workbench server (one image, different command — no new image
+# to build): the executors sleep forever, and `sandbox_run` dispatches a
+# python file into one of them via the Kubernetes exec subresource.
+#
+# Hardening (each item test-asserted in tests/test_sandbox_exec.py):
+#   - automountServiceAccountToken: false — an executor has NO credentials.
+#   - non-root (runAsNonRoot + uid 10001 = the image user), no privilege
+#     escalation, ALL capabilities dropped, seccomp RuntimeDefault.
+#   - readOnlyRootFilesystem + a per-pod emptyDir at /tmp (python needs a
+#     writable temp dir; the scratch resets with the pod — stateless runs).
+#   - Modest fixed resources (requests 100m/128Mi, limits 1 CPU/512Mi).
+#   - NO tolerations block AT ALL: control-plane NoSchedule taints
+#     self-exclude the pool — it schedules on workers only without this chart
+#     needing to know the worker label.
+#   - nodeAffinity requires the absence of the control-plane role label
+#     (workers only, expressed without the worker label).
+#   - topologySpreadConstraint over kubernetes.io/hostname (maxSkew 1,
+#     ScheduleAnyway) — spread the pool over the workers, soft so a
+#     single-node cluster still schedules.
+#   - NO GPU resource keys anywhere: without an `nvidia.com/gpu` request the
+#     scheduler structurally cannot grant GPU access.
+#
+# The companion NetworkPolicy (same file, below) selects these pods with
+# policyTypes [Ingress, Egress] and NO rules = deny-all BOTH directions.
+# Exec needs no network: workbench → API server → kubelet → container
+# runtime, and the result rides the same connection back. The executor pod
+# itself never opens a socket. (DNS: nothing to resolve — it runs what it is
+# handed on stdin and prints.)
+#
+# RBAC (also below, same gate): Role + RoleBinding giving the workbench SA
+# get/list on pods and create on pods/exec IN THE RELEASE NAMESPACE ONLY.
+# Honest limit: RBAC cannot select pods by label, so this permits exec into
+# ANY pod in the workbench namespace — which holds only workbench + executor
+# pods by design. This is the sandbox-exec v1 trust-posture change, bounded
+# to one namespace and documented in the README.
+#
+# Values: executors.* (see helm/values.yaml). Everything in this file renders
+# only when executors.enabled: true — the default render is byte-identical to
+# the baseline.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}-exec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.executors.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.executors.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.executors.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.executors.appName }}
+    spec:
+      # No credentials on executors: the pod never talks to the API server,
+      # so there is nothing for a script to steal. Test-asserted.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Workers only, WITHOUT needing the worker label: require the ABSENCE
+      # of the control-plane role label (self-exclusion via NoSchedule taints
+      # would do the same; this makes it explicit and auditable).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ .Values.executors.appName }}
+      containers:
+        - name: {{ .Values.executors.containerName }}
+          # executors.image may be a plain reference OR a helm expression
+          # (the shipped default is `{{ .Values.image.repository }}:{{ .Values.image.tag }}`,
+          # which values files do NOT template by themselves — helm 4 renders
+          # values verbatim) — `tpl` evaluates it at the consumption point,
+          # and a plain string passes through tpl unchanged.
+          image: {{ tpl (.Values.executors.image | toString) . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No shell, no MCP server: sleep forever (2147483647 s ≈ 68 years).
+          # Every sandbox_run execs a fresh `python3 -I --` against this
+          # container; the pod stays stateless by construction.
+          command:
+            - python3
+            - -c
+            - "import time; time.sleep(2147483647)"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          # python needs a writable temp dir under the read-only rootfs; the
+          # scratch is per-pod and vanishes with it (stateless runs by design).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Values-gated HPA (executors.autoscaling.enabled, default false): scale the
+# pool between minReplicas and maxReplicas on CPU. The executor sleeps at ~0%
+# CPU when idle, so CPU is a serviceable signal for "how many runs are in
+# flight" (a python run pegs its 1-CPU limit while it works).
+{{- if .Values.executors.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Values.deployment.name }}-exec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.executors.appName }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.deployment.name }}-exec
+  minReplicas: {{ .Values.executors.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.executors.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.executors.autoscaling.targetCPUUtilizationPercentage }}
+---
+{{- end }}
+# Deny-all NetworkPolicy for the executor pool: policyTypes lists Ingress AND
+# Egress and there are NO rules — both directions default-deny. The executor
+# needs no network (exec rides workbench → API server → kubelet → container
+# runtime) and must never reach the cluster, the workbench volume, or the
+# internet. Test-asserted: rendered yaml has both policyTypes and zero rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-exec-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.executors.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.executors.appName }}
+  # NO ingress: block. NO egress: block. The absence of both rule blocks IS
+  # the posture — do not "fix" this template by adding rules.
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# RBAC — the ONE posture change of sandbox-exec v1, same-namespace only
+# (shape follows the logsearch chart's rbac.yaml). The workbench SA gains:
+#   get/list on pods           — executor-pool discovery/selection
+#   create on pods/exec        — the exec subresource (dispatch a run)
+# RBAC cannot select pods by label: this permits exec into ANY pod in the
+# workbench namespace. That namespace holds only workbench + executor pods by
+# design, the workbench SA has no credentials beyond this namespace, and the
+# workbench API surface stays API-key-gated — the residual is documented in
+# the README ("Trust posture").
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.deployment.name }}-exec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.executors.appName }}
+rules:
+  # Executor-pool discovery (sandbox_run's least-loaded pod selection).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # The exec subresource — the dispatch path of sandbox_run. Namespaced only:
+  # the workbench SA can exec into pods of ITS OWN namespace and nothing else.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-exec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.executors.appName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.deployment.name }}-exec
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.deployment.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

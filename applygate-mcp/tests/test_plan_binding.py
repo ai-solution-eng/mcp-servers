@@ -348,3 +348,84 @@ def test_unplanned_apply_refusal_is_audit_logged(tmp_path):
     assert len(lines) == 1
     assert lines[0]["tool"] == "apply_manifest" and lines[0]["outcome"] == "refused"
     assert lines[0]["dry_run"] is False
+
+
+# ---------------------------------------------------------------------------
+# Superseded-plan visibility (D11) — "latest plan wins" is unchanged; the
+# supersession is now VISIBLE on the plan response, and the tamper refusal
+# carries the re-plan hint.
+# ---------------------------------------------------------------------------
+
+
+def test_first_plan_is_not_marked_superseded(monkeypatch):
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    plan = parse(run(server.plan_apply(namespace="team-a", manifest=SIMPLE)))
+    assert plan["ok"] is True
+    assert "superseded_plan" not in plan
+    assert "newer plan_apply supersedes" not in plan["note"]
+
+
+def test_replanning_a_different_manifest_reports_superseded_plan(monkeypatch):
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    v1 = manifest(doc(name="app-config", data={"rev": "1"}))
+    v2 = manifest(doc(name="app-config", data={"rev": "2"}))
+    first = parse(run(server.plan_apply(namespace="team-a", manifest=v1)))
+    assert "superseded_plan" not in first
+    second = parse(run(server.plan_apply(namespace="team-a", manifest=v2)))
+    assert second["ok"] is True
+    assert second["superseded_plan"] is True
+    assert "newer plan_apply supersedes older planned bytes" in second["note"]
+    assert "apply_manifest binds to the latest plan only" in second["note"]
+
+
+def test_replanning_identical_bytes_is_not_supersession(monkeypatch):
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    run(server.plan_apply(namespace="team-a", manifest=SIMPLE))
+    again = parse(run(server.plan_apply(namespace="team-a", manifest=SIMPLE)))
+    assert "superseded_plan" not in again  # same sha → nothing was superseded
+
+
+def test_supersession_is_namespaced(monkeypatch):
+    allow(monkeypatch, "team-a", "team-b")
+    install_apply_spy(monkeypatch)
+    v1 = manifest(doc(name="app-config", data={"rev": "1"}))
+    v2 = manifest(doc(name="app-config", data={"rev": "2"}))
+    run(server.plan_apply(namespace="team-a", manifest=v1))
+    other = parse(run(server.plan_apply(namespace="team-b", manifest=v2)))
+    assert "superseded_plan" not in other  # a different namespace's plan
+
+
+def test_apply_tampered_bytes_refusal_carries_replan_hint(monkeypatch):
+    """plan-good-A → plan-bad-B → apply-A still refuses, and the refusal now
+    says HOW to recover: re-plan the exact bytes you intend to apply."""
+    allow(monkeypatch, "team-a")
+    spy = install_apply_spy(monkeypatch)
+    run(server.plan_apply(namespace="team-a", manifest=SIMPLE))
+    other = manifest(doc(name="app-config", data={"k": "other"}))
+    run(server.plan_apply(namespace="team-a", manifest=other))  # supersedes A
+    stale = parse(run(server.apply_manifest(namespace="team-a", manifest=SIMPLE, confirm_apply=True)))
+    assert stale["refused"] is True
+    assert stale["hint"] == "re-run plan_apply on the exact bytes you intend to apply"
+    assert "do not match the planned bytes" in stale["error"]
+    assert all(c["dry_run"] is True for c in spy.calls)  # still nothing applied
+
+
+def test_apply_refusal_without_any_plan_also_carries_the_hint(monkeypatch):
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    out = parse(run(server.apply_manifest(namespace="team-a", manifest=SIMPLE, confirm_apply=True)))
+    assert out["refused"] is True
+    assert out["hint"] == "re-run plan_apply on the exact bytes you intend to apply"
+
+
+def test_confirmed_apply_refusals_other_than_binding_keep_the_plain_shape(monkeypatch):
+    """The hint rides ONLY the D11 binding refusal — policy/manifest refusals
+    keep the exact {"ok","refused","error"} shape."""
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    out = parse(run(server.apply_manifest(namespace="team-a", manifest=":::not yaml:::", confirm_apply=True)))
+    assert out["refused"] is True
+    assert set(out) == {"ok", "refused", "error"}

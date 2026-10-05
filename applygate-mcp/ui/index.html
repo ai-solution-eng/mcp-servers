@@ -449,6 +449,7 @@
           <option value="500">last 500</option>
         </select>
         <button id="audit-refresh" class="ghost copy-btn">↻ refresh</button>
+        <button id="audit-verify" class="ghost copy-btn">✓ verify chain</button>
       </h2>
       <div class="result-meta" id="audit-meta"></div>
       <div id="audit-table"><div class="empty">no audit lines loaded</div></div>
@@ -737,7 +738,7 @@ function renderAudit(data) {
     (data.exists ? "" : '<span class="hint">(file not created yet)</span>') +
     "<span>" + data.n_total + " line(s)" + (data.window_truncated ? " in tail window" : "") + "</span>" +
     "<span>showing " + data.n_shown + "</span>" +
-    (data.malformed ? '<span class="bad">malformed: ' + data.malformed + "</span>" : "");
+    (data.malformed ? '<span class="badge fail">malformed: ' + data.malformed + "</span>" : "");
   const entries = data.entries || [];
   if (!entries.length) {
     $("audit-table").innerHTML = '<div class="empty">no audit entries yet — plans, applies, deletes and refusals will appear here</div>';
@@ -750,6 +751,26 @@ function renderAudit(data) {
       "</td><td>" + esc(e.kind || "") + "</td><td>" + esc(e.name || "") + "</td><td>" +
       (e.dry_run ? "true" : "false") + "</td><td>" + outcomeBadge(e.outcome) + "</td></tr>"
     ).join("") + "</tbody></table>";
+}
+
+// Hash-chain verdict for the configured audit file (read-only, parameter-free).
+async function verifyAuditChain() {
+  $("audit-meta").innerHTML = '<span class="hint">verifying hash chain…</span>';
+  try {
+    const v = await api("/api/audit/verify");
+    const ok = v.ok && v.exists;
+    const badgeCls = "badge " + (ok ? "ok" : "fail");
+    $("audit-meta").innerHTML =
+      '<span class="' + badgeCls + '">' + (ok ? "chain OK" : "CHAIN BROKEN / unavailable") + "</span>" +
+      '<span class="hint" style="overflow-wrap:anywhere">' + esc(v.file || "?") + "</span>" +
+      (v.exists ? "" : '<span class="hint">(file not created yet)</span>') +
+      "<span>" + v.entries + " chained</span>" +
+      (v.legacy_entries ? "<span>" + v.legacy_entries + " legacy root(s)</span>" : "") +
+      (v.first_bad_line ? '<span class="badge fail">first bad line: ' + v.first_bad_line + "</span>" : "") +
+      (v.error ? '<span class="badge fail">' + esc(v.error) + "</span>" : "");
+  } catch (e) {
+    $("audit-meta").innerHTML = '<span class="badge fail">' + esc(e.message) + "</span>";
+  }
 }
 
 // ---- POLICY panel ---------------------------------------------------------------------
@@ -825,6 +846,7 @@ $("plan-manifest").addEventListener("keydown", (e) => { if ((e.ctrlKey || e.meta
 $("status-run").addEventListener("click", runStatus);
 $("audit-refresh").addEventListener("click", loadAudit);
 $("audit-lines").addEventListener("change", loadAudit);
+$("audit-verify").addEventListener("click", verifyAuditChain);
 $("audit-auto").addEventListener("change", () => {
   clearInterval(state.autoTimer);
   state.autoTimer = null;

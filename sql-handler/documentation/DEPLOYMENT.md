@@ -400,9 +400,45 @@ or read it off an audit line's `caller.key_fp`):
 (`X-API-Key`/`Bearer`, bound to their fingerprint), gateway relay attribution
 (`X-MCP-Caller-Subject` over a key-valid request — the MCP-bundle topology
 where the gateway holds the key), SSO bearer JWTs (verified via JWKS with the
-`security.oidc.*` values above), and oauth2-proxy browser headers (only with
-the workload AuthorizationPolicy enabled — the existing
-`security.identity.trustBrowserHeaders` pin).
+`security.oidc.*` values above), the app's own browser-SSO session cookie
+(D22, below — the verified token the `/oauth/oidc/callback` flow plants), and
+oauth2-proxy browser headers (only with the workload AuthorizationPolicy
+enabled — the existing `security.identity.trustBrowserHeaders` pin).
+
+#### Browser SSO (D22 — the MM-RAG parity, `scripts/configure-oidc-sql.sh`)
+
+Where the edge proxy does not forward the access token, the browser-header
+rung can only resolve the IdP's `sub` UUID — the UI chip would read
+`Signed in as 1d2fee26-… (browser)`. The D22 flow makes the app an OIDC
+**client**: `/oauth/login` → realm → `/oauth/oidc/callback` exchanges +
+verifies the token with the SAME D21 machinery (no new trust) and plants the
+HttpOnly `pcai-sso` cookie, the ladder's LOWEST-priority envelope. The
+resolved subject is the verified `preferred_username` — the same string
+policy grants and self-minted keys bind to (`subject:<name>` rows).
+
+One-time setup per environment (`scripts/configure-oidc-sql.sh`, run from a
+kubectl-configured terminal; idempotent):
+
+1. Registers `https://<endpoint>/oauth/oidc/callback` in the UA realm's `ua`
+   client — appended to the EXISTING redirect URIs (MM-RAG's stays), PUT
+   field-scoped to `clientId`/`name`/`redirectUris` so concurrent client
+   edits survive, and VERIFIED after the write (a lying 200 aborts).
+2. Prints the ready-to-paste `security.oidc.sso` values block and the client
+   secret ONCE (masked in the comment, full value on its own line). Secret
+   paths: (a) the PCAI values-editor envsubst `${OIDC_CLIENT_SECRET}` — what
+   MM-RAG runs — or (b) your own Secret via `clientExistingSecret`
+   (`kubectl -n sqlhandler create secret generic oidc-client
+   --from-literal=clientSecret=…`). The script never writes the secret
+   anywhere but the terminal.
+
+Chart wiring: `security.oidc.sso.*` renders ONLY when `sso.enabled: true`
+(default render byte-identical; inert = the `/oauth/*` routes 404 and no
+cookie is ever accepted). `SQLHANDLER_TRUST_BROWSER_HEADERS` can stay on —
+the cookie rung sits BELOW the explicit-credential rungs and ABOVE the
+header rung, so a signed-in SSO visitor resolves as `andrew-bydlon (oidc)`
+while a key-presentation still wins. `/api/whoami` (public identity probe)
+gains `sso_login_available` so the UI chip offers the sign-in link only when
+the flow is actually served.
 
 #### Administering from the frontend (Access-control panel)
 

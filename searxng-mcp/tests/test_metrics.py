@@ -106,7 +106,9 @@ def test_counters_increment_search_outcomes(monkeypatch):
     with running(monkeypatch, enabled=True) as metrics_text:
         real_searcher, real_formatter = server.searcher, server.format_search_response
         server.searcher = _StubSearcher()
-        server.format_search_response = lambda resp, limit: "stub-search-ok"
+        # **_: format_search_response gained a keyword seam (engine_hint) —
+        # the stub accepts the tool's full call signature.
+        server.format_search_response = lambda resp, limit, **_: "stub-search-ok"
         try:
             call_tool("search", {"query": "metrics smoke"})
         finally:

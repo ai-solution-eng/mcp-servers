@@ -12,6 +12,7 @@ Run:  python -m pytest tests/test_auth.py -v
 import pytest
 from starlette.testclient import TestClient
 
+import mcp_auth
 import server
 
 
@@ -127,3 +128,55 @@ def test_universal_and_server_keys_are_unioned(app, monkeypatch):
     with TestClient(app) as c:
         assert c.get("/api/status", headers={"X-API-Key": "uni-key"}).status_code == 200
         assert c.get("/api/status", headers={"X-API-Key": "wb-key"}).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# transport security from env (fleet-shared mcp_auth adoption)
+# ---------------------------------------------------------------------------
+
+
+def test_transport_security_adopted_from_shared_helper():
+    """server.py must bind the SHARED helper's output, not hand-construct
+    settings (the fleet one-address pattern; K8S-MCP precedent)."""
+    assert mcp_auth.transport_security_from_env is not None
+    # The module-level binding IS the helper's result for import-time env.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    assert server._mcp_transport_security is None or isinstance(
+        server._mcp_transport_security, TransportSecuritySettings
+    )
+
+
+def test_transport_security_dev_mode_is_none(monkeypatch):
+    """No MCP_HOSTNAME / MCP_EXTRA_ALLOWED_HOSTS → None (the SDK's implicit
+    default applies untouched — loopback auto-protection on a loopback bind)."""
+    monkeypatch.delenv("MCP_HOSTNAME", raising=False)
+    monkeypatch.delenv("MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    assert mcp_auth.transport_security_from_env() is None
+
+
+def test_transport_security_pinned_hostname(monkeypatch):
+    """MCP_HOSTNAME turns protection ON with the pinned FQDN + loopback and
+    the https-only browser-form Origin allowlist (mcp_auth contract)."""
+    monkeypatch.setenv("MCP_HOSTNAME", "workbench.example.com")
+    monkeypatch.delenv("MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    ts = mcp_auth.transport_security_from_env()
+    assert ts is not None and ts.enable_dns_rebinding_protection is True
+    assert ts.allowed_hosts == ["workbench.example.com", "localhost:*", "127.0.0.1:*"]
+    assert ts.allowed_origins == ["https://workbench.example.com"]
+
+
+def test_transport_security_extra_allowed_hosts(monkeypatch):
+    """In-cluster svc-DNS callers: MCP_EXTRA_ALLOWED_HOSTS joins the Host
+    allowlist (verbatim or host:*); no Origin entries without a hostname."""
+    monkeypatch.delenv("MCP_HOSTNAME", raising=False)
+    monkeypatch.setenv("MCP_EXTRA_ALLOWED_HOSTS", "wb-service.ns.svc.cluster.local:*, wb2.ns.svc.cluster.local")
+    ts = mcp_auth.transport_security_from_env()
+    assert ts is not None and ts.enable_dns_rebinding_protection is True
+    assert ts.allowed_hosts == [
+        "wb-service.ns.svc.cluster.local:*",
+        "wb2.ns.svc.cluster.local",
+        "localhost:*",
+        "127.0.0.1:*",
+    ]
+    assert ts.allowed_origins == []

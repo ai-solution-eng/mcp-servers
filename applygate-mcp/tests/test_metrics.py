@@ -107,3 +107,18 @@ def test_metric_labels_carry_no_resource_identity(monkeypatch, tmp_path):
     c = server._metric_tool_calls()
     assert c is not None
     assert set(c._labelnames) == {"tool", "outcome"}
+
+
+def test_metrics_route_served_when_enabled_prom_installed(monkeypatch, pytestconfig):
+    """The matrix test above (test_metrics_route_served_when_enabled) pins
+    BOTH paths; this variant pins the prometheus-client-present assertion
+    shape so a venv WITH the package cannot silently regress the fallback
+    text and vice versa. Skipped where the package is absent (the fleet
+    unit-test venv) exactly like test_tool_call_counter_increments_on_audit."""
+    if not HAS_PROM_CLIENT:
+        pytest.skip("prometheus-client not installed in this env")
+    monkeypatch.setenv(server.METRICS_ENV, "true")
+    with TestClient(server._build_http_app()) as c:
+        r = c.get("/metrics")
+        assert r.status_code == 200
+        assert "applygate_tool_calls_total" in r.text

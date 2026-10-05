@@ -45,6 +45,33 @@ spec:
             # an empty allowlist means every namespace is searchable.
             - name: LOGSEARCH_EMPTY_ALLOWS_ALL
               value: {{ .Values.logsearch.emptyAllowsAll | quote }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection ON
+            # with the mcp_auth.transport_security_from_env allowlist). The
+            # MCP path is gateway-fronted, so without this pin every gateway
+            # request would 421 "Invalid Host header" (the K8S-MCP lesson).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (ezua endpoint pinned or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
             # API keys for /mcp — MANDATORY (fleet decision 2026-09). Always
             # from an operator-created Secret (existingSecret-only, the
             # K8S-MCP invariant): the pod fails loud

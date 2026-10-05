@@ -27,6 +27,10 @@ Contract:
   and validation all apply; nothing here re-implements a query).
 * The store is per-process (each replica has its own); the file is
   per-replica state, not a shared multi-writer database.
+  ``PROMETHEUS_SAVED_QUERIES_SHARED`` (default "0") lets the deployment
+  declare otherwise — "1" says the store really is shared (single replica
+  or a RWX volume every replica mounts) and silences the per-replica
+  warning in save results. See :func:`storage_facts`.
 """
 
 from __future__ import annotations
@@ -38,6 +42,18 @@ import tempfile
 import time
 
 SAVED_QUERIES_ENV = "PROMETHEUS_SAVED_QUERIES_PATH"
+
+# Deployment honesty (Wave-5 follow-up): the store is PER-REPLICA — a
+# multi-replica deployment fragments stores (each replica keeps its own
+# memory/file), whatever the path is. The server cannot know its own
+# replica count, so the deployment declares it: SHARED_ENV=1 says the store
+# is genuinely shared across replicas (single replica, or a RWX volume every
+# replica mounts) and silences the per-replica warning; the default "0"
+# keeps the honest warning in every query_save result. This is a
+# DECLARATION about the deployment, not a concurrency feature — no
+# cross-process locking is implemented (a multi-writer JSON store would be
+# worse: lost updates with no error; see README).
+SHARED_ENV = "PROMETHEUS_SAVED_QUERIES_SHARED"
 
 # Upper bounds (honest caps instead of unbounded growth): 100 saved
 # queries, names up to 64 chars. Saving one more past the cap fails with
@@ -60,6 +76,35 @@ def saved_queries_path(environ: dict[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     raw = (env.get(SAVED_QUERIES_ENV) or "").strip()
     return raw or None
+
+
+# The warning appended to query_save results while the deployment has NOT
+# declared its store shared (default). Honest by default: the fleet default
+# is one replica, but nothing stops replicaCount > 1 — and a silently
+# fragmented store looks like "saved queries disappear randomly".
+_NOT_SHARED_WARNING = (
+    "saved queries live on this replica only (PROMETHEUS_SAVED_QUERIES_SHARED=0)"
+    " — multi-replica deployments fragment stores; see README"
+)
+
+
+def storage_shared(environ: dict[str, str] | None = None) -> bool:
+    """Has the deployment declared its saved-query store shared?"""
+    env = os.environ if environ is None else environ
+    return (env.get(SHARED_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def storage_facts(environ: dict[str, str] | None = None) -> dict:
+    """The ``storage`` block query_save attaches to its result: where the
+    store lives and whether the deployment has declared it shared. When NOT
+    declared shared, ``warning`` carries the honest per-replica caveat
+    (empty when shared — no noise for the common single-replica case)."""
+    path = saved_queries_path(environ)
+    shared = storage_shared(environ)
+    facts: dict = {"path": path, "shared": shared}
+    if not shared:
+        facts["warning"] = _NOT_SHARED_WARNING
+    return facts
 
 
 def sanitize_name(name: str) -> str:

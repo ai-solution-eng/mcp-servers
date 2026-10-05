@@ -69,6 +69,8 @@ touch these directly:
 | `APPLYGATE_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
 | `APPLYGATE_CLIENTS` | `clients.existingSecret{,Key}` (only when set) — the caller-name registry Secret |
 | `MCP_CALLER_TRUSTED_CIDRS` | `callerPassthrough.trustedCidrs` (only when set; empty = header ignored everywhere) |
+| `MCP_HOSTNAME` | `mcpHostname` (only when set; pins the public FQDN for DNS-rebinding protection) |
+| `MCP_EXTRA_ALLOWED_HOSTS` | own service DNS FIRST (`<deployment.name>-service.<ns>.svc.cluster.local:*` — the gateway relay's Host header, always included when transport security is active), then `extraAllowedHosts` joined with commas; absent when neither `mcpHostname` nor `extraAllowedHosts` is set (dev) |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*` — each key wired only when non-empty (empty = not rendered) |
 
 ## Gateway exposure (ezua / Istio)
@@ -111,9 +113,10 @@ Behavior that differs by target, and the paste-ready values for each
 
 ### Proxied corporate site (SITE: your-cluster.example)
 
-- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
-  write the literal domain into `ezua.domainName` and
-  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Domain.** PCAI envsubsts `${DOMAIN_NAME}` in pasted values before
+  rendering, so the hosted-trial placeholders work as-pasted; the G2 site
+  files deliberately carry the literal domain instead (plain `helm -f`
+  readability — either form deploys correctly on PCAI).
 - **Fleet API key.** The shared fleet Secret `mcp-fleet-apikeys` (key
   `api-keys`), created cluster-side before the deploy — the examples point
   `apiKey.existingSecret` at it.

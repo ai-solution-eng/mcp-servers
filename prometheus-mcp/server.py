@@ -53,6 +53,20 @@ Configuration (environment variables):
                             (Wave-5 F4). Unset (default) → in-memory only
                             for the session (tool results say so); set →
                             durable, written atomically (tmp+rename).
+  PROMETHEUS_SAVED_QUERIES_SHARED  "1" declares the saved-query store
+                            genuinely shared across replicas (single replica
+                            or a RWX volume every replica mounts) and
+                            silences the per-replica warning query_save
+                            otherwise attaches (default "0" = warn).
+  PROMETHEUS_API_KEYS / MCP_API_KEYS  Comma-separated API keys gating /mcp
+                            (OPTIONAL per fleet decision 2026-09). Unset →
+                            /mcp runs open with a loud startup warning;
+                            /health, /healthz, the console, /api/* and
+                            /metrics are never keyed.
+  MCP_HOSTNAME / MCP_EXTRA_ALLOWED_HOSTS  DNS-rebinding Host allowlist:
+                            the pinned public FQDN + in-cluster svc-DNS
+                            hosts. Neither set → the SDK's implicit
+                            loopback-only protection (local dev).
   PROMETHEUS_METRICS_ENABLED  Serve the server's own /metrics counters
                             (Wave-3 C3; the chart gates this — default off).
 """
@@ -64,9 +78,9 @@ import traceback
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
 
+import mcp_auth
 import mcp_metrics
 import saved_queries
 from prom_client import (
@@ -93,9 +107,29 @@ print(
     file=sys.stderr,
 )
 
-_mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+# API-key auth (fleet pattern, shared module: pcai_utils/mcp_auth.py) —
+# OPTIONAL per fleet decision 2026-09 (read-only observation surface fronted
+# by the SSO gateway): /mcp requires a key ONLY when PROMETHEUS_API_KEYS (or
+# the fleet-universal MCP_API_KEYS) is configured — no keys → open, with a
+# loud startup warning. One-address wiring: the UNIVERSAL env is honored
+# alongside the per-server name (key sets unioned, constant-time compares);
+# comma-separated keys = the rotation story.
+PROMETHEUS_API_KEYS_ENV = "PROMETHEUS_API_KEYS"
+AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, PROMETHEUS_API_KEYS_ENV)
 
-
+# Transport security (DNS-rebinding Host allowlist) via the shared helper:
+# MCP_HOSTNAME pins the public FQDN (rendered by the chart from
+# ezua.virtualService.endpoint); MCP_EXTRA_ALLOWED_HOSTS adds in-cluster
+# svc-DNS hosts so local clients can call the server directly. Neither set
+# (local dev) → None = the SDK's implicit loopback-only protection, i.e.
+# the SAME behavior the hardcoded disabled-settings line had in dev, while
+# gateway-fronted deployments stop serving 421s to valid-key callers.
+# Evaluated at APP BUILD time via _build_transport_security(), which
+# re-reads env on EVERY call (the fleet pattern, see _metrics_enabled) —
+# so a chart-set env lands without import-order games. There is
+# deliberately NO module-level
+# snapshot: a constant would freeze whatever env existed at import and can
+# silently diverge from what the built app actually uses.
 def _err(context: str, exc: Exception) -> str:
     if isinstance(exc, PrometheusError):
         return f"Error: {exc}"
@@ -337,21 +371,31 @@ async def prom_alerts(ctx: Context) -> str:
     title="Prometheus Rules",
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
-async def prom_rules(ctx: Context, state: str = "", search: str = "") -> str:
+async def prom_rules(ctx: Context, state: str = "", search: str = "", max_rules: int = 50) -> str:
     """List alerting/recording rules, optionally filtered. Use it to learn
     WHAT is monitored and WHY an alert fires (each rule shows its expr):
     the bridge between 'something is firing' and 'here is the exact
     condition and threshold'.
 
+    Results are capped — a kube-prometheus-stack ships hundreds of rules,
+    and rendering every expr unbounded floods the context window (same
+    truncation convention as prom_series/prom_label_values).
+
     Args:
         state: Optional filter: 'firing', 'pending', or 'inactive'.
         search: Optional case-insensitive substring match on rule/alert names.
+        max_rules: Max rules rendered (default 50); more are summarized in
+            a truncation footer — narrow with state/search instead of paging.
+            JSON `true` is schema-coerced to 1 by the SDK (pydantic) before
+            this body runs — treat non-integer input as caller error.
         ctx: MCP context for logging.
     """
     try:
         state_l = (state or "").strip().lower()
         if state_l and state_l not in ("firing", "pending", "inactive"):
             return "Error: state must be one of firing, pending, inactive."
+        if not isinstance(max_rules, int) or isinstance(max_rules, bool) or max_rules < 1:
+            return "Error: max_rules must be a positive integer."
         search_l = (search or "").strip().lower()
         groups = await client.rules()
         lines = []
@@ -365,6 +409,8 @@ async def prom_rules(ctx: Context, state: str = "", search: str = "") -> str:
                 if search_l and search_l not in name.lower() and search_l not in str(r.get("query", "")).lower():
                     continue
                 total += 1
+                if total > max_rules:
+                    continue
                 kind = "alert" if r.get("type") == "alerting" else "record"
                 duration = r.get("duration", 0)
                 dur_s = f" for {int(duration)}s" if duration else ""
@@ -376,8 +422,11 @@ async def prom_rules(ctx: Context, state: str = "", search: str = "") -> str:
                     lines.append(f"      summary: {r['annotations']['summary']}")
         if not lines:
             return "No rules match the given filters."
-        header = f"{total} rule(s):"
-        return "\n".join([header, *lines])
+        header = f"{total} rule(s) (showing up to {max_rules}):" if total > max_rules else f"{total} rule(s):"
+        lines = [header, *lines]
+        if total > max_rules:
+            lines.append(f"  …[truncated {total - max_rules} more rules] — narrow with state/search or raise max_rules")
+        return "\n".join(lines)
     except Exception as e:
         return _err("rules", e)
 
@@ -413,6 +462,10 @@ async def query_save(name: str, query: str, ctx: Context, params: dict | None = 
     """Save a PromQL expression under a name for later reuse (distinct from the
     sqlhandler server's SQL query_save — this one stores PromQL).
 
+    /mcp requires an API key when PROMETHEUS_API_KEYS/MCP_API_KEYS are
+    configured (optional by design — without keys this server runs open);
+    the saved-query storage itself has no auth layer of its own — see README.
+
     Names are sanitized (letters/digits/space/._- ; everything else becomes
     '_'); saving under an existing name overwrites it. ``params`` optionally
     records run defaults for :func:`query_saved` — the same arguments the
@@ -429,11 +482,20 @@ async def query_save(name: str, query: str, ctx: Context, params: dict | None = 
     try:
         entry = saved_queries.get_store().save(name, query, params)
         suffix = f" (runs as {entry['params']['mode']})" if entry["params"].get("mode") else ""
-        return (
+        storage = saved_queries.storage_facts()
+        saved_line = (
             f"Saved {entry['name']!r} — {entry['query']}"
             f"{'; params: ' + _fmt_params(entry['params']) if entry['params'] else ''}"
-            f"{suffix}\nStore: {_store_note()}"
+            f"{suffix}"
         )
+        lines = [
+            saved_line,
+            f"Store: {_store_note()}",
+            f"Storage: shared={str(storage['shared']).lower()} — {storage['path'] or 'in-memory'}",
+        ]
+        if storage.get("warning"):
+            lines.append(f"Warning: {storage['warning']}")
+        return "\n".join(lines)
     except Exception as e:
         return _err("save query", e)
 
@@ -561,6 +623,13 @@ def _metrics_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _build_transport_security():
+    """TransportSecuritySettings for the MCP app, or None — the shared
+    mcp_auth helper's semantics, evaluated per BUILD (env re-read, the
+    fleet pattern; see the module-level comment above)."""
+    return mcp_auth.transport_security_from_env()
+
+
 def _build_http_app():
     """Starlette app for the streamable-http transport.
 
@@ -589,7 +658,7 @@ def _build_http_app():
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
-        transport_security=_mcp_transport_security,
+        transport_security=_build_transport_security(),
     )
     routes = [
         Route("/health", health),
@@ -604,18 +673,36 @@ def _build_http_app():
         # request counters for THIS server (no queries, label names, or error
         # text are exported — see mcp_metrics.py). The route exists only when
         # the chart opted in (metrics.enabled=true → PROMETHEUS_METRICS_ENABLED).
-        # There is no auth middleware here (read-only surface behind the
-        # gateway); /metrics carries non-sensitive counters only.
+        # "/metrics" is not "/mcp...", so it stays key-free under the auth
+        # gate below — matching the probes' posture; the ServiceMonitor can
+        # scrape it unauthenticated. Carries non-sensitive counters only.
         routes.append(Route("/metrics", mcp_metrics.endpoint))
-    return Starlette(
-        routes=routes,
-        lifespan=http_app.router.lifespan_context,
+    # API-key auth (fleet pattern, shared module: pcai_utils/mcp_auth.py).
+    # Scope matches applygate/searxng: ONLY the MCP endpoint (/mcp) is
+    # enforced — /health, /healthz, the web console and its /api/* routes
+    # stay key-free (read-only browser surface through the SSO-gated
+    # gateway; see the AUTH_ENV_NAMES comment above for the posture).
+    app = mcp_auth.ApiKeyAuthMiddleware(
+        Starlette(
+            routes=routes,
+            lifespan=http_app.router.lifespan_context,
+        ),
+        env_names=AUTH_ENV_NAMES,
+        protected=lambda p: p.startswith("/mcp"),
     )
+    # No CORSMiddleware: the old allow_origins=["*"] let any website the
+    # operator visits read query results cross-origin (fleet audit S-6).
+    # The console is same-origin; MCP clients are not browsers.
+    return app
 
 
 def main():
     import uvicorn
-    from starlette.middleware.cors import CORSMiddleware
+
+    # One-address wiring: the fleet-universal MCP_API_KEYS is honored
+    # alongside PROMETHEUS_API_KEYS (see AUTH_ENV_NAMES) — warn here, in the
+    # HTTP-mode main, when neither is set (stdio dev use never needed auth).
+    mcp_auth.warn_if_open("prometheus-mcp", AUTH_ENV_NAMES)
 
     parser = argparse.ArgumentParser(description="Prometheus MCP Server")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default=["stdio"])
@@ -628,13 +715,6 @@ def main():
         return
 
     app = _build_http_app()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["Mcp-Session-Id"],
-    )
     print(f"Prometheus MCP streamable-http endpoint: http://{args.host}:{args.port}/mcp")
     uvicorn.run(app, host=args.host, port=args.port)
 

@@ -76,6 +76,7 @@ __all__ = [
     "CALLER_CLASS_KEY",
     "CALLER_CLASS_USER",
     "CALLER_CONTEXT",
+    "HEADER_BROWSER_ACCESS_TOKEN",
     "HEADER_BROWSER_GROUPS",
     "HEADER_BROWSER_USER",
     "HEADER_CALLER_CLASS",
@@ -97,7 +98,9 @@ __all__ = [
     "relay_signature_headers",
     "resolve_bearer_jwt",
     "resolve_browser_caller",
+    "resolve_forwarded_access_token",
     "resolve_relay_caller",
+    "resolve_sso_cookie",
     "set_static_keys_source",
 ]
 
@@ -128,6 +131,26 @@ RELAY_SIG_MAX_SKEW_SECONDS = 300
 #: identity module uses (X-Auth-Request-User, groups via X-Forwarded-Groups).
 HEADER_BROWSER_USER = "X-Auth-Request-User"
 HEADER_BROWSER_GROUPS = "X-Forwarded-Groups"
+#: The oauth2-proxy FORWARDED ACCESS TOKEN envelope (D21, fleet mcp_auth.py
+#: convention): when the edge proxy is configured with pass-access-token it
+#: forwards the user's OIDC access token on every authenticated browser
+#: request. This is an ENVELOPE, not a trust grant — whatever arrives in it
+#: is fully verified (RS256, iss/aud/exp) by the JWT rung before it can
+#: resolve any identity, so spoofing the header gains nothing. It outranks
+#: the user-header rung because a verified JWT is a proof of possession
+#: while X-Auth-Request-User is an injected assertion — and it carries the
+#: ``preferred_username`` claim, the human-meaningful identity the header
+#: rung lacks (the header carries the IdP's ``sub``, a UUID on this realm).
+HEADER_BROWSER_ACCESS_TOKEN = "X-Auth-Request-Access-Token"
+
+#: The app's OWN D22 SSO session cookie (the oidc_sso flow's session): the
+#: VERIFIED access token planted by /oauth/oidc/callback. The LOWEST-priority
+#: envelope — an explicit key or Bearer always outranks the browser session
+#: behind it (D19's explicit-over-ambient), and the token inside is verified
+#: like every other JWT-shaped credential before it resolves anything. The
+#: cookie NAME is the oidc_sso module's (default ``pcai-sso``) — read from
+#: there, never hardcoded here.
+SSO_COOKIE_STATE = "sqlhandler.sso_cookie_token"
 
 #: The trust gate for rung 2. Unset/untruthy = browser headers NEVER resolve an
 #: identity (default; hardening posture). Truthy = the operator asserts the
@@ -436,10 +459,111 @@ def set_static_keys_source(fn) -> None:
     _static_keys_fn = fn
 
 
+def resolve_forwarded_access_token(scope) -> Caller | None:
+    """The D21 forwarded-token envelope: ``X-Auth-Request-Access-Token``.
+
+    The oauth2-proxy edge (pass-access-token) forwards the browser user's
+    OIDC access token on every authenticated request. The header is an
+    ENVELOPE, not a trust grant: the value is verified through the SAME
+    JWT path as an Authorization Bearer (RS256 + iss/aud/exp against the
+    realm JWKS) before it can resolve anything — a forged header value is
+    just an invalid token and declines silently. Verified success resolves
+    exactly like the bearer rung: Caller(cls=user, subject=<identity claim
+    — preferred_username on this realm>, via="jwt").
+
+    Precedence: ABOVE the browser-header rung (a verified token is proof
+    of possession; X-Auth-Request-User is an injected assertion carrying
+    only the ``sub`` UUID), but BELOW an explicit Authorization Bearer —
+    the caller's own presented credential always governs over the ambient
+    forwarded one (D19's explicit-over-ambient convention).
+    """
+    raw = _header(scope, HEADER_BROWSER_ACCESS_TOKEN)
+    if not raw:
+        return None
+    token = raw[7:].strip() if raw[:7].lower() == "bearer " else raw.strip()
+    if not token:
+        return None
+    # A static key arriving in this envelope stays the KEY rung's
+    # credential — never parsed as a JWT (disjoint credential spaces).
+    if match_api_key(token, _static_keys()) is not None:
+        return None
+    if not _is_jwt_format(token):
+        return None
+    try:
+        claims = _oidc_verify_and_decode(token)
+    except Exception:
+        logger.debug("forwarded access token verification raised; rung declines", exc_info=True)
+        return None
+    if claims is None:
+        return None
+    subject = _oidc_subject_from_claims(claims)
+    if not subject:
+        return None
+    return Caller(cls=CALLER_CLASS_USER, subject=subject, key_fp=None, via="jwt")
+
+
+def resolve_sso_cookie(scope) -> Caller | None:
+    """The D22 SSO session-cookie envelope (the oidc_sso flow's session).
+
+    Reads the cookie the /oauth/oidc/callback planted (an HttpOnly session
+    carrying the VERIFIED access token) and verifies it through the SAME
+    JWT path as every other token-shaped credential — the cookie is an
+    envelope, not a trust grant (a forged/tampered/expired cookie is just
+    an invalid token and declines silently). Verified success resolves
+    exactly like the bearer rung: Caller(cls=user, subject=<
+    preferred_username>, via="jwt").
+
+    Precedence: the LOWEST envelope — above nothing. An explicit
+    Authorization Bearer, a forwarded access token, and (on trust-flagged
+    deployments) the injected user headers all outrank the browser session:
+    the session is what you fall back to, never what overrides you. The
+    cookie name comes from the oidc_sso module (env-configurable), so a
+    deployment that renames the cookie stays consistent at both ends.
+    """
+    from . import oidc_sso
+
+    name = oidc_sso.cookie_name()
+    raw = ""
+    for k, v in scope.get("headers", []) or []:
+        lk = k.lower() if isinstance(k, bytes) else str(k).lower().encode("latin-1")
+        if lk == b"cookie":
+            try:
+                raw = v.decode("latin-1") if isinstance(v, bytes) else str(v)
+            except Exception:
+                raw = ""
+            break
+    if not raw:
+        return None
+    token = ""
+    for part in raw.split(";"):
+        pname, _, pvalue = part.strip().partition("=")
+        if pname.strip() == name:
+            token = pvalue.strip()
+            break
+    if not token:
+        return None
+    if match_api_key(token, _static_keys()) is not None:
+        return None
+    if not _is_jwt_format(token):
+        return None
+    try:
+        claims = _oidc_verify_and_decode(token)
+    except Exception:
+        logger.debug("SSO cookie verification raised; rung declines", exc_info=True)
+        return None
+    if claims is None:
+        return None
+    subject = _oidc_subject_from_claims(claims)
+    if not subject:
+        return None
+    return Caller(cls=CALLER_CLASS_USER, subject=subject, key_fp=None, via="jwt")
+
+
 def caller_from_scope(scope) -> Caller:
     """Resolve one request's identity from the ASGI scope (the middleware's
     entry point). Rungs: relay-attribution → OIDC bearer-JWT →
-    browser-headers → key-fp.
+    forwarded-access-token envelope → SSO session cookie → browser-headers
+    → key-fp.
 
     The key fingerprint comes from ``scope["state"]`` where
     ``_McpApiKeyMiddleware`` recorded it when a key matched. When no key gate
@@ -460,6 +584,12 @@ def caller_from_scope(scope) -> Caller:
     jwt_caller = resolve_bearer_jwt(scope)
     if jwt_caller is not None:
         return jwt_caller
+    forwarded = resolve_forwarded_access_token(scope)
+    if forwarded is not None:
+        return forwarded
+    sso = resolve_sso_cookie(scope)
+    if sso is not None:
+        return sso
     browser = resolve_browser_caller(scope)
     if browser is not None:
         return Caller(

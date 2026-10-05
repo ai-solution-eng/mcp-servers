@@ -34,7 +34,7 @@ ezua:
 |---|---|---|
 | `logsearch.maxPods` | `50` | Max pods touched by one fan-out search/count — bounds API-server load. |
 | `logsearch.maxLinesPerPod` | `1000` | Max tail lines fetched per pod (also the tail `count_matches` uses). |
-| `logsearch.maxTotalLines` | `300` | Default cap on merged `search_logs` matches (bounds the MCP response = the agent's context window). Enforced DURING the fan-out — the pull stops when the budget is full (`pods_skipped_budget` in the response). |
+| `logsearch.maxTotalLines` | `300` | Default cap on merged `search_logs`/`export_matches` matches when the call omits `max_total_lines` (bounds the MCP response = the agent's context window). Enforced DURING the fan-out — the pull stops when the budget is full (`pods_skipped_budget` in the response). An explicit per-call `max_total_lines` overrides the env. |
 | `logsearch.maxLineChars` | `2000` | Per-line char cap on search output; overlong lines get an explicit `...[truncated N chars]` marker. `0` disables. |
 | `logsearch.fetchConcurrency` | `8` | Parallel pod-fetch fan-out width (asyncio.gather under a bounded semaphore); `1` = sequential. |
 | `logsearch.maxRegexChars` | `512` | User regexes longer than this are refused by the compile-time ReDoS screen (see the server README's "Regex safety"). |
@@ -51,6 +51,7 @@ ezua:
 | `rbac.create` | `true` | Creates the ServiceAccount + the read-only Role/RoleBinding (release namespace only). `false` falls back to the namespace default ServiceAccount — leave `true`. |
 | `rbac.clusterWide` | `false` | Opt-in: renders the SAME two read-only rules (`pods` get/list + `pods/log` get — nothing else, ever) as a ClusterRole + ClusterRoleBinding, so the SA reads pods/logs cluster-wide. Lab/trusted clusters only; pair with a deliberate namespace policy — RBAC bounds what the SA can read, the policy bounds what agents may ask for. Cluster-wide includes `kube-system`; use `logsearch.blockedNamespaces` ("kube-*") to keep system logs out of agents' reach. Switching an existing release from false→true removes the old namespaced Role/RoleBinding on upgrade. |
 | `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring (fleet convention): each key is wired only when non-empty, and `proxy: {}` (or omitting the block) means fully off. Fleet-consistency block — the only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries; no `caCert` wiring exists because there is no outbound TLS to trust. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
+| `extraAllowedHosts` | `[]` | **EXTRA DNS-rebinding allowlist entries** (fleet pattern: K8S-MCP): Host header values IN-CLUSTER callers use when addressing the server by svc DNS, joined into `MCP_EXTRA_ALLOWED_HOSTS`. Entries match verbatim or as `host:*` for any port. With `ezua` enabled the pinned public FQDN (`ezua.virtualService.endpoint`) is rendered as `MCP_HOSTNAME` automatically; without `ezua` (or in local dev, with neither env set) the SDK's implicit loopback-only protection applies untouched. When transport security is active the chart AUTO-prepends the release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*` — the gateway relay's Host header), so this key lists only EXTRA hosts; the default render is unchanged (neither env). |
 
 ## Underlying detail: values → environment variables
 
@@ -69,6 +70,8 @@ these directly):
 | `LOGSEARCH_FETCH_CONCURRENCY` | `logsearch.fetchConcurrency` |
 | `LOGSEARCH_MAX_REGEX_CHARS` | `logsearch.maxRegexChars` |
 | `LOGSEARCH_EXPORT_ROOT` | `logsearch.exportRoot` — rendered ONLY when non-empty (default: no env at all, `export_matches` refuses) |
+| `MCP_HOSTNAME` | `ezua.virtualService.endpoint` — rendered ONLY when `ezua.enabled` and the endpoint are set (DNS-rebinding Host pin; fleet-shared `mcp_auth.transport_security_from_env`) |
+| `MCP_EXTRA_ALLOWED_HOSTS` | own service DNS first (`<deployment.name>-service.<ns>.svc.cluster.local:*`), then `extraAllowedHosts` — rendered when transport security is active (ezua endpoint pinned or extras non-empty); in-cluster svc-DNS Host additions, verbatim or `host:*` |
 | `LOGSEARCH_WEBUI_ENABLED` | `webui.enabled` |
 | `LOGSEARCH_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
 | `LOGSEARCH_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
@@ -139,9 +142,10 @@ Behavior that differs by target, and the paste-ready values for each
 
 ### Proxied corporate site (SITE: your-cluster.example)
 
-- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
-  write the literal domain into `ezua.domainName` and
-  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Domain.** PCAI envsubsts `${DOMAIN_NAME}` in pasted values before
+  rendering, so the hosted-trial placeholders work as-pasted; the G2 site
+  files deliberately carry the literal domain instead (plain `helm -f`
+  readability — either form deploys correctly on PCAI).
 - **Lab posture, set EXPLICITLY.** `emptyAllowsAll: true` keeps this lab's
   pre-D8 open default (with an empty `allowedNamespaces`) — that is a
   deliberate escape-hatch choice, never a default; flip it off (and set an

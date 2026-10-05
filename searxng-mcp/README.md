@@ -88,6 +88,8 @@ so. `render="always"` skips plain HTTP entirely; `render="never"` keeps the old 
 | `SEARXNG_SEARCH_CACHE_TTL` | `120` | Search result cache TTL seconds (`0` disables) |
 | `FETCH_REQUESTS_PER_MINUTE` | `20` | Fetch rate limit |
 | `FETCH_VERIFY_TLS` | `true` | TLS verification for fetched pages |
+| `FETCH_CA_BUNDLE` | — | Combined CA bundle (public roots + the egress proxy's CA) for TLS-intercepting egress (Zscaler et al.); passed as `verify=` to both fetch rungs. The chart's `caCert:` block builds it |
+| `FETCH_TLS_INSECURE_FALLBACK` | `false` | Retry a certificate-verification failure ONCE unverified, output marked — last-resort for CA-rotation gaps, never for HTTP/DNS/policy failures |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | Corporate proxy for `fetch_content` |
 | `SEARXNG_FETCH_ALLOW_HOSTS` | — | SSRF-guard escape (D6): hosts/CIDRs allowed despite resolving internally |
 | `SEARXNG_FETCH_DENY_EXTRA` | — | SSRF-guard: extra denied hosts/CIDRs (deny wins over allow) |
@@ -97,6 +99,27 @@ so. `render="always"` skips plain HTTP entirely; `render="never"` keeps the old 
 | `SEARXNG_FETCH_MAX_REDIRECTS` | `5` | Redirect-hop cap (each hop re-validated) |
 | `BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Headless-browser sidecar CDP endpoint |
 | `BROWSER_NAV_TIMEOUT_MS` etc. | see `browser_client.py` | Nav timeout, settle wait, max pages, resource blocking |
+| `MCP_HOSTNAME` | — | Public FQDN clients use to reach `/mcp` (DNS-rebinding Host pin; set ⇒ protection explicitly ON). Read at startup — changing it requires a restart |
+| `MCP_EXTRA_ALLOWED_HOSTS` | — | Comma-separated in-cluster Host allowlist additions (verbatim or `host:*`). When transport security is active, the chart AUTO-prepends the release's own service DNS (`searxng-mcp-service.<ns>.svc.cluster.local:*`) — the LLM-gateway relay hop's Host header (421 Misdirected Request without it); chart key `extraAllowedHosts` lists only EXTRA hosts. Empty ⇒ unset ⇒ behavior unchanged |
+
+**Config freeze — which envs are read when.** The connection block is read
+**once at import/startup**: `SEARXNG_URL`, `SEARXNG_LANGUAGE`,
+`SEARXNG_TIMEOUT`, `SEARXNG_VERIFY_TLS`, `SEARXNG_REQUESTS_PER_MINUTE`,
+`FETCH_REQUESTS_PER_MINUTE`, and `FETCH_VERIFY_TLS` configure the long-lived
+`SearXNGClient` / `WebContentFetcher` objects and module-level constants —
+changing any of them requires a pod (or process) restart, and so do
+`MCP_HOSTNAME` / `MCP_EXTRA_ALLOWED_HOSTS` (the transport-security helper
+resolves them once at startup). **Re-read live (no restart needed):** the
+API-key envs (`SEARXNG_API_KEYS` / `MCP_API_KEYS` — key rotation via the
+Secret is live). Everything else is read once: the connection block, the
+transport-security pair, AND the cache/cap knobs (`SEARXNG_SEARCH_CACHE_TTL`,
+`SEARXNG_FETCH_CACHE_TTL`, `SEARXNG_FETCH_MAX_BODY_BYTES`,
+`SEARXNG_FETCH_MAX_SCREENSHOT_KB`, `SEARXNG_FETCH_MAX_REDIRECTS`,
+`FETCH_CA_BUNDLE`, `FETCH_TLS_INSECURE_FALLBACK`) are read when the
+client/fetcher objects are CONSTRUCTED (or at import) — changing any of
+them requires a pod (or process) restart. Aligning the connection block
+with the per-request re-read pattern is deferred — a later work item; do
+not assume a changed `SEARXNG_URL` in a running pod does anything.
 
 The search client deliberately ignores environment proxies (`trust_env=False`): the sidecar is reached over `localhost`, and nothing must intercept that.
 
@@ -231,7 +254,7 @@ The chart **fails to render** unless these are set:
 |---|---|
 | `searxng.secretKey` | **REQUIRED** — the deployment template errors (`searxng.secretKey is required (SEARXNG_SECRET) — or set searxng.existingSecret`) when it is empty. It seeds SearXNG's `SEARXNG_SECRET` (session/crypto); the chart default is a placeholder, so change it for any real deployment. |
 | `searxng.existingSecret` (+ `existingSecretKey`, default `secret`) | **Alternative wiring, preferred**: point at a pre-created Secret and `SEARXNG_SECRET` comes from `secretKeyRef` instead — when set, the literal `secretKey` above is ignored and the empty-value render failure cannot happen. `kubectl create secret generic <name> --from-literal=secret=$(openssl rand -hex 32)`. |
-| `ezua.virtualService.endpoint` | **REQUIRED when `ezua.enabled`** (default `true`): the VirtualService host — e.g. `searxng-mcp.${DOMAIN_NAME}` (PCAI resolves `${DOMAIN_NAME}`). Empty endpoint aborts the render. |
+| `ezua.virtualService.endpoint` | **REQUIRED when `ezua.enabled`** (default `true`): the VirtualService host — e.g. `searxng-mcp.${DOMAIN_NAME}` (PCAI resolves `${DOMAIN_NAME}`). Empty endpoint aborts the render. Doubles as `MCP_HOSTNAME` (DNS-rebinding Host pin, read at startup). |
 
 ```yaml
 searxng:

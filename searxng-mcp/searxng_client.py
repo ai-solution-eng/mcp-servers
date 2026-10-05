@@ -47,9 +47,28 @@ class RateLimiter:
     def __init__(self, requests_per_minute: int = 30):
         self.requests_per_minute = requests_per_minute
         self._timestamps: list[float] = []
+        # Per-process cooldown pushed in on HTTP 429 (see _request): until
+        # this monotonic deadline, acquire() waits instead of admitting. This
+        # is deliberately local state — the upstream SearXNG limiter stays
+        # OFF (settings.yml server.limiter: false, no valkey), so the
+        # per-IP engine budget is protected only by client-side pacing.
+        self._cooldown_until: float = 0.0
+
+    def push_cooldown(self, seconds: float) -> None:
+        """Pause local admission for ``seconds`` (a 429's Retry-After)."""
+        try:
+            wait = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return
+        deadline = time.monotonic() + wait
+        if wait and deadline > self._cooldown_until:
+            self._cooldown_until = deadline
 
     async def acquire(self) -> None:
         now = time.monotonic()
+        if now < self._cooldown_until:
+            await asyncio.sleep(self._cooldown_until - now)
+            now = time.monotonic()
         self._timestamps = [t for t in self._timestamps if now - t < 60.0]
         if len(self._timestamps) >= self.requests_per_minute:
             wait = 60.0 - (now - self._timestamps[0])
@@ -277,12 +296,59 @@ def normalize_language(value: str) -> str:
     return v
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into seconds, or None.
+
+    Accepts the two RFC 7231 forms — delay-seconds (``"30"``) and HTTP-date
+    (``"Wed, 21 Oct 2026 07:28:00 GMT"``) — and tolerates missing or
+    garbage values (None) so a bad header never blocks the error path.
+    Relative dates in the past yield 0.0 (retry now); a negative or
+    unparseable delta is None.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        pass
+    else:
+        # "inf"/"1e400"-style garbage parses as float but would OverflowError
+        # on int() downstream — treat non-finite as unparseable.
+        from math import isfinite
+
+        if not isfinite(seconds):
+            return None
+        return seconds if seconds >= 0 else None
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # RFC 7231 dates always carry GMT; treat a naive one as UTC rather
+        # than guessing the local zone.
+        from datetime import UTC
+
+        when = when.replace(tzinfo=UTC)
+    delta = when.timestamp() - time.time()
+    return delta if delta >= 0 else 0.0
+
+
 class SearXNGClient:
     """Talks to one SearXNG instance over its JSON API.
 
     ``transport`` is a test hook (httpx2.MockTransport) — leave None in
     production.
     """
+
+    # A 429 Retry-After larger than this is treated as garbage: blocking
+    # local admission for minutes on one bad header hurts more than the
+    # extra request it saves. The error text still reports the raw value.
+    MAX_COOLDOWN_SECONDS = 120.0
 
     def __init__(
         self,
@@ -297,6 +363,10 @@ class SearXNGClient:
         self.base_url = base_url.rstrip("/")
         self.default_language = default_language
         self.rate_limiter = RateLimiter(requests_per_minute)
+        # Engine list from GET /config, fetched lazily (None = unknown —
+        # fetch not yet attempted or last one failed; retried on a later
+        # call). See engines_from_config_hint().
+        self._engine_names: set[str] | None = None
         if cache_ttl_seconds is not None:
             ttl = float(cache_ttl_seconds)
         else:
@@ -321,6 +391,31 @@ class SearXNGClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def _engine_names_from_config(self) -> set[str] | None:
+        """Engine names from ``GET {base_url}/config``, fetched once per
+        process (cached; any failure → None, silently — the sanity hint is
+        best-effort diagnostics, never a hard dependency on /config).
+        Cache values are ``set[str] | None``: None = unknown (fetch failed
+        or not yet attempted), a set = the engine list. A failed fetch is
+        retried on a LATER call (cheap, diagnostics-only) rather than
+        being pinned False for the life of the process."""
+        if self._engine_names is not None:
+            return self._engine_names
+        try:
+            resp = await self._client.get(f"{self.base_url}/config")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            engines = data.get("engines") if isinstance(data, dict) else None
+            names: set[str] = set()
+            for e in engines or []:
+                if isinstance(e, dict) and e.get("name"):
+                    names.add(str(e["name"]))
+            self._engine_names = names or None
+        except Exception:  # diagnostics only, never fatal
+            return None
+        return self._engine_names or None
 
     async def search(
         self,
@@ -380,8 +475,16 @@ class SearXNGClient:
         return resp
 
     async def _request(self, params: dict[str, str]) -> dict | None:
-        """GET /search; returns parsed JSON, or None on HTTP 4xx (caller may
-        retry), or raises SearXNGError for anything else."""
+        """GET /search; returns parsed JSON, raises SearXNGError on
+        anything but a retryable 400.
+
+        Only HTTP 400 returns None (the caller retries once without the
+        language filter — some SearXNG builds reject unknown language codes
+        with a 400). Every other 4xx is a request problem no retry fixes
+        (401 wrong API key, 404 wrong path, 405 wrong method, …), so it
+        raises with the specific status instead of being retried identically
+        and reported generically.
+        """
         try:
             resp = await self._client.get(f"{self.base_url}/search", params=params)
         except httpx2.HTTPError as e:
@@ -393,11 +496,26 @@ class SearXNGClient:
                 "enabled. Add 'json' to search.formats in settings.yml."
             )
         if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After", ""))
+            if retry_after is not None:
+                # Per-process pacing only (no valkey/shared state — the
+                # upstream limiter stays off by design): pause local
+                # admission until the server says the window resets, so the
+                # next search instead of racing straight back into 429.
+                self.rate_limiter.push_cooldown(min(retry_after, self.MAX_COOLDOWN_SECONDS))
+            if retry_after is not None and retry_after > 0:
+                raise SearXNGError(
+                    f"SearXNG returned 429 (rate limited); slow down — retry after ~{int(retry_after)}s."
+                )
             raise SearXNGError("SearXNG returned 429 (rate limited); slow down.")
+        if resp.status_code == 400:
+            # The ONLY retryable 4xx (the caller drops the language filter
+            # once). Other 4xx fall through to the named raise below.
+            return None
         if 400 <= resp.status_code < 500:
-            return None  # retryable by the caller (e.g. drop language)
+            raise SearXNGError(f"SearXNG returned {resp.status_code}; not retrying.")
         if resp.status_code != 200:
-            raise SearXNGError(f"SearXNG returned HTTP {resp.status_code}")
+            raise SearXNGError(f"SearXNG returned HTTP {resp.status_code}; not retrying.")
 
         try:
             return resp.json()
@@ -442,11 +560,43 @@ class SearXNGClient:
         )
 
 
-def format_search_response(resp: SearXNGResponse, max_results: int) -> str:
+def engines_from_config_hint(engines_param: str, available: set[str] | None) -> str:
+    """Sanity note for an EMPTY search made with ``backend`` != auto.
+
+    backend values beyond "auto" are engine allowlists, and a typo'd engine
+    name ("braveimages" vs "brave.images" — names must match GET /config
+    exactly) silently returns zero results. When the instance's engine list
+    is known and NONE of the named engines exist, return the hint line;
+    otherwise "" (no hint when anything matches, or when /config is
+    unknown/unreachable — best-effort diagnostics only).
+    """
+    if not available or not engines_param:
+        return ""
+    named = [e.strip() for e in engines_param.split(",") if e.strip()]
+    if not named or any(e in available for e in named):
+        return ""
+    return (
+        f"\nNote: engines you named: {engines_param} — none match SearXNG's engine list; "
+        "check spelling (e.g. 'brave.images', not 'braveimages')."
+    )
+
+
+def format_search_response(
+    resp: SearXNGResponse,
+    max_results: int,
+    *,
+    engine_hint: str = "",
+) -> str:
     """Format a SearXNGResponse for an LLM, mirroring the ddgs-lite layout."""
     results = resp.results[:max_results]
 
     if not results and not resp.answers:
+        # Keep the leading sentence BYTE-STABLE (downstream grep/tests match
+        # it); everything below is APPENDED guidance for the retry-loop trap:
+        # an empty result used to land here with nothing to act on, so agents
+        # re-ran the identical query (a documented fleet lesson). Surface the
+        # corrections/suggestions the response already carried, and point at
+        # the knobs that actually change the outcome.
         msg = "No results were found. Try rephrasing your search query."
         if resp.unresponsive_engines:
             names = ", ".join(e for e, _ in resp.unresponsive_engines)
@@ -455,6 +605,16 @@ def format_search_response(resp: SearXNGResponse, max_results: int) -> str:
                 msg += (
                     "\nNote: some engines are temporarily suspended/rate-limited; retrying in a few minutes may help."
                 )
+        if resp.corrections:
+            msg += f"\nDid you mean: {resp.corrections[0]}?"
+        if resp.suggestions:
+            msg += "\nRelated searches: " + " | ".join(resp.suggestions[:5])
+        if engine_hint:
+            msg += engine_hint
+        msg += (
+            "\nNext step: do not re-run the identical query — change category, "
+            "region, or time_range, or fetch a known good URL directly."
+        )
         return msg
 
     output = [f"Found {len(results)} search results:\n"]

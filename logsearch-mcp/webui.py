@@ -205,6 +205,8 @@ def build_ui_routes() -> list[Route]:
             kwargs["container"] = str(body["container"]).strip()
         if body.get("max_total_lines") is not None:
             kwargs["max_total_lines"] = body["max_total_lines"]
+        if body.get("context_lines") is not None:
+            kwargs["context_lines"] = body["context_lines"]
         return await _run_tool(server.search_logs(namespace, pattern, **kwargs))
 
     async def count(request):
@@ -225,6 +227,8 @@ def build_ui_routes() -> list[Route]:
             kwargs["since_minutes"] = body["since_minutes"]
         if body.get("case_insensitive") is not None:
             kwargs["case_insensitive"] = bool(body["case_insensitive"])
+        if body.get("tail_lines") is not None:
+            kwargs["tail_lines"] = body["tail_lines"]
         return await _run_tool(server.count_matches(namespace, pattern, **kwargs))
 
     return [

@@ -15,6 +15,29 @@ set -e
 if [ -d /certs-src ] && [ -n "$(ls -A /certs-src 2>/dev/null)" ]; then
   cp /certs-src/*.crt /usr/local/share/ca-certificates/ 2>/dev/null || true
   update-ca-certificates >/dev/null 2>&1 || true
+  # Chromium >= 105 (playwright's headless_shell included) verifies against
+  # the Chrome Root Store + the NSS DB at $HOME/.pki/nssdb — the Debian
+  # system bundle above is NOT consulted (SE-G2 live evidence 2026-10-04:
+  # net_error -202 / ERR_CERT_AUTHORITY_INVALID with the CA present only in
+  # /etc/ssl/certs). Import every mounted PEM into the NSS DB too; split
+  # multi-cert files first (a ConfigMap key may concatenate a full root set).
+  if command -v certutil >/dev/null 2>&1; then
+    NSSDB=/home/browser/.pki/nssdb
+    mkdir -p "$NSSDB"
+    certutil -d sql:"$NSSDB" -N --empty >/dev/null 2>&1 || true
+    rm -f /tmp/split-ca-*.crt 2>/dev/null || true
+    for crt in /certs-src/*.crt; do
+      awk 'BEGIN{i=0} /BEGIN CERTIFICATE/{i++; f=sprintf("/tmp/split-ca-%02d.crt", i)} {print > f} /END CERTIFICATE/{close(f)}' "$crt"
+    done
+    n=0
+    for part in /tmp/split-ca-*.crt; do
+      [ -e "$part" ] || continue
+      n=$((n+1))
+      certutil -d sql:"$NSSDB" -A -t "C,," -n "egress-ca-$n" -i "$part" >/dev/null 2>&1 || true
+    done
+    rm -f /tmp/split-ca-*.crt 2>/dev/null || true
+    chown -R browser:browser /home/browser/.pki 2>/dev/null || true
+  fi
 fi
 
 # --- 2. Browser binary.

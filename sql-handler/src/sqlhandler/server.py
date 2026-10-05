@@ -315,7 +315,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                     "Error setting policy: 'policy' must be the FULL policy document as a JSON string"
                     + _errors.structured(
                         _errors.E_PARAM_INVALID,
-                        ["Call admin_policy_set with {\"policy\": \"{...}\"} — the whole document, JSON-encoded."],
+                        ['Call admin_policy_set with {"policy": "{...}"} — the whole document, JSON-encoded.'],
                     ),
                     True,
                 )
@@ -929,8 +929,8 @@ _TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional dataset globs to grant, e.g. [\"workorder/*\"]. "
-                        "Omitted = [\"*\"] (full access) recorded in the policy."
+                        'Optional dataset globs to grant, e.g. ["workorder/*"]. '
+                        'Omitted = ["*"] (full access) recorded in the policy.'
                     ),
                 },
             },
@@ -970,10 +970,7 @@ def mcp_tool_specs() -> list[dict]:
     is reflected too. Tools only — resources/prompts stay out of scope, the
     same boundary an MCP client's tools/list draws.
     """
-    return [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.input_schema}
-        for t in _TOOLS
-    ]
+    return [{"name": t.name, "description": t.description or "", "inputSchema": t.input_schema} for t in _TOOLS]
 
 
 mcp = Server(
@@ -1248,6 +1245,39 @@ _handler_lock = threading.Lock()
 _handler_singleton: SqlEngine | None = None
 
 
+def _seed_policy_from_configmap() -> None:
+    """One-time policy migration: copy the SEED file (the read-only
+    ConfigMap mount, SQLHANDLER_POLICY_SEED_FILE) to the LIVE policy file
+    (the writable claim, SQLHANDLER_POLICY_FILE) when the live file does
+    not exist yet (values: security.policy.existingClaim +
+    seedFromConfigMap).
+
+    Claim mode without a live file = an empty policy store — every gated
+    surface fails closed, so seeding on first boot is what makes the
+    ConfigMap→PVC switch zero-downtime for existing deployments. Idempotent
+    by construction: once the live file exists, the seed is ignored FOREVER
+    (the live file is the truth from then on; ConfigMap edits stop
+    applying — the documented trade of the writable-policy mode).
+
+    Best-effort: any failure logs loudly and continues (the pod must boot;
+    an operator can seed by hand via kubectl exec cp).
+    """
+    import shutil
+
+    seed = os.environ.get("SQLHANDLER_POLICY_SEED_FILE", "").strip()
+    live = os.environ.get("SQLHANDLER_POLICY_FILE", "").strip()
+    if not seed or not live or seed == live:
+        return
+    if os.path.exists(live):
+        return  # the live file exists — the seed's one-time job is done
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(live)), exist_ok=True)
+        shutil.copyfile(seed, live)
+        logger.info("policy seeded: %s -> %s (one-time migration; ConfigMap edits stop applying)", seed, live)
+    except OSError as exc:
+        logger.error("policy seeding FAILED (%s -> %s): %s — seed by hand: kubectl exec cp", seed, live, exc)
+
+
 def _handler() -> SqlEngine:
     """Return the process-wide SqlEngine, building it on first use.
 
@@ -1262,6 +1292,9 @@ def _handler() -> SqlEngine:
     with _handler_lock:
         if _handler_singleton is None:
             load_dotenv()
+            # One-time policy migration BEFORE anything reads the policy
+            # store (the keys store + every admin route read it).
+            _seed_policy_from_configmap()
             # Federated multi-source mode (SQLHANDLER_SOURCES) or single backend.
             provider = load_source_providers()
             if provider is None:
@@ -1538,6 +1571,45 @@ def whoami(*, caller=None) -> str:
         return json.dumps(payload, indent=2, default=str)
     except Exception as exc:
         return f"Error computing whoami: {_errors.enrich(str(exc))}"
+
+
+def _whoami_rest_payload(request) -> dict:
+    """The REST /api/whoami body — the same contract the MCP whoami tool
+    returns, as JSON for the web UI's header identity widget (D-UI, 2026-10).
+
+    Resolution mirrors the ADMIN surface (``_admin_resolve_caller``), not
+    the bare ladder: an X-API-Key / Bearer presented on the request is
+    authenticated HERE (the /api routes have no key middleware), and a
+    key-shaped value that matches NOTHING stays anonymous — a wrong key is
+    never redeemed as the browser user behind it (the same contract
+    ``require_admin`` pins). A genuinely keyless request resolves through
+    the full ladder (SSO bearer JWT rung → oauth2-proxy browser rung).
+
+    The payload previews the identity — it is NOT a grant: it answers
+    "who would this request resolve as" so the UI can render the header
+    chip (``Signed in as …``) and tell an SSO visitor why self-mint will
+    or will not accept them (``via``). Audit-safe by construction: the
+    caller renders through ``as_audit_dict`` (class/subject/fp — never a
+    raw key) and the response never says whether the caller is an ADMIN
+    (an admin designation must not be probeable from an unauthenticated
+    page; the Access-control panel's own calls already 401/403 loudly).
+    """
+    presented = _admin_presented_keys(request)
+    caller = _admin_resolve_caller(request, presented)
+    if caller is None:
+        caller = _identity.ANONYMOUS
+    # The D22 sign-in hint: when anonymous AND the SSO flow is served, the
+    # header chip offers "Sign in with SSO" instead of only the key modal.
+    # A config read only — no identity leak (the flow is public knowledge).
+    from . import oidc_sso
+
+    return {
+        "caller": caller.as_audit_dict(),
+        "via": caller.via,
+        "authenticated": not caller.is_anonymous,
+        "require_identity": _IdentityRequiredMiddleware._required(),
+        "sso_login_available": oidc_sso.sso_enabled(),
+    }
 
 
 def _validate_output_format(output_format: str) -> str:
@@ -2522,10 +2594,12 @@ def _admin_presented_keys(request) -> dict[str, list[str]]:
     — because the kinds have different fallback semantics (see
     :func:`_admin_resolve_caller`):
 
-    ``bearer``  — Authorization: Bearer tokens. AMBIGUOUS by nature: could
-                  be a fleet/minted key OR an OIDC SSO token (oauth2-proxy
-                  forwards one on every authenticated browser request since
-                  the parity flip).
+    ``bearer``  — Authorization: Bearer tokens, plus the D21 forwarded-token
+                  envelope (X-Auth-Request-Access-Token, appended AFTER any
+                  explicit Bearer — ambient never outranks presented). Each
+                  is AMBIGUOUS by nature: could be a fleet/minted key OR an
+                  OIDC SSO token (oauth2-proxy forwards one on every
+                  authenticated browser request since the parity flip).
     ``api_key`` — X-API-Key / X-API-Token. An EXPLICIT key claim: the caller
                   is asserting 'this is a key'; a wrong key claim is a hard
                   refusal, never a fallback to the browser session behind it.
@@ -2546,6 +2620,16 @@ def _admin_presented_keys(request) -> dict[str, list[str]]:
         token = auth[7:].strip()
         if token:
             out["bearer"].append(token)
+    # The D21 forwarded-token envelope (oauth2-proxy pass-access-token):
+    # AMBIENT, never explicit — collected as a bearer so it gets the same
+    # verified-or-decline treatment, but AFTER any Authorization Bearer
+    # (explicit-over-ambient, D19) and always behind an explicit key claim
+    # (the api_key branch returns before bearer candidates are consulted).
+    forwarded = (headers.get("x-auth-request-access-token") or "").strip()
+    if forwarded[:7].lower() == "bearer ":
+        forwarded = forwarded[7:].strip()
+    if forwarded and forwarded not in out["bearer"]:
+        out["bearer"].append(forwarded)
     for header in ("x-api-key", "x-api-token"):
         value = (headers.get(header) or "").strip()
         if value and value not in out["api_key"]:
@@ -2572,14 +2656,14 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
        presented key hashed, compared constant-time against each stored
        ``key_sha256``) → Caller(cls=key, key_fp=the stored fp).
     3. The FULL identity ladder (identity.caller_from_request_state) —
-       gateway-relay attribution, the OIDC bearer-JWT rung, and the
-       oauth2-proxy browser rung. This is what lets an SSO subject in the
-       policy's ``admins`` list administer from the browser with no key at
-       all (the DECISIONS "admins: subjects and/or fingerprints" contract).
-       The relay rung self-guards (attribution-never-authorization: it only
-       resolves over a key-valid request), so step 3 can never ELEVATE an
-       unauthenticated caller — it can only name an already-authenticated
-       one.
+       gateway-relay attribution, the OIDC bearer-JWT rung, the D22 SSO
+       session-cookie rung, and the oauth2-proxy browser rung. This is what
+       lets an SSO subject in the policy's ``admins`` list administer from
+       the browser with no key at all (the DECISIONS "admins: subjects
+       and/or fingerprints" contract). The relay rung self-guards
+       (attribution-never-authorization: it only resolves over a key-valid
+       request), so step 3 can never ELEVATE an unauthenticated caller —
+       it can only name an already-authenticated one.
 
     A key-shaped presented value that matches nothing in steps 1-2 → None
     (401), NOT a fallback to step 3 with a fabricated identity: a wrong key
@@ -2602,7 +2686,9 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
     for candidate in presented["api_key"]:
         static = _identity.match_api_key(candidate, keys_env)
         if static is not None:
-            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
+            return _identity.Caller(
+                cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key"
+            )
         try:
             entry = _admin_keys.match_presentation(candidate)
         except Exception:
@@ -2619,7 +2705,9 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
     for candidate in presented["bearer"]:
         static = _identity.match_api_key(candidate, keys_env)
         if static is not None:
-            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key")
+            return _identity.Caller(
+                cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=_identity.key_fp(static), via="key"
+            )
         try:
             entry = _admin_keys.match_presentation(candidate)
         except Exception:
@@ -2633,8 +2721,9 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
         return None  # a Bearer that is neither a key nor a valid token
 
     # 3) Nothing presented — the plain SSO-browser case: the full ladder
-    #    (browser rung). ANONYMOUS → None (the 401 contract: a
-    #    credential-less caller must never probe the admins list via 403).
+    #    (D22 session-cookie rung → browser rung). ANONYMOUS → None (the
+    #    401 contract: a credential-less caller must never probe the admins
+    #    list via 403).
     caller = _identity.caller_from_request_state(request)
     if getattr(caller, "is_anonymous", True):
         return None
@@ -2689,7 +2778,9 @@ def _policy_atomic_write(text: str) -> None:
     """
     path = _policy.policy_file_path()
     if not path:
-        raise AdminHTTPError(503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — the policy is read-only")
+        raise AdminHTTPError(
+            503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — the policy is read-only"
+        )
     target = Path(path)
     try:
         directory = target.parent if str(target.parent) else Path(".")
@@ -2840,6 +2931,16 @@ def _self_mint_key(caller, label: str, assign: list[str] | None) -> dict:
         max_keys = max(1, int(os.environ.get("SQLHANDLER_SELF_MINT_MAX_KEYS", "1").strip() or "1"))
     except ValueError:
         max_keys = 1
+    # INPUT VALIDATION before any store write: the self-mint cannot accept
+    # custom 'assign' globs (custom-scoped keys are the admin mint's job) —
+    # refusing here leaves no orphan entry to compensate for.
+    if assign:
+        raise AdminHTTPError(
+            403,
+            "self-mint cannot accept 'assign' — a minted key carries the "
+            "subject's grants by name (no policy write); use the admin mint "
+            "for custom-scoped keys",
+        )
     raw = secrets.token_urlsafe(32)
     from .mcp_fleet_common.audit import key_fingerprint
 
@@ -2855,23 +2956,22 @@ def _self_mint_key(caller, label: str, assign: list[str] | None) -> dict:
         message = str(exc)
         status = 409 if "already exists" in message else 503
         raise AdminHTTPError(status, message) from exc
-    # The assignment: EXPLICIT globs if the caller passed any (they can only
-    # ever repeat what the policy already grants — the policy doc is what
-    # ENFORCES), else the subject's EXISTING policy assignment.
-    try:
-        if assign:
-            _admin_merge_assignment_with_fp(fp, [str(g).strip() for g in assign if str(g).strip()])
-        else:
-            _self_mint_copy_subject_assignment(subject, fp)
-    except AdminHTTPError:
-        try:
-            _admin_keys.remove_key(fp)
-        except Exception:
-            pass
-        raise
+    # NO POLICY WRITE (live 2026-10-05, G2: "[Errno 30] Read-only file
+    # system" — the policy file is a ConfigMap mount, read-only by
+    # construction). None is needed: the minted key is SUBJECT-BOUND (the
+    # store entry above carries subject=), and the identity ladder
+    # resolves subject-bound keys to a subject-carrying Caller — so
+    # groups_for(subject, fp) falls through the (absent) fp binding to the
+    # SUBJECT binding and the key inherits the human's grants BY NAME,
+    # live. Grant changes (Access-control tab / policy edit) apply to the
+    # key with the same hot-reload that applies to the human — no per-key
+    # policy rows to maintain, no write to a read-only volume.
     _self_mint_enforce_cap(subject, max_keys, keep_fp=fp)
     _audit_admin_event(
-        "selfservice.key_mint", fp=fp, subject=subject, by=f"subject:{subject}",
+        "selfservice.key_mint",
+        fp=fp,
+        subject=subject,
+        by=f"subject:{subject}",
         assign=list(assign) if assign else None,
     )
     return {
@@ -2883,46 +2983,6 @@ def _self_mint_key(caller, label: str, assign: list[str] | None) -> dict:
     }
 
 
-def _self_mint_copy_subject_assignment(subject: str, fp: str) -> None:
-    """Copy the subject's EXISTING policy assignment onto the new fp.
-
-    Reads the policy file (the authored truth), finds the ``subject:<name>``
-    (or bare-name) row in datasets.assignments, and binds the SAME globs to
-    the new fp — the key carries the user's grants; it never creates them.
-    403 (not 503) when the subject has NO assignment row: the actionable
-    fix belongs to the operator (grant the user by name) or the deployment
-    (a datasets.global default), and the distinction matters to the UI.
-    """
-    path = _policy.policy_file_path()
-    if not path:
-        raise AdminHTTPError(
-            403,
-            "no policy grants exist for your account yet — ask an operator to grant "
-            "your user (subject) access, then mint again",
-        )
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise AdminHTTPError(503, f"cannot read the policy file ({path}): {exc}") from exc
-    data = _admin_validate_policy_text(text)
-    doc = data.get("datasets")
-    if not isinstance(doc, dict):
-        raise AdminHTTPError(
-            403,
-            "no per-user grants exist for your account yet (the policy uses the "
-            "group form) — ask an operator to grant your user access",
-        )
-    assignments = doc.get("assignments") or {}
-    globs = assignments.get(f"subject:{subject}") or assignments.get(subject)
-    if not globs:
-        raise AdminHTTPError(
-            403,
-            f"no grants exist for subject '{subject}' yet — ask an operator to grant "
-            "your user access (Access control tab), then mint again",
-        )
-    _admin_merge_assignment_with_fp(fp, [str(g) for g in globs])
-
-
 def _self_mint_enforce_cap(subject: str, max_keys: int, *, keep_fp: str) -> None:
     """Keep at most max_keys self-minted keys per subject (revoke-to-rotate).
 
@@ -2932,10 +2992,7 @@ def _self_mint_enforce_cap(subject: str, max_keys: int, *, keep_fp: str) -> None
     one (every key still carries only the subject's own grants).
     """
     try:
-        mine = [
-            e for e in _admin_keys.list_keys()
-            if e.get("subject") == subject and e.get("fp") != keep_fp
-        ]
+        mine = [e for e in _admin_keys.list_keys() if e.get("subject") == subject and e.get("fp") != keep_fp]
         mine.sort(key=lambda e: str(e.get("created_at", "")))
         excess = mine[: max(0, len(mine) - max_keys + 1)]
         for e in excess:
@@ -2945,9 +3002,7 @@ def _self_mint_enforce_cap(subject: str, max_keys: int, *, keep_fp: str) -> None
                 _admin_drop_assignment(fp)
                 _audit_admin_event("selfservice.key_rotated_out", fp=fp, subject=subject)
     except Exception:
-        logging.getLogger("sqlhandler.server").debug(
-            "self-mint cap enforcement skipped", exc_info=True
-        )
+        logging.getLogger("sqlhandler.server").debug("self-mint cap enforcement skipped", exc_info=True)
 
 
 def _self_revoke_key(caller, fp: str) -> dict:
@@ -2997,19 +3052,21 @@ def _admin_users_payload() -> dict:
     for ident, globs in raw_assignments.items():
         ident = str(ident)
         if ident.startswith("subject:"):
-            _ensure(ident[len("subject:"):])["grants"] = list(globs or [])
+            _ensure(ident[len("subject:") :])["grants"] = list(globs or [])
 
     # 2) subject-bound minted keys
     for e in _admin_keys.list_keys():
         s = e.get("subject")
         if not s:
             continue
-        _ensure(str(s))["keys"].append({
-            "fp": e.get("fp"),
-            "label": e.get("label", ""),
-            "created_at": e.get("created_at"),
-            "source": e.get("source", "file"),
-        })
+        _ensure(str(s))["keys"].append(
+            {
+                "fp": e.get("fp"),
+                "label": e.get("label", ""),
+                "created_at": e.get("created_at"),
+                "source": e.get("source", "file"),
+            }
+        )
 
     # 3) last-seen from the audit tail (bounded scan, best-effort)
     tail = _audit_subject_last_seen()
@@ -3095,7 +3152,9 @@ def _admin_assign_user_grants(caller, subject: str, globs: list) -> dict:
         assignments.pop(subject, None)
     _admin_write_policy(json.dumps(data, indent=2))
     _audit_admin_event(
-        "admin.user_grants", subject=subject, by=_admin_created_by(caller),
+        "admin.user_grants",
+        subject=subject,
+        by=_admin_created_by(caller),
         globs=cleaned or None,
     )
     pol = _policy.policy_store().get()
@@ -3393,7 +3452,9 @@ def _admin_merge_assignment_with_fp(fp: str, globs: list[str]) -> dict:
     """
     path = _policy.policy_file_path()
     if not path:
-        raise AdminHTTPError(503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — cannot record the assignment")
+        raise AdminHTTPError(
+            503, "no policy file is configured (SQLHANDLER_POLICY_FILE unset) — cannot record the assignment"
+        )
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
@@ -3581,9 +3642,7 @@ class _McpApiKeyMiddleware:
                 # bootstrap lockout, and env-only deployments keep the
                 # exact env-only behavior (zero store I/O: the path check
                 # is one env read).
-                gate_on = (
-                    _admin_keys.keys_file_path() is not None and bool(_admin_keys.list_keys())
-                )
+                gate_on = _admin_keys.keys_file_path() is not None and bool(_admin_keys.list_keys())
             if gate_on:
                 provided = ""
                 for k, v in scope.get("headers", []):
@@ -3739,7 +3798,28 @@ class _IdentityRequiredMiddleware:
     #: Paths NEVER gated — kubelet probes cannot carry secrets (2026-09-18),
     #: and the UI shell is static bytes (its data comes through gated /api):
     #: the html_page mounts at "/", "/ui" and "/ui/index.html".
-    UNGATED_EXACT = ("/", "/health", "/ready", "/metrics", "/ui", "/ui/index.html")
+    #: /api/whoami joins them (D-UI, 2026-10): it is the shell's identity
+    #: probe — a PREVIEW of what a gated call would resolve to (audit-safe
+    #: shape, no grant, no admin answer), so gating it would blind exactly
+    #: the caller it exists to tell "why am I 401-ing?" while admitting
+    #: nothing (every gated route re-resolves on its own).
+    #: /oauth/* joins them (D22, 2026-10): the SSO login round trip IS the
+    #: way an anonymous visitor becomes authenticated — gating it would
+    #: make sign-in unreachable. The callback verifies the exchanged token
+    #: with the full D21 machinery before any cookie exists, so the exempt
+    #: surface admits nothing by itself.
+    UNGATED_EXACT = (
+        "/",
+        "/health",
+        "/ready",
+        "/metrics",
+        "/api/whoami",
+        "/oauth/login",
+        "/oauth/oidc/callback",
+        "/oauth/logout",
+        "/ui",
+        "/ui/index.html",
+    )
 
     def __init__(self, app):
         self.app = app
@@ -3856,8 +3936,7 @@ def main(argv: list | None = None) -> None:
             _handler()
             _loop_log.info("Engine pre-warm complete — readiness can pass immediately")
         except Exception as exc:  # the probe path re-raises with the real error
-            _loop_log.warning("Engine pre-warm FAILED (first /ready will carry the real "
-                              "error): %s", exc)
+            _loop_log.warning("Engine pre-warm FAILED (first /ready will carry the real error): %s", exc)
 
     _threading.Thread(target=_prewarm, name="sqlhandler-prewarm", daemon=True).start()
     uvicorn.run(app, host=args.host, port=args.port)
@@ -3935,8 +4014,10 @@ def _build_http_app():
         try:
             engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=30)
         except TimeoutError:
-            logger.warning("readiness: ENGINE INIT timed out after 30s — engine build still "
-                           "grinding in its thread (lock held); later probes will succeed once warm")
+            logger.warning(
+                "readiness: ENGINE INIT timed out after 30s — engine build still "
+                "grinding in its thread (lock held); later probes will succeed once warm"
+            )
             observability.drift.note_backend(False)
             return _ready_response(503, "engine init timed out")
         except Exception as exc:

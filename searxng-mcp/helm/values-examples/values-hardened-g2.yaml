@@ -47,3 +47,14 @@ networkPolicy:
 ezua:
   virtualService:
     enabled: true
+
+# In-cluster MCP callers reach /mcp on the local service DNS; the SDK's
+# DNS-rebinding protection otherwise 421s them after the network zone lets
+# them through. The chart AUTO-includes the release's own service DNS
+# (searxng-mcp-service.<ns>.svc.cluster.local:*) as the first entry whenever
+# transport security is active; list only EXTRA svc host(s) here — `host:*`
+# accepts any port. The pinned public FQDN (ezua.virtualService.endpoint) and
+# loopback are always allowed. This example OVERLAYS the chart defaults
+# (chart default: []).
+extraAllowedHosts:
+  - searxng-mcp-service.<release-namespace>.svc.cluster.local:*   # SITE: replace <release-namespace>

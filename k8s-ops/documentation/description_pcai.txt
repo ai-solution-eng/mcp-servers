@@ -1,0 +1,1 @@
+K8S operations in a read only controlled manner, by default. Exec is allowed if opted in only. Helpful for debugging deployments.

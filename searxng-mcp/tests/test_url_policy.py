@@ -78,8 +78,8 @@ def make_fetcher(monkeypatch, responder, **kwargs):
     fetcher = WebContentFetcher(requests_per_minute=10000, **kwargs)
     base_make = fetcher._make_client
 
-    def make_client(*, pinned):
-        client = base_make(pinned=pinned)
+    def make_client(*, pinned, verify=None):
+        client = base_make(pinned=pinned, verify=verify)
         client._transport = httpx2.MockTransport(responder)
         return client
 

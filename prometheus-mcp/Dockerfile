@@ -29,7 +29,7 @@ COPY pyproject.toml ./
 RUN uv pip install --system "httpx2>=2.12.0" "mcp>=2.0.0" "starlette>=0.37.0" "uvicorn>=0.27.0"
 
 # App code + assets (cheap layers, keyed on the source files themselves).
-COPY server.py prom_client.py webui.py saved_queries.py ./
+COPY server.py prom_client.py webui.py saved_queries.py mcp_auth.py ./
 COPY mcp_metrics.py ./mcp_metrics.py
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `prometheus-mcp`
@@ -46,7 +46,7 @@ RUN uv pip install --system --no-deps .
 # name against the dependency layer — catching "dep added to pyproject but
 # not to the RUN above" drift in the build log instead of as a
 # ModuleNotFoundError in the pod.
-RUN python -c "import server, prom_client, webui, saved_queries, mcp_metrics; print('prometheus-mcp imports clean')"
+RUN python -c "import server, prom_client, webui, saved_queries, mcp_metrics, mcp_auth; print('prometheus-mcp imports clean')"
 
 EXPOSE 9095
 

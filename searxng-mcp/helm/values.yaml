@@ -20,7 +20,7 @@ image:
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
   # an MCP too old to know the sidecar exists.
-  tag: v1.5.1
+  tag: v1.7.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE. Public packages (the
@@ -120,7 +120,7 @@ browser:
   enabled: false
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.2.1
+    tag: v1.6.1
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -141,6 +141,11 @@ browser:
     configMap: "ezaf-root-ca"
   # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
   extraArgs: ""
+  # Skip TLS verification in rendered contexts (BROWSER_IGNORE_CERT_ERRORS on
+  # the MCP container — the playwright client creates the contexts there).
+  # Escape hatch for egress proxies whose CA cannot be distributed; the
+  # top-level caCert bundle is the proper fix. Default false.
+  ignoreCertErrors: false
 
 # -- Environment ------------------------------------------------------------------------------------
 env:
@@ -179,6 +184,28 @@ apiKey:
   existingSecret: ""
   existingSecretKey: api-keys
 
+# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts, for
+# in-cluster callers that address the server by its service DNS name instead of
+# the public FQDN (e.g. a peer MCP →
+# http://other-mcp.<ns>.svc.cluster.local:9090/mcp). Joined into
+# MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the `host:*`
+# form to accept any port. The pinned public FQDN (ezua.virtualService.endpoint,
+# wired as MCP_HOSTNAME) and loopback are always allowed; without this knob
+# behaviour is unchanged (the SDK's implicit loopback-only protection).
+# List of strings.
+#
+# NOTE — the chart AUTO-INCLUDES this release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
+# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
+# endpoint pinned or extraAllowedHosts non-empty — the DEFAULT render has
+# both, since ezua ships enabled): the LLM-gateway relay arrives with Host:
+# <deployment.name>-service.<ns>.svc.cluster.local:<port>, and without that
+# entry every relay hop gets 421 Misdirected Request. This key only lists
+# hosts BEYOND that; a site setting extraAllowedHosts never loses the
+# own-svc entry (the chart prepends it):
+extraAllowedHosts: []
+
 # -- fetch_content SSRF policy (fleet decision D6 — guard default-ON) ----------
 # Escapes/caps for the fetch SSRF guard (mcp url_policy.py + fetcher.py).
 # Empty strings keep the built-in defaults, so rendering is unchanged unless
@@ -201,6 +228,32 @@ fetch:
   maxScreenshotKb: ""
   # SEARXNG_FETCH_MAX_REDIRECTS — redirect hops, each re-validated ("" = 5).
   maxRedirects: ""
+  # FETCH_TLS_INSECURE_FALLBACK — last-resort resilience for TLS-intercepting
+  # egress: when a fetch rung fails on a certificate error specifically, it
+  # retries ONCE with verification disabled and the tool output is marked.
+  # Default "" (off). Consider "true" on sites whose CA bundle may lag the
+  # proxy's CA rotation (Zscaler rotates roots); the proper fix is the
+  # caCert bundle below.
+  tlsInsecureFallback: ""
+
+# -- Corporate egress CA (TLS interception — Zscaler/Blue Coat style) -----------
+# When the egress proxy re-signs TLS, every HTTPS fetch dies with
+# "unable to get local issuer certificate" (curl: (60)) and the browser rung
+# with ERR_CERT_AUTHORITY_INVALID — unless the proxy's root CA is trusted.
+# Point caCert at a ConfigMap in the release namespace whose keys are PEM
+# certificates of the proxy's root/intermediate CAs. The chart mounts it and
+# the init-ca-bundle init container combines it with the image's public
+# bundle into /ca-bundle/ca-bundle.crt, wired to FETCH_CA_BUNDLE /
+# SSL_CERT_FILE / CURL_CA_BUNDLE on the MCP container (verification stays
+# ON — this is the proper fix; fetch.tlsInsecureFallback is the escape
+# hatch). To capture and verify the CA your proxy actually presents:
+#   openssl s_client -proxy <proxy-host>:<port> -connect example.com:443 \
+#     -servername example.com -showcerts </dev/null
+# then verify a candidate root against the captured intermediate:
+#   openssl verify -CAfile candidate-root.pem intermediate.pem
+caCert:
+  enabled: false
+  configMap: "zscaler-root-ca"
 
 # -- Egress proxy ---------------------------------------------------------------------------------------
 # Per-key proxy wiring — each key is wired into the pod only when non-empty,
@@ -226,7 +279,10 @@ ezua:
     # `default` treats an explicit `false` as empty and would return true.
     enabled: true
     # Root of this host serves the normal SearXNG web page; /mcp is routed
-    # to the MCP server (streamable-http + SSE).
+    # to the MCP server (streamable-http + SSE). Doubles as MCP_HOSTNAME —
+    # the DNS-rebinding Host pin (must be unique per release on the shared
+    # gateway; two VirtualServices claiming one host split traffic between
+    # their backends).
     endpoint: "searxng-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s

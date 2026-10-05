@@ -18,7 +18,7 @@ deployment:
 # Chart.yaml by the release tooling) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.3.1
+  tag: v0.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -58,6 +58,16 @@ logsearch:
   maxLineChars: 2000
   fetchConcurrency: 8
   maxRegexChars: 512
+
+# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts for
+# IN-CLUSTER callers addressing the server by svc DNS (joined into
+# MCP_EXTRA_ALLOWED_HOSTS; verbatim or `host:*`). The pinned public FQDN
+# (ezua.virtualService.endpoint) and loopback are always allowed; empty =
+# behaviour unchanged (fleet pattern: K8S-MCP). The chart AUTO-prepends the
+# release's own service DNS (<deployment.name>-service.<ns>.svc.cluster.local:*)
+# whenever transport security is active — sites list only EXTRA hosts.
+extraAllowedHosts: []
 
 # -- Service exposure ---------------------------------------------------------------------
 service:

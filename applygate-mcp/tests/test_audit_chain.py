@@ -379,3 +379,38 @@ def test_middleware_exposes_routes_passthrough(monkeypatch):
     assert app.routes  # introspection of the wrapped app keeps working
     paths = {getattr(r, "path", None) for r in app.routes}
     assert "/mcp" in paths and "/healthz" in paths
+
+
+# ---------------------------------------------------------------------------
+# verify_audit_chain as an MCP tool — parameter-free, own-file-only
+# ---------------------------------------------------------------------------
+
+
+def test_verify_tool_reports_the_configured_file(monkeypatch, tmp_path):
+    for i in range(3):
+        server._audit("plan_apply", "team-a", "ConfigMap", f"cm-{i}", True, "dry-run")
+    report = json.loads(asyncio.run(server.verify_audit_chain_tool()))
+    assert report["ok"] is True
+    assert report["exists"] is True
+    assert report["entries"] == 3
+    assert report["file"] == audit_path(tmp_path)
+
+
+def test_verify_tool_reads_only_the_configured_path(monkeypatch, tmp_path):
+    """The path is SERVER configuration: the tool body resolves
+    APPLYGATE_AUDIT_FILE and never accepts a caller path."""
+    other = tmp_path / "tampered.jsonl"
+    other.write_text('{"prev_sha256": "deadbeef"}\n', encoding="utf-8")
+    monkeypatch.setenv("APPLYGATE_AUDIT_FILE", str(tmp_path / "audit.jsonl"))
+    server._audit("plan_apply", "team-a", "ConfigMap", "cm", True, "dry-run")
+    report = json.loads(asyncio.run(server.verify_audit_chain_tool()))
+    assert report["ok"] is True  # verified the configured trail ...
+    assert report["file"] == str(tmp_path / "audit.jsonl")  # ... only that one
+    assert report["file"] != str(other)
+
+
+def test_verify_tool_reports_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPLYGATE_AUDIT_FILE", str(tmp_path / "absent.jsonl"))
+    report = json.loads(asyncio.run(server.verify_audit_chain_tool()))
+    assert report["ok"] is True and report["exists"] is False
+    assert report["entries"] == 0

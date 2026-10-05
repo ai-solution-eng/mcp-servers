@@ -35,12 +35,47 @@ spec:
               mountPath: /config-dst
             - name: config-src
               mountPath: /config-src
+        {{- if .Values.caCert.enabled }}
+        - name: init-ca-bundle
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The MCP image is reused on purpose: it already carries the
+          # certifi bundle the server's HTTP stack would otherwise use, so
+          # the combined bundle stays consistent with the code's defaults.
+          command:
+            - sh
+            - -ec
+            - >-
+              mkdir -p /bundle-dst;
+              CERTIFI="$(find /usr/local/lib -path '*site-packages/certifi/cacert.pem' 2>/dev/null | head -n1)";
+              if [ -n "$CERTIFI" ]; then cp "$CERTIFI" /bundle-dst/ca-bundle.crt;
+              else cp /etc/ssl/certs/ca-certificates.crt /bundle-dst/ca-bundle.crt 2>/dev/null || : > /bundle-dst/ca-bundle.crt; fi;
+              cat /bundle-src/*.crt >> /bundle-dst/ca-bundle.crt
+          volumeMounts:
+            - name: proxy-ca-bundle
+              mountPath: /bundle-dst
+            - name: proxy-ca-src
+              mountPath: /bundle-src
+              readOnly: true
+        {{- end }}
       volumes:
         - name: config-src
           configMap:
             name: {{ .Values.deployment.name }}-settings
         - name: config-runtime
           emptyDir: {}
+        {{- if .Values.caCert.enabled }}
+        # Corporate egress CA for the MCP container (TLS-intercepting
+        # proxies — Zscaler et al.). init-ca-bundle combines the mounted
+        # PEMs with the image's own public bundle into ONE file: OpenSSL
+        # REPLACES the default store with whatever verify= points at, so a
+        # proxy-CA-only bundle would break every non-intercepted site.
+        - name: proxy-ca-src
+          configMap:
+            name: {{ .Values.caCert.configMap }}
+        - name: proxy-ca-bundle
+          emptyDir: {}
+        {{- end }}
         {{- if and .Values.browser.enabled .Values.browser.caCert.enabled }}
         # Corporate MITM CA for the headless browser (Chromium verifies TLS
         # against the OS trust store, not *_PROXY env or SSL_CERT_FILE).
@@ -122,6 +157,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.service.targetPort }}
+          {{- if .Values.caCert.enabled }}
+          volumeMounts:
+            - name: proxy-ca-bundle
+              mountPath: /ca-bundle
+              readOnly: true
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           env:
@@ -135,6 +176,31 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            {{- end }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection;
+            # read once at server startup, changing it requires a restart).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (ezua endpoint pinned or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
             {{- end }}
             {{- with .Values.fetch.allowHosts }}
             # fetch_content SSRF guard escapes/caps (fleet decision D6 — the
@@ -179,6 +245,29 @@ spec:
               value: {{ .Values.proxy.noProxy | quote }}
             - name: no_proxy
               value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+            {{- if .Values.caCert.enabled }}
+            # Combined CA bundle (public roots + the egress proxy's CA),
+            # built by init-ca-bundle. FETCH_CA_BUNDLE is read by the server
+            # code (verify= to both HTTP rungs); SSL_CERT_FILE /
+            # CURL_CA_BUNDLE cover the same rungs natively in images that
+            # predate that code (httpx2 and curl_cffi honor them).
+            - name: FETCH_CA_BUNDLE
+              value: /ca-bundle/ca-bundle.crt
+            - name: SSL_CERT_FILE
+              value: /ca-bundle/ca-bundle.crt
+            - name: CURL_CA_BUNDLE
+              value: /ca-bundle/ca-bundle.crt
+            {{- end }}
+            {{- if and .Values.browser.enabled .Values.browser.ignoreCertErrors }}
+            # Read by the MCP container's playwright client (the browser
+            # contexts are created there), not by the sidecar itself.
+            - name: BROWSER_IGNORE_CERT_ERRORS
+              value: "true"
+            {{- end }}
+            {{- with .Values.fetch.tlsInsecureFallback }}
+            - name: FETCH_TLS_INSECURE_FALLBACK
+              value: {{ . | quote }}
             {{- end }}
             {{- if .Values.metrics.enabled }}
             # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the

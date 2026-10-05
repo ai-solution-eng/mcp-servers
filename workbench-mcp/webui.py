@@ -9,7 +9,9 @@ confinement, the argv allowlist/denylist, timeouts, output caps, and the
 JSONL audit log all live in those core functions and apply identically
 whether the caller is an MCP tool or this API. The one addition is
 ``/api/audit``, a READ-ONLY tail over the same ``.audit.jsonl`` file the
-core ``_audit`` writer produces.
+core ``_audit`` writer produces (spanning the active AND the previous
+``.audit.jsonl.1`` generation, so a tail that crosses a rotation stays
+complete).
 
 Trust model (rendered as a banner in the UI): this is a scratch pad by
 design — it executes allow-listed commands. The endpoint must sit behind
@@ -19,12 +21,12 @@ Endpoints (all JSON unless noted):
 
   GET  /                        -> the HTML UI (also at /ui)
   GET  /api/status              -> {"status", "workbench", "caps": {...}}
-  GET  /api/workspaces          -> {"workspaces": [...]}
+  GET  /api/workspaces          -> {"workspaces": [...]}  (deep listing)
   POST /api/workspaces          -> create        {"name"}
   POST /api/workspaces/delete   -> delete        {"name", "confirm"}
   GET  /api/ws/{ws}/files       -> file tree     {"path"?}
   GET  /api/ws/{ws}/file        -> read          {"path", "max_bytes"?}
-  POST /api/ws/{ws}/file        -> write         {"path", "content"}
+  POST /api/ws/{ws}/file        -> write         {"path", "content", "append"?}
   POST /api/ws/{ws}/file/delete -> delete        {"path", "confirm"}
   GET  /api/ws/{ws}/env         -> {"env": {...}}
   POST /api/ws/{ws}/env         -> set           {"key", "value"}
@@ -178,8 +180,11 @@ def build_ui_routes() -> list[Route]:
             except WorkbenchError as exc:
                 return _err_payload(exc)
             return JSONResponse(out)
+        # Console consumers (ui/index.html) render w.files / w.bytes, so the
+        # internal API path defaults to the DEEP listing — the MCP tool's
+        # default flip to lazy does not change what the UI shows.
         try:
-            listing = await asyncio.to_thread(_ws_list)
+            listing = await asyncio.to_thread(_ws_list, True)
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse({"workspaces": listing})
@@ -233,8 +238,9 @@ def build_ui_routes() -> list[Route]:
             return JSONResponse({"error": "path is required"}, status_code=400)
         if not isinstance(content, str):
             return JSONResponse({"error": "content must be a string"}, status_code=400)
+        append = bool(body.get("append"))
         try:
-            out = await asyncio.to_thread(_file_write, ws, path, content)
+            out = await asyncio.to_thread(_file_write, ws, path, content, append)
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse(out)
@@ -309,12 +315,20 @@ def build_ui_routes() -> list[Route]:
         except ValueError:
             return JSONResponse({"error": "n must be an integer"}, status_code=400)
         n = max(1, min(n, _MAX_AUDIT_TAIL))
-        path = _root() / ".audit.jsonl"
-        try:
-            raw = await asyncio.to_thread(path.read_bytes)
-        except OSError:
+
+        def _tail_lines():
+            # Active generation first, then the previous one (.audit.jsonl.1,
+            # written by the server's rotation) — a tail that spans a rotation
+            # still shows the events that scrolled into the .1 generation.
             raw = b""
-        lines = [ln for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+            for p in (_root() / ".audit.jsonl.1", _root() / ".audit.jsonl"):
+                try:
+                    raw += p.read_bytes()
+                except OSError:
+                    continue
+            return [ln for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+
+        lines = await asyncio.to_thread(_tail_lines)
         events = []
         for line in lines[-n:]:
             try:

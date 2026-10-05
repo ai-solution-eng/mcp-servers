@@ -18,12 +18,26 @@ deployment:
 # Chart.yaml by the release tooling) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.3.1
+  tag: v0.5.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
 # anonymously).
 imagePullSecrets: []
+
+# -- Transport security (DNS-rebinding protection) ----------------------------------
+# SITE: mcpHostname is the public FQDN clients use to reach /mcp — the
+# DNS-rebinding pin. Keep in lockstep with ezua.virtualService.endpoint
+# below: WITHOUT it every gateway-fronted request gets 421 "Invalid Host
+# header". extraAllowedHosts lists EXTRA in-cluster svc-DNS hosts for callers
+# that bypass the gateway (verbatim or host:* form; loopback is always
+# allowed; empty = unchanged behavior). The chart AUTO-prepends the release's
+# own service DNS (<deployment.name>-service.<ns>.svc.cluster.local:*) when
+# transport security is active — the gateway relay's Host header — so this
+# list is for hosts BEYOND that.
+mcpHostname: applygate-mcp.your-cluster.example
+extraAllowedHosts:
+  - applygate-mcp.mcp-demo.svc.cluster.local
 
 # -- Web console ---------------------------------------------------------------------------
 # The strictly READ-ONLY HPE-branded UI at / (plan previews are ALWAYS

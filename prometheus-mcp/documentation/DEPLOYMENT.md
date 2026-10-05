@@ -39,7 +39,9 @@ ezua:
 | `resources` | `100m`/`128Mi` requests, `512Mi` memory limit | A query proxy, not a compute node. |
 | `ezua.authorizationPolicy.enabled` | `false` | Gateway-level auth gate (Istio `AuthorizationPolicy`, action CUSTOM) delegating this host to the PCAI **oauth2-proxy** extension — external callers then need a valid PCAI token. OFF by default: the rotating 30-min SSO token is a known pain for machine MCP callers (accepted lab trade — flip on per environment if the trust posture changes). `namespace: istio-system`, `providerName: oauth2-proxy`. |
 | `service.type` / `port` / `targetPort` | `ClusterIP` / `9095` | Don't move the port without moving the probes' target. |
-| `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (one counter family: per-tool request counts with outcome ok/error — no PromQL text, label names, or error strings exported). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is served key-free on the same port (this server has no auth middleware — read-only surface behind the gateway) so the ServiceMonitor can scrape it. Requires prometheus-operator CRDs. |
+| `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (one counter family: per-tool request counts with outcome ok/error — no PromQL text, label names, or error strings exported). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is served key-free on the same port (the API-key gate below scopes to `/mcp` only) so the ServiceMonitor can scrape it. Requires prometheus-operator CRDs. |
+| `apiKey.existingSecret` (+ `existingSecretKey`) | `""` | OPTIONAL API-key gate on `/mcp` (fleet decision 2026-09): rendered ONLY when the values point at a pre-deployed Secret — `/mcp` then requires a key (`PROMETHEUS_API_KEYS`; the fleet-universal `MCP_API_KEYS` is honored too), everything else (`/health`, `/healthz`, console, `/api/*`, `/metrics`) stays key-free. Empty (default) = the server runs open with a loud startup warning. The chart NEVER creates the Secret and never inlines a key. |
+| `extraAllowedHosts` | `[]` | EXTRA in-cluster svc-DNS Host allowlist additions for the MCP SDK's DNS-rebinding protection (joined into `MCP_EXTRA_ALLOWED_HOSTS`; matched verbatim or as `host:*`). Together with the pinned `MCP_HOSTNAME` (rendered from `ezua.virtualService.endpoint` whenever ezua + endpoint are set) this turns Host-header protection ON; with NEITHER set the SDK's implicit loopback-only protection applies unchanged. When transport security is active, the chart AUTO-prepends the release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*` — the gateway relay's Host header) as the first entry. |
 
 There is deliberately NO `webui` toggle: the read-only console at `/` and its
 `/api/*` endpoints are always served by the same container (every dashboard
@@ -55,6 +57,11 @@ these directly):
 | `PROM_URL` | `prometheusUrl` |
 | `PROM_UI_GPU_NVLINK_DOMAINS` | `gpuNvlinkDomains` (JSON string or YAML list — both render to the same value; omitted when empty) |
 | `PROMETHEUS_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
+| `PROMETHEUS_API_KEYS` | rendered from the `apiKey.existingSecret` Secret reference ONLY when set (otherwise absent — `/mcp` runs open with the startup warning) |
+| `MCP_HOSTNAME` | `ezua.virtualService.endpoint` whenever `ezua.enabled` + endpoint are set (DNS-rebinding Host pin) |
+| `MCP_EXTRA_ALLOWED_HOSTS` | own service DNS first (`<deployment.name>-service.<ns>.svc.cluster.local:*`), then `extraAllowedHosts` joined with commas — rendered when transport security is active (ezua endpoint pinned or extras non-empty) |
+| `PROMETHEUS_SAVED_QUERIES_PATH` | `persistence.mountPath`/`persistence.savedQueriesFile` ONLY when `persistence.enabled=true` |
+| `PROMETHEUS_SAVED_QUERIES_SHARED` | rendered `"1"` ONLY when `persistence.enabled=true` AND `persistence.shared=true` (the per-replica warning in `query_save` results then goes silent) |
 
 Server-side env knobs not wired by the chart (sane defaults built in,
 documented for completeness): `PROM_TIMEOUT` (30 s), `PROM_MAX_SERIES` (20),
@@ -70,7 +77,10 @@ refresh within the TTL is served instantly and marked `cached=true` with
 `cache_age_seconds`, and concurrent identical overviews share one
 computation), and `PROMETHEUS_SAVED_QUERIES_PATH` (saved-query store: unset
 = in-memory for the session, tool results say so; set = durable, written
-atomically).
+atomically) plus `PROMETHEUS_SAVED_QUERIES_SHARED` (default "0" — set "1"
+to declare the store genuinely shared across replicas, silencing the
+per-replica warning in `query_save` results; it is a declaration, not
+concurrency control).
 
 ## Gateway exposure (ezua / Istio + oauth2-proxy)
 
@@ -98,9 +108,10 @@ posture is entirely the `ezua.authorizationPolicy` gate above.
 
 ### Proxied corporate site (SITE: your-cluster.example)
 
-- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
-  write the literal domain into `ezua.virtualService.endpoint` (the G2
-  example ships it already; `ezua.domainName` is informational).
+- **Domain.** PCAI envsubsts `${DOMAIN_NAME}` in pasted values before
+  rendering, so the hosted-trial placeholders work as-pasted; the G2 site
+  files deliberately carry the literal domain instead (the G2 example ships
+  it already; `ezua.domainName` is informational).
 - GPU wiring: `gpuNvlinkDomains` pinned to the operator-confirmed two
   4-GPU islands, `nvlinkAutodetect.enabled: false` (no resident detector
   pods); `persistence.enabled: true` (RWX `gl4f-filesystem`) so saved

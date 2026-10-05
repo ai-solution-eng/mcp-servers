@@ -25,7 +25,8 @@ K8S_MCP_BLOCKED_NAMESPACES   comma-separated deny patterns (e.g.
                              "kube-system,kube-*"); always denied, even when
                              whitelisted.
 When a policy is active, namespaced kubectl queries must pass -n; -A/--all-
-namespaces is rewritten into one query per allowed namespace (limit 20) when
+namespaces is rewritten into one query per allowed namespace (limit
+K8S_MCP_MAX_NS_REWRITE, default 20) when
 a whitelist is set, and rejected when only a blacklist is set (arbitrary
 kubectl output cannot be filtered reliably). Python-API-backed tools
 (cluster_health, list_*, get_events) filter denied namespaces from results.
@@ -51,6 +52,7 @@ import re
 import shlex
 import sys
 import tempfile
+import time
 from typing import Any, NamedTuple
 
 from kubernetes import client, config, dynamic
@@ -117,9 +119,22 @@ dyn_client = dynamic.DynamicClient(api_client)
 
 ALLOWED_NAMESPACES_ENV = "K8S_MCP_ALLOWED_NAMESPACES"
 BLOCKED_NAMESPACES_ENV = "K8S_MCP_BLOCKED_NAMESPACES"
-MAX_NS_QUERY_REWRITE = 20
+DEFAULT_MAX_NS_REWRITE = 20
+MAX_NS_REWRITE_ENV = "K8S_MCP_MAX_NS_REWRITE"
 _NS_NAME_RE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 _NS_PATTERN_RE = re.compile(r"[a-z0-9*?][a-z0-9*?-]{0,61}")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def _max_ns_rewrite() -> int:
+    """Cluster-wide rewrite limit (>= 1; malformed values keep the default)."""
+    return max(1, _env_int(MAX_NS_REWRITE_ENV, DEFAULT_MAX_NS_REWRITE))
 
 
 def _parse_ns_patterns(raw: str) -> tuple:
@@ -475,15 +490,42 @@ def _is_cluster_scoped(resource_token: str) -> bool:
     return _short_resource(resource_token) in _CLUSTER_SCOPED_RESOURCES
 
 
+# 30s-TTL cache for _expand_allowed's live namespace lookup. A whitelist
+# rewrite used to call v1.list_namespace on EVERY cluster-wide query; with
+# the cache, at most one live lookup lands per 30s window (per policy env).
+# Staleness is therefore ≤30s and INTENTIONAL: a namespace created or deleted
+# in that window can be missing from / present in one rewrite plan. That is
+# acceptable for a read-only fan-out — per-namespace results are still
+# policy-filtered, and fail-open/fail-closed behavior is unchanged (any list
+# error bypasses the cache and behaves exactly as before).
+_EXPANSION_CACHE_TTL_SECONDS = 30.0
+_expansion_cache: dict = {}  # policy-env-key -> (monotonic ts, frozenset names)
+
+
+def _expansion_cache_key() -> tuple:
+    """Cache key = the resolved policy pair (the only input to the expansion)."""
+    allowed, blocked = _namespace_policy()
+    return (allowed, blocked)
+
+
 async def _expand_allowed(allowed) -> list:
     """Expand glob patterns against the live namespace list; pass exact names."""
     if not any(ch in pattern for pattern in allowed for ch in "*?"):
         return sorted(allowed)
+    key = _expansion_cache_key()
+    now = time.monotonic()
+    cached = _expansion_cache.get(key)
+    if cached is not None and now - cached[0] <= _EXPANSION_CACHE_TTL_SECONDS:
+        return sorted(cached[1])
     try:
         ns_list = await asyncio.to_thread(v1.list_namespace)
     except ApiException as e:
+        # On error, bypass the cache entirely and behave as the pre-cache code:
+        # surface the API failure (a stale "good" answer must never mask it).
         raise NamespacePolicyError(f"could not expand namespace glob patterns: {e.reason}") from e
-    matched = {n.metadata.name for n in ns_list.items if _visible(n.metadata.name)}
+    matched = frozenset(n.metadata.name for n in ns_list.items if _visible(n.metadata.name))
+    _expansion_cache.clear()  # only one policy pair can be live at a time
+    _expansion_cache[key] = (now, matched)
     return sorted(matched)
 
 
@@ -520,10 +562,11 @@ async def _namespace_plan(argv: list):
     expanded = await _expand_allowed(allowed)
     if not expanded:
         raise NamespacePolicyError(f"the {ALLOWED_NAMESPACES_ENV} patterns matched no live namespaces.")
-    if len(expanded) > MAX_NS_QUERY_REWRITE:
+    limit = _max_ns_rewrite()
+    if len(expanded) > limit:
         raise NamespacePolicyError(
             f"{len(expanded)} allowed namespaces exceed the "
-            f"{MAX_NS_QUERY_REWRITE}-namespace cluster-wide rewrite limit; "
+            f"{limit}-namespace cluster-wide rewrite limit; "
             "pass -n <namespace> instead."
         )
     base = [tok for tok in argv if tok not in ("-A", "--all-namespaces")]
@@ -608,25 +651,20 @@ def _truncate(text: str, max_len: int = 50000) -> str:
 # ─── Cluster-wide listing guardrails ─────────────────────────────────────
 #
 # K8S_MCP_LIST_CONCURRENCY — width of the bounded-semaphore fan-out when a
-#   whitelist rewrites one -A query into up to MAX_NS_QUERY_REWRITE
+#   whitelist rewrites one -A query into up to K8S_MCP_MAX_NS_REWRITE
 #   per-namespace kubectl spawns (>= 1; malformed values fall back to the
 #   default — a perf knob, not a policy).
 # K8S_MCP_MAX_LIST_ITEMS — cap on what a CLUSTER-WIDE (namespace omitted /
-#   -A) Python-API listing may render. Namespaced listings are untouched;
-#   when the cap bites, a truncation marker naming this env is appended so
-#   operators can page per-namespace or raise it. (kubectl-backed output
-#   stays bounded by _truncate's 50k-char cap, as before.)
+#   -A) listing may render, for BOTH the Python-API paths (_cap_cluster_wide)
+#   and the kubectl-backed get_resource listing fast path. Namespaced
+#   listings are untouched; when the cap bites, a truncation marker naming
+#   this env is appended so operators can page per-namespace or raise it.
+#   (kubectl output on other paths stays bounded by _truncate's 50k-char
+#   cap, as before.)
 LIST_CONCURRENCY_ENV = "K8S_MCP_LIST_CONCURRENCY"
 DEFAULT_LIST_CONCURRENCY = 8
 MAX_LIST_ITEMS_ENV = "K8S_MCP_MAX_LIST_ITEMS"
-DEFAULT_MAX_LIST_ITEMS = 500
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip())
-    except ValueError:
-        return default
+DEFAULT_MAX_LIST_ITEMS = 100
 
 
 def _list_concurrency() -> int:
@@ -637,6 +675,15 @@ def _list_concurrency() -> int:
 def _max_list_items() -> int:
     """Cluster-wide list cap (>= 1; malformed values keep the default)."""
     return max(1, _env_int(MAX_LIST_ITEMS_ENV, DEFAULT_MAX_LIST_ITEMS))
+
+
+MAX_EVENTS_ENV = "K8S_MCP_MAX_EVENTS"
+DEFAULT_MAX_EVENTS = 100
+
+
+def _max_events() -> int:
+    """Event cap for get_events and triage's Warning section (>= 1)."""
+    return max(1, _env_int(MAX_EVENTS_ENV, DEFAULT_MAX_EVENTS))
 
 
 def _cap_cluster_wide(items: list) -> tuple:
@@ -664,6 +711,94 @@ def _cap_suffix(marker) -> str:
     return f"\n{marker}" if marker else ""
 
 
+# ─── get_resource fast path (un-named listings) ──────────────────────────
+#
+# The noisiest common read is an UN-NAMED listing ("what pods exist?").
+# kubectl serves it as a subprocess spawn rendering full YAML per item until
+# the 50k-char _truncate wall — a context window of noise. The dynamic client
+# (already in-process for triage / get_custom_resource / list_virtual_services)
+# can serve the same listing without the subprocess, rendered COMPACTLY: one
+#   <namespace>/<name> (Age: …)
+# line per item, policy-filtered and capped exactly like the other Python-API
+# listings. Only the default -o yaml un-named listing takes this path; the
+# kubectl contract stays byte-for-byte for everything else:
+#   - named gets (tests and the console parse the YAML; PyYAML and Go also
+#     disagree on timestamp quoting and < > & JSON escaping, so a Python-
+#     rendered named get would NOT be byte-identical — kubectl stays),
+#   - jsonpath= / custom-columns= / wide / name output modes,
+#   - tokens the dynamic client cannot resolve to exactly one resource
+#     (unknown kinds, group-qualified or dotted tokens, short aliases not
+#     in _FASTPATH_ALIASES), and
+#   - ANY exception on the dynamic path (the fallback is total).
+# Namespace-policy note: under a whitelist this listing is policy-FILTERED
+# (like list_pods / get_events cluster-wide) instead of rewritten per
+# namespace; under a blacklist-only policy the kubectl path refuses -A
+# outright, while this filtered listing can answer safely — same posture as
+# every other Python-API tool.
+_FASTPATH_ALIASES = {
+    # kubectl short names worth mapping — muscle-memory tokens keep the fast
+    # path; anything not listed falls back to kubectl (still correct output).
+    "po": "pods",
+    "deploy": "deployments",
+    "sts": "statefulsets",
+    "ds": "daemonsets",
+    "svc": "services",
+    "cm": "configmaps",
+    "ing": "ingresses",
+    "ep": "endpoints",
+    "netpol": "networkpolicies",
+    "sa": "serviceaccounts",
+    "rs": "replicasets",
+    "hpa": "horizontalpodautoscalers",
+}
+_FASTPATH_RESOURCE_TTL_SECONDS = 300.0
+_fastpath_resources: dict = {}  # resolved plural -> (monotonic ts, Resource | None)
+
+
+def _fastpath_resource(token: str):
+    """Resolve a resource token to a dynamic-client Resource, 5min-TTL cached.
+
+    Returns None when the token does not map to exactly one listable resource
+    (unknown / ambiguous / discovery error); the caller then uses the kubectl
+    path as before. Negative resolutions are cached for the same TTL so a
+    bogus token costs one discovery attempt per 5 minutes, not per call.
+    """
+    short = _short_resource(token)
+    short = _FASTPATH_ALIASES.get(short, short)
+    now = time.monotonic()
+    cached = _fastpath_resources.get(short)
+    if cached is not None and now - cached[0] <= _FASTPATH_RESOURCE_TTL_SECONDS:
+        return cached[1]
+    try:
+        resource = dyn_client.resources.get(name=short)
+    except Exception:
+        # Unknown kind, ResourceNotUniqueError (same plural in several API
+        # versions/groups), stale discovery cache, auth blip — all resolve
+        # the same way: let kubectl answer (its error text is battle-tested).
+        _fastpath_resources[short] = (now, None)
+        return None
+    _fastpath_resources[short] = (now, resource)
+    return resource
+
+
+async def _fastpath_list(resource, plural: str) -> str:
+    """Un-named listing via the in-process dynamic client, compact form."""
+    listing = await asyncio.to_thread(resource.get)
+    instances = list(getattr(listing, "items", None) or [])
+    dicts = [i.to_dict() if hasattr(i, "to_dict") else i for i in instances]
+    if _namespace_policy_active():
+        dicts = [d for d in dicts if _dict_visible(d)]
+    dicts, marker = _cap_cluster_wide(dicts)
+    if not dicts:
+        return f"No {plural} found."
+    lines = [f"{plural.upper()} ({len(dicts)}):"]
+    for d in dicts:
+        meta = d.get("metadata") or {}
+        ns = meta.get("namespace") or "cluster-scoped"
+        lines.append(f"  {ns}/{meta.get('name', '?')} (Age: {_iso_age(meta.get('creationTimestamp'))})")
+    return "\n".join(lines) + _cap_suffix(marker)
+
+
 # ─── Generic K8s API Tools ───────────────────────────────────────────────
 
 
@@ -685,21 +820,43 @@ async def get_resource(
       get_resource("inferenceservices", namespace="ml-ns")
       get_resource("nodes")
       get_resource("customresourcedefinitions")
-    Namespace policy applies: an omitted namespace means cluster-wide
-    (rewritten per allowed namespace, or rejected under a blacklist-only
+    Un-named listings (no name) of kinds the server can resolve in-process
+    render compactly — one "namespace/name (Age: …)" line per item, capped by
+    K8S_MCP_MAX_LIST_ITEMS (default 100) — instead of one full YAML document
+    per item; a marker names the env when the cap bites. Named gets and every
+    other output mode (jsonpath=, custom-columns=, wide, name) keep kubectl's
+    exact output. Namespace policy applies: an omitted namespace means
+    cluster-wide (policy-filtered on the compact path, rewritten per allowed
+    namespace on the kubectl path, or rejected under a blacklist-only
     policy)."""
     try:
-        argv = ["get", _validated_resource_type(resource_type)]
-        if name:
-            argv.append(_validated_name(name))
+        rt = _validated_resource_type(resource_type)
+        nm = _validated_name(name) if name else ""
         ns = _validated_namespace(namespace)
-        if ns:
-            argv += ["-n", ns]
-        else:
-            argv.append("--all-namespaces")
-        argv += ["-o", _validated_output(output)]
+        out = _validated_output(output)
     except ValueError as e:
         return f"Error: {e}"
+
+    if not nm and not ns and out == "yaml" and "/" not in rt and "." not in rt:
+        # Un-named cluster-wide listing: the fast path. Any dynamic-path
+        # exception falls through to kubectl, whose output contract is
+        # unchanged (the fallback IS the old behavior).
+        resource = _fastpath_resource(rt)
+        if resource is not None:
+            try:
+                _metrics_inc("get_resource_fastpath", "ok")
+                return await _fastpath_list(resource, resource.name or rt)
+            except Exception:
+                _metrics_inc("get_resource_fastpath", "fallback")
+
+    argv = ["get", rt]
+    if nm:
+        argv.append(nm)
+    if ns:
+        argv += ["-n", ns]
+    else:
+        argv.append("--all-namespaces")
+    argv += ["-o", out]
     return await _kubectl_plan_execute(argv)
 
 
@@ -886,7 +1043,7 @@ async def list_pods(namespace: str = "", label_selector: str = "") -> str:
 )
 async def get_pod_logs(
     pod_name: str,
-    namespace: str = "default",
+    namespace: str,
     container: str = "",
     tail: int = 100,
     previous: bool = False,
@@ -898,8 +1055,9 @@ async def get_pod_logs(
 
     Args:
         pod_name: Name of the pod (find with list_pods).
-        namespace: Namespace of the pod. Defaults to "default" — pass it
-            explicitly unless the pod really lives in default.
+        namespace: Namespace of the pod (REQUIRED — omitting it used to
+            silently read from "default", which masked the real target when
+            a pod of the same name lived elsewhere).
         container: Container name for multi-container pods; empty = the first
             (default) container.
         tail: How many trailing lines to return (default 100).
@@ -907,6 +1065,12 @@ async def get_pod_logs(
             running one — the first move for a CrashLoopBackOff pod whose
             current container has nothing to say.
     """
+    if not (namespace or "").strip():
+        return (
+            "Error: namespace is required for get_pod_logs — pass the pod's "
+            "namespace explicitly (find it with list_pods or triage; there is "
+            "no implicit 'default')."
+        )
     violation = namespace_violation(namespace)
     if violation:
         return f"Error: {violation}"
@@ -985,7 +1149,7 @@ async def get_events(
             key=lambda e: e.last_timestamp or e.event_time or datetime.datetime.min.replace(tzinfo=datetime.UTC),
             reverse=True,
         )
-        items = items[:100]  # limit
+        items = items[:_max_events()]  # limit
 
         if not items:
             return "No events found matching filters."
@@ -1387,7 +1551,7 @@ async def triage(namespace: str, app: str = "") -> str:
             key=lambda e: e.last_timestamp or e.event_time or datetime.datetime.min.replace(tzinfo=datetime.UTC),
             reverse=True,
         )
-        warning_items = warning_items[:100]
+        warning_items = warning_items[:_max_events()]
         for ev in warning_items:
             if getattr(ev, "reason", None) == "Unhealthy" and (
                 not app_name or app_name in (ev.involved_object.name or "")

@@ -5,8 +5,12 @@ pass a stub client (same pattern as the MCP wire tests) and drive the
 Starlette app with TestClient.
 """
 
+import re
+import shutil
+import subprocess
 from typing import ClassVar
 
+import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -536,3 +540,229 @@ def test_gpu_duplicate_domain_claim_skips_host():
     data = TestClient(Starlette(routes=webui.build_ui_routes(Dupes(), cfg))).get("/api/gpu").json()
     assert data["domains_source"] == "default"
     assert data["domains_detected"] is None
+
+
+# ---------------------------------------------------------------------------
+# Nodes (capacity vs allocation vs usage): /api/nodes
+# ---------------------------------------------------------------------------
+
+NODE_A = "pcai-se-scs04.hst.lab"  # GPU node (nvidia allocatable present)
+NODE_B = "pcai-se-ez-master01.hst.lab"  # plain node
+
+
+def _node_sample(name, value, name_override=None):
+    return {"metric": {"__name__": "x", "node": name}, "value": [1757337600, str(value)]}
+
+
+class NodesClient(StubClient):
+    """kube-prometheus-stack-shaped stub: one GPU node + one plain node.
+
+    scs04 (GPU): 344 allocatable cores / 700 GiB, requests 172c 350GiB,
+    limits 688c 1400GiB, active 86c 100GiB, 330 pods.
+    master01: 4 cores / 16 GiB, requests 2c 8GiB, limits 8c 32GiB,
+    active 1c 1GiB, 9 pods.
+    """
+
+    async def instant_query(self, query, ts=None):
+        spec = {
+            'kube_node_status_allocatable{resource="cpu"}': [
+                _node_sample(NODE_A, 343.92),
+                _node_sample(NODE_B, 3.92),
+            ],
+            'kube_node_status_allocatable{resource="memory"}': [
+                _node_sample(NODE_A, 700 * 2**30),
+                _node_sample(NODE_B, 16 * 2**30),
+            ],
+            'sum by (node) (kube_pod_container_resource_requests{resource="cpu", node!=""})': [
+                _node_sample(NODE_A, 172),
+                _node_sample(NODE_B, 2),
+            ],
+            'sum by (node) (kube_pod_container_resource_requests{resource="memory", node!=""})': [
+                _node_sample(NODE_A, 350 * 2**30),
+                _node_sample(NODE_B, 8 * 2**30),
+            ],
+            'sum by (node) (kube_pod_container_resource_limits{resource="cpu", node!=""})': [
+                _node_sample(NODE_A, 688),
+                _node_sample(NODE_B, 8),
+            ],
+            'sum by (node) (kube_pod_container_resource_limits{resource="memory", node!=""})': [
+                _node_sample(NODE_A, 1400 * 2**30),
+                _node_sample(NODE_B, 32 * 2**30),
+            ],
+            'sum by (node) (rate(container_cpu_usage_seconds_total{container!="",image!=""}[5m]))': [
+                _node_sample(NODE_A, 86),
+                _node_sample(NODE_B, 1),
+            ],
+            "sum by (node) (rate(container_cpu_usage_seconds_total{container!="
+            '",image!=""}[5m]) * on(instance) group_left(node) node_uname_info)': [
+                _node_sample(NODE_A, 999),  # must be IGNORED when A answers
+            ],
+            'sum by (node) (container_memory_working_set_bytes{container!="",image!=""})': [
+                _node_sample(NODE_A, 100 * 2**30),
+                _node_sample(NODE_B, 2**30),
+            ],
+            "sum by (node) (container_memory_working_set_bytes{container!="
+            '",image!=""} * on(instance) group_left(node) node_uname_info)': [
+                _node_sample(NODE_A, 888),
+            ],
+            'count by (node) (kube_pod_info{node!=""})': [
+                _node_sample(NODE_A, 330),
+                _node_sample(NODE_B, 9),
+            ],
+        }
+        if query in spec:
+            return {"resultType": "vector", "result": spec[query]}
+        if query == webui._NODES_FILTER_QUERY:
+            return {"resultType": "vector", "result": [_node_sample(NODE_A, 8)]}
+        return await StubClient.instant_query(self, query, ts)
+
+
+def _nodes_client(client_cls=NodesClient):
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    return TestClient(Starlette(routes=webui.build_ui_routes(client_cls(), cfg)))
+
+
+def test_nodes_endpoint_assembles_allocation():
+    data = _nodes_client().get("/api/nodes?filter=all").json()
+    by_node = {n["node"]: n for n in data["nodes"]}
+    # GPU node ranks first, every column joined on the node label
+    top = data["nodes"][0]
+    assert top["node"] == NODE_A and top["gpu_node"] is True
+    assert top["alloc_cpu"] == 343.92
+    assert top["req_cpu"] == 172.0 and top["lim_cpu"] == 688.0 and top["used_cpu"] == 86.0
+    assert top["req_cpu_pct"] == 50.0 and top["lim_cpu_pct"] == 200.0 and top["used_cpu_pct"] == 25.0
+    assert top["pods"] == 330
+    assert top["alloc_mem"] == 700 * 2**30
+    assert top["req_mem_pct"] == 50.0 and top["used_mem_pct"] == pytest.approx(14.3, abs=0.1)
+    # the native-cAdvisor path wins: the node_uname_info join (999/888) is ignored
+    plain = by_node[NODE_B]
+    assert plain["node"] == NODE_B and plain["gpu_node"] is False
+    assert plain["used_cpu"] == 1.0 and plain["used_mem"] == 2**30
+    assert plain["lim_cpu_pct"] == pytest.approx(204.1, abs=0.1)
+    # summary = sums of the SHOWN nodes, percentages recomputed on the sums
+    s = data["summary"]
+    assert s["nodes"] == 2 and s["gpu_nodes"] == 1
+    assert s["alloc_cpu"] == pytest.approx(347.84, abs=0.01)
+    assert s["used_cpu"] == 87.0
+    assert s["used_cpu_pct"] == pytest.approx(25.0, abs=0.1)
+    assert set(data["queries"]) == {name for name, _ in webui._NODES_QUERIES} | {"gpu_alloc"}
+
+
+def test_nodes_default_filter_selects_gpu_nodes():
+    data = _nodes_client().get("/api/nodes").json()
+    assert [n["node"] for n in data["nodes"]] == [NODE_A]
+    assert data["node_filter_source"] == "default"
+    assert data["node_filter"] is None
+    assert data["gpu_nodes_detected"] == [NODE_A]
+    # summary covers the SHOWN nodes only (the tab's numbers add up)
+    assert data["summary"]["nodes"] == 1
+    assert data["summary"]["alloc_cpu"] == 343.92
+
+
+def test_nodes_filter_query_param_overrides(monkeypatch):
+    # ?filter regex narrows (matches by substring, case-insensitive)
+    data = _nodes_client().get("/api/nodes?filter=ez-master").json()
+    assert [n["node"] for n in data["nodes"]] == [NODE_B]
+    assert data["node_filter_source"] == "query"
+    assert data["node_filter"] == "ez-master"
+    # 'all' disables the selection entirely
+    data = _nodes_client().get("/api/nodes?filter=all").json()
+    assert {n["node"] for n in data["nodes"]} == {NODE_A, NODE_B}
+    # a filter matching nothing falls back to all detected nodes, never []
+    data = _nodes_client().get("/api/nodes?filter=nomatch-xyz").json()
+    assert {n["node"] for n in data["nodes"]} == {NODE_A, NODE_B}
+
+
+def test_nodes_env_filter(monkeypatch):
+    monkeypatch.setenv("PROM_UI_NODE_FILTER", "scs")
+    data = _nodes_client().get("/api/nodes").json()
+    assert [n["node"] for n in data["nodes"]] == [NODE_A]
+    assert data["node_filter_source"] == "env" and data["node_filter"] == "scs"
+    # the query param still wins over the env
+    data = _nodes_client().get("/api/nodes?filter=ez").json()
+    assert [n["node"] for n in data["nodes"]] == [NODE_B]
+    # invalid regex -> silently the default (GPU nodes)
+    monkeypatch.setenv("PROM_UI_NODE_FILTER", "[unclosed")
+    data = _nodes_client().get("/api/nodes").json()
+    assert [n["node"] for n in data["nodes"]] == [NODE_A]
+    assert data["node_filter_source"] == "default"
+
+
+def test_nodes_fail_soft_per_family():
+    class Partial(NodesClient):
+        async def instant_query(self, query, ts=None):
+            if "limits" in query or query == webui._NODES_FILTER_QUERY:
+                raise PrometheusError("query error: unknown metric")
+            return await NodesClient.instant_query(self, query, ts)
+
+    data = _nodes_client(Partial).get("/api/nodes").json()
+    assert "error" not in data  # tab still renders
+    # GPU detection failed too -> the default selection falls back to all
+    # nodes, sorted alphabetically
+    by_node = {n["node"]: n for n in data["nodes"]}
+    top = by_node[NODE_A]
+    assert top["lim_cpu"] is None and top["lim_cpu_pct"] is None  # limits column absent
+    assert top["req_cpu"] == 172.0  # everything else still answers
+    # GPU detection failing -> no gpu_node badges, but node list survives
+    assert all(n["gpu_node"] is False for n in data["nodes"])
+
+    # whole-API fail soft: only the pods block survives -> still a payload
+    class Bare(StubClient):
+        async def instant_query(self, query, ts=None):
+            if query == 'count by (node) (kube_pod_info{node!=""})':
+                return {"resultType": "vector", "result": [_node_sample(NODE_B, 9)]}
+            raise PrometheusError("no such metric: " + query)
+
+    data = _nodes_client(Bare).get("/api/nodes").json()
+    assert data["summary"]["nodes"] == 1
+    assert data["nodes"][0]["pods"] == 9
+    assert data["nodes"][0]["alloc_cpu"] is None
+
+
+def test_nodes_zero_allocatable_never_divides():
+    class ZeroAlloc(NodesClient):
+        async def instant_query(self, query, ts=None):
+            if query == 'kube_node_status_allocatable{resource="cpu"}':
+                return {"resultType": "vector", "result": [_node_sample(NODE_A, 0)]}
+            return await NodesClient.instant_query(self, query, ts)
+
+    data = _nodes_client(ZeroAlloc).get("/api/nodes").json()
+    top = data["nodes"][0]
+    assert top["alloc_cpu"] == 0.0
+    assert top["req_cpu_pct"] is None and top["used_cpu_pct"] is None  # no ZeroDivisionError
+
+
+def test_ui_serves_nodes_tab_and_axis_fix():
+    html = webui._load_html()
+    assert 'data-tab="nodes"' in html and "/api/nodes" in html
+    assert "PROM_UI_NODE_FILTER" in html  # the note documents the env override
+    assert 'id="axis-core"' in html and "axisTicks" in html
+
+
+def test_axis_ticks_escalate_precision_for_flat_series():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available — the pure-JS block cannot be executed here")
+    m = re.search(r'<script id="axis-core">(.*?)</script>', webui._load_html(), re.DOTALL)
+    assert m, "axis-core block missing from the UI"
+    js = m.group(1)
+    # The exact bug from the screenshot: three gridlines of a near-flat
+    # memory series all rendering "1.4 TiB".
+    harness = (
+        "const t = axisTicks([1.533e12, 1.538e12, 1.5399e12], true);\n"
+        "if (new Set(t.labels).size !== 3) throw new Error('flat memory axis labels collide: ' + t.labels.join(' | '));\n"
+        "if (!t.labels.every((l) => /TiB$/.test(l))) throw new Error('bytes axis must stay in TiB: ' + t.labels.join(' | '));\n"
+        "const cpu = axisTicks([86, 87, 88], false);\n"
+        "if (new Set(cpu.labels).size !== 3) throw new Error('cpu labels collide: ' + cpu.labels.join(' | '));\n"
+        "if (cpu.digits < 3) throw new Error('digits escalation skipped');\n"
+        "const spaced = axisTicks([0, 500e9, 1.1e12], true);\n"
+        "if (spaced.labels.join('|') !== axisTicks([0, 500e9, 1.1e12], true).labels.join('|')) throw new Error('unstable');\n"
+        "if (axisTicks([0, 1e6, 2e9], true).labels.length !== 3) throw new Error('length');\n"
+        "const dup = axisTicks([1.5e12, 1.5e12, 1.5e12], true);\n"
+        "if (new Set(dup.labels).size !== 1) throw new Error('identical values must stay identical, honestly');\n"
+        "if (axisTicks([], true).labels.length !== 0) throw new Error('empty input');\n"
+        "console.log('AXIS-ALL-OK');\n"
+    )
+    proc = subprocess.run([node, "-e", js + "\n" + harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "AXIS-ALL-OK" in proc.stdout

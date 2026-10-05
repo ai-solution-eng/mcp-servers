@@ -193,6 +193,7 @@ def test_api_surface_is_strictly_read_only():
         "/api/plan",
         "/api/resource_status",
         "/api/audit",
+        "/api/audit/verify",  # read-only hash-chain verdict (parameter-free)
     }
     # THE hard rule: no mutating endpoint exists — not even a gated one.
     for r in routes:
@@ -528,3 +529,48 @@ def test_webui_enabled_flag_parsing():
         assert webui.webui_enabled({"APPLYGATE_WEBUI_ENABLED": on}) is True, on
     for off in ("false", "FALSE", "0", "no", "off", "disabled"):
         assert webui.webui_enabled({"APPLYGATE_WEBUI_ENABLED": off}) is False, off
+
+
+# ---------------------------------------------------------------------------
+# /api/audit/verify — the hash-chain verdict over the ONE configured file
+# ---------------------------------------------------------------------------
+
+
+def test_audit_verify_endpoint_returns_chain_verdict(monkeypatch, tmp_path):
+    for i in range(3):
+        server._audit("plan_apply", "team-a", "ConfigMap", f"cm-{i}", True, "dry-run")
+    c = make_client()
+    data = c.get("/api/audit/verify").json()
+    assert data["ok"] is True and data["entries"] == 3
+    assert data["file"] == os.environ["APPLYGATE_AUDIT_FILE"]
+
+
+def test_audit_verify_endpoint_refuses_client_selected_paths():
+    c = make_client()
+    for attempt in ({"file": "/etc/passwd"}, {"path": "../../etc/passwd"}, {"auditFile": "/etc/passwd"}):
+        r = c.get("/api/audit/verify", params=attempt)
+        assert r.status_code == 400, f"{attempt} must be refused"
+        assert "APPLYGATE_AUDIT_FILE" in r.json()["error"]
+
+
+def test_audit_verify_endpoint_detects_tampering(monkeypatch, tmp_path):
+    p = tmp_path / "audit.jsonl"
+    for i in range(3):
+        server._audit("plan_apply", "team-a", "ConfigMap", f"cm-{i}", True, "dry-run")
+    lines = p.read_text().splitlines()
+    # TAMPER: rewrite line 2 (index 1) — flip the outcome and keep the link;
+    # line 3's prev_sha256 then no longer matches line 2's new hash.
+    tampered = json.loads(lines[1])
+    tampered["outcome"] = "applied"  # forge a cleaner-looking history
+    lines[1] = json.dumps(tampered, sort_keys=True)
+    p.write_text("\n".join(lines) + "\n")
+    c = make_client()
+    data = c.get("/api/audit/verify").json()
+    assert data["ok"] is False and data["first_bad_line"] == 3
+    assert "tampered" in data["error"] or "reordered" in data["error"]
+
+
+def test_audit_verify_endpoint_missing_file_is_not_an_error(monkeypatch, tmp_path):
+    c = make_client()
+    data = c.get("/api/audit/verify").json()
+    assert data["ok"] is True and data["exists"] is False and data["entries"] == 0

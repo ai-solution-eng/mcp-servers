@@ -475,6 +475,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="dashboard">Dashboard</button>
       <button class="tab" data-tab="gpu">GPU</button>
+      <button class="tab" data-tab="nodes">Nodes</button>
       <button class="tab" data-tab="query">Query</button>
       <button class="tab" data-tab="alerts">Alerts &amp; Rules</button>
       <button class="tab" data-tab="tools">MCP Tools</button>
@@ -557,6 +558,43 @@
       <div class="panel">
         <h2>All GPUs <span class="hint">util · framebuffer · thermals · NVLink · workload</span></h2>
         <div id="gpu-table"><div class="loading">loading…</div></div>
+      </div>
+    </div>
+
+    <!-- ============ NODES (capacity vs allocation vs usage) ============ -->
+    <div id="pane-nodes" class="pane hidden">
+      <div class="cards">
+        <div class="card"><div class="card-label">Nodes shown</div><div class="card-value green" id="nodes-card-count">—</div><div class="card-sub" id="nodes-card-count-sub"></div></div>
+        <div class="card"><div class="card-label">CPU cores</div><div class="card-value" id="nodes-card-cpu">—</div><div class="card-sub" id="nodes-card-cpu-sub">allocatable, shown nodes</div></div>
+        <div class="card"><div class="card-label">CPU requested</div><div class="card-value" id="nodes-card-cpu-req">—</div><div class="card-sub" id="nodes-card-cpu-req-sub"></div></div>
+        <div class="card"><div class="card-label">CPU limits</div><div class="card-value" id="nodes-card-cpu-lim">—</div><div class="card-sub" id="nodes-card-cpu-lim-sub"></div></div>
+        <div class="card"><div class="card-label">CPU active</div><div class="card-value" id="nodes-card-cpu-used">—</div><div class="card-sub" id="nodes-card-cpu-used-sub">5m rate, shown nodes</div></div>
+        <div class="card"><div class="card-label">Memory allocatable</div><div class="card-value" id="nodes-card-mem">—</div><div class="card-sub" id="nodes-card-mem-sub"></div></div>
+        <div class="card"><div class="card-label">Memory active</div><div class="card-value" id="nodes-card-mem-used">—</div><div class="card-sub" id="nodes-card-mem-used-sub">working set, shown nodes</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Per-node allocation <span class="hint">requests · limits · active usage against allocatable — bars share each node's track so they read against the same 100%</span>
+          <span class="spacer"></span>
+          <input id="node-filter" class="inline" style="width:200px" placeholder="node regex · empty = default" title="Regex on node name. Default: GPU nodes (auto-detected from the GPU allocatable). 'all' = every node." />
+          <label class="hint" style="text-transform:none"><input type="checkbox" id="nodes-auto-refresh" checked /> auto 30s</label>
+          <button id="nodes-refresh" class="ghost copy-btn">↻ refresh</button>
+        </h2>
+        <div id="nodes-note" class="hint" style="margin-bottom:8px"></div>
+        <div id="nodes-allocation"><div class="loading">loading…</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Node trends <span class="hint">last 3h · per node · shown nodes only</span></h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+          <div><div class="hint" style="margin-bottom:4px">CPU active (cores)</div><div id="chart-nodes-cpu-trend"><div class="loading">loading…</div></div></div>
+          <div><div class="hint" style="margin-bottom:4px">Memory active (working set)</div><div id="chart-nodes-mem-trend"><div class="loading">loading…</div></div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>All shown nodes <span class="hint">cores · bytes · % of allocatable · pods</span></h2>
+        <div id="nodes-table"><div class="loading">loading…</div></div>
       </div>
     </div>
 
@@ -711,6 +749,61 @@ function deepLinkDecode(hash) {
 }
 </script>
 
+<script id="axis-core">
+"use strict";
+// Chart axis ticks (PURE functions, no DOM): the test suite executes this
+// block verbatim under node (tests/test_webui.py), so the tick math cannot
+// drift between the page and its tests.
+//
+// The bug this fixes: with a near-flat series (e.g. cluster memory hugging
+// one value with small spikes), three gridlines fall so close together that
+// the fixed-precision formatter renders them IDENTICALLY ("1.4 TiB" three
+// times) — the axis lies. The fix is precision escalation: keep adding
+// significant digits until the rendered ticks are distinct.
+function fmtBytesPrec(v, sig) {
+  if (!isFinite(v)) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let i = 0;
+  let x = v;
+  while (Math.abs(x) >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+  const digits = Math.max(0, sig - Math.max(1, Math.ceil(Math.log10(Math.abs(x) || 1))));
+  return x.toFixed(digits) + " " + units[i];
+}
+
+// Default tick text: compact (bytes → binary units, big numbers → 3 sig figs).
+function fmtTick(v, bytes) {
+  if (!isFinite(v)) return "—";
+  if (bytes) return fmtBytesPrec(v, 3);
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toPrecision(3) + "G";
+  if (a >= 1e6) return (v / 1e6).toPrecision(3) + "M";
+  if (a >= 1000) return (v / 1000).toPrecision(3) + "k";
+  return Number(v.toPrecision(3)).toString();
+}
+
+// Choose the number of significant digits so the given tick values render
+// DISTINCTLY, preserving input order. Returns {labels, digits}. Escalates
+// 3 → 8 sig figs; if even that cannot separate them the values ARE equal
+// after rounding, and the duplicate label is honest. Non-numeric inputs
+// pass through as strings.
+function axisTicks(values, bytes) {
+  const all = values || [];
+  const isNum = (v) => typeof v === "number" && isFinite(v);
+  const nums = [];
+  all.forEach((v, i) => { if (isNum(v)) nums.push({ v, i }); });
+  if (!nums.length) return { labels: all.map(String), digits: 3 };
+  let labels = null, digits = 8;
+  for (let sig = 3; sig <= 8; sig++) {
+    const tryLabels = nums.map((x) => (bytes ? fmtBytesPrec(x.v, sig) : fmtTick(x.v)));
+    if (new Set(tryLabels).size === tryLabels.length) { labels = tryLabels; digits = sig; break; }
+  }
+  if (!labels) labels = nums.map((x) => (bytes ? fmtBytesPrec(x.v, 8) : fmtTick(x.v)));
+  const out = all.map(String);
+  nums.forEach((x, j) => { out[x.i] = labels[j]; });
+  return { labels: out, digits };
+}
+</script>
+
 <script>
 "use strict";
 
@@ -777,10 +870,9 @@ function esc(s) {
 
 function fmtBytes(v) {
   if (!isFinite(v)) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-  let i = 0;
-  while (Math.abs(v) >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + " " + units[i];
+  // 3 sig figs default — the axis formatters escalate precision themselves
+  // when ticks would collide (see axisTicks / fmtBytesPrec in axis-core).
+  return fmtBytesPrec(v, 3);
 }
 
 function fmtVal(v, bytes) {
@@ -860,12 +952,15 @@ function lineChart(hostId, seriesArr, opts) {
   const H = 190, padL = 52, padR = 12, padT = 8, padB = 22;
   const X = (t) => padL + ((t - tMin) / (tMax - tMin)) * (W - padL - padR);
   const Y = (v) => padT + (1 - (v - vMin) / (vMax - vMin)) * (H - padT - padB);
-  const fmtAxis = (v) => (opts.bytes ? fmtBytes(v) : (Math.abs(v) >= 1000 ? v.toPrecision(3) : Number(v.toPrecision(3)).toString()));
+  // Distinct-tick formatting (axis-core): escalate precision until the 3
+  // gridline labels differ — a near-flat series must not render "1.4 TiB"
+  // three times.
+  const ticks = axisTicks([vMin, (vMin + vMax) / 2, vMax], !!opts.bytes);
   let svg = '<svg width="' + W + '" height="' + H + '" role="img" aria-label="time series chart">';
   for (let i = 0; i <= 2; i++) {
     const v = vMin + (vMax - vMin) * (i / 2), yy = Y(v).toFixed(1);
     svg += '<line class="grid" x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy + '"/>';
-    svg += '<text class="axis" x="' + (padL - 6) + '" y="' + (Number(yy) + 3) + '" text-anchor="end">' + esc(fmtAxis(v)) + "</text>";
+    svg += '<text class="axis" x="' + (padL - 6) + '" y="' + (Number(yy) + 3) + '" text-anchor="end">' + esc(ticks.labels[i]) + "</text>";
   }
   for (let i = 0; i <= 3; i++) {
     const t = tMin + ((tMax - tMin) * i) / 3;
@@ -1224,6 +1319,150 @@ async function loadGpuTrends() {
   ]);
 }
 
+// ---- nodes tab (capacity vs allocation vs usage) -----------------------------------
+// One per-node card per shown node. All three bars (requested / limits / active)
+// share the node's allocatable track, so they read against the same 100% —
+// the overcommit question ("limits sum to 2× the box, is it actually hot?")
+// is visible at a glance.
+function allocBar(label, used, total, opts) {
+  opts = opts || {};
+  const f = used == null ? null : parseFloat(used);
+  const t = total == null ? null : parseFloat(total);
+  const pct = f == null || !t ? null : (100 * f) / t;
+  const val = f == null
+    ? "—"
+    : opts.cores
+      ? f.toFixed(f >= 100 ? 0 : 1) + " cores"
+      : fmtBytes(f);
+  const rel = pct == null ? "" : " (" + pct.toFixed(pct >= 10 ? 0 : 1) + "%)";
+  return '<div class="gbar"><span>' + esc(label) + "</span>" +
+    '<div class="hbar-track"><div class="hbar-fill" style="width:' +
+    (pct == null ? 0 : Math.max(Math.min(pct, 100), 0.75)) + "%;background:" + (opts.color || utilColor(pct)) +
+    '" title="' + esc(label + ": " + (pct == null ? "n/a" : pct.toFixed(1) + "% of allocatable")) + '"></div></div>' +
+    '<span class="gbar-val">' + esc(val + rel) + "</span></div>";
+}
+
+function renderNodesAllocation(nodes) {
+  const host = $("nodes-allocation");
+  if (!nodes || !nodes.length) { host.innerHTML = '<div class="empty">no node data (kube-state-metrics / node-exporter absent?)</div>'; return; }
+  let html = '<div class="gpu-grid">';
+  nodes.forEach((n) => {
+    const badge = n.gpu_node ? "<span class='wl-chip' title='GPU node — detected from the nvidia GPU allocatable'>GPU</span> " : "";
+    html += '<div class="gpu-domain">' +
+      '<div class="gpu-domain-head"><span class="gpu-domain-name">' + esc(n.hostname) + "</span>" +
+      "<span class='hint'>" + (n.pods != null ? n.pods + " pods · " : "") + (n.gpu_node ? "GPU node" : "node") + "</span>" + badge + "</div>" +
+      '<div class="gpu-domain-stats">' +
+      (n.alloc_cpu != null ? "allocatable " + (n.alloc_cpu % 1 ? n.alloc_cpu.toFixed(1) : n.alloc_cpu) + " cores" : "allocatable —") +
+      (n.alloc_mem != null ? " · " + fmtBytes(n.alloc_mem) : "") +
+      "</div>" +
+      '<div class="gpu-tiles" style="grid-template-columns:1fr">' +
+      '<div class="gpu-tile">' +
+      '<div class="gpu-tile-head"><b>CPU</b><span class="hint">cores · % of allocatable</span></div>' +
+      allocBar("req", n.req_cpu, n.alloc_cpu, { cores: true, color: "var(--accent-2)" }) +
+      allocBar("lim", n.lim_cpu, n.alloc_cpu, { cores: true, color: "var(--yellow)" }) +
+      allocBar("used", n.used_cpu, n.alloc_cpu, { cores: true }) +
+      "</div>" +
+      '<div class="gpu-tile">' +
+      '<div class="gpu-tile-head"><b>Memory</b><span class="hint">working set · % of allocatable</span></div>' +
+      allocBar("req", n.req_mem, n.alloc_mem, { color: "var(--accent-2)" }) +
+      allocBar("lim", n.lim_mem, n.alloc_mem, { color: "var(--yellow)" }) +
+      allocBar("used", n.used_mem, n.alloc_mem, {}) +
+      "</div></div></div>";
+  });
+  host.innerHTML = html + "</div>";
+}
+
+function renderNodesTable(nodes) {
+  if (!nodes || !nodes.length) { $("nodes-table").innerHTML = '<div class="empty">no nodes match the current filter</div>'; return; }
+  renderSortableTable("nodes-table", [
+    { key: "node", label: "node",
+      render: (n, ctx) => "<td>" + (ctx.runStart ? "<span class='grp-dot' style='background:" + groupColor(ctx.group) + "'></span>" : "") + esc(n.hostname) + (n.gpu_node ? " <span class='wl-chip'>GPU</span>" : "") + "</td>",
+      sortVal: (n) => n.node },
+    { key: "pods", label: "pods", render: (n) => "<td>" + (n.pods != null ? n.pods : "—") + "</td>", sortVal: (n) => n.pods },
+    { key: "alloc_cpu", label: "alloc cores", render: (n) => "<td>" + (n.alloc_cpu != null ? n.alloc_cpu : "—") + "</td>", sortVal: (n) => n.alloc_cpu },
+    { key: "req_cpu", label: "cpu req",
+      render: (n) => "<td>" + (n.req_cpu != null ? n.req_cpu + " <span class='hint'>(" + (n.req_cpu_pct == null ? "—" : n.req_cpu_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.req_cpu_pct },
+    { key: "lim_cpu", label: "cpu lim",
+      render: (n) => "<td>" + (n.lim_cpu != null ? n.lim_cpu + " <span class='hint'>(" + (n.lim_cpu_pct == null ? "—" : n.lim_cpu_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.lim_cpu_pct },
+    { key: "used_cpu", label: "cpu used",
+      render: (n) => "<td style='color:" + utilColor(n.used_cpu_pct) + "'>" + (n.used_cpu != null ? n.used_cpu + " <span class='hint'>(" + (n.used_cpu_pct == null ? "—" : n.used_cpu_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.used_cpu_pct },
+    { key: "alloc_mem", label: "alloc mem", render: (n) => "<td>" + (n.alloc_mem != null ? fmtBytes(n.alloc_mem) : "—") + "</td>", sortVal: (n) => n.alloc_mem },
+    { key: "req_mem", label: "mem req",
+      render: (n) => "<td>" + (n.req_mem != null ? fmtBytes(n.req_mem) + " <span class='hint'>(" + (n.req_mem_pct == null ? "—" : n.req_mem_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.req_mem_pct },
+    { key: "lim_mem", label: "mem lim",
+      render: (n) => "<td>" + (n.lim_mem != null ? fmtBytes(n.lim_mem) + " <span class='hint'>(" + (n.lim_mem_pct == null ? "—" : n.lim_mem_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.lim_mem_pct },
+    { key: "used_mem", label: "mem used",
+      render: (n) => "<td style='color:" + utilColor(n.used_mem_pct) + "'>" + (n.used_mem != null ? fmtBytes(n.used_mem) + " <span class='hint'>(" + (n.used_mem_pct == null ? "—" : n.used_mem_pct + "%") + ")</span>" : "—") + "</td>", sortVal: (n) => n.used_mem_pct },
+  ], nodes, {
+    // GPU nodes first by default: they are the sizing targets
+    fallback: (a, b) => (b.gpu_node - a.gpu_node) || String(a.node).localeCompare(String(b.node)),
+    groupBy: (n) => (n.gpu_node ? "gpu" : "plain"),
+  });
+}
+
+async function loadNodesTrends(regex) {
+  const nodesRe = regex ? 'node=~"' + regex.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"' : "";
+  const fill = async (id, tmpl, bytes) => {
+    try {
+      const q = tmpl.replace("${nodes}", nodesRe);
+      const d = await api("/api/query_range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, start: "now-3h", end: "now" }),
+      });
+      const rows = (d.result || []).map((r) => ({ name: hostShort((r.labels && r.labels.node) || r.series), values: r.values }));
+      if (rows.length) lineChart(id, rows, { bytes });
+      else $(id).innerHTML = '<div class="empty">no trend data</div>';
+    } catch (e) {
+      $(id).innerHTML = '<div class="empty">' + esc(trunc(e.message, 140)) + "</div>";
+    }
+  };
+  await Promise.all([
+    fill("chart-nodes-cpu-trend", 'sum by (node${nodes}) (rate(container_cpu_usage_seconds_total{container!="",image!=""${nodes}}[5m]))', false),
+    fill("chart-nodes-mem-trend", 'sum by (node${nodes}) (container_memory_working_set_bytes{container!="",image!=""${nodes}})', true),
+  ]);
+}
+
+async function loadNodes() {
+  const blocks = ["nodes-allocation", "nodes-table", "chart-nodes-cpu-trend", "chart-nodes-mem-trend"];
+  const nodeCards = ["nodes-card-count", "nodes-card-cpu", "nodes-card-cpu-req", "nodes-card-cpu-lim", "nodes-card-cpu-used", "nodes-card-mem", "nodes-card-mem-used"];
+  let d;
+  try { d = await api("/api/nodes" + ($("node-filter").value.trim() ? "?filter=" + encodeURIComponent($("node-filter").value.trim()) : "")); }
+  catch (e) {
+    blocks.forEach((id) => { $(id).innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+    nodeCards.forEach((id) => setCard(id, "?", ""));
+    return;
+  }
+  const s = d.summary || {};
+  const cores = (v) => (v != null ? (v >= 100 ? Math.round(v) : v) : "—");
+  setCard("nodes-card-count", s.nodes ?? "—", s.gpu_nodes ? s.gpu_nodes + " GPU node(s)" : "");
+  setCard("nodes-card-cpu", cores(s.alloc_cpu), "");
+  setCard("nodes-card-cpu-req", cores(s.req_cpu), s.req_cpu_pct != null ? s.req_cpu_pct + "% of allocatable" : "");
+  setCard("nodes-card-cpu-lim", cores(s.lim_cpu), s.lim_cpu_pct != null ? s.lim_cpu_pct + "% of allocatable" : "");
+  setCard("nodes-card-cpu-used", cores(s.used_cpu), s.used_cpu_pct != null ? s.used_cpu_pct + "% of allocatable" : "");
+  setCard("nodes-card-mem", s.alloc_mem != null ? fmtBytes(s.alloc_mem) : "—", "");
+  setCard("nodes-card-mem-used", s.used_mem != null ? fmtBytes(s.used_mem) : "—", s.used_mem_pct != null ? s.used_mem_pct + "% of allocatable" : "");
+  renderNodesAllocation(d.nodes || []);
+  renderNodesTable(d.nodes || []);
+  const note = $("nodes-note");
+  if (d.node_filter_source === "query") {
+    note.textContent = "Filter (browser input): /" + d.node_filter + "/i — empty the box for the default selection";
+  } else if (d.node_filter_source === "env") {
+    note.textContent = "Filter from PROM_UI_NODE_FILTER: /" + d.node_filter + "/i — the browser input overrides it";
+  } else {
+    note.textContent = "Default selection: GPU nodes (auto-detected from the nvidia GPU allocatable: " +
+      (d.gpu_nodes_detected || []).map((n) => n.split(".")[0]).join(", ") + ") — type a node regex (or 'all') above to change";
+  }
+  // Trends follow exactly the SHOWN nodes (whatever selected them): a regex
+  // of escaped node names, capped — an "all" tab of 100 nodes would build a
+  // monster regex, and the chart caps series anyway.
+  const shown = d.nodes || [];
+  const regex = shown.length && shown.length <= 12
+    ? shown.map((n) => n.node.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
+    : null;
+  loadNodesTrends(regex);
+}
+
 async function loadGpu() {
   const blocks = ["gpu-domains", "gpu-table", "chart-gpu-util-trend", "chart-gpu-mem-trend"];
   const gpuCards = ["gpu-card-count", "gpu-card-util", "gpu-card-mem", "gpu-card-power", "gpu-card-temp", "gpu-card-nvlink"];
@@ -1562,7 +1801,14 @@ function restoreDeepLink() {
     switchTab("query");
     runQuery();
     toast("Restored shared query link");
+    return;
   }
+  // #tab=<name> — restore-only tab deep link (shareable view links; the
+  // query fragment keeps its own #q=…&range=… format).
+  try {
+    const tab = new URLSearchParams(location.hash.slice(1)).get("tab");
+    if (tab && document.querySelector('.tab[data-tab="' + tab + '"]')) switchTab(tab);
+  } catch (e) { /* ignore */ }
 }
 
 function updateDeepLink() {
@@ -1689,6 +1935,7 @@ function switchTab(tab) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $("pane-dashboard").classList.toggle("hidden", tab !== "dashboard");
   $("pane-gpu").classList.toggle("hidden", tab !== "gpu");
+  $("pane-nodes").classList.toggle("hidden", tab !== "nodes");
   $("pane-query").classList.toggle("hidden", tab !== "query");
   $("pane-alerts").classList.toggle("hidden", tab !== "alerts");
   $("pane-tools").classList.toggle("hidden", tab !== "tools");
@@ -1696,6 +1943,7 @@ function switchTab(tab) {
   // thousands of alerts — no reason to fetch them before they are wanted).
   if (tab === "alerts" && !state.alertsLoaded) { state.alertsLoaded = true; loadAlerts(); loadRules(); }
   if (tab === "gpu" && !state.gpuLoaded) { state.gpuLoaded = true; loadGpu(); }
+  if (tab === "nodes" && !state.nodesLoaded) { state.nodesLoaded = true; loadNodes(); }
 }
 
 // ---- theme toggle ----------------------------------------------------------------------
@@ -1728,6 +1976,12 @@ document.querySelectorAll("input[name=mode]").forEach((r) => (r.onchange = syncM
 $("filter").oninput = renderPresets;
 $("dash-refresh").onclick = loadOverview;
 $("gpu-refresh").onclick = loadGpu;
+$("nodes-refresh").onclick = loadNodes;
+let nodesFilterTimer = null;
+$("node-filter").oninput = () => {
+  clearTimeout(nodesFilterTimer);
+  nodesFilterTimer = setTimeout(loadNodes, 350);
+};
 $("alerts-refresh").onclick = loadAlerts;
 $("rules-refresh").onclick = loadRules;
 $("alert-filter").oninput = renderAlertsFiltered;
@@ -1747,6 +2001,7 @@ function startAuto() {
     if (document.hidden) return;
     if (state.tab === "dashboard" && $("auto-refresh").checked) loadOverview();
     if (state.tab === "gpu" && $("gpu-auto-refresh").checked) loadGpu();
+    if (state.tab === "nodes" && $("nodes-auto-refresh").checked) loadNodes();
   }, 30000);
 }
 

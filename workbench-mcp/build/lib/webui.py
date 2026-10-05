@@ -189,7 +189,9 @@ def build_ui_routes() -> list[Route]:
         # confirm=true must come from the caller; _ws_delete still enforces
         # it (the UI cannot bypass the core policy).
         try:
-            out = await asyncio.to_thread(_ws_delete, str(body.get("name") or ""), bool(body.get("confirm")))
+            out = await asyncio.to_thread(
+                _ws_delete, str(body.get("name") or ""), bool(body.get("confirm"))
+            )
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse(out)
@@ -246,7 +248,9 @@ def build_ui_routes() -> list[Route]:
         if not path:
             return JSONResponse({"error": "path is required"}, status_code=400)
         try:
-            out = await asyncio.to_thread(_file_delete, ws, path, bool(body.get("confirm")))
+            out = await asyncio.to_thread(
+                _file_delete, ws, path, bool(body.get("confirm"))
+            )
         except WorkbenchError as exc:
             return _err_payload(exc)
         return JSONResponse(out)
@@ -288,7 +292,9 @@ def build_ui_routes() -> list[Route]:
             return JSONResponse({"error": str(exc)}, status_code=400)
         command = body.get("command")
         if not isinstance(command, list):
-            return JSONResponse({"error": "command must be a list of argv string tokens"}, status_code=400)
+            return JSONResponse(
+                {"error": "command must be a list of argv string tokens"}, status_code=400
+            )
         timeout_raw = body.get("timeout_s")
         try:
             timeout_s = _timeout_default() if timeout_raw is None else int(timeout_raw)

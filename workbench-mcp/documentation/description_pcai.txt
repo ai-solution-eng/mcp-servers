@@ -1,0 +1,1 @@
+A dedicate share volume for agents to execute governed commands against. Enabled a python sidecar-style container with no network access as a sidecar.

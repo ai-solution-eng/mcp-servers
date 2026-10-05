@@ -516,6 +516,62 @@ def test_delete_kind_and_namespace_gates(monkeypatch, tmp_path):
     assert spy.calls == []
 
 
+def test_delete_api_failure_is_normalized_keeping_the_legacy_string(monkeypatch, tmp_path):
+    """A seam failure returns the structured shape — the legacy `error`
+    string is byte-identical, `refused: false` separates it from a
+    guardrail refusal, `reason`/`status` are machine-readable."""
+    allow(monkeypatch, "team-a")
+
+    class _ApiException(Exception):
+        status = 409  # Conflict — the classic delete race
+
+    install_delete_spy(monkeypatch, exc=_ApiException("Conflict"))
+    out = parse(run(server.delete_resource(namespace="team-a", kind="ConfigMap", name="x", confirm_delete=True)))
+    assert out["ok"] is False
+    assert out["refused"] is False  # an API failure, not a guardrail refusal
+    assert out["error"] == "delete failed: _ApiException: Conflict"  # legacy text, unchanged
+    assert out["reason"] == "api_error"
+    assert out["status"] == 409
+    assert "rbac_hint" not in out  # 409 is not an RBAC problem
+    assert [e["outcome"] for e in audit_lines(tmp_path)] == ["failed"]
+
+
+def test_delete_403_failure_carries_the_rbac_hint(monkeypatch):
+    """A 403 on an admitted-but-ungranted kind (registry-vs-RBAC mismatch)
+    is augmented with the operator hint; a 403 on a chart-granted kind is not."""
+    allow(monkeypatch, "team-a", "*")
+    kinds(monkeypatch, "PersistentVolumeClaim")
+
+    class _ApiException(Exception):
+        status = 403
+
+    install_delete_spy(monkeypatch, exc=_ApiException("Forbidden"))
+    out = parse(
+        run(server.delete_resource(namespace="team-a", kind="PersistentVolumeClaim", name="data", confirm_delete=True))
+    )
+    assert out["status"] == 403 and out["reason"] == "api_error"
+    assert "rbac_hint" in out and "rbac.yaml" in out["rbac_hint"]
+    # A chart-granted kind 403ing is a different problem — no hint.
+    kinds(monkeypatch, "ConfigMap")
+    install_delete_spy(monkeypatch, exc=_ApiException("Forbidden"))
+    out = parse(run(server.delete_resource(namespace="team-a", kind="ConfigMap", name="x", confirm_delete=True)))
+    assert out["status"] == 403 and "rbac_hint" not in out
+
+
+def test_delete_non_api_failure_has_reason_but_no_fabricated_status(monkeypatch):
+    allow(monkeypatch, "team-a")
+
+    class _ConnectionError(Exception):
+        pass
+
+    install_delete_spy(monkeypatch, exc=_ConnectionError("connection refused"))
+    out = parse(run(server.delete_resource(namespace="team-a", kind="ConfigMap", name="x", confirm_delete=True)))
+    assert out["ok"] is False and out["refused"] is False
+    assert out["reason"] == "api_error"
+    assert "status" not in out  # never fabricate an HTTP status
+    assert out["error"] == "delete failed: _ConnectionError: connection refused"
+
+
 # ---------------------------------------------------------------------------
 # 7. get_resource_status — status shaping
 # ---------------------------------------------------------------------------
@@ -620,10 +676,23 @@ def test_audit_refusal_recorded(monkeypatch, tmp_path):
 
 def test_tool_catalog_and_hints():
     tools = {t.name: t for t in run(server.mcp.list_tools())}
-    assert set(tools) == {"plan_apply", "apply_manifest", "delete_resource", "get_resource_status"}
+    assert set(tools) == {
+        "plan_apply",
+        "apply_manifest",
+        "delete_resource",
+        "get_resource_status",
+        # Delete dry-run planning (the delete twin of plan_apply) and the
+        # parameter-free hash-chain verifier over the server's own audit file.
+        "plan_delete",
+        "verify_audit_chain",
+    }
     hints = {name: t.annotations for name, t in tools.items()}
     assert hints["plan_apply"].read_only_hint is True
     assert hints["get_resource_status"].read_only_hint is True
+    # The two new read-only tools: plan_delete can never delete, and the
+    # verifier only reads the server's own configured audit file.
+    assert hints["plan_delete"].read_only_hint is True
+    assert hints["verify_audit_chain"].read_only_hint is True
     assert hints["apply_manifest"].read_only_hint is False
     assert hints["apply_manifest"].destructive_hint is True
     assert hints["delete_resource"].destructive_hint is True

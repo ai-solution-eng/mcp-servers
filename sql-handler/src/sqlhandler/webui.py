@@ -12,6 +12,9 @@ SELECT cannot read files inside the container or COPY results out.
 Endpoints (all JSON unless noted):
 
   GET  /api/status    -> {"status": "ok", "version", "backend"}
+  GET  /api/whoami    -> the caller's own identity preview (class/subject/fp,
+                          which ladder rung resolved, `authenticated`) — the
+                          REST twin of the MCP whoami tool (header widget probe)
   GET  /api/tables    -> {"tables": [{"name", "path", "format"}]}
   POST /api/describe  -> {"table", "uri", "columns": [{"name", "type"}]}
   POST /api/query     -> {"columns": [...], "rows": [[...]], "n_rows", "duration_ms"}
@@ -70,6 +73,7 @@ import asyncio
 import base64
 import io
 import json as _json
+import logging
 import math
 import os
 import re
@@ -84,6 +88,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import identity as _identity
+from . import oidc_identity as _oidc_identity
 from . import policy as _policy
 from .dbt_import import apply_import as _dbt_apply_import
 from .dbt_import import import_dbt_manifest as _dbt_import_dbt_manifest
@@ -121,6 +126,8 @@ _FALLBACK_MAX_LIMIT = 1000
 # (unbounded ``await request.body()`` on an open port is a memory-DoS lever).
 _BODY_READ_MAX_BYTES = 8 * 1024 * 1024
 
+logger = logging.getLogger("sqlhandler.webui")
+
 
 class _BodyTooLarge(Exception):
     """Raised by :func:`_read_bounded_body` when the body cap is exceeded."""
@@ -156,12 +163,14 @@ async def _read_bounded_body(request, max_bytes: int = _BODY_READ_MAX_BYTES) -> 
             chunks.append(chunk)
     return b"".join(chunks)
 
+
 _HTML = (Path(__file__).parent / "ui" / "index.html").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # security headers (the /ui HTML + JSON API responses)
 # ---------------------------------------------------------------------------
+
 
 # The single HTML page inlines exactly two <script> blocks (the theme
 # bootstrap and the app). They are static bytes of a static file, so the CSP
@@ -1114,6 +1123,27 @@ def register_ui(app, engine_getter) -> None:
     async def status(_request) -> JSONResponse:
         return JSONResponse(await asyncio.to_thread(api_status, engine_getter()))
 
+    # ---- GET /api/whoami — the header identity widget's probe (the REST
+    # twin of the MCP whoami tool, preview shape only — never a grant).
+    # Resolution mirrors the ADMIN surface (an explicitly presented
+    # X-API-Key / Bearer is authenticated HERE; a wrong key stays
+    # anonymous — never redeemed as the browser user behind it), a
+    # keyless request resolves through the full ladder (SSO bearer JWT →
+    # browser headers). Public like /api/status: the response is the
+    # caller's OWN audit-safe shape (class/subject/fp — never key
+    # material, never an admin-designation answer), so it leaks nothing
+    # an unauthenticated caller could not already learn. Un-gated even
+    # under requireIdentity (the UI shell is un-gated and this only
+    # previews what a gated call would resolve to — it is the page's way
+    # to ASK, not a way past the gate).
+    async def whoami(request) -> JSONResponse:
+        try:
+            from .server import _whoami_rest_payload
+
+            return JSONResponse(await asyncio.to_thread(_whoami_rest_payload, request))
+        except Exception as exc:  # never 500 the identity probe
+            return JSONResponse({"authenticated": False, "error": str(exc)})
+
     def _caller_for(request):
         """The request's resolved Caller (identity spine); None-safe."""
         try:
@@ -1226,9 +1256,7 @@ def register_ui(app, engine_getter) -> None:
             # submit may block on the query-concurrency gate — never block
             # the event loop. caller rides the job so masking/policy apply.
             return _response(
-                await asyncio.to_thread(
-                    api_async_query, engine_getter(), manager, body, caller=_caller_for(request)
-                )
+                await asyncio.to_thread(api_async_query, engine_getter(), manager, body, caller=_caller_for(request))
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -1256,10 +1284,120 @@ def register_ui(app, engine_getter) -> None:
     async def query_job_cancel(request) -> JSONResponse:
         return _response(await asyncio.to_thread(api_query_cancel, manager, request.path_params["query_id"]))
 
+    # ---- Browser SSO (D22, the MM-RAG approach ported verbatim): the app is
+    # an OIDC CLIENT — /oauth/login redirects to the realm, the callback
+    # exchanges + VERIFIES the token with the same D21 machinery every other
+    # credential goes through, and plants an HttpOnly session cookie. The
+    # identity ladder treats that cookie as the LOWEST-priority envelope
+    # (an explicit key or Bearer always outranks it), so SSO resolves the
+    # VERIFIED preferred_username — what the browser-header rung cannot
+    # know (it only sees the IdP sub UUID). Inert by default: without
+    # SQLHANDLER_OIDC_SSO_* fully configured these routes 404 and no cookie
+    # is ever accepted (byte-identical to pre-D22). Redirects on failure —
+    # never error bodies (no error detail leaked to the browser).
+    async def oauth_login(request):
+        from starlette.responses import RedirectResponse
+
+        from . import oidc_sso
+
+        if not oidc_sso.sso_enabled():
+            return JSONResponse({"error": "SSO is not enabled on this deployment"}, status_code=404)
+        url = await asyncio.to_thread(oidc_sso.build_authorization_url, oidc_sso.new_state())
+        if not url:
+            return JSONResponse({"error": "OIDC provider discovery unavailable — try again shortly"}, status_code=503)
+        # The state cookie value is "<state>|<safe-next>" — the callback
+        # splits it back (never trusting the query string for the target).
+        state = url.split("state=")[-1]
+        target = oidc_sso.safe_next_path(request.query_params.get("next", "/ui"))
+        resp = RedirectResponse(url, status_code=302)
+        secure = oidc_sso.cookie_secure()
+        parts = [
+            f"{oidc_sso.state_cookie_name()}={state}|{target}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Max-Age=600",
+        ]
+        if secure:
+            parts.append("Secure")
+        resp.headers.append("set-cookie", "; ".join(parts))
+        return resp
+
+    async def oauth_callback(request):
+        from starlette.responses import RedirectResponse
+
+        from . import oidc_sso
+
+        if not oidc_sso.sso_enabled():
+            return JSONResponse({"error": "SSO is not enabled on this deployment"}, status_code=404)
+        params = request.query_params
+        code, state = params.get("code", ""), params.get("state", "")
+        if not code or not state:
+            return RedirectResponse("/ui?sso=error", status_code=302)
+        # Split the state cookie: <nonce>|<safe-next>.
+        raw_state = request.cookies.get(oidc_sso.state_cookie_name(), "")
+        cookie_state, _, cookie_target = raw_state.partition("|")
+        if not oidc_sso.state_matches(cookie_state, state):
+            return RedirectResponse("/ui?sso=error", status_code=302)
+        token_response = await asyncio.to_thread(oidc_sso.exchange_code, code)
+        if not token_response:
+            return RedirectResponse("/ui?sso=error", status_code=302)
+        token = str(token_response.get("access_token") or "")
+        if not token:
+            return RedirectResponse("/ui?sso=error", status_code=302)
+        # Verify with the D21 machinery — the SAME pipeline every credential
+        # goes through (RS256/JWKS, iss/aud/exp via the vendored fork). An
+        # unverifiable token never becomes a session.
+        try:
+            claims = await asyncio.to_thread(_oidc_identity.verify_and_decode, token)
+        except Exception:
+            claims = None
+        if not claims:
+            return RedirectResponse("/ui?sso=error", status_code=302)
+        target = oidc_sso.safe_next_path(cookie_target or "/ui")
+        resp = RedirectResponse(target, status_code=302)
+        secure = oidc_sso.cookie_secure()
+        parts = [
+            f"{oidc_sso.cookie_name()}={token}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            f"Max-Age={oidc_sso.cookie_max_age_for(token)}",
+        ]
+        if secure:
+            parts.append("Secure")
+        resp.headers.append("set-cookie", "; ".join(parts))
+        # Clear the state cookie (its one job is done).
+        resp.headers.append(
+            "set-cookie",
+            f"{oidc_sso.state_cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        )
+        subject = _oidc_identity.subject_from_claims(claims) or "unknown"
+        logger.info("SSO sign-in: subject '%s' session established", subject)
+        return resp
+
+    async def oauth_logout(request):
+        from starlette.responses import RedirectResponse
+
+        from . import oidc_sso
+
+        resp = RedirectResponse("/ui", status_code=302)
+        for name in (oidc_sso.cookie_name(), oidc_sso.state_cookie_name()):
+            resp.headers.append(
+                "set-cookie",
+                f"{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+            )
+        return resp
+
+    app.add_route("/oauth/login", oauth_login, methods=["GET"])
+    app.add_route("/oauth/oidc/callback", oauth_callback, methods=["GET"])
+    app.add_route("/oauth/logout", oauth_logout, methods=["GET"])
+
     app.add_route("/", html_page, methods=["GET"])
     app.add_route("/ui", html_page, methods=["GET"])
     app.add_route("/ui/index.html", html_page, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
+    app.add_route("/api/whoami", whoami, methods=["GET"])
     app.add_route("/api/tables", tables, methods=["GET"])
     app.add_route("/api/describe", describe, methods=["POST"])
     app.add_route("/api/query", query, methods=["POST"])
@@ -1348,9 +1486,7 @@ def register_ui(app, engine_getter) -> None:
             # caller scopes the listing (enforcement ON → own entries only),
             # exactly like the MCP list twin — without it every caller sees
             # every subject's saved queries.
-            return JSONResponse(
-                {"queries": await asyncio.to_thread(api_saved_list, caller=_caller_for(request))}
-            )
+            return JSONResponse({"queries": await asyncio.to_thread(api_saved_list, caller=_caller_for(request))})
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
@@ -1398,9 +1534,7 @@ def register_ui(app, engine_getter) -> None:
         try:
             # caller scopes the lookup too: running another subject's saved
             # query must 404 under enforcement, not just mask the output.
-            sql, params, _entry = await asyncio.to_thread(
-                api_saved_run, name, body, caller=_caller_for(request)
-            )
+            sql, params, _entry = await asyncio.to_thread(api_saved_run, name, body, caller=_caller_for(request))
         except UnknownSavedQuery as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except ValueError as exc:
@@ -1769,9 +1903,7 @@ def register_ui(app, engine_getter) -> None:
             from .server import _admin_created_by, _admin_write_policy, _audit_admin_event
 
             result = await asyncio.to_thread(_admin_write_policy, str(body.get("policy", body)))
-            _audit_admin_event(
-                "admin.policy_set", policy_hash=result["policy_hash"], by=_admin_created_by(caller)
-            )
+            _audit_admin_event("admin.policy_set", policy_hash=result["policy_hash"], by=_admin_created_by(caller))
             return JSONResponse(result)
         except _AdminHTTPError as exc:
             return _admin_response(exc)
@@ -1884,9 +2016,7 @@ def register_ui(app, engine_getter) -> None:
             caller = _caller_for(request)
             from .server import _self_revoke_key
 
-            result = await asyncio.to_thread(
-                _self_revoke_key, caller, str(request.path_params["fp"]).strip()
-            )
+            result = await asyncio.to_thread(_self_revoke_key, caller, str(request.path_params["fp"]).strip())
             return JSONResponse(result)
         except _AdminHTTPError as exc:
             return _admin_response(exc)

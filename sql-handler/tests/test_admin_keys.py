@@ -38,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlhandler import admin_keys
+from sqlhandler import identity
 from sqlhandler.admin_keys import (
     ADMIN_KEYS_FILE_ENV,
     AdminKeysError,
@@ -49,7 +49,6 @@ from sqlhandler.admin_keys import (
     match_presentation,
     remove_key,
 )
-from sqlhandler import identity
 from sqlhandler.identity import Caller
 from sqlhandler.mcp_fleet_common.audit import key_fingerprint
 from sqlhandler.policy import (
@@ -114,6 +113,27 @@ def test_store_disabled_fails_closed(monkeypatch):
     assert remove_key("sha256:000000000000") is False
 
 
+def test_first_write_creates_missing_directory(tmp_path, monkeypatch):
+    """The store SELF-INITIALIZES: a configured path whose PARENT directory
+    does not exist is created on the first mint (the chart's claim mode
+    points the store at a fresh subdir of the catalog PVC — live 2026-10-05,
+    the first mint failed with 'No such file or directory' for the temp
+    file before this). The created dir is private (0o700) and the store
+    then works exactly as a pre-seeded one."""
+    kf = tmp_path / "deep" / "nested" / "admin-keys-file"
+    assert not kf.parent.exists()
+    monkeypatch.setenv(KEYS_ENV, str(kf))
+    e1 = add_key("raw-key-one", label="first", created_by="alice")
+    assert kf.parent.is_dir()
+    assert kf.exists()
+    assert e1["fp"] == key_fingerprint("raw-key-one")
+    # The store now behaves like any other: reload, add, list.
+    e2 = add_key("raw-key-two", label="second", created_by="bob")
+    assert [e["fp"] for e in list_keys()] == [e1["fp"], e2["fp"]]
+    on_disk = json.loads(kf.read_text())
+    assert [e["fp"] for e in on_disk["keys"]] == [e1["fp"], e2["fp"]]
+
+
 def test_store_round_trip(tmp_path, monkeypatch):
     kf = _keys_file(tmp_path)
     monkeypatch.setenv(KEYS_ENV, str(kf))
@@ -163,8 +183,16 @@ def test_mtime_cache_and_hot_reload(tmp_path, monkeypatch):
     assert len(list_keys()) == 1
     # Simulate an external edit (what the admin API's atomic write produces).
     entries = json.loads(kf.read_text())["keys"]
-    entries.append({"fp": key_fingerprint("k-two"), "key_sha256": hashlib.sha256(b"k-two").hexdigest(),
-                    "label": "l2", "created_at": "2026-09-30T00:00:00+00:00", "created_by": "x", "source": "file"})
+    entries.append(
+        {
+            "fp": key_fingerprint("k-two"),
+            "key_sha256": hashlib.sha256(b"k-two").hexdigest(),
+            "label": "l2",
+            "created_at": "2026-09-30T00:00:00+00:00",
+            "created_by": "x",
+            "source": "file",
+        }
+    )
     kf.write_text(json.dumps({"keys": entries}))
     assert len(list_keys()) == 2
 
@@ -181,8 +209,9 @@ def test_vanished_file_keeps_last_valid_store(tmp_path, monkeypatch, caplog):
         listed = list_keys()
     assert [x["fp"] for x in listed] == [e["fp"]]
     assert match_presentation("survivor-key") is not None
-    assert any("keeping the previous contents" in r.getMessage() or "does not exist" in r.getMessage()
-               for r in caplog.records)
+    assert any(
+        "keeping the previous contents" in r.getMessage() or "does not exist" in r.getMessage() for r in caplog.records
+    )
 
 
 def test_broken_file_keeps_last_valid_store(tmp_path, monkeypatch, caplog):
@@ -291,9 +320,12 @@ def test_match_presentation_no_store_is_cheap_noop():
 
 def test_match_presentation_skips_entries_without_digest(tmp_path, monkeypatch):
     """A malformed/legacy entry (no key_sha256) is skipped, not fatal."""
-    kf = _keys_file(tmp_path, entries=[
-        {"fp": "sha256:aaaaaaaaaaaa", "label": "legacy", "created_at": "x", "created_by": "y", "source": "file"},
-    ])
+    kf = _keys_file(
+        tmp_path,
+        entries=[
+            {"fp": "sha256:aaaaaaaaaaaa", "label": "legacy", "created_at": "x", "created_by": "y", "source": "file"},
+        ],
+    )
     monkeypatch.setenv(KEYS_ENV, str(kf))
     assert match_presentation("whatever") is None  # no crash, no match
 
@@ -304,12 +336,15 @@ def test_match_presentation_skips_entries_without_digest(tmp_path, monkeypatch):
 
 
 def test_admins_with_hand_written_groups(tmp_path, monkeypatch):
-    pf = _policy_file(tmp_path, {
-        "version": 1,
-        "admins": ["alice", key_fingerprint("minted-1")],
-        "groups": {"g": {"hidden_tables": ["scratch/*"]}},
-        "default_group": "g",
-    })
+    pf = _policy_file(
+        tmp_path,
+        {
+            "version": 1,
+            "admins": ["alice", key_fingerprint("minted-1")],
+            "groups": {"g": {"hidden_tables": ["scratch/*"]}},
+            "default_group": "g",
+        },
+    )
     pol = load_policy(str(pf))
     assert pol.admins == ("alice", key_fingerprint("minted-1"))
     # The designation is invisible to enforcement: composition is unchanged
@@ -324,11 +359,14 @@ def test_admins_with_datasets_doc_coexists(tmp_path, monkeypatch):
     """THE CONTRACT: admins alongside the compiled datasets document —
     designation is orthogonal to grants; NO mutual exclusion."""
     fp = key_fingerprint("minted-2")
-    pf = _policy_file(tmp_path, {
-        "version": 1,
-        "admins": ["alice", f"key:{fp}"],
-        "datasets": {"global": ["workorder/*"], "assignments": {"bob": ["payroll/*"]}},
-    })
+    pf = _policy_file(
+        tmp_path,
+        {
+            "version": 1,
+            "admins": ["alice", f"key:{fp}"],
+            "datasets": {"global": ["workorder/*"], "assignments": {"bob": ["payroll/*"]}},
+        },
+    )
     pol = load_policy(str(pf))
     assert pol.admins == ("alice", fp)  # the key: spelling normalized to bare
     assert pol.datasets is not None
@@ -340,12 +378,12 @@ def test_admins_with_datasets_doc_coexists(tmp_path, monkeypatch):
 def test_admins_validates_fail_closed(tmp_path):
     base = {"version": 1, "groups": {"g": {}}, "default_group": "g"}
     cases = [
-        {"admins": "alice"},                                # not a list
-        {"admins": [42]},                                   # non-string entry
-        {"admins": [""]},                                   # empty entry
-        {"admins": ["   "]},                                # whitespace-only
-        {"admins": ["sha256:ZZZZ"]},                        # fp-shaped, malformed
-        {"admins": ["key:sha256:short"]},                   # prefixed, malformed
+        {"admins": "alice"},  # not a list
+        {"admins": [42]},  # non-string entry
+        {"admins": [""]},  # empty entry
+        {"admins": ["   "]},  # whitespace-only
+        {"admins": ["sha256:ZZZZ"]},  # fp-shaped, malformed
+        {"admins": ["key:sha256:short"]},  # prefixed, malformed
     ]
     for admins in cases:
         spec = {**base, **admins}
@@ -379,6 +417,26 @@ def test_is_admin_via_subject(tmp_path, monkeypatch):
     _enable_policy(monkeypatch, pf)
     assert is_admin(Caller(cls="user", subject="alice", via="relay")) is True
     assert is_admin(Caller(cls="user", subject="mallory", via="relay")) is False
+
+
+def test_is_admin_via_subject_prefixed_spelling(tmp_path, monkeypatch):
+    """The 'subject:<name>' spelling in admins (the datasets.assignments
+    canonical form — what the grant-by-name UI writes and the docs show)
+    matches a bare Caller.subject. Live 2026-10-05: the prefixed spelling
+    silently failed every subject-designated admin (is_admin compared the
+    bare subject against the prefixed entry)."""
+    pf = _policy_file(
+        tmp_path,
+        {"version": 1, "admins": ["subject:alice"], "groups": {"g": {}}},
+    )
+    _enable_policy(monkeypatch, pf)
+    assert is_admin(Caller(cls="user", subject="alice", via="jwt")) is True
+    assert is_admin(Caller(cls="key", subject="alice", key_fp="sha256:f4e09f1a0e49", via="key")) is True
+    assert is_admin(Caller(cls="user", subject="mallory", via="jwt")) is False
+    # The bare spelling keeps working (backward compatible).
+    pf2 = _policy_file(tmp_path, {"version": 1, "admins": ["bob"], "groups": {"g": {}}})
+    _enable_policy(monkeypatch, pf2)
+    assert is_admin(Caller(cls="user", subject="bob", via="jwt")) is True
 
 
 def test_is_admin_via_key_fp(tmp_path, monkeypatch):
@@ -428,8 +486,9 @@ def test_is_admin_prefixed_spelling_matches_bare_fp(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _stack_request(keys_env: str | None, kf: Path | None, headers: list[tuple[bytes, bytes]],
-                   monkeypatch, path: str = "/mcp"):
+def _stack_request(
+    keys_env: str | None, kf: Path | None, headers: list[tuple[bytes, bytes]], monkeypatch, path: str = "/mcp"
+):
     """One request through the REAL middleware order (key gate outer →
     identity inner); returns (status-ish, caller, state) via the recorder."""
     monkeypatch.delenv("MCP_API_KEYS", raising=False)
@@ -552,19 +611,31 @@ def test_union_via_full_http_app(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_API_KEYS", "http-env-key")
     app = _build_http_app()
     with TestClient(app) as c:
-        r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-                   headers={"Accept": "application/json, text/event-stream"})
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Accept": "application/json, text/event-stream"},
+        )
         assert r.status_code == 401
-        r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-                   headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-store-key"})
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-store-key"},
+        )
         assert r.status_code == 200  # the minted key is live immediately
-        r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-                   headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-env-key"})
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-env-key"},
+        )
         assert r.status_code == 200
         # Revoke → the minted key 401s on the next request (mtime reload).
         remove_key(entry["fp"])
-        r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-                   headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-store-key"})
+        r = c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Accept": "application/json, text/event-stream", "X-API-Key": "http-store-key"},
+        )
         assert r.status_code == 401
 
 
@@ -582,11 +653,14 @@ def test_union_non_mcp_paths_untouched(tmp_path, monkeypatch):
 def test_is_admin_policy_store_integration(tmp_path, monkeypatch):
     """is_admin reads the LIVE policy store (the same instance the engine
     uses), so a hot reload flips admin status without any restart."""
-    pf = _policy_file(tmp_path, {
-        "version": 1,
-        "admins": [key_fingerprint("live-admin-key")],
-        "datasets": {"global": ["*"], "assignments": {}},
-    })
+    pf = _policy_file(
+        tmp_path,
+        {
+            "version": 1,
+            "admins": [key_fingerprint("live-admin-key")],
+            "datasets": {"global": ["*"], "assignments": {}},
+        },
+    )
     _enable_policy(monkeypatch, pf)
     pol = policy_store().get()
     assert pol.admins == (key_fingerprint("live-admin-key"),)

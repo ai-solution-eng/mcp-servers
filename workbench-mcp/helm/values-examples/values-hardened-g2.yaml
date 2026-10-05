@@ -52,3 +52,16 @@ networkPolicy:
 
 # The VirtualService STAYS rendered (fleet doctrine 2026-09): external/browser
 # traffic keeps flowing through the SSO-gated edge gateway exactly as pre-zone.
+
+# -- Sandbox executor pool (sandbox-exec v1) ------------------------------------------------------
+# Overlay add-on: paste this block (and the workbench.sandboxExec keys from
+# values.yaml) onto a FULL values doc to add the executor pool to a zoned
+# deploy. Pool OFF here — with the zone ON, keep the surface minimal and
+# opt in deliberately. Same hardening as everywhere: no network, no GPU,
+# no SA token, non-root, no tolerations.
+# executors:
+#   enabled: false
+#   appName: workbench-exec
+#   containerName: python
+#   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+#   replicas: 2

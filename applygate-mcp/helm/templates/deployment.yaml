@@ -59,6 +59,33 @@ spec:
               value: {{ .Values.kinds.allowed | quote }}
             - name: APPLYGATE_AUDIT_FILE
               value: {{ .Values.audit.file | quote }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- if .Values.mcpHostname }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection,
+            # fleet-shared helper mcp_auth.transport_security_from_env).
+            # Without it, every gateway-fronted request gets 421 "Invalid
+            # Host header" — set it whenever ezua fronts this server (usually
+            # the same value as ezua.virtualService.endpoint).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.mcpHostname | quote }}
+            {{- end }}
+            {{- if or .Values.mcpHostname .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (pinned mcpHostname or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.planBinding.unplannedApply }}
             # D11 plan-binding transition knob (values: planBinding.unplannedApply).
             # Only rendered when set — the server's built-in default is deny

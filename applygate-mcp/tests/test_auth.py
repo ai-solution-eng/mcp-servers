@@ -39,7 +39,14 @@ SIMPLE = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\ndata:\
 
 
 @pytest.fixture()
-def app():
+def app(monkeypatch):
+    # Transport security adopts the fleet helper (mcp_auth.
+    # transport_security_from_env): with neither MCP_HOSTNAME nor
+    # MCP_EXTRA_ALLOWED_HOSTS set (dev mode) it returns None and the SDK
+    # AUTO-ENABLES loopback-only Host protection. The TestClient addresses
+    # the app as `testserver`, so these tests pin the dev-mode allowlist
+    # env to it (production wiring stays via MCP_HOSTNAME from the chart).
+    monkeypatch.setenv("MCP_EXTRA_ALLOWED_HOSTS", "testserver")
     return server._build_http_app()
 
 
@@ -334,3 +341,55 @@ def test_stale_plan_cannot_be_replayed_even_with_spoofed_caller(monkeypatch):
     )
     assert out["ok"] is False and "plan binding (D11)" in out["error"]
     server._caller_context.set(None)
+
+
+# ---------------------------------------------------------------------------
+# Transport security — the fleet-shared helper (mcp_auth.
+# transport_security_from_env), wired from MCP_HOSTNAME / MCP_EXTRA_ALLOWED_HOSTS
+# ---------------------------------------------------------------------------
+
+
+def test_transport_security_dev_mode_is_none(app, monkeypatch):
+    """Neither env set (local dev) → None: the SDK's implicit loopback
+    protection applies untouched (K8S-MCP fleet-reference semantics)."""
+    monkeypatch.delenv("MCP_HOSTNAME", raising=False)
+    monkeypatch.delenv("MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    assert server._mcp_transport_security() is None
+
+
+def test_transport_security_pinned_hostname_enables_protection(monkeypatch):
+    """MCP_HOSTNAME set → protection ON with the pinned FQDN + loopback in
+    the Host allowlist (and an https-only Origin allowlist)."""
+    monkeypatch.setenv("MCP_HOSTNAME", "applygate.example.com")
+    monkeypatch.delenv("MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    ts = server._mcp_transport_security()
+    assert ts is not None
+    assert ts.enable_dns_rebinding_protection is True
+    assert "applygate.example.com" in ts.allowed_hosts
+    assert "localhost:*" in ts.allowed_hosts
+    assert ts.allowed_origins == ["https://applygate.example.com"]
+
+
+def test_transport_security_extra_hosts_add_in_cluster_callers(monkeypatch):
+    """MCP_EXTRA_ALLOWED_HOSTS adds in-cluster svc-DNS hosts so local
+    clients calling the service directly do not get 421s."""
+    monkeypatch.delenv("MCP_HOSTNAME", raising=False)
+    monkeypatch.setenv("MCP_EXTRA_ALLOWED_HOSTS", "applygate-mm-rag.mm-rag.svc.cluster.local, other.host:8443")
+    ts = server._mcp_transport_security()
+    assert ts is not None
+    assert "applygate-mm-rag.mm-rag.svc.cluster.local" in ts.allowed_hosts
+    assert "other.host:8443" in ts.allowed_hosts
+    assert "localhost:*" in ts.allowed_hosts
+    assert ts.allowed_origins == []  # no pinned FQDN → no Origin list
+
+
+def test_transport_security_is_read_per_app_build(monkeypatch):
+    """Env is re-read at _build_http_app time (same call-time discipline as
+    every other knob) — flipping MCP_HOSTNAME without a restart changes the
+    next built app's posture."""
+    monkeypatch.delenv("MCP_HOSTNAME", raising=False)
+    monkeypatch.setenv("MCP_EXTRA_ALLOWED_HOSTS", "testserver")
+    server._build_http_app()  # built while the env pin is set
+    assert server._mcp_transport_security() is not None
+    monkeypatch.delenv("MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    assert server._mcp_transport_security() is None  # now dev-mode

@@ -524,6 +524,8 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_L2_WRITE_ASYNC` | `0` publishes results to the shared dir synchronously at the end of the computing query (the historical behavior); the default (`1`) hands the publish to a bounded background worker — the query returns once its memory L1 copy is placed and other replicas read the artifact at a small non-RAM cost once it lands (the sglang HiCache write-through shape, HA review 2026-09). A full queue DROPS the write (an ordinary cache miss) rather than blocking the query |
 | `SQLHANDLER_L2_METADATA` | `0` keeps `profile_table` / `column_stats` outputs per-replica (the historical behavior); the default (`1`) shares them through the same L2 dir under `meta/` — a few KB of JSON whose recompute is a multi-second sampled scan, so every replica (and every replica's restart) skips the rescan. Keys carry snapshot versions + the policy hash, so ETL commits and policy changes invalidate instantly. Preview results (`SELECT * FROM t LIMIT n`) are cached like any query — and published past the small-result floor, since a preview's recompute is an object-store round trip (perf review 2026-09: previews used to bypass the caches entirely and re-read storage on every call) |
 | `SQLHANDLER_TRUST_BROWSER_HEADERS` | Trust gate for the identity spine's **browser rung**: when truthy, oauth2-proxy identity headers (`X-Auth-Request-User`, `X-Forwarded-Groups`) resolve the request's Caller on keyless requests (the UI/API path). Set it ONLY when the workload AuthorizationPolicy pins ingress to the gateway — the headers are forgeable on any pod reachable without that pin (default off) |
+| `SQLHANDLER_OIDC_*` (`_ENABLED` / `_ISSUER` / `_AUDIENCE` / `_JWKS_URL` / `_IDENTITY_CLAIM`) | The **JWT rung** (resource-server posture): verified `Authorization: Bearer` OIDC tokens resolve `Caller(cls=user, subject=<identity claim — default `preferred_username`, `sub` fallback>, via=jwt)`. RS256 + iss/aud/exp via the realm JWKS, re-read per request; enabled-without-issuer warns loudly and fails closed. Chart: `security.oidc.*` |
+| `SQLHANDLER_OIDC_SSO_*` (`_ENABLED` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI` / `_PROVIDER_URL` / `_SCOPES` / `_COOKIE_NAME` / `_COOKIE_MAX_AGE` / `_COOKIE_SECURE`) | **Browser SSO (D22)** — the app as OIDC client: `/oauth/login` → realm → `/oauth/oidc/callback` verifies the exchanged token with the SAME JWT machinery and plants the HttpOnly session cookie (the ladder's LOWEST-priority envelope; resolved subject = the verified `preferred_username`). INERT without the full block: routes 404, no cookie accepted. Setup: `scripts/configure-oidc-sql.sh` (registers the callback URL + prints the values block; secret printed once). Chart: `security.oidc.sso.*` — see "Browser SSO (D22)" above |
 | `SQLHANDLER_POLICY_FILE` | Path to the **policy-as-code** document (JSON or YAML): `groups → {tables glob → {row_filter, column_masks{col: redact | hash | const}}, hidden_tables}` + `subjects`/`key_fps` → groups + `default_group`. Hot-reloaded on mtime; a broken edit keeps the previous policy enforcing (fail-closed). Enforcement per caller: masking views in DuckDB, hidden-table invisibility, per-policy cache keys — see FEATURES.md "Policy-as-code" |
 | `SQLHANDLER_POLICY_ENABLED` | `1` turns policy enforcement ON (default `0` — with the flag off, everything is byte-identical to the pre-policy behavior: no masking views, no policy hash in any cache key, shared query memory/saved queries). When ON, identities with no binding fall to the policy file's `default_group` (the restricted default for legacy keys) |
 | `SQLHANDLER_VIRTUAL_CACHE_SORT` | `0` disables clustering (auto-sorting) of materialized virtual results by their lowest-cardinality columns (default on) |
@@ -618,11 +620,60 @@ the `restricted` group above expresses for `workorder/*`.
 a minted static API key (pseudonymous fingerprint, `sha256:<12hex>` of the key —
 never the key itself), a gateway relay attribution (`X-MCP-Caller-Subject` over a
 key-valid request — the MCP-bundle topology where the gateway holds the key), an
-SSO bearer JWT, or oauth2-proxy browser headers (only behind the
+SSO bearer JWT, the app's own browser-SSO session cookie (D22, below), or
+oauth2-proxy browser headers (only behind the
 `security.identity.trustBrowserHeaders` trust gate — the workload
 AuthorizationPolicy must pin ingress to the gateway). See
 [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) for the full
 mint → Secret → policy-assignment workflow.
+
+### Browser SSO (D22 — the MM-RAG parity)
+
+The web UI's header shows **who you are** (`Signed in as …`, with the rung tag:
+`oidc` / `browser` / `key`). On deployments where the edge proxy does not forward
+the access token, the oauth2-proxy **header** rung can only carry the IdP's
+`sub` UUID — so the app runs the OIDC authorization-code flow itself (the same
+D22 pattern MM-RAG ships): `GET /oauth/login` redirects to the realm,
+`GET /oauth/oidc/callback` exchanges + **verifies** the token with the same
+RS256/JWKS machinery every other credential goes through, and plants an
+**HttpOnly `pcai-sso` session cookie**. The cookie is the LOWEST-priority
+envelope — an explicit `X-API-Key` always outranks the browser session behind
+it — and binds the **verified `preferred_username`** (e.g. `andrew-bydlon`),
+which is also the subject self-mint keys bind to. `GET /oauth/logout` clears
+the app session; the header's **Sign out** chains the edge sign-out too.
+
+**Setup (once per environment):**
+
+1. Register the callback URL in the `ua` client (the PCAI platform realm, `UA`
+   — the realm the gateway's oauth2-proxy and MM-RAG already use):
+
+   ```bash
+   scripts/configure-oidc-sql.sh
+   ```
+
+   Idempotent (safe to re-run; no duplicate URIs, never rewrites the client).
+   It derives the domain from the cluster (`ezapp-manager-parameters`),
+   registers `https://<endpoint>/oauth/oidc/callback`, verifies the
+   registration landed, and prints the ready-to-paste `security.oidc.sso`
+   values block — with the **client secret printed once** (key material; see
+   the script's output for the two secret paths: the PCAI values-editor
+   envsubst `${OIDC_CLIENT_SECRET}`, or your own Secret via
+   `clientExistingSecret`).
+
+2. Chart wiring: `security.oidc.sso.*` — rendered ONLY when
+   `sso.enabled: true` (the default render is byte-identical; inert mode = 404
+   routes, no cookie ever accepted). The G2 overlay
+   (`helm/local/values.g2.yaml`) ships pre-configured for this platform.
+
+3. Re-apply the chart (a values edit alone never restarts pods), then verify:
+   the pod env `SQLHANDLER_OIDC_SSO_CLIENT_SECRET` shows a real string (the
+   literal `${OIDC_CLIENT_SECRET}` means substitution did not happen — switch
+   to `clientExistingSecret`), open `/ui`, and the anonymous header offers
+   **Sign in with SSO**.
+
+Inert by default: without the flag + client secret + OIDC issuer, every
+`/oauth/*` route 404s and no cookie is ever accepted — behavior byte-identical
+to pre-D22.
 
 ### Administering from the frontend (Access-control panel)
 

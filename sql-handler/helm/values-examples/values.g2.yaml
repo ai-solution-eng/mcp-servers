@@ -40,7 +40,7 @@ readiness:
   driftGate: false            # optional fail-fast for new scans while degraded
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.3.2
+  tag: v3.6.0
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3
@@ -300,17 +300,21 @@ security:
     mountPath: /etc/sqlhandler/policy
   # Resource-server JWT rung: users paste their SSO bearer token and
   # SQLhandler verifies it via the realm's JWKS (RS256, TLS always on).
-  # NO client secret, NO redirect URIs — this is NOT the browser-SSO D22
-  # pattern; OAuth terminates at the ezaf-gateway (OAuth REVISION §3).
-  # The issuer URL below must resolve IN-CLUSTER for JWKS fetches.
+  # NO client secret, NO redirect URIs for THIS rung — OAuth terminates at
+  # the ezaf-gateway (OAuth REVISION §3). The issuer URL must equal the
+  # token's iss claim (claim-compared, never fetched for the JWT rung; the
+  # JWKS fetch rides the IN-CLUSTER headless service — plain HTTP, no CA
+  # gap). Realm: UA — the PCAI platform realm (live-verified 2026-10-05:
+  # realms/ezaf does not exist, realms/UA 200).
   oidc:
     enabled: true
-    issuer: https://keycloak.${DOMAIN_NAME}/realms/ezaf
+    issuer: https://keycloak.${DOMAIN_NAME}/realms/UA
     audience: ua
-    # jwksUrl derived from the issuer (…/protocol/openid-connect/certs);
-    # set it explicitly ONLY if the realm path differs.
-    jwksUrl: ""
-    identityClaim: ""          # default preferred_username; sub as fallback
+    # jwksUrl: the in-cluster Keycloak HEADLESS service (the plain `keycloak`
+    # Service has no endpoints — selector mismatch); empty = derived from
+    # the issuer, which the pod CANNOT fetch (private CA) — so set it.
+    jwksUrl: "http://keycloak-headless.keycloak.svc.cluster.local:8080/realms/UA/protocol/openid-connect/certs"
+    identityClaim: preferred_username
   # Admin keys store (frontend minting): the Secret-mounted JSON keys file
   # lets mint/revoke happen from the /ui Access-control tab with zero
   # kubectl after bootstrap. Empty = store disabled (Secret keys only).

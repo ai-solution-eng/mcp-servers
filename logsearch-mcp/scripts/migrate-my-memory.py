@@ -19,9 +19,9 @@ Before running:
 Run:  python3 mcp_servers/logsearch_mcp/scripts/migrate-my-memory.py
 """
 import json
+import sys
 import urllib.error
 import urllib.request
-import sys
 
 API = "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
 MCP = API + "/mcp"

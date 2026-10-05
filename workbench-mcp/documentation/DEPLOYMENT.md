@@ -37,6 +37,8 @@ ezua:
 | `workbench.maxListEntries` | `500` | Entries per `list_files` response. |
 | `workbench.logLevel` | `INFO` | Server logging level. |
 | `workbench.templates` | `{}` | Workspace templates for `workspace_create(name, template=<name>)` — **default OFF: an empty object renders no env at all and the tool's `template` parameter is refused**, exactly the pre-templates behavior. Each named template may only (a) **widen** that workspace's exec allowlist with operator-supplied *bare binary names* (`extra_allowed` — the denylist still wins, so a template can never re-enable a denied binary) and (b) pre-run `canned_setup` argv commands **inside the new workspace through the exact `run_command` machinery** (confinement, server-PATH allowlist resolution, timeouts, output caps, audit — each setup run is audited as a `workspace_template_setup` event carrying the template name). Only the template *name* persists in the workspace; the widened allowlist is re-derived from the current values on every call, so removing a template shrinks its workspaces back to the base allowlist. See the `helm/values.yaml` comment block for a worked example. |
+| `executors.enabled` (+ `appName` / `containerName` / `image` / `replicas` / `autoscaling.*`) | `false` / `workbench-exec` / `python` / workbench image / `2` / off | **Sandbox-exec v1 (default OFF — the default render is byte-identical to the baseline)**: renders the `workbench-exec` executor Deployment (the SAME image as the server, `python3 -c "import time; time.sleep(2147483647)"` command — no new image to build), its deny-all NetworkPolicy (policyTypes `[Ingress, Egress]`, zero rules), and a namespaced Role + RoleBinding granting the workbench SA `get`/`list` on pods + `create` on `pods/exec` in its OWN namespace. Executors are hardened (no SA token, non-root uid 10001, caps dropped, seccomp RuntimeDefault, read-only rootfs + emptyDir `/tmp`, 100m/128Mi → 1 CPU/512Mi, no tolerations, control-plane `DoesNotExist` affinity, hostname topologySpread, no GPU keys anywhere). **Pair with `workbench.sandboxExec: true`** — the executor pool and the `sandbox_run` tool switch are two gates, and both must be on. Trust posture: the workbench SA gains pods/exec in its own namespace (RBAC cannot select by label — exec into any pod of that namespace, which holds only workbench + executor pods by design); see the README "Sandbox exec" section. `autoscaling.enabled: true` renders an HPA (min 2 / max 4 / CPU 70%). |
+| `workbench.sandboxExec` | `false` | The `sandbox_run` tool's server-side switch (renders `WORKBENCH_SANDBOX_EXEC=1` ONLY when true). Off = the tool refuses self-describingly naming `executors.enabled`. Related server knobs: `workbench.sandboxLabel` (`app=workbench-exec`), `sandboxContainer` (`python`), `sandboxTimeoutS` (`120`, clamped 1..600), `sandboxMaxOutputChars` (`50000`) — each rendered into env ONLY when it diverges from its default. |
 | `metrics.enabled` (+ `serviceMonitor` / `interval`) | `false` | `GET /metrics` self-metrics (per-tool request counters, nothing else). Default OFF renders no env and no ServiceMonitor — the default pod has no `/metrics` route; when on, `/metrics` is key-free like the probes. |
 | `apiKey.existingSecret` / `existingSecretKey` | `workbench-mcp-apikey` / `api-keys` | **Mandatory wiring, never created by the chart**: every route except `/health`/`/healthz` requires an API key, so the Secret must exist in the target namespace before `helm install` or the pod sits in `CreateContainerConfigError`. Comma-separated keys (`api-keys=new,old`) are the zero-downtime rotation mechanism (env re-read per request). |
 | `webui.enabled` | `true` | The HPE-branded console at `/` — workspace switcher, file tree + viewer/saver, env editor, run-command console, audit tail. The UI is read/write and calls the SAME core functions (confinement, caps, allowlist, audit all still apply). Auth posture: the console HTML (`/`, `/ui`) is public-but-inert (an in-page unlock bar collects the key — the browser cannot load the page behind a 401); every `/api/*` data route stays API-key-gated, and the endpoint sits behind gateway authn. |
@@ -65,6 +67,8 @@ these directly):
 | `WORKBENCH_LOG_LEVEL` | `workbench.logLevel` |
 | `WORKBENCH_TEMPLATES` | `workbench.templates` as JSON — rendered ONLY when the object is non-empty (default: no env at all, template parameter refused) |
 | `WORKBENCH_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
+| `WORKBENCH_SANDBOX_EXEC` | rendered `"1"` only when `workbench.sandboxExec=true` (otherwise absent — the `sandbox_run` tool refuses) |
+| `WORKBENCH_SANDBOX_LABEL` / `WORKBENCH_SANDBOX_CONTAINER` / `WORKBENCH_SANDBOX_TIMEOUT_S` / `WORKBENCH_SANDBOX_MAX_OUTPUT_CHARS` | `workbench.sandboxLabel` / `sandboxContainer` / `sandboxTimeoutS` / `sandboxMaxOutputChars` — each rendered ONLY when it diverges from its server default (default render carries none of them) |
 | `HOME` | fixed `/tmp` (read-only-rootfs scratch so pip/tempfiles keep working; resets with the pod — workspaces persist on the PVC) |
 | `WORKBENCH_API_KEYS` | `apiKey.existingSecret{,Key}` — always from the operator-created Secret |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (+ lowercase) | `proxy.*` — each key wired only when non-empty (empty = not rendered; passed through to `run_command` children) |
@@ -98,9 +102,10 @@ Behavior that differs by target, and the paste-ready values for each
 
 ### Proxied corporate site (SITE: your-cluster.example)
 
-- **Literal domain.** This PCAI build does not envsubst `${DOMAIN_NAME}` —
-  write the literal domain into `ezua.domainName` and
-  `ezua.virtualService.endpoint` (the G2 example ships it already).
+- **Domain.** PCAI envsubsts `${DOMAIN_NAME}` in pasted values before
+  rendering, so the hosted-trial placeholders work as-pasted; the G2 site
+  files deliberately carry the literal domain instead (plain `helm -f`
+  readability — either form deploys correctly on PCAI).
 - **Proxy + MITM CA on** — explicit `proxy.http/https` block and
   `caCert.enabled: true` (the `ezaf-root-ca` ConfigMap present in the release
   namespace; the former `hpe_proxies` flag is removed — see "Migrating from

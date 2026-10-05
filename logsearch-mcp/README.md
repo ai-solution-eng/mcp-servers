@@ -25,8 +25,8 @@ return a JSON string. All are read-only against the cluster.
 | --- | --- |
 | `list_log_sources(namespace, label_selector="")` | Pods + containers in one namespace with restart counts and age — the discovery call before searching. |
 | `get_pod_logs(namespace, pod, container="", tail_lines=500, since_seconds=None, previous=False)` | Raw tail-bounded log fetch for ONE pod; `previous=true` reads the PREVIOUS (crashed) container — the first move on CrashLoopBackOff. |
-| `search_logs(namespace, pattern, label_selector="", pod_regex="", since_minutes=None, tail_lines=200, case_insensitive=True, container="", max_total_lines=300)` | Fan-out regex search: pods are fetched in PARALLEL (bounded semaphore, `LOGSEARCH_FETCH_CONCURRENCY`); tail of each pod (timestamps on); keep matching lines with `podname/container: ` provenance; merge chronologically. The `max_total_lines` budget is enforced DURING the fan-out — once it is full the search stops pulling further pods (`pods_skipped_budget` counts them, `truncated: true`). Each returned line is capped at `LOGSEARCH_MAX_LINE_CHARS` characters with a `...[truncated N chars]` marker. Returns `{matches, pods_searched, pods_with_matches, truncated, pods_skipped_budget, ...}`. |
-| `count_matches(namespace, pattern, label_selector="", since_minutes=None, case_insensitive=True)` | Per-pod match counts over each pod's tail, `{pod: count}` sorted descending — the "where is this error coming from?" call before reading full logs. Pod fetches run in parallel (same bounded semaphore). |
+| `search_logs(namespace, pattern, label_selector="", pod_regex="", since_minutes=None, tail_lines=200, case_insensitive=True, container="", max_total_lines=None, context_lines=0)` | Fan-out regex search: pods are fetched in PARALLEL (bounded semaphore, `LOGSEARCH_FETCH_CONCURRENCY`); tail of each pod (timestamps on); keep matching lines with `podname/container: ` provenance; merge chronologically. The `max_total_lines` budget (default: `LOGSEARCH_MAX_TOTAL_LINES`, 300 — an explicit per-call value overrides the env) is enforced DURING the fan-out — once it is full the search stops pulling further pods (`pods_skipped_budget` counts them, `truncated: true`). Each returned line is capped at `LOGSEARCH_MAX_LINE_CHARS` characters with a `...[truncated N chars]` marker. Returns `{matches, pods_searched, pods_with_matches, truncated, pods_skipped_budget, ...}`. |
+| `count_matches(namespace, pattern, label_selector="", since_minutes=None, case_insensitive=True, tail_lines=None)` | Per-pod match counts over each pod's effective tail — min(`tail_lines`, `LOGSEARCH_MAX_LINES_PER_POD`); unset = the cap itself (1000 by default, reported in `effective_tail_lines`) — `{pod: count}` sorted descending: the "where is this error coming from?" call before reading full logs. Pod fetches run in parallel (same bounded semaphore). |
 | `export_matches(namespace, pattern, dest_name, ...same params as search_logs)` | **OPT-IN (Wave-5 F3)** — runs the EXACT `search_logs` pipeline and writes the matched lines to `<LOGSEARCH_EXPORT_ROOT>/<dest_name>`: for result sets too big for a context window, the agent reads the FILE back instead. With `LOGSEARCH_EXPORT_ROOT` unset the tool refuses with setup instructions and writes nothing. `dest_name` must be a bare file name (no separators/`..`); the write is bounded by the same caps as the search and the file gets a small `#`-prefixed header. See "Exports". |
 
 Errors are self-describing strings (`Error: ...`), never tracebacks: a denied
@@ -43,16 +43,25 @@ are empty results, not errors.
 | `LOGSEARCH_BLOCKED_NAMESPACES` | *(empty)* | Comma-separated fnmatch globs; **always wins** over the allowed list. |
 | `LOGSEARCH_MAX_PODS` | `50` | Max pods touched by one fan-out search/count. |
 | `LOGSEARCH_MAX_LINES_PER_POD` | `1000` | Max tail lines fetched per pod (also the tail used by `count_matches`). |
-| `LOGSEARCH_MAX_TOTAL_LINES` | `300` | Default cap on merged `search_logs` matches — enforced DURING the fan-out (the pull stops when the budget is full). |
+| `LOGSEARCH_MAX_TOTAL_LINES` | `300` | Default cap on merged `search_logs`/`export_matches` matches when the call omits `max_total_lines` — enforced DURING the fan-out (the pull stops when the budget is full). An explicit per-call `max_total_lines` still overrides the env. |
 | `LOGSEARCH_MAX_LINE_CHARS` | `2000` | Per-line char cap on `search_logs` output; overlong lines are cut with an explicit `...[truncated N chars]` marker. `0` disables. |
 | `LOGSEARCH_FETCH_CONCURRENCY` | `8` | Width of the parallel pod-fetch fan-out (asyncio.gather under a bounded semaphore); `1` = sequential. |
 | `LOGSEARCH_MAX_REGEX_CHARS` | `512` | Max user-regex length before the ReDoS screen refuses it; `0` disables the length cap (the shape screen stays on). |
 | `LOGSEARCH_WEBUI_ENABLED` | `true` | Serve the web console (`/`, `/ui`, `/api/*`) on the streamable-http transport; `false` = MCP-only surface. |
 | `LOGSEARCH_EXPORT_ROOT` | *(unset)* | **Opt-in directory** `export_matches` may write into (`<root>/<dest_name>`). UNSET by default = the tool refuses with a self-describing setup message and writes nothing. Set it to an absolute directory on a writable, agent-readable volume — fleet convention: a path on the workbench/shared PVC so workbench workspaces can read exports back (see "Exports"). Chart: `logsearch.exportRoot` (rendered only when set). |
 | `LOGSEARCH_METRICS_ENABLED` | `false` | Serve `GET /metrics` — Prometheus self-metrics: `logsearch_mcp_tool_requests_total{tool,outcome}` (per-tool call counts, ok/error incl. namespace-policy denials; no namespace/pod names, patterns, or log content are exported). Chart-gated default-OFF (`metrics.enabled: false` renders no env and no ServiceMonitor); when on, `/metrics` is key-free like the probes. See `helm/values.yaml` (which also documents the fleet audit-JSONL searchability convention — this server is the SEARCH side of it). |
+| `MCP_HOSTNAME` / `MCP_EXTRA_ALLOWED_HOSTS` | *(unset)* | **DNS-rebinding Host allowlist** (fleet-shared `mcp_auth.transport_security_from_env`): with BOTH unset (local dev) the SDK's implicit loopback-only protection applies untouched; with either set, protection is explicitly ON and the Host allowlist is the pinned public FQDN (`MCP_HOSTNAME`) + in-cluster svc-DNS extras (comma-separated `MCP_EXTRA_ALLOWED_HOSTS`, matched verbatim or as `host:*`) + loopback. Chart: `ezua.virtualService.endpoint` → `MCP_HOSTNAME` and `extraAllowedHosts` → `MCP_EXTRA_ALLOWED_HOSTS`. When transport security is active (ezua endpoint pinned or extras non-empty), the chart AUTO-prepends the release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*`) — the LLM-gateway relay hop's Host header — as the first `MCP_EXTRA_ALLOWED_HOSTS` entry; sites list only EXTRA hosts (the default render still has neither env). |
 
 Matching is `fnmatch`-style and case-sensitive (`prod-*` matches
 `prod-eu-1`, not `prod`; namespace names are lowercase DNS labels).
+`search_logs`/`export_matches` accept SEVERAL namespaces in one call —
+comma-separated exact names (`ns-a,ns-b`) or a glob (`team-*`, expanded
+against the live namespace list). The policy is evaluated PER RESOLVED
+namespace: a denied namespace is skipped and reported (in the response's
+`namespaces` breakdown and `errors`), never silently merged, and each
+namespace is searched under its own pod cap and its own slice of the global
+`max_total_lines` budget. A single name keeps the exact pre-multi-namespace
+response shape.
 
 ## Regex safety (ReDoS guard)
 
@@ -258,8 +267,9 @@ sanitized paste-ready per-target examples (SE-G2 / hosted trial) live in
 endpoint aborts the render before anything is created — `Valid
 .Values.ezua.virtualService.endpoint is required !` (logsearch ships
 `ezua.enabled: false` by default; the check only bites an operator who enables
-the gateway exposure and then blanks the endpoint, or the `${DOMAIN_NAME}`
-placeholder fails to resolve). With `ezua.enabled: false` no VirtualService is
+the gateway exposure and then blanks the endpoint — an unresolved
+`${DOMAIN_NAME}` literal on a plain-Helm site registers a host that matches
+nothing). With `ezua.enabled: false` no VirtualService is
 rendered and the endpoint is never read — in-cluster Service access only.
 
 ```yaml

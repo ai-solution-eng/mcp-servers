@@ -27,7 +27,7 @@ deployment:
 # the registry, and IfNotPresent would serve a stale cached digest.
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.6.1
+  tag: v0.7.0
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -76,6 +76,9 @@ service:
 # -- Saved-query persistence ---------------------------------------------------------
 # SITE: enabled — user-defined queries must survive pod updates (the whole
 # point of saving them); the chart default stays OFF for new sites.
+# shared: true declares the store genuinely shared across replicas (single
+# replica here — and the RWX class would share the file anyway), silencing
+# the per-replica warning query_save otherwise attaches.
 persistence:
   enabled: true
   mountPath: /data
@@ -84,6 +87,7 @@ persistence:
   accessModes:
     - ReadWriteMany   # gl4f-filesystem (cluster default) is RWX
   savedQueriesFile: saved-queries.json
+  shared: true
 
 # -- Resources ---
 #---------------------------------------------------------------------------

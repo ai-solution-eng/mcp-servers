@@ -400,9 +400,7 @@ def test_prewarm_fills_block_cache_and_second_read_hits(tmp_path, monkeypatch):
     def wrapped_open(self, info, version=None):
         orig_open(self, info, version)  # keep the open-call accounting honest
         wfs = bc.maybe_block_cache(pafs.LocalFileSystem(), purpose="test")
-        return pad.dataset(
-            [str(self.root / info.path / "part.parquet")], filesystem=wfs, format="parquet"
-        )
+        return pad.dataset([str(self.root / info.path / "part.parquet")], filesystem=wfs, format="parquet")
 
     monkeypatch.setattr(FakeProvider, "open_dataset", wrapped_open)
     outcomes = eng.prewarm(("workorder/work_order",))
@@ -481,3 +479,228 @@ def test_usage_count_ordering_unchanged(tmp_path, monkeypatch):
     top = eng.usage_top_tables(3)
     assert top[0] == "workorder/work_order"
     assert counts[("default", "workorder/work_order")] == 1
+
+
+# ---------------------------------------------------------------------------
+# CROSS-SURFACE sharing (live 2026-10-05): the Query tab always sends a
+# transport limit (the UI box, default 100) while the Inspector sends none —
+# repr(limit) was a key part, so the SAME SQL cached TWICE. The canonical
+# preview key strips BOTH the SQL's LIMIT token and the transport limit:
+# one entry per shape, every surface hits it.
+# ---------------------------------------------------------------------------
+
+
+def test_query_tab_and_inspector_share_one_entry(tmp_path, monkeypatch):
+    """LIMIT 100 via the transport-limit path (Query tab: api limit=100,
+    SQL text with LIMIT 100) then the same via the inspector path
+    (api limit=None): the second call is a canonical hit — no IO, no
+    second entry."""
+    eng, provider = _make_engine(tmp_path)
+    # Query tab: /api/query clamps limit → 100, SQL text says LIMIT 100.
+    tab = eng.query_duckdb("SELECT * FROM work_order LIMIT 100", limit=100)
+    assert tab.num_rows == 100
+    provider.open_calls.clear()
+
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+
+    # Inspector: dispatch passes limit=None; SQL text says LIMIT 100.
+    insp = eng.query_duckdb("SELECT * FROM work_order LIMIT 100", limit=None)
+    assert insp.num_rows == 100
+    assert calls["fp"] == 0, "the inspector must hit the Query tab's canonical entry"
+    assert provider.open_calls == []
+    assert insp.to_pydict() == tab.to_pydict()
+
+
+def test_smaller_want_after_transport_limit_100(tmp_path, monkeypatch):
+    """Inspector LIMIT 50 after the Query tab cached the LIMIT-100 shape:
+    canonical hit, sliced — one entry serves both surfaces and both asks."""
+    eng, provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 100", limit=100)
+    provider.open_calls.clear()
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+    got = eng.query_duckdb("SELECT * FROM work_order LIMIT 100", limit=50)
+    assert got.num_rows == 50
+    assert calls["fp"] == 0
+    assert provider.open_calls == []
+
+
+# ---------------------------------------------------------------------------
+# LIMIT-supersede prefix reuse (live 2026-10-05: LIMIT 99/98/97 re-read
+# object storage on every distinct n — a bigger cached preview must serve a
+# smaller one by slicing; any >=n subset is a correct bare-LIMIT answer).
+# ---------------------------------------------------------------------------
+
+
+def test_smaller_limit_served_from_bigger_cached_preview(tmp_path):
+    """LIMIT 5 after a cached LIMIT 50 preview: NO IO, rows sliced from the
+    superseding entry (counted via the provider's open_calls)."""
+    eng, provider = _make_engine(tmp_path)
+    big = eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+    assert big.num_rows == 50
+    provider.open_calls.clear()  # everything past this point must be IO-free
+
+    small = eng.query_duckdb("SELECT * FROM work_order LIMIT 5")
+    assert small.num_rows == 5
+    assert small.column_names == big.column_names
+    # The slice is a PREFIX of the bigger cached result (same order).
+    assert small.to_pydict() == {k: v[:5] for k, v in big.to_pydict().items()}
+    assert provider.open_calls == [], "a superset hit must never touch storage"
+
+
+def test_reuse_only_within_the_same_shape(tmp_path, monkeypatch):
+    """A different projection (or a different table) never reuses another
+    shape's cached preview — the candidate key carries the full SQL
+    identity, so 'SELECT id ...' cannot be served from 'SELECT * ...'.
+    Counted via the fast path: a reuse would skip it entirely."""
+    eng, _provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+
+    cols = eng.query_duckdb("SELECT id FROM work_order LIMIT 5")
+    assert cols.num_rows == 5 and cols.column_names == ["id"]
+    assert calls["fp"] == 1, "a different projection must NOT reuse the star preview"
+
+
+def test_supersede_ladder_hits_the_closest_superset(tmp_path):
+    """LIMIT 12 (not on the ladder) is served from the cached LIMIT 50 —
+    the candidate scan covers both the fixed ladder and the multipliers."""
+    eng, provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+    provider.open_calls.clear()
+
+    got = eng.query_duckdb("SELECT * FROM work_order LIMIT 12")
+    assert got.num_rows == 12
+    assert provider.open_calls == []
+
+
+def test_bigger_limit_after_smaller_still_executes(tmp_path, monkeypatch):
+    """LIMIT 100 after a cached LIMIT 50: no superset exists (50 < 100 and
+    the candidate ladder above 100 is capped-out by the 1000 default, but
+    50 cannot serve 100) — the fast path runs and the result is cached
+    under ITS key; a repeat is then a direct hit (no fast-path call)."""
+    eng, _provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+
+    big = eng.query_duckdb("SELECT * FROM work_order LIMIT 100")
+    assert big.num_rows == 100  # 150-row table; the fast path read a row group
+    assert calls["fp"] == 1, "no superset cached — must execute"
+    # The executed result is cached under its exact key: a repeat hits it
+    # before the fast path would run again.
+    again = eng.query_duckdb("SELECT * FROM work_order LIMIT 100")
+    assert again.num_rows == 100
+    assert calls["fp"] == 1
+
+
+def test_supersede_respects_row_cap(tmp_path, monkeypatch):
+    """A cap below the request refuses to manufacture a superset beyond it:
+    the probe never proposes candidates above the cap."""
+    eng, provider = _make_engine(tmp_path)
+    import sqlhandler.engine as eng_mod
+
+    monkeypatch.setattr(eng_mod, "_max_rows", lambda: 10)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 10")
+    provider.open_calls.clear()
+    # LIMIT 10 with cap 10: want >= cap → the probe declines immediately.
+    # The exact-key hit serves it instead (already cached) — still no IO,
+    # but the assertion here is that nothing crashes and rows are right.
+    got = eng.query_duckdb("SELECT * FROM work_order LIMIT 10")
+    assert got.num_rows == 10
+
+
+def test_repeated_small_requests_are_canonical_hits(tmp_path, monkeypatch):
+    """The canonical entry is the shared cache: repeated small requests
+    (and different small limits) never re-touch the fast path."""
+    eng, _provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+
+    first = eng.query_duckdb("SELECT * FROM work_order LIMIT 5")
+    assert first.num_rows == 5
+    second = eng.query_duckdb("SELECT * FROM work_order LIMIT 5")
+    third = eng.query_duckdb("SELECT * FROM work_order LIMIT 7")
+    assert calls["fp"] == 0, "the canonical entry serves every smaller want"
+    assert second.to_pydict() == first.to_pydict()
+    assert third.num_rows == 7
+
+
+def test_decorated_queries_never_reuse(tmp_path):
+    """ORDER BY/WHERE variants are not bare previews — the reuse probe
+    declines them (same guard as the fast path) and the normal path runs."""
+    eng, _provider = _make_engine(tmp_path)
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+
+    # ORDER BY is not a bare preview: neither the reuse probe nor the fast
+    # path engages (the reuse probe calls _is_bare_preview first). Prove it
+    # by the SQL job path — the result is correct and the preview cache was
+    # not consulted for it (the exact key of an ORDER BY query differs from
+    # any preview key by construction).
+    ordered = eng.query_duckdb("SELECT * FROM work_order ORDER BY id LIMIT 5")
+    assert ordered.num_rows == 5
+    assert ordered.column("id").to_pylist() == sorted(ordered.column("id").to_pylist())
+
+
+def test_supersede_l2_only_store_still_reusable(tmp_path, monkeypatch):
+    """The superseding entry stored with the preview floor-0 rule reaches
+    the OTHER replica via L2 — simulate by a fresh engine over the same L2
+    dir: the smaller request slices from the L2 artifact, no fast-path call."""
+    l2_dir = str(tmp_path / "l2")
+    monkeypatch.setenv("SQLHANDLER_L2_DIR", l2_dir)
+    monkeypatch.setenv("SQLHANDLER_L2_ENABLED", "1")
+    monkeypatch.setenv("SQLHANDLER_L2_MIN_BYTES", "0")
+    monkeypatch.setenv("SQLHANDLER_L2_MAX_BYTES", "0")
+    # Synchronous publish: the async writer would race eng2's read below.
+    monkeypatch.setenv("SQLHANDLER_L2_WRITE_ASYNC", "0")
+    eng, _provider = _make_engine(tmp_path)
+    assert eng._l2_cache is not None
+    eng.query_duckdb("SELECT * FROM work_order LIMIT 50")
+
+    # A fresh engine = the other replica (empty L1, same shared L2 dir).
+    eng2, _provider2 = _make_engine(tmp_path)
+    assert eng2._l2_cache is not None and eng2._l2_cache is not eng._l2_cache
+    calls = {"fp": 0}
+    orig_fp = SqlEngine._preview_fastpath
+
+    def counting_fp(self, sql, version):
+        calls["fp"] += 1
+        return orig_fp(self, sql, version)
+
+    monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
+    small = eng2.query_duckdb("SELECT * FROM work_order LIMIT 5")
+    assert small.num_rows == 5
+    assert calls["fp"] == 0, "L2 superset must serve the smaller request cross-replica"

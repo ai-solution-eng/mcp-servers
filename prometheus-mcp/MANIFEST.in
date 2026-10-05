@@ -3,3 +3,7 @@
 # /app/ui fallback, so this only matters for source installs).
 include ui/index.html
 include saved_queries.py
+# Auth module (fleet mcp_auth adoption): py-modules already covers wheels,
+# but an sdist built without this file would silently omit it — the exact
+# silent-omission class the packaging tests pin.
+include mcp_auth.py

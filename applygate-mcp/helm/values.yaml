@@ -4,9 +4,40 @@ deployment:
   replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
-  tag: v0.3.1
+  tag: v0.5.0
   pullPolicy: IfNotPresent
 imagePullSecrets: []
+# -- Transport security (DNS-rebinding protection; fleet pattern: K8S-MCP) --
+# The server builds TransportSecuritySettings via the SHARED
+# mcp_auth.transport_security_from_env(). With NEITHER key set (default) it
+# returns None → the SDK's implicit LOOPBACK-ONLY Host protection applies
+# untouched (local dev; in-cluster callers via svc DNS still work because
+# the SDK auto-protection is loopback-allowlist based... in-cluster callers
+# reaching the pod through the Service DO need the extra host below).
+#
+# mcpHostname: the public FQDN clients use to reach /mcp (DNS-rebinding
+# pin). Usually the same value as ezua.virtualService.endpoint — set it
+# explicitly (or template it there) whenever the gateway fronts this
+# server: WITHOUT it, every gateway request gets 421 "Invalid Host header".
+# MUST be unique per release on the shared gateway (the K8S-MCP lesson).
+#
+# extraAllowedHosts: EXTRA in-cluster callers that address the server by its
+# service DNS name (e.g. a peer MCP →
+# http://other-mcp.<ns>.svc.cluster.local:9102/mcp). Entries are matched
+# verbatim, or use the `host:*` form to accept any port. The pinned FQDN
+# (mcpHostname) and loopback are always allowed; without this knob the
+# behavior is unchanged. List of strings.
+#
+# NOTE — the chart AUTO-INCLUDES this release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
+# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active
+# (mcpHostname set or extraAllowedHosts non-empty): the LLM-gateway relay
+# arrives with Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>,
+# and without that entry every relay hop gets 421 Misdirected Request. This
+# key only lists hosts BEYOND that; a site setting extraAllowedHosts never
+# loses the own-svc entry (the chart prepends it):
+mcpHostname: ''
+extraAllowedHosts: []
 # API keys for the /mcp endpoint (fleet pattern: K8S-MCP). The chart NEVER
 # creates a key and NEVER inlines one in values — an envsubst apply once
 # emptied a live key Secret (the K8S-MCP lesson). The deployment references

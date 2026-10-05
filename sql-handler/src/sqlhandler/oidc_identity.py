@@ -241,20 +241,22 @@ def _fetch_jwks(url: str, timeout: float) -> dict[str, tuple[int, int]]:
     import urllib.parse
 
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "sqlhandler"})
-    opener_kwargs: dict = {}
+    handlers: list = []
     ca_bundle = os.environ.get("REMOTE_CA_BUNDLE", "").strip()
     if url.lower().startswith("https://") and ca_bundle and os.path.exists(ca_bundle):
         try:
-            opener_kwargs["handlers"] = [urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle))]
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle)))
         except Exception:
             pass  # unusable bundle -> default verification (fail closed as usual)
     host = urllib.parse.urlparse(url).hostname or ""
     if host.endswith((".svc", ".svc.cluster.local", ".local")) or host == "localhost":
         # in-cluster: never route through an ambient proxy
-        opener_kwargs.setdefault("handlers", [])
-        opener_kwargs["handlers"] = [urllib.request.ProxyHandler({})] + opener_kwargs["handlers"]
-    if opener_kwargs:
-        with urllib.request.build_opener(**opener_kwargs).open(req, timeout=timeout) as resp:
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    if handlers:
+        # build_opener takes handlers POSITIONALLY (*handlers) — the handlers=
+        # kwarg raised TypeError on every fetch, killing the OIDC rung when
+        # REMOTE_CA_BUNDLE is set (the same live G2 bug RAG hit 2026-10-02).
+        with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
             payload = json.loads(resp.read(_JWKS_MAX_BYTES).decode("utf-8"))
     else:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

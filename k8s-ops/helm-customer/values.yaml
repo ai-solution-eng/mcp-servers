@@ -30,7 +30,7 @@ image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
   # Keep in lockstep with Chart.yaml appVersion (same image as the internal
   # chart — the locking lives in this chart, not the binary).
-  tag: v1.1.1
+  tag: v1.2.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -53,7 +53,11 @@ resources:
     memory: 128Mi
   limits:
     cpu: 500m
-    memory: 512Mi
+    # 2026-10-05: 512Mi OOMKilled x4 during heavy get_resource listing bursts
+    # (full-YAML renders + concurrent kubectl fan-out spike RSS; steady-state is
+    # only ~136Mi but the burst is what counts — see wave report POST-DEPLOY
+    # VERIFICATION). 2Gi matches the live G2 deployment; ~15x steady-state.
+    memory: 2Gi
 
 # -- Service account ------------------------------------------------------------------------------
 serviceAccount:
@@ -84,8 +88,10 @@ console:
 # Performance guardrails only — NOT security knobs. "" = the server's own
 # default (an unset key renders NO env var; the default render is unchanged).
 listing:
-  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 500): cap on -A/cluster-wide list results, with a truncation marker naming the env
+  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 100): cap on -A/cluster-wide list results, with a truncation marker naming the env
   concurrency: ""            # K8S_MCP_LIST_CONCURRENCY (server default 8): bounded-semaphore width for the per-namespace -A fan-out
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
 
 # -- Observability (opt-in; default off = byte-identical render) --------------------------------------------
 metrics:

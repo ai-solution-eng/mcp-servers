@@ -21,7 +21,7 @@ image:
   # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
   # this default is what a deploy WITHOUT a site values file uses, and a
   # stale default is how an "old MCP server" pod happens.
-  tag: v0.3.1
+  tag: v0.4.0
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -59,13 +59,41 @@ workbench:
   # Per-command timeout bounds (seconds).
   execTimeoutDefault: 60
   execTimeoutMax: 600
-  # write_file cap (bytes, 8 MiB).
+  # Dedicated run_command pool width (WORKBENCH_EXEC_MAX_CONCURRENCY, default
+  # 4): long runs (up to execTimeoutMax) can no longer starve the file/env
+  # tools; a saturated pool returns a structured busy response without
+  # executing (no queue) and the busy outcome is audit-logged.
+  execMaxConcurrency: 4
+  # write_file cap (bytes, 8 MiB). Enforced per payload AND cumulatively on
+  # append=true chunked writes (existing + incoming ≤ cap).
   maxFileBytes: 8388608
   # stdout/stderr cap per run_command (bytes, 200 KiB).
   maxOutputBytes: 204800
   # Max entries per list_files response.
   maxListEntries: 500
+  # Audit-JSONL rotation threshold (WORKBENCH_AUDIT_MAX_BYTES, bytes —
+  # default 100 MiB = 104857600): the active .audit.jsonl renames to
+  # .audit.jsonl.1 (single generation, previous .1 overwritten) and a fresh
+  # file starts with an audit_rotated provenance entry.
+  auditMaxBytes: 104857600
   logLevel: INFO
+  # -- Sandbox-exec server switches (pair with executors.* above) ------------------
+  # All DEFAULT OFF / defaults: with executors disabled the sandbox_run tool
+  # refuses self-describingly regardless (the fleet refusals-are-answers
+  # doctrine — the tool is registered, the switch gates it).
+  # Master switch: sandbox_run refuses unless "1".
+  sandboxExec: false
+  # Pod label selector sandbox_run balances over (must match executors.appName
+  # if you rename it) — Ready pods only, least-loaded pick.
+  sandboxLabel: "app=workbench-exec"
+  # Target container inside each executor pod (must match
+  # executors.containerName if you rename it).
+  sandboxContainer: python
+  # Per-run wall clock (seconds; the server clamps 1..600).
+  sandboxTimeoutS: 120
+  # stdout/stderr cap per run (chars each, fleet k8s-mcp exec convention of
+  # 50000; the explicit " ...[truncated N chars]" marker is appended when hit).
+  sandboxMaxOutputChars: 50000
   # -- Workspace templates (Wave-5 F3, ADDITIVE, DEFAULT OFF) ----------------------
   # Named operator templates for workspace_create(name, template=<name>).
   # Rendered into the WORKBENCH_TEMPLATES env as JSON — ONLY when the object
@@ -90,6 +118,56 @@ workbench:
   #         - ["git", "init", "-q"]
   templates: {}
 
+# -- Sandbox executors (v1, ADDITIVE, DEFAULT OFF) --------------------------------
+# The no-network python execution pool behind the `sandbox_run` MCP tool.
+# When enabled the chart renders (helm/templates/executors.yaml):
+#   - Deployment `workbench-exec`: SAME container image as the workbench
+#     server (one image, different command — no new image to build), 2+
+#     replicas sleeping forever in their own namespace;
+#   - a deny-all NetworkPolicy selecting them (policyTypes [Ingress, Egress],
+#     zero rules — exec rides workbench → API server → kubelet → container
+#     runtime, so the pod needs no network);
+#   - a namespaced Role + RoleBinding giving the workbench SA get/list on
+#     pods + create on pods/exec IN THIS NAMESPACE ONLY.
+# The executors are hardened pods: no SA token (zero credentials), non-root
+# uid 10001, no privilege escalation, all caps dropped, seccomp
+# RuntimeDefault, read-only rootfs + per-pod emptyDir /tmp, modest resources,
+# NO tolerations (control-plane taints self-exclude), control-plane
+# DoesNotExist nodeAffinity (workers only), hostname topologySpread, and NO
+# GPU resource keys anywhere (no request = structurally no GPU).
+#
+# ⚠️ Trust posture (the one change): the workbench SA gains pods/exec in its
+# OWN namespace — RBAC cannot select by label, so this permits exec into any
+# pod of the namespace, which holds only workbench + executor pods by design.
+# Bounded to one namespace; documented in the README.
+#
+# Pair with the server-side kill switch: executors.enabled=true renders the
+# pool, but the TOOL stays refused until the deployment also carries
+# WORKBENCH_SANDBOX_EXEC=1 (workbench.sandboxExec). Default OFF everywhere:
+# the default chart render is byte-identical to the baseline.
+executors:
+  enabled: false
+  appName: workbench-exec
+  # Name of the single container in each executor pod (the exec target of
+  # sandbox_run). Renaming it means re-pointing WORKBENCH_SANDBOX_CONTAINER.
+  containerName: python
+  # Executor image — defaults to the workbench image (same repo/tag): the
+  # executors need only stdlib python, and reusing the server image means
+  # nothing new is built or published. ⚠️ Helm does NOT template inside
+  # values files (the prometheus-mcp lesson): the {{ }} default is expanded
+  # by the TEMPLATE (executors.yaml runs `tpl` on this value at the
+  # consumption point). A plain "repo:tag" string in a site values file also
+  # works — tpl passes plain strings through unchanged.
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  replicas: 2
+  # CPU-based autoscaling for the pool (default off — a fixed pool of 2 is
+  # the v1 posture; flips render an autoscaling/v2 HPA).
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
 # -- Per-key proxy wiring -------------------------------------------------------------------------
 # Each key is wired into the pod only when non-empty, so a corporate-proxy
 # site sets http/https (and usually noProxy), while a direct-egress site
@@ -107,6 +185,28 @@ proxy: {}
 # noProxy), while a direct-egress site leaves proxy: {} and everything renders
 # off. Standard cluster-local noProxy exclusions (searxng-mcp convention):
 # ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+
+# -- In-cluster host allowlist (DNS-rebinding additions; K8S-MCP pattern) ---
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts, for
+# in-cluster callers that address the server by its service DNS name instead
+# of the public FQDN (e.g. a peer MCP →
+# http://other-mcp.<ns>.svc.cluster.local:9103/mcp). Joined into
+# MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the `host:*`
+# form to accept any port. The pinned public FQDN (ezua.virtualService.endpoint,
+# wired as MCP_HOSTNAME when ezua is enabled) and loopback are always allowed;
+# with neither key set the SDK's implicit dev-mode protection applies (None —
+# behavior unchanged). List of strings.
+#
+# NOTE — the chart AUTO-INCLUDES this release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
+# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
+# endpoint pinned or extraAllowedHosts non-empty): the LLM-gateway relay
+# arrives with Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+# (pod-log confirmed 2026-10 — the fleet 421 Misdirected Request class), and
+# without that entry every relay hop gets 421. This key only lists hosts
+# BEYOND that; a site setting extraAllowedHosts never loses the own-svc
+# entry (the chart prepends it):
+extraAllowedHosts: []
 
 # -- Corporate MITM CA ---------------------------------------------------------------------------
 # INDEPENDENT of the proxy wiring (enable one, both, or neither). Enable
@@ -158,22 +258,28 @@ metrics:
 # This server writes a best-effort JSONL audit trail at <root>/.audit.jsonl
 # (root = persistence.mountPath → /data/.audit.jsonl on the PVC by default):
 # one JSON object per audited event — workspace_create / workspace_delete /
-# file_delete / run_command / run_command_refused — with ts, event, workspace,
-# argv, exit_code, timed_out and duration_ms fields. That file is the fleet's
-# workbench "who ran what" trail, and the fleet convention (fleet-audit item 11,
-# plan §7 C3) is that audit JSONLs must be SEARCHABLE, not just written:
-# operators mount/expose the file for logsearch to search — e.g. a log-tailing
-# sidecar (or node agent) that ships .audit.jsonl lines to a pod's stdout in a
-# namespace the logsearch policy allows, whereupon search_logs / count_matches
-# over that namespace make the workbench trail queryable. Deliberately
-# documentation-only (NO behavior change): the path is derived by the server
-# from workbench.root (= persistence.mountPath), and nothing in this chart
-# renders from an audit.* key — an unconsumed values key would be dead config,
-# the exact anti-pattern the fleet audit flags. applygate's side of this
-# convention is owned by the applygate chart/agent.
+# file_delete / run_command / run_command_refused / run_command_busy — with ts,
+# event, workspace, argv, exit_code, timed_out and duration_ms fields. That file
+# is the fleet's workbench "who ran what" trail, and the fleet convention
+# (fleet-audit item 11, plan §7 C3) is that audit JSONLs must be SEARCHABLE,
+# not just written: operators mount/expose the file for logsearch to search —
+# e.g. a log-tailing sidecar (or node agent) that ships .audit.jsonl lines to a
+# pod's stdout in a namespace the logsearch policy allows, whereupon
+# search_logs / count_matches over that namespace make the workbench trail
+# queryable. Since audit rotation (WORKBENCH_AUDIT_MAX_BYTES, default 100 MiB)
+# the trail ALSO has a previous generation at <root>/.audit.jsonl.1 (single
+# generation, overwritten on each rotation; its successor's first entry is an
+# audit_rotated event carrying rotated_from = sha256 of .1's last line) —
+# ship BOTH paths to the tailer so no generation is silently unsearched.
+# Deliberately documentation-only (NO behavior change): the path is derived by
+# the server from workbench.root (= persistence.mountPath), and nothing in
+# this chart renders from an audit.* key — an unconsumed values key would be
+# dead config, the exact anti-pattern the fleet audit flags. applygate's side
+# of this convention is owned by the applygate chart/agent.
 #
 #   audit:
-#     path: /data/.audit.jsonl   # informational: <persistence.mountPath>/.audit.jsonl
+#     path: /data/.audit.jsonl      # informational: <persistence.mountPath>/.audit.jsonl
+#     path_prev: /data/.audit.jsonl.1  # previous generation after rotation
 
 # -- Resources (modest: a scratch pad, not a compute node) -------------------------
 resources:

@@ -23,7 +23,7 @@ image:
   # pushed — with IfNotPresent, nodes holding the cached old digest would
   # silently serve the broken image. To cut a proper release: push
   # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
-  tag: v0.6.1
+  tag: v0.7.0
   pullPolicy: Always
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull
@@ -57,6 +57,22 @@ prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
 # still render in the "All GPUs" table with domain "—"; an invalid value
 # falls back to the default server-side (it never breaks the pod).
 gpuNvlinkDomains: ""
+
+# -- Nodes tab: which nodes are shown by default --------------------------------------
+# The Nodes tab (per-node CPU/memory: allocatable vs requests vs limits vs
+# active usage) needs a default selection on a cluster with many nodes.
+# Precedence:
+#   1. the browser filter input (?filter=<regex> — per-view, not persisted)
+#   2. this regex, applied to node names (rendered as PROM_UI_NODE_FILTER)
+#   3. built-in default: the GPU nodes, auto-detected from the nvidia GPU
+#      allocatable (kube_node_status_allocatable{resource="nvidia_com_gpu"})
+#      — they are the sizing targets. No GPU nodes detected -> every node.
+#   nodeFilter: "scs"        # show every node matching /scs/i
+#   nodeFilter: "all"        # always show every node
+#   nodeFilter: ""           # default (GPU nodes)
+# An invalid regex, or one matching nothing, falls back to the default
+# selection server-side (it never breaks the pod or empties the tab).
+nodeFilter: ""
 
 # -- GPU tab: NVLink topology auto-detection ----------------------------------------
 # Detects the REAL NVLink islands on every GPU node: a TWO-container
@@ -181,6 +197,16 @@ persistence:
   # Store file INSIDE the mount, pinned explicitly so a moved mountPath
   # cannot silently orphan an existing store.
   savedQueriesFile: saved-queries.json
+  # PER-REPLICA honesty (default OFF): the saved-query store is per-replica —
+  # replicaCount > 1 fragments stores (each replica keeps its own memory/file)
+  # and the server cannot know its own replica count. Set to true ONLY when
+  # the store is genuinely shared across replicas (single replica, or a RWX
+  # volume every replica mounts); it renders PROMETHEUS_SAVED_QUERIES_SHARED=1
+  # and silences the per-replica warning that query_save otherwise attaches.
+  # It is a declaration about the deployment, NOT concurrency control — no
+  # cross-process locking exists (a multi-writer JSON store would lose updates
+  # silently; see README).
+  shared: false
 
 # -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
 
@@ -200,6 +226,44 @@ metrics:
   serviceMonitor: true
   # Scrape interval rendered into the ServiceMonitor.
   interval: 30s
+
+# -- MCP API keys (OPTIONAL — fleet decision 2026-09, fleet pattern: searxng) ---
+# /mcp requires a key ONLY when existingSecret is set; /health, /healthz,
+# the web console and its /api/* routes stay key-free (the auth scope is
+# exactly the /mcp prefix — the ServiceMonitor scrape and kubelet probes are
+# unaffected). Leave empty for gateway-fronted deployments (the server then
+# runs open, with a loud startup warning). The chart NEVER inlines a key in
+# values — pre-deploy the Secret, then point the values at it (no pod
+# restart needed; the server re-reads the env per request). Comma-separated
+# keys all authenticate: that is the rotation mechanism — append the new
+# key, move clients over, drop the old one, no downtime. The fleet-universal
+# MCP_API_KEYS env is honored too (either var authenticates).
+apiKey:
+  existingSecret: ""
+  existingSecretKey: api-keys
+
+# -- In-cluster host allowlist (DNS-rebinding additions, fleet pattern: K8S-MCP) -
+# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts,
+# for in-cluster callers that address the server by its service DNS name
+# instead of the public FQDN (e.g. a peer MCP →
+# http://other-mcp.<ns>.svc.cluster.local:9095/mcp). Joined
+# into MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the
+# `host:*` form to accept any port. The pinned public FQDN
+# (ezua.virtualService.endpoint, rendered as MCP_HOSTNAME) and loopback are
+# always allowed; with NEITHER knob set the server's transport security is
+# unset — the SDK's implicit loopback-only protection applies unchanged
+# (local-dev behavior). List of strings.
+#
+# NOTE — the chart AUTO-INCLUDES this release's own service DNS
+# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
+# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
+# endpoint pinned or extraAllowedHosts non-empty — the DEFAULT render has
+# both, since ezua ships enabled): the LLM-gateway relay arrives with Host:
+# <deployment.name>-service.<ns>.svc.cluster.local:<port>, and without that
+# entry every relay hop gets 421 Misdirected Request. This key only lists
+# hosts BEYOND that; a site setting extraAllowedHosts never loses the
+# own-svc entry (the chart prepends it):
+extraAllowedHosts: []
 
 # -- Resources --------------------------------------------------------------------------------
 resources:

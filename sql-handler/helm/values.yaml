@@ -81,7 +81,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.3.2
+  tag: v3.6.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -532,9 +532,29 @@ security:
   # Secret are NOT picked up by a mounted Secret until the kubelet resyncs
   # (about a minute) — the bootstrap keys inside it reach the store through
   # the file, and the api-keys Secret above stays the /mcp gate.
+  #
+  # WRITABLE mode (self-service minting — the D22 SSO flow's "Mint my key"):
+  # the store file must be WRITABLE (the API mints/revokes through it) and
+  # SHARED across replicas, so point existingClaim at an RWX PVC — the
+  # catalog store claim works (the chart creates <release>-catalog for
+  # semanticCatalog.store; the store lives under its own subdir). The file
+  # AND its directory are created on the FIRST mint (atomic write) — no
+  # bootstrap file needed; an existing file carries over (hot-reloaded on
+  # mtime). DURABILITY: the claim IS the keys' persistence — minted keys
+  # live on network-backed PVC storage, surviving pod reschedules,
+  # restarts, and `helm uninstall` when the claim carries the chart's
+  # helm.sh/resource-policy: keep annotation (the catalog PVC does). Never
+  # point this at an emptyDir / pod-local path: keys would die with the
+  # pod. existingSecret wins when BOTH are set (bootstrap Secret + durable
+  # runtime store).
   adminKeys:
     existingSecret: ""
     existingSecretKey: admin-keys-file
+    # RWX claim for the writable store (existingClaim mode). The file lives
+    # at <mountPath>/admin-keys-file. Render-guarded: requires the claim to
+    # exist (the chart's own catalog PVC or an operator-created one).
+    existingClaim: ""
+    mountPath: /etc/sqlhandler/admin-keys
   # Per-caller identity + policy-as-code (implementation review §3/§5):
   identity:
     # TRUST GATE for the oauth2-proxy browser rung (X-Auth-Request-User /
@@ -603,6 +623,47 @@ security:
     jwksRefreshSeconds: ""
     fetchTimeoutSeconds: ""
     clockSkewSeconds: ""
+    # ---- Browser SSO (D22, the MM-RAG parity): the app is an OIDC CLIENT.
+    # /oauth/login redirects to the realm; the callback exchanges + verifies
+    # the token with the SAME D21 machinery and plants an HttpOnly session
+    # cookie — the VERIFIED preferred_username, which the browser-header
+    # rung cannot know (it only sees the IdP sub UUID). The cookie is the
+    # LOWEST-priority envelope: an explicit key/Bearer always outranks it.
+    # INERT by default: with sso.enabled false the routes 404 and no cookie
+    # is ever accepted (byte-identical render/behavior).
+    sso:
+      enabled: false
+      clientId: ua
+      # The client secret: prefer an existing Secret (inline only for
+      # non-production bootstrap — never commit a real one).
+      clientExistingSecret: ""
+      clientExistingSecretKey: client-secret
+      clientSecret: ""
+      # The callback URL MUST be the publicly reachable https host (the
+      # browser returns to it):
+      #   https://sqlhandler.<domain>/oauth/oidc/callback
+      redirectUri: ""
+      # Discovery: prefer the IN-CLUSTER Keycloak service (plain HTTP) —
+      # the external issuer URL is claim-compared only, never fetched, so
+      # the platform-CA TLS gap cannot break sign-in. Empty = derived from
+      # `issuer` above (works when the pod can reach it with REMOTE_CA_BUNDLE).
+      providerUrl: ""
+      scopes: "openid profile email"
+      cookieName: pcai-sso
+      cookieMaxAge: "43200"
+      cookieSecure: "true"
+      # The platform private-CA bundle — REQUIRED when providerUrl is the
+      # EXTERNAL https URL (the pod cannot verify the gateway's cert against
+      # system CAs; RAG's live-learned note). Mounts the platform ConfigMap
+      # (ezaf-root-ca / ezaf-root-ca.crt on PCAI) and sets REMOTE_CA_BUNDLE
+      # for the discovery + token-exchange fetches. In-cluster providerUrl
+      # (plain HTTP) needs no CA — leave false there.
+      platformCa:
+        enabled: false
+        configMapName: ezaf-root-ca
+        configMapKey: ezaf-root-ca.crt
+        mountPath: /etc/platform-ca
+        bundleFile: ca-certificates.crt
   # Policy-as-code: per-caller row filters + column masks + hidden tables
   # from an operator-authored JSON/YAML file (hot-reloaded on mtime).
   # DEFAULT OFF = the whole feature is byte-identical to before (no policy
@@ -630,6 +691,20 @@ security:
     existingConfigMap: ""
     existingConfigMapKey: policy.json
     mountPath: /etc/sqlhandler/policy
+    # WRITABLE mode (runtime policy editing — the Access-control policy
+    # editor, grant-by-name, and the admin mint twins write the policy
+    # file): mount the store on an RWX CLAIM instead of the read-only
+    # ConfigMap. The catalog PVC is the natural home (RWX, chart-created
+    # with helm.sh/resource-policy: keep). On first boot the server SEEDS
+    # the claim's file from the ConfigMap when the ConfigMap is also set
+    # (one-time migration: ConfigMap = bootstrap content, PVC = live
+    # truth from then on; kubectl edit cm edits stop applying). When the
+    # ConfigMap is absent, the server creates an empty doc on first edit.
+    # Render-guarded: needs the claim to exist; existingConfigMap wins as
+    # the SEED only.
+    existingClaim: ""
+    fileName: policy.json
+    seedFromConfigMap: true
   # Optional auth gate on /metrics ONLY (audit: /metrics leaks table counts,
   # RSS and error strings unauthenticated). Default false = today's
   # behavior (open). When true, a scrape/read must present SQLHANDLER_API_TOKEN

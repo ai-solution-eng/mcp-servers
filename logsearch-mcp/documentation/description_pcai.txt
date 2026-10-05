@@ -1,0 +1,1 @@
+Uses regex to search through all logs in a given namespace, allowing LLMs to isolate problems efficiently.

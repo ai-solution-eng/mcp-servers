@@ -62,14 +62,47 @@ spec:
               value: {{ .Values.workbench.execTimeoutDefault | quote }}
             - name: WORKBENCH_EXEC_TIMEOUT_MAX
               value: {{ .Values.workbench.execTimeoutMax | quote }}
+            - name: WORKBENCH_EXEC_MAX_CONCURRENCY
+              value: {{ .Values.workbench.execMaxConcurrency | quote }}
             - name: WORKBENCH_MAX_FILE_BYTES
               value: {{ .Values.workbench.maxFileBytes | quote }}
             - name: WORKBENCH_MAX_OUTPUT_BYTES
               value: {{ .Values.workbench.maxOutputBytes | quote }}
             - name: WORKBENCH_MAX_LIST_ENTRIES
               value: {{ .Values.workbench.maxListEntries | quote }}
+            - name: WORKBENCH_AUDIT_MAX_BYTES
+              value: {{ .Values.workbench.auditMaxBytes | quote }}
             - name: WORKBENCH_LOG_LEVEL
               value: {{ .Values.workbench.logLevel | quote }}
+            {{- if .Values.workbench.sandboxExec }}
+            # Sandbox-exec server switch (workbench.sandboxExec → the env
+            # master switch of the sandbox_run tool). Rendered ONLY when true
+            # — the default render has no WORKBENCH_SANDBOX_EXEC at all and
+            # the tool refuses. Pairs with templates/executors.yaml
+            # (executors.* renders the executor pool + its RBAC/netpol).
+            - name: WORKBENCH_SANDBOX_EXEC
+              value: "1"
+            {{- end }}
+            {{- if or (ne .Values.workbench.sandboxLabel "app=workbench-exec") (ne .Values.workbench.sandboxContainer "python") (ne (int .Values.workbench.sandboxTimeoutS) 120) (ne (int .Values.workbench.sandboxMaxOutputChars) 50000) }}
+            # Sandbox-exec tuning — rendered ONLY when a value diverges from
+            # its server default, so the default render carries no extra env.
+            {{- if ne .Values.workbench.sandboxLabel "app=workbench-exec" }}
+            - name: WORKBENCH_SANDBOX_LABEL
+              value: {{ .Values.workbench.sandboxLabel | quote }}
+            {{- end }}
+            {{- if ne .Values.workbench.sandboxContainer "python" }}
+            - name: WORKBENCH_SANDBOX_CONTAINER
+              value: {{ .Values.workbench.sandboxContainer | quote }}
+            {{- end }}
+            {{- if ne (int .Values.workbench.sandboxTimeoutS) 120 }}
+            - name: WORKBENCH_SANDBOX_TIMEOUT_S
+              value: {{ .Values.workbench.sandboxTimeoutS | quote }}
+            {{- end }}
+            {{- if ne (int .Values.workbench.sandboxMaxOutputChars) 50000 }}
+            - name: WORKBENCH_SANDBOX_MAX_OUTPUT_CHARS
+              value: {{ .Values.workbench.sandboxMaxOutputChars | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.workbench.templates }}
             # Workspace templates (Wave-5 F3, ADDITIVE, DEFAULT OFF): the
             # optional template parameter of workspace_create. Rendered ONLY
@@ -111,6 +144,33 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection,
+            # mcp_auth.transport_security_from_env; the K8S-MCP fleet
+            # pattern). Unset (ezua disabled) = dev mode: the SDK's implicit
+            # loopback-only protection applies unchanged.
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (ezua endpoint pinned or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders (pod-log confirmed 2026-10: the gateway relay arrives
+            # with "Invalid Host header: workbench-mcp-service.
+            # workbench-mcp.svc.cluster.local:9103"). Site extraAllowedHosts
+            # append after it; entries are matched verbatim or as `host:*`
+            # by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.proxy.http }}
             # Corporate proxy: reaches fetch/pip from the server process AND
             # every run_command child (the server passes these through).

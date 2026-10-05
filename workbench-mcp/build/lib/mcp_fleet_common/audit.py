@@ -34,19 +34,19 @@ import json
 import os
 import sys
 import threading
-from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Callable
 
 __all__ = [
     "AUDIT_GENESIS",
-    "CALLER_CONTEXT",
-    "Caller",
     "HashChainedAuditLog",
+    "Caller",
+    "CALLER_CONTEXT",
     "key_fingerprint",
     "verify_audit_chain",
 ]
 
 AUDIT_GENESIS = "0" * 64
-
 
 #: sha256 of *key* truncated to 12 hex — the stable, NON-SECRET caller
 #: fingerprint (the raw key never enters an audit trail).
@@ -70,7 +70,11 @@ class Caller:
         return {"key_fp": self.key_fp, "client": self.client}
 
     def __eq__(self, other) -> bool:  # pragma: no cover - trivial
-        return isinstance(other, Caller) and self.key_fp == other.key_fp and self.client == other.client
+        return (
+            isinstance(other, Caller)
+            and self.key_fp == other.key_fp
+            and self.client == other.client
+        )
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"Caller(key_fp={self.key_fp!r}, client={self.client!r})"
@@ -78,7 +82,9 @@ class Caller:
 
 #: The request-scoped caller slot — the auth/capture middleware sets it per
 #: request; the audit writer reads it when no explicit provider is bound.
-CALLER_CONTEXT: contextvars.ContextVar = contextvars.ContextVar("mcp_fleet_common_caller", default=None)
+CALLER_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
+    "mcp_fleet_common_caller", default=None
+)
 
 
 def _caller_from_context():
@@ -152,7 +158,12 @@ class HashChainedAuditLog:
         Never raises: OS errors warn loudly on stderr instead (best-effort by
         design — the audit sink must not block or fail the recorded action).
         """
-        resolved = path or self.path or (os.environ.get(self.env_var) if self.env_var else None) or self.default_path
+        resolved = (
+            path
+            or self.path
+            or (os.environ.get(self.env_var) if self.env_var else None)
+            or self.default_path
+        )
         try:
             if resolved is None:
                 raise OSError("no audit path configured (path/env_var/default_path)")
@@ -226,11 +237,15 @@ def verify_audit_chain(path: str) -> dict:
         result["error"] = f"could not read audit file: {exc}"
         return result
     prev = AUDIT_GENESIS
-    for lineno, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), start=1):
+    for lineno, line in enumerate(
+        raw.decode("utf-8", errors="replace").splitlines(), start=1
+    ):
         if not line.strip():
             result["ok"] = False
             result["first_bad_line"] = lineno
-            result["error"] = f"line {lineno} is blank — the chain has a gap (injected or corrupted line)"
+            result["error"] = (
+                f"line {lineno} is blank — the chain has a gap (injected or corrupted line)"
+            )
             return result
         try:
             entry = json.loads(line)

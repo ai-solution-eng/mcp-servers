@@ -21,6 +21,12 @@ Configuration (environment variables):
   SEARXNG_REQUESTS_PER_MINUTE Search rate limit (default 30)
   FETCH_REQUESTS_PER_MINUTE   Fetch rate limit (default 20)
   FETCH_VERIFY_TLS            Verify TLS on fetched pages (default true)
+  FETCH_CA_BUNDLE             Path to a combined CA bundle (public roots +
+                              the egress proxy's CA) for TLS-intercepting
+                              egress; passed as verify= to both fetch rungs
+  FETCH_TLS_INSECURE_FALLBACK Retry a certificate-verification failure ONCE
+                              with verification disabled, output marked
+                              (default off)
   HTTP_PROXY / HTTPS_PROXY    Corporate proxy for outbound fetch_content
                               traffic (honored with NO_PROXY, as usual)
   BROWSER_CDP_URL             Headless-browser sidecar CDP endpoint
@@ -40,6 +46,15 @@ Configuration (environment variables):
   SEARXNG_FETCH_MAX_SCREENSHOT_KB  screenshot data-URL cap KB (default 512)
   SEARXNG_FETCH_MAX_REDIRECTS  redirect-hop cap, per-hop re-validation
                               (default 5)
+  MCP_HOSTNAME                public FQDN clients use to reach /mcp — pins
+                              the Host header (DNS-rebinding protection);
+                              with MCP_EXTRA_ALLOWED_HOSTS also unset, the
+                              SDK's implicit loopback-only protection
+                              applies (dev mode). Read at startup.
+  MCP_EXTRA_ALLOWED_HOSTS     comma-separated in-cluster Host allowlist
+                              additions (e.g.
+                              searxng-mcp-service.<ns>.svc.cluster.local:*);
+                              matched verbatim or host:* — read at startup
 """
 
 import argparse
@@ -50,7 +65,6 @@ import traceback
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
 
 import mcp_auth
@@ -61,6 +75,7 @@ from fetcher import WebContentFetcher
 from searxng_client import (
     SearXNGClient,
     SearXNGError,
+    engines_from_config_hint,
     format_search_response,
 )
 
@@ -85,6 +100,16 @@ FETCH_VERIFY_TLS = os.getenv("FETCH_VERIFY_TLS", "true").lower() not in (
     "false",
     "no",
 )
+# Corporate-egress CA (TLS-intercepting proxies — Zscaler et al.): a combined
+# PEM bundle passed as verify= to both fetch rungs (empty = default bundles).
+FETCH_CA_BUNDLE = os.getenv("FETCH_CA_BUNDLE", "").strip() or None
+# Last-resort: retry a certificate-verification failure once unverified.
+FETCH_TLS_INSECURE_FALLBACK = os.getenv("FETCH_TLS_INSECURE_FALLBACK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 # SSRF guard escapes/caps (fleet decision D6 — guard is default-ON). See
 # url_policy.py and fetcher.py; documented in README.md.
 SEARXNG_FETCH_ALLOW_HOSTS = os.getenv("SEARXNG_FETCH_ALLOW_HOSTS", "")
@@ -108,7 +133,14 @@ COMMON_CATEGORIES = (
 # MCP server setup
 # ---------------------------------------------------------------------------
 
-_mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+# Host-header (DNS-rebinding) protection via the shared fleet helper
+# (mcp_auth.transport_security_from_env): with neither MCP_HOSTNAME nor
+# MCP_EXTRA_ALLOWED_HOSTS set (local dev) it returns None — the SDK's
+# implicit loopback-only protection applies untouched, which is exactly the
+# old `TransportSecuritySettings(enable_dns_rebinding_protection=False)`
+# posture; with either set, protection is explicitly ON with that host
+# allowlist. The chart wires both (mcpHostname / extraAllowedHosts values).
+_mcp_transport_security = mcp_auth.transport_security_from_env()
 
 # API-key auth (shared module pcai_utils/mcp_auth.py) — OPTIONAL per fleet
 # decision 2026-09: unset → open (dev mode) with a loud startup warning.
@@ -127,6 +159,8 @@ searcher = SearXNGClient(
 fetcher = WebContentFetcher(
     requests_per_minute=FETCH_RPM,
     verify_tls=FETCH_VERIFY_TLS,
+    ca_bundle=FETCH_CA_BUNDLE,
+    insecure_tls_fallback=FETCH_TLS_INSECURE_FALLBACK,
 )
 
 print("SearXNG MCP Server initialized:", file=sys.stderr)
@@ -210,10 +244,16 @@ async def search(
         await ctx.info(f"Found {len(resp.results)} results for: {query}")
         # getattr: test stubs may not carry the attribute (duck-typed seam).
         if getattr(resp, "cache_hit", False):
-            await ctx.info(
-                f"Served from search cache (TTL {searcher.result_cache.ttl_seconds:.0f}s): {query}"
-            )
-        return format_search_response(resp, max(1, min(20, int(max_results))))
+            await ctx.info(f"Served from search cache (TTL {searcher.result_cache.ttl_seconds:.0f}s): {query}")
+        # backend engine-name sanity (trap 1): a typo'd engine allowlist
+        # ("braveimages" vs "brave.images") silently returns zero results.
+        # On an empty search with backend != auto, check the named engines
+        # against GET /config (fetched once per process, failure tolerated).
+        engine_hint = ""
+        if backend != "auto" and not resp.results and not resp.answers:
+            available = await searcher._engine_names_from_config()
+            engine_hint = engines_from_config_hint(backend, available)
+        return format_search_response(resp, max(1, min(20, int(max_results))), engine_hint=engine_hint)
     except SearXNGError as e:
         await ctx.error(f"Search error: {e}")
         return f"Search failed: {e}"

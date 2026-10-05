@@ -765,6 +765,43 @@ def test_saved_queries_module_is_packaged_everywhere():
     pyproject = open(os.path.join(root, "pyproject.toml"), encoding="utf-8").read()
     assert '"saved_queries"' in pyproject, "add saved_queries to [tool.setuptools] py-modules"
     dockerfile = open(os.path.join(root, "Dockerfile"), encoding="utf-8").read()
-    assert "saved_queries.py ./" in dockerfile, "add saved_queries.py to the Dockerfile COPY line"
+    copy_line = next((ln for ln in dockerfile.splitlines() if ln.startswith("COPY") and "server.py" in ln), "")
+    assert "saved_queries.py" in copy_line, "add saved_queries.py to the Dockerfile COPY line"
     manifest = open(os.path.join(root, "MANIFEST.in"), encoding="utf-8").read()
     assert "saved_queries.py" in manifest, "ship the module in sdists too"
+
+
+def test_mcp_auth_module_is_packaged_everywhere_and_byte_exact():
+    """mcp_auth.py must ship in EVERY packaging path (the Wave-7 crash-loop
+    class, committed 7c52b4c for mcp_metrics: setuptools SILENTLY omits a
+    declared py-module that is missing from the build context — the source
+    tree imports fine and the image still crash-loops in the pod).
+
+    Beyond presence, the copy must stay BYTE-EXACT vs the pcai_utils source:
+    this module is a fleet-managed copy (the lead engages the true hardlink
+    after the wave) — drift here is fleet drift, so pin it. Skipped when the
+    sibling source tree is absent (delivery mirrors without pcai_utils)."""
+    import mcp_auth
+
+    root = os.path.dirname(os.path.abspath(mcp_auth.__file__))
+    pyproject = open(os.path.join(root, "pyproject.toml"), encoding="utf-8").read()
+    assert '"mcp_auth"' in pyproject, "add mcp_auth to [tool.setuptools] py-modules"
+    dockerfile = open(os.path.join(root, "Dockerfile"), encoding="utf-8").read()
+    assert "mcp_auth.py ./" in dockerfile, "add mcp_auth.py to the Dockerfile COPY line"
+    manifest = open(os.path.join(root, "MANIFEST.in"), encoding="utf-8").read()
+    assert "mcp_auth.py" in manifest, "ship the module in sdists too"
+
+    # Byte-exact vs the fleet source (pcai_utils/mcp_auth.py — READ-ONLY from
+    # this repo's perspective): sha256 must match the copy exactly.
+    fleet_source = os.path.join(root, os.pardir, os.pardir, "pcai_utils", "mcp_auth.py")
+    fleet_source = os.path.normpath(fleet_source)
+    if not os.path.isfile(fleet_source):
+        pytest.skip("pcai_utils sibling tree not present (delivery mirror layout)")
+    import hashlib
+
+    copy_bytes = open(os.path.join(root, "mcp_auth.py"), "rb").read()
+    source_bytes = open(fleet_source, "rb").read()
+    assert hashlib.sha256(copy_bytes).hexdigest() == hashlib.sha256(source_bytes).hexdigest(), (
+        "mcp_auth.py has drifted from pcai_utils/mcp_auth.py — do not hand-edit the "
+        "copy; re-copy byte-exact from the fleet source (the hardlink replaces this)"
+    )

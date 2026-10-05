@@ -21,9 +21,11 @@ RUN apt-get update \
 # cheap COPY/install layers instead of re-resolving + re-downloading every
 # dependency. The list below is the explicit expansion of pyproject
 # [project].dependencies (there are no extras) — keep the two in sync.
+# `kubernetes` (sandbox-exec v1) is import-LAZY in server.py — installed here
+# for the image (executor dispatch), never imported at server startup.
 COPY pyproject.toml ./
 
-RUN uv pip install --system "mcp>=2.0.0" "starlette>=0.37.0" "uvicorn>=0.27.0"
+RUN uv pip install --system "mcp>=2.0.0" "starlette>=0.37.0" "uvicorn>=0.27.0" "kubernetes>=29.0.0"
 
 # App code + assets (cheap layers, keyed on the source files themselves).
 COPY server.py webui.py mcp_auth.py ./
@@ -45,8 +47,10 @@ RUN uv pip install --system --no-deps . \
 # (server, = workbench-mcp server:main) plus every shipped module/package
 # against the dependency layer — catching "dep added to pyproject but not to
 # the RUN above" drift in the build log instead of as a ModuleNotFoundError
-# crash-loop in the pod.
-RUN python -c "import server, webui, mcp_auth, mcp_fleet_common; print('workbench-mcp imports clean')"
+# crash-loop in the pod. The kubernetes import here proves the sandbox-exec
+# dependency landed in the dependency layer (server imports it lazily, so
+# server's own import does not exercise it).
+RUN python -c "import server, webui, mcp_auth, mcp_fleet_common, kubernetes; print('workbench-mcp imports clean')"
 
 # Scratch pad by design: runs as non-root; /data is a PVC mounted by the
 # chart (fsGroup 10001) and holds no secrets.

@@ -19,10 +19,12 @@ MCP 2.0 (stateless, JSON responses) on both stdio and streamable-http.
 
 | Tool | Mutates | Guardrails enforced | Contract |
 |---|---|---|---|
-| `plan_apply(namespace, manifest, force=False)` | **never** (always `dry_run=All`) | DNS-1123 namespace, namespace policy, kind allowlist, alias-limited manifest hygiene | Per-doc `{kind, name, ok, message}` + `summary` + **`manifest_sha256`** (the sha256 of the EXACT planned bytes — carry it to `apply_manifest`); `readOnlyHint=True`. `force` is accepted for call-site symmetry but can never turn a plan into a mutation. |
-| `apply_manifest(namespace, manifest, confirm_apply=False, plan_sha256="")` | yes, per doc | confirm gate → DNS-1123 namespace → namespace policy → manifest hygiene → **plan binding (D11)** → kind allowlist | Real server-side apply per document (`field_manager=applygate-mcp`); refuses loudly unless `confirm_apply=True`. Result carries `plan_binding` (`enforced`/`warn`/`allow`) and `manifest_sha256`. `readOnlyHint=False, destructiveHint=True`. |
-| `delete_resource(namespace, kind, name, confirm_delete=False)` | yes | confirm gate → DNS-1123 namespace/name → namespace policy → kind allowlist | Deletes one allowlisted resource; audit-logged. `destructiveHint=True`. |
+| `plan_apply(namespace, manifest, force=False)` | **never** (always `dry_run=All`) | DNS-1123 namespace, namespace policy, kind allowlist, alias-limited manifest hygiene | Per-doc `{kind, name, ok, message}` + `summary` + **`manifest_sha256`** (the sha256 of the EXACT planned bytes — carry it to `apply_manifest`); `readOnlyHint=True`. `force` is accepted for call-site symmetry but can never turn a plan into a mutation. When a DIFFERENT sha was already recorded for the namespace, the response adds `superseded_plan: true` (see D11 below). |
+| `apply_manifest(namespace, manifest, confirm_apply=False, plan_sha256="")` | yes, per doc | confirm gate → DNS-1123 namespace → namespace policy → manifest hygiene → **plan binding (D11)** → kind allowlist | Real server-side apply per document (`field_manager=applygate-mcp`); refuses loudly unless `confirm_apply=True`. Result carries `plan_binding` (`enforced`/`warn`/`allow`) and `manifest_sha256`. A D11 binding refusal adds `hint: "re-run plan_apply on the exact bytes you intend to apply"`. `readOnlyHint=False, destructiveHint=True`. |
+| `delete_resource(namespace, kind, name, confirm_delete=False)` | yes | confirm gate → DNS-1123 namespace/name → namespace policy → kind allowlist | Deletes one allowlisted resource; audit-logged. `destructiveHint=True`. An API failure (not a refusal) returns `{"ok": false, "refused": false, "error": <same string as before>, "reason": "api_error", "status": <HTTP status>}` — plus the RBAC hint on a 403 mismatch. |
+| `plan_delete(namespace, kind, name)` | **never** | DNS-1123 namespace/name, namespace policy, kind allowlist (the SAME fence as delete, minus the confirm gate — a plan never mutates) | The delete dry-run: surfaces `would_delete {kind, name, namespace}` + the object's CURRENT state (the exact view `get_resource_status` renders) or a clean `exists: false` 404 verdict. NEVER deletes — after review call `delete_resource` with `confirm_delete=true`. `readOnlyHint=True`. |
 | `get_resource_status(namespace, kind, name)` | never | DNS-1123 namespace/name, namespace policy, kind allowlist (same fence as writes) | Status excerpt: Deployment/StatefulSet ready-vs-total replicas, Job succeeded/failed, else raw phase/conditions. `readOnlyHint=True`. |
+| `verify_audit_chain()` | never | none needed — reads ONLY the server's configured `APPLYGATE_AUDIT_FILE`; no path parameter exists | The hash-chain verdict `{ok, file, exists, entries, legacy_entries, first_bad_line, error}` — the README procedure without kubectl exec. Also at `GET /api/audit/verify` (console). `readOnlyHint=True`. |
 
 All tool results are `json.dumps` strings. Refusals are structured JSON:
 `{"ok": false, "refused": true, "error": "<self-describing message>"}`.
@@ -36,6 +38,16 @@ apply_manifest(ns, manifest, confirm_apply=True,
                plan_sha256=<manifest_sha256>)   # only after a clean plan,
                                                 # bound to those exact bytes
 get_resource_status(ns, kind, name)             # verify what you applied
+```
+
+Deletes get the same discipline — the most destructive verb is planned
+first:
+
+```
+plan_delete(ns, kind, name)     # dry-run: what WOULD be removed, current
+  └─ human review of the verdict  state included; NEVER deletes anything
+delete_resource(ns, kind, name,
+                confirm_delete=True)            # only after the review
 ```
 
 Multi-doc manifests are applied **per document**: a bad document never
@@ -132,6 +144,14 @@ to the exact bytes `plan_apply` validated** for that namespace.
   chart default, are unaffected).
 - A tool-level-refused plan (namespace policy, unparseable manifest)
   records **no** binding — the apply would die on the same gate anyway.
+- **Superseded-plan visibility.** "Latest plan wins" is unchanged, but it is
+  no longer silent: when a `plan_apply` records a sha DIFFERENT from the one
+  already recorded for that namespace, its response carries
+  `superseded_plan: true` and the note *"a newer plan_apply supersedes older
+  planned bytes; apply_manifest binds to the latest plan only"* — an agent
+  holding older planned bytes can see they will not bind. A binding refusal
+  (tampered bytes, stale carried sha, missing plan) carries
+  `hint: "re-run plan_apply on the exact bytes you intend to apply"`.
 
 The chart wires the knob only when set (`planBinding.unplannedApply` in
 values) — the default render is byte-identical to the Wave-0 baseline and
@@ -205,12 +225,24 @@ Given the trail file (default `/data/audit.jsonl`):
      entry — treat it as a chain root;
    - set `expected = sha256(line)` (the exact line text, UTF-8).
 4. `server.verify_audit_chain(path)` runs exactly this procedure and returns
-   `{"ok", "entries", "legacy_entries", "first_bad_line", "error"}`:
+   `{"ok", "entries", "legacy_entries", "first_bad_line", "error"}`.
 
-   ```bash
-   kubectl -n <ns> exec deploy/applygate-mcp -- python -c \
-     "import json,sys; sys.path.insert(0,'/app'); import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
-   ```
+**Verifying it — three surfaces, one code path:**
+
+- **MCP tool `verify_audit_chain()`** — parameter-free by design: it
+  verifies ONLY the server's own configured `APPLYGATE_AUDIT_FILE`. A
+  caller that somehow passes a path is refused with the same discipline as
+  the `/api/audit` console endpoint (the path is server configuration, full
+  stop). `readOnlyHint=True`.
+- **Console `GET /api/audit/verify`** — the same verdict JSON over the same
+  configured file, so the web UI can show "chain OK / CHAIN BROKEN" without
+  exec access (the audit panel's **✓ verify chain** button).
+- **kubectl exec** — still available for break-glass checks from a shell:
+
+  ```bash
+  kubectl -n <ns> exec deploy/applygate-mcp -- python -c \
+    "import json,sys; sys.path.insert(0,'/app'); import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
+  ```
 
 Known limitation (documented, standard for hash chains): the **last** line
 is protected only by the next entry — tampering with the final line is
@@ -259,6 +291,8 @@ CRDs in-cluster.
 | `APPLYGATE_METRICS_ENABLED` | *(off)* | Serve `/metrics` (prometheus-client when installed, honest fallback otherwise). Chart key: `metrics.enabled`. |
 | `APPLYGATE_CLIENTS` | *(unset)* | Optional per-request caller-name registry, `name:key;name:key;...` — NAMES keys the auth middleware already matched (audit `caller.name`). Never authenticates anything. Chart key: `clients.existingSecret` (secret material — existingSecret-only). |
 | `MCP_CALLER_TRUSTED_CIDRS` | *(empty)* | Comma-separated CIDRs of trusted direct peers whose `X-MCP-Caller` claim is recorded (audit `caller.via`, sanitized, ≤200 chars). **Empty = fail-closed: the header is ignored from every peer.** Chart key: `callerPassthrough.trustedCidrs`. Attribution-never-authorization: never unlocks anything. |
+| `MCP_HOSTNAME` | *(empty)* | The public FQDN clients use to reach `/mcp` — the DNS-rebinding pin (fleet-shared `mcp_auth.transport_security_from_env`). With this OR `MCP_EXTRA_ALLOWED_HOSTS` set, Host-header protection is explicitly ON (allowlist = pinned FQDN + extras + loopback, Origin = `https://<MCP_HOSTNAME>`); with NEITHER set (dev mode) the SDK's implicit loopback-only protection applies untouched. Chart key: `mcpHostname`. |
+| `MCP_EXTRA_ALLOWED_HOSTS` | *(empty)* | Comma-separated extra Host-header allowlist entries for in-cluster callers addressing the server by svc DNS (verbatim or `host:*`). The chart AUTO-prepends this release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*`) as the first entry whenever transport security is active — the LLM-gateway relay hop arrives with that Host header (421 otherwise). Chart key: `extraAllowedHosts` (EXTRA hosts only). |
 
 ## RBAC requirements
 
@@ -270,6 +304,18 @@ resource surface as the kind allowlist across the `""` (core), `apps`,
 ServiceAccount (or kubeconfig outside the cluster). To write into more
 namespaces, deploy the chart (or copy the Role) there — do **not** widen the
 identity to cluster scope.
+
+**Registry ≠ RBAC.** The kind registry admits more kinds than the chart's
+Role grants (`PersistentVolumeClaim`, `Role`, `RoleBinding`, `Lease`,
+`Endpoints`, `ResourceQuota`, …): a kind the tool's policy admits can still
+get an **HTTP 403 from the API server** when the ServiceAccount lacks the
+resource/verb. Extending the allowlist to such a kind is fine — but the
+write only succeeds after the RBAC manifests are extended too (chart Role in
+the release namespace, or the one-time bootstrap Role for other namespaces).
+On a 403 for a kind the shipped RBAC does NOT grant, the failing tool result
+carries `rbac_hint` naming the exact manifests to extend; the tool itself
+NEVER extends RBAC — that is a deliberate one-time human act (see the
+comment block in `helm/templates/rbac.yaml`).
 
 ## Trust model
 
@@ -286,14 +332,24 @@ identity to cluster scope.
 - **No Secrets ever**: no secret values are read, written, or deleted.
 - **Audit trail — tamper-evident**: every operation (including refusals)
   leaves a hash-chained JSONL line on a persistent volume, attributed to a
-  non-secret caller fingerprint; verification is one command
-  (`server.verify_audit_chain` / README procedure).
+  non-secret caller fingerprint; verification is one call — the
+  parameter-free `verify_audit_chain` MCP tool, `GET /api/audit/verify` on
+  the console, or `server.verify_audit_chain(path)` under kubectl exec.
 - **Parser hygiene**: alias bombs, YAML quines, and over-deep manifests are
   refused at parse time, before any seam call.
 - **HTTP posture**: MCP 2.0 stateless (any replica serves any request, no
-  session state), DNS-rebinding protection disabled per fleet convention —
-  put real gateway auth in front if you expose `/mcp` through the Istio
-  gateway (`ezua.enabled=true`).
+  session state). DNS-rebinding protection follows the fleet-shared helper
+  (`mcp_auth.transport_security_from_env`): OFF-by-default became
+  **loopback-only by default** (dev mode) and **explicitly ON with a Host
+  allowlist** the moment `MCP_HOSTNAME` / `MCP_EXTRA_ALLOWED_HOSTS` is set
+  (chart keys `mcpHostname` / `extraAllowedHosts`) — set `mcpHostname` when
+  the gateway fronts `/mcp`, or in-cluster svc-DNS callers get 421s after
+  the flip. The chart AUTO-includes the release's own service DNS as the
+  first `MCP_EXTRA_ALLOWED_HOSTS` entry when transport security is active —
+  the gateway's relay hop arrives with
+  `Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>` — so sites
+  only list EXTRA hosts in `extraAllowedHosts`. Real gateway auth still
+  belongs in front (`ezua.enabled=true`).
 - **API-key auth — MANDATORY**: `/mcp` requires a key (`X-API-Key` or
   `Authorization: Bearer`; the read-only console and probes stay public).
   **The chart never creates the key Secret — you MUST pre-deploy it in the
@@ -345,7 +401,7 @@ by construction, and the k8s seam only ever receives `dry_run=True`.
 | --- | --- |
 | **Plan** | The plan console: paste a manifest, pick a namespace, get the per-document `{kind, name, ok, message}` verdicts the `plan_apply` tool would give (dry-run passed / refused, with the exact refusal text). |
 | **Status** | `get_resource_status` for one kind/name/namespace — same namespace policy + kind gates as the write tools; Deployment/StatefulSet replica summaries, Job counters, conditions. |
-| **Audit** | Tail of the JSONL audit file (last N lines, parsed): every plan, apply, delete, failure and refusal, with the configured file path. The endpoint reads ONLY the configured `APPLYGATE_AUDIT_FILE` — client-selected paths are refused with 400. |
+| **Audit** | Tail of the JSONL audit file (last N lines, parsed): every plan, apply, delete, failure and refusal, with the configured file path — plus the **✓ verify chain** button (hash-chain verdict over the same configured file). The endpoints read ONLY the configured `APPLYGATE_AUDIT_FILE` — client-selected paths are refused with 400. |
 | **Policy** | The effective namespace allowlist/blocklist + kind allowlist (from the same config functions the tools read), the default-deny state, and the unconditional Secret / cluster-scoped refusal texts — so a human can see exactly why a plan was refused. |
 
 ### JSON API (all read-only)
@@ -357,6 +413,7 @@ by construction, and the k8s seam only ever receives `dry_run=True`.
 | `POST /api/plan` | Plan console `{"namespace", "manifest"}` — ALWAYS a dry-run; returns the tool's per-doc verdicts |
 | `GET /api/resource_status?namespace=&kind=&name=` | Status excerpt (tool-equivalent, guardrails included) |
 | `GET /api/audit?lines=N` | Last N parsed audit entries — configured path only, traversal refused |
+| `GET /api/audit/verify` | The hash-chain verdict (`server.verify_audit_chain` over the same configured file) — parameter-free, traversal refused |
 
 The console is gated by `webui.enabled` (values) → `APPLYGATE_WEBUI_ENABLED`
 (env; unset = on, `false|0|no|off` strips `/`, `/ui` and `/api/*` while `/mcp`
@@ -478,6 +535,24 @@ byte-identical to the Wave-0 baseline** (verified by render-diff):
   `MCP_CALLER_TRUSTED_CIDRS` only when set: CIDRs of trusted direct peers
   whose `X-MCP-Caller` claim is recorded → audit `caller.via`. Omitted ⇒
   the header is ignored from every peer (fail-closed).
+- `mcpHostname: ''` / `extraAllowedHosts: []` (transport security, the
+  K8S-MCP knob pattern) — render `MCP_HOSTNAME` when `mcpHostname` is set;
+  `MCP_EXTRA_ALLOWED_HOSTS` renders when transport security is active
+  (`mcpHostname` set OR `extraAllowedHosts` non-empty) and ALWAYS starts
+  with the chart-derived own service DNS
+  `<deployment.name>-service.<ns>.svc.cluster.local:*` — the LLM-gateway
+  relay hop's Host header — with any site `extraAllowedHosts` joined after
+  it. `mcpHostname` is the public FQDN clients use to reach `/mcp` — set it
+  in lockstep with `ezua.virtualService.endpoint` (the gateway fronts that
+  host; unset ⇒ every gateway request gets 421 "Invalid Host header").
+  `extraAllowedHosts` lists EXTRA in-cluster svc-DNS names for callers
+  beyond the own service (a site setting it never loses the own-svc
+  entry — the chart prepends it). Both unset ⇒ dev mode: neither env
+  renders and the SDK's implicit loopback-only protection applies
+  untouched (behavior unchanged from the pre-adoption
+  `enable_dns_rebinding_protection=False` render for gateway-less
+  deployments; note the SDK now rejects non-loopback Host headers in dev
+  mode — that is the fleet-reference dev posture).
 - `audit.file` carries the audit-path comment block: **the audit.path is
   documented for ops mount/expose** — the fleet convention is to mount the
   same path/PVC into the logsearch pod so the trail is searchable.

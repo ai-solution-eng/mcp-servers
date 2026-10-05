@@ -34,6 +34,10 @@ Configuration (environment variables):
   BROWSER_MAX_PAGES         Max concurrent pages (default 3)
   BROWSER_BLOCK_RESOURCES   Block image/media/font requests (default true)
   BROWSER_MAX_HTML_BYTES    Cap on stored serialized DOM (default 5000000)
+  BROWSER_IGNORE_CERT_ERRORS  Skip TLS verification in rendered contexts
+                            (default false) — the browser-side mirror of the
+                            fetch ladder's FETCH_TLS_INSECURE_FALLBACK, for
+                            egress proxies whose CA is not (yet) installed
 """
 
 from __future__ import annotations
@@ -94,6 +98,7 @@ class BrowserClient:
         max_pages: int | None = None,
         block_resources: bool | None = None,
         max_html_bytes: int | None = None,
+        ignore_cert_errors: bool | None = None,
     ):
         self.cdp_url = cdp_url or os.getenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
         self.connect_timeout_ms = (
@@ -109,6 +114,9 @@ class BrowserClient:
         )
         self.max_html_bytes = (
             max_html_bytes if max_html_bytes is not None else _env_int("BROWSER_MAX_HTML_BYTES", 5_000_000)
+        )
+        self.ignore_cert_errors = (
+            ignore_cert_errors if ignore_cert_errors is not None else _env_bool("BROWSER_IGNORE_CERT_ERRORS", False)
         )
         self._pw = None
         self._browser = None
@@ -200,7 +208,7 @@ class BrowserClient:
         except url_policy.UrlPolicyError as e:
             raise BrowserError(f"SSRF policy blocked navigation to {url}: {e}") from None
         async with self._page_sem:
-            context = await self._browser.new_context()
+            context = await self._browser.new_context(ignore_https_errors=self.ignore_cert_errors)
             page = await context.new_page()
             try:
                 if self.block_resources:

@@ -120,6 +120,52 @@
     color: var(--text);
   }
   header .spacer { flex: 1; }
+  /* ---- header identity widget (D-UI: chip + use-key + sign out) ---- */
+  /* Same visual language as header .meta (12px muted row), RAG's chip
+     logic — NOT RAG's markup/classes: this page has its own stylesheet. */
+  #id-chip {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #id-chip.show { display: inline-flex; }
+  #id-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); flex-shrink: 0; }
+  #id-dot.session { background: var(--green); }
+  #id-dot.keycred { background: var(--yellow); }
+  #id-src {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text);
+  }
+  #id-key-link {
+    display: none;
+    color: var(--muted);
+    font-size: 12px;
+    text-decoration: none;
+  }
+  #id-key-link:hover { color: var(--accent); }
+  #id-signout { display: none; padding: 4px 12px; font-size: 12px; font-weight: 500; }
+  /* The use-key dialog: same overlay shape as the sv-modal pair above. */
+  #id-key-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
+  #id-key-modal.hidden { display: none; }
+  #id-key-dialog {
+    position: relative;
+    width: min(440px, 92vw);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px var(--shadow);
+    padding: 16px 18px;
+  }
+  #id-key-dialog h3 { margin: 0 0 6px; font-size: 14px; color: var(--text); }
+  #id-key-dialog .insp-field { margin: 10px 0; }
+  #id-status { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
   #status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
   #status-dot.ok { background: var(--green); }
   #status-dot.err { background: var(--red); }
@@ -473,8 +519,36 @@
     <span class="dot" style="color:var(--yellow)">read-only</span>
   </div>
   <div class="spacer"></div>
+  <div id="id-chip">
+    <span id="id-dot"></span>
+    <span id="id-name">…</span>
+    <span id="id-src" title="Which credential resolved this session (the identity ladder's rung)"></span>
+  </div>
+  <a href="#" id="id-key-link" title="Paste a key for this page session — the same credential the Access-control panel uses">Use an API key</a>
+  <a href="/oauth/login?next=%2Fui" id="id-sso-link" style="display:none;color:var(--muted);font-size:12px;text-decoration:none" title="Start the SSO round trip (the verified session carries your username, not the IdP sub UUID)">Sign in with SSO</a>
+  <button id="id-signout" class="ghost" title="Clear this page's credential (and end an edge SSO session when deployed behind the gateway)">Sign out</button>
   <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
 </header>
+
+<!-- Use-an-API-key dialog: the pasted key becomes adminCredential — the SAME
+     page-memory variable the Access-control panel reads. Never persisted
+     (the panel's contract: the raw key must not live anywhere an XSS could
+     silently read back); Sign out clears it. -->
+<div id="id-key-modal" class="hidden" role="dialog" aria-modal="true" aria-label="Use an API key">
+  <div class="sv-backdrop" id="id-key-backdrop"></div>
+  <div id="id-key-dialog">
+    <h3>Use an API key</h3>
+    <div class="hint" style="margin-bottom:4px">The pasted key governs this page's Access-control calls — held in memory only, never stored. An SSO session (signed in above) needs no key here.</div>
+    <div class="insp-field">
+      <input type="password" id="id-key-input" placeholder="paste the admin key" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="query-actions" style="margin-top:10px">
+      <button id="id-key-use">Use key</button>
+      <button id="id-key-cancel" class="ghost">Cancel</button>
+      <span class="hint" id="id-key-msg" style="margin-left:4px"></span>
+    </div>
+  </div>
+</div>
 
 <div class="layout">
   <aside>
@@ -665,7 +739,7 @@
           </div>
         </div>
         <div class="panel">
-          <h2>Policy document <span class="hint" id="adm-policy-hash"></span></h2>
+          <h2>Policy document <span class="hint" id="adm-policy-hash"></span><span class="hint"> — JSON or YAML</span></h2>
           <textarea id="adm-policy" spellcheck="false" style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:12px;padding:10px;min-height:220px;resize:vertical;line-height:1.5"></textarea>
           <div class="query-actions">
             <button id="adm-policy-save">Save policy</button>
@@ -759,6 +833,153 @@ function toast(msg, isErr) {
   el.className = "toast show" + (isErr ? " err" : "");
   clearTimeout(el._t);
   el._t = setTimeout(() => { el.className = "toast"; }, 2600);
+}
+
+// ---- header identity widget (chip + use-an-API-key + sign out) ------------
+// Ported from the MultimodalRAG header (renderIdentityChip / openKeyModal /
+// signOut) onto SQLhandler's contract — one credential, page memory only:
+//
+// * The probe is GET /api/whoami (the REST twin of the MCP whoami tool): it
+//   previews the identity THIS request resolves to. A presented X-API-Key is
+//   authenticated by the endpoint itself (a wrong key stays anonymous — a
+//   wrong key is never redeemed as the browser user behind it); a keyless
+//   request resolves through the ladder (SSO bearer JWT → browser headers).
+// * The chip shows the resolved identity + the rung tag (oidc / browser /
+//   key / sso) — including via="anonymous" with require_identity on, which
+//   is exactly the "why can't I mint?" answer rendered in place.
+// * Use an API key: sets `adminCredential` — the SAME variable the
+//   Access-control panel reads (single credential per page; no second
+//   storage location to forget). The key is NOT persisted (the panel's
+//   no-storage contract, pinned by test_admin_ui).
+// * Sign out: clears that credential and — when deployed behind the
+//   gateway's oauth2-proxy — ends the edge SSO session too (best-effort:
+//   a 404 from a non-gated deployment falls back to a plain reload).
+const ID_SRC_LABELS = {
+  jwt: "oidc",
+  browser: "browser",
+  key: "key",
+  relay: "relay",
+  "sso-cookie": "SSO",
+};
+
+function idCredentialName(caller) {
+  // What to CALL the identity: a subject (SSO/relay/subject-bound key) by
+  // name; a pseudonymous key by its middle-truncated fingerprint.
+  const s = (caller && caller.subject) || "";
+  if (s) return s;
+  const fp = (caller && caller.key_fp) || "";
+  if (!fp) return "";
+  return fp.length <= 18 ? fp : fp.slice(0, 11) + "…" + fp.slice(-6);
+}
+
+function renderIdentityChip(sess) {
+  const chip = $("id-chip"), dot = $("id-dot"), name = $("id-name"),
+    src = $("id-src"), keylink = $("id-key-link"), signout = $("id-signout"),
+    ssolink = $("id-sso-link");
+  if (!chip) return;
+  if (!sess || !sess.authenticated) {
+    // Anonymous: on a requireIdentity deployment show WHY the gated pages
+    // refuse (the exact question the SSO mint card gets); on an open one
+    // stay quiet — the historical no-chip look. When the D22 flow is
+    // served, offer the SSO round trip (the RAG parity: sign-in link).
+    chip.classList.remove("show");
+    signout.style.display = "none";
+    keylink.style.display = sess && sess.require_identity ? "inline" : "none";
+    if (ssolink) ssolink.style.display = sess && sess.sso_login_available ? "inline" : "none";
+    return;
+  }
+  const cls = (sess.caller && sess.caller.class) || "";
+  dot.className = cls === "user" || cls === "browser" ? "session" : "keycred";
+  name.textContent = "Signed in as " + (idCredentialName(sess.caller) || "unknown");
+  src.textContent = ID_SRC_LABELS[sess.via] || sess.via || "?";
+  src.title = "resolved via: " + (sess.via || "?") + (cls ? " (" + cls + ")" : "");
+  chip.classList.add("show");
+  keylink.style.display = sess.via === "jwt" || sess.via === "browser" ? "inline" : "none";
+  if (ssolink) ssolink.style.display = "none";
+  signout.style.display = "inline-flex";
+}
+
+async function probeIdentity() {
+  // ONE probe, with the page's current credential riding along so the
+  // response reflects the credential the workspace actually uses (an
+  // explicit key outranks the browser session server-side).
+  const headers = adminCredential ? { "X-API-Key": adminCredential } : {};
+  try {
+    const r = await fetch("/api/whoami", { credentials: "same-origin", headers });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function openIdKeyModal(event) {
+  if (event) event.preventDefault();
+  $("id-key-input").value = "";
+  $("id-key-msg").textContent = "";
+  $("id-key-modal").classList.remove("hidden");
+  $("id-key-input").focus();
+}
+
+function closeIdKeyModal() {
+  $("id-key-modal").classList.add("hidden");
+}
+
+async function applyIdKey() {
+  const key = ($("id-key-input").value || "").trim();
+  if (!key) { $("id-key-msg").textContent = "paste a key first"; return; }
+  // Verify BEFORE adopting: the probe with the candidate key must resolve
+  // authenticated — otherwise the panel would just render the 401 verbatim
+  // on the next click (fine) but the header would keep saying anonymous
+  // (confusing). A non-authenticating key is refused here with the same
+  // message the panel would show.
+  try {
+    const r = await fetch("/api/whoami", {
+      credentials: "same-origin",
+      headers: { "X-API-Key": key },
+    });
+    const sess = r.ok ? await r.json() : null;
+    if (!sess || !sess.authenticated) {
+      $("id-key-msg").textContent = "the server did not accept that key";
+      return;
+    }
+  } catch (e) {
+    $("id-key-msg").textContent = "server unreachable — try again";
+    return;
+  }
+  adminCredential = key;       // the panel's variable — the single credential
+  $("adm-key").value = key;    // keep the panel field in step
+  closeIdKeyModal();
+  toast("Key set for this page session");
+  await renderIdentityFromServer();
+}
+
+function idSignOut() {
+  // Clear the page credential (adminCredential + the panel field), then end
+  // the server-side sessions: the app's own D22 SSO cookie (/oauth/logout)
+  // and — when deployed behind the gateway's oauth2-proxy — the edge
+  // session (/oauth2/sign_out, which chains the IdP end_session on the G2
+  // platform). /oauth2/sign_out redirects back to /ui either way; on a
+  // deployment without the edge proxy it 404s into the same visible reload.
+  adminCredential = "";
+  $("adm-key").value = "";
+  location.href = "/oauth2/sign_out?rd=" + encodeURIComponent("/oauth/logout");
+}
+
+function wireIdentityWidget() {
+  $("id-key-link").onclick = openIdKeyModal;
+  $("id-key-cancel").onclick = closeIdKeyModal;
+  $("id-key-backdrop").onclick = closeIdKeyModal;
+  $("id-key-use").onclick = applyIdKey;
+  $("id-key-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); applyIdKey(); }
+    if (e.key === "Escape") closeIdKeyModal();
+  });
+  $("id-signout").onclick = idSignOut;
+}
+
+async function renderIdentityFromServer() {
+  renderIdentityChip(await probeIdentity());
 }
 
 function setError(msg) {
@@ -1685,6 +1906,7 @@ async function admConnect() {
   adminCredential = ($("adm-key").value || "").trim();
   if (!adminCredential) { admShowError("Enter the admin key first."); return; }
   await accessRefresh();
+  await renderIdentityFromServer(); // the header chip follows the credential
 }
 
 function admForget() {
@@ -1693,6 +1915,7 @@ function admForget() {
   $("adm-body").style.display = "none";
   admShowError("");
   $("adm-grants-meta").textContent = "";
+  renderIdentityChip(null); // the credential is gone — the chip must not claim it
 }
 
 async function admMint() {
@@ -1720,17 +1943,28 @@ async function admMint() {
 async function admPolicySave() {
   const err = $("adm-policy-err");
   err.textContent = "";
-  let doc = null;
   const text = $("adm-policy").value.trim();
-  if (text) {
-    try { doc = JSON.parse(text); }
-    catch (e) { err.textContent = "Not valid JSON: " + e.message; return; }
+  let body;
+  let doc = null;
+  if (!text) {
+    body = {};
+  } else {
+    try {
+      doc = JSON.parse(text);          // JSON round-trips as before
+      body = doc;
+    } catch (e) {
+      // Not JSON — send the text verbatim; the server sniffs YAML
+      // (_parse_text: JSON first, YAML second) and its 400 carries the
+      // verbatim refusal for genuinely-bad input (same contract as the
+      // semantic-catalog upload, which accepts both).
+      body = { policy: text };
+    }
   }
   try {
     const res = await api("/api/admin/policy", {
       method: "PUT",
       headers: admHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(doc || {}),
+      body: JSON.stringify(body),
     });
     $("adm-policy")._dirty = false;
     $("adm-policy-hash").textContent = "policy_hash: " + (res.policy_hash || "?");
@@ -2226,7 +2460,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 initThemeToggle();
+wireIdentityWidget();
 refreshStatus();
+renderIdentityFromServer();
 refreshTables();
 refreshCatalog();
 renderSaved();

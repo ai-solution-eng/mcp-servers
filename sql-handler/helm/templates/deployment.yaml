@@ -163,14 +163,43 @@ spec:
                   name: {{ .Values.security.apiKey.existingSecret }}
                   key: {{ .Values.security.apiKey.existingSecretKey }}
             {{- end }}
-            {{- if .Values.security.adminKeys.existingSecret }}
-            {{- /* Frontend admin-keys store (values: security.adminKeys): the
-                   Secret's key IS the store's JSON file — mounted as a FILE
-                   (never env-rendered) so the store hot-reloads on mtime like
-                   the policy file; SQLHANDLER_ADMIN_KEYS_FILE names the mount.
-                   Empty default renders nothing (store disabled). */}}
+            {{- if or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
+            {{- /* Frontend admin-keys store (values: security.adminKeys):
+                   SECRET mode — the Secret's key IS the store's JSON file,
+                   mounted as a file (never env-rendered) so the store
+                   hot-reloads on mtime like the policy file; CLAIM mode —
+                   a WRITABLE RWX claim (the self-mint/frontend-mint path:
+                   the API writes the file; it is created on the first
+                   mint), shared across replicas. SQLHANDLER_ADMIN_KEYS_FILE
+                   names the mounted path either way. Both empty renders
+                   nothing (store disabled). Secret wins when both set. */}}
             - name: SQLHANDLER_ADMIN_KEYS_FILE
               value: {{ printf "%s/%s" (.Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys") .Values.security.adminKeys.existingSecretKey | quote }}
+            {{- end }}
+            {{- if and .Values.security.policy.enabled .Values.security.policy.existingClaim }}
+            {{- /* WRITABLE policy (values: security.policy.existingClaim):
+                   the file lives ON THE CLAIM — under the catalog-store
+                   mount (semanticCatalog.store.mountPath), NOT the legacy
+                   /etc read-only path (live 2026-10-05: mountPath's
+                   legacy default put the live file on the container's
+                   read-only rootfs — seeding failed Errno 30 and the
+                   store loaded empty, which 403'd every admin). The
+                   ConfigMap (when set) is the ONE-TIME SEED source,
+                   mounted at its own read-only ...-seed path. */}}
+            {{- $claimRoot := .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
+            - name: SQLHANDLER_POLICY_FILE
+              value: {{ printf "%s/policy/%s" $claimRoot (.Values.security.policy.fileName | default "policy.json") | quote }}
+            {{- if and .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
+            - name: SQLHANDLER_POLICY_SEED_FILE
+              value: {{ printf "%s-seed/%s" (.Values.security.policy.mountPath | default "/etc/sqlhandler/policy") .Values.security.policy.existingConfigMapKey | quote }}
+            {{- end }}
+            {{- else if .Values.security.policy.enabled }}
+            {{- /* Read-only ConfigMap mode (the legacy posture): hot-
+                   reloadable via kubectl edit cm but NOT writable from
+                   inside the pod — the policy editor / grant-by-name answer
+                   503 on this wiring. */}}
+            - name: SQLHANDLER_POLICY_FILE
+              value: {{ printf "%s/%s" .Values.security.policy.mountPath .Values.security.policy.existingConfigMapKey | quote }}
             {{- end }}
             {{- /* Identity + SSO rungs (values: security.identity.requireIdentity,
                    security.oidc.*). Rendered UNCONDITIONALLY with "" when unset
@@ -208,6 +237,47 @@ spec:
               value: {{ .Values.security.oidc.fetchTimeoutSeconds | default "" | quote }}
             - name: SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS
               value: {{ .Values.security.oidc.clockSkewSeconds | default "" | quote }}
+            {{- if .Values.security.oidc.sso.enabled }}
+            {{- /* Browser SSO (D22, the MM-RAG parity): /oauth/* routes +
+                   the pcai-sso HttpOnly session cookie. Rendered ONLY when
+                   sso.enabled — the default render is byte-identical. The
+                   client secret prefers an existing Secret (inline is the
+                   non-production back-compat). */}}
+            - name: SQLHANDLER_OIDC_SSO_ENABLED
+              value: "true"
+            - name: SQLHANDLER_OIDC_SSO_CLIENT_ID
+              value: {{ .Values.security.oidc.sso.clientId | quote }}
+            {{- if .Values.security.oidc.sso.clientExistingSecret }}
+            - name: SQLHANDLER_OIDC_SSO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.oidc.sso.clientExistingSecret }}
+                  key: {{ .Values.security.oidc.sso.clientExistingSecretKey }}
+            {{- else }}
+            - name: SQLHANDLER_OIDC_SSO_CLIENT_SECRET
+              value: {{ .Values.security.oidc.sso.clientSecret | default "" | quote }}
+            {{- end }}
+            - name: SQLHANDLER_OIDC_SSO_REDIRECT_URI
+              value: {{ .Values.security.oidc.sso.redirectUri | quote }}
+            - name: SQLHANDLER_OIDC_SSO_PROVIDER_URL
+              value: {{ .Values.security.oidc.sso.providerUrl | default "" | quote }}
+            - name: SQLHANDLER_OIDC_SSO_SCOPES
+              value: {{ .Values.security.oidc.sso.scopes | quote }}
+            - name: SQLHANDLER_OIDC_SSO_COOKIE_NAME
+              value: {{ .Values.security.oidc.sso.cookieName | quote }}
+            - name: SQLHANDLER_OIDC_SSO_COOKIE_MAX_AGE
+              value: {{ .Values.security.oidc.sso.cookieMaxAge | quote }}
+            - name: SQLHANDLER_OIDC_SSO_COOKIE_SECURE
+              value: {{ .Values.security.oidc.sso.cookieSecure | quote }}
+            {{- if and .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
+            {{- /* Platform private-CA trust for the EXTERNAL providerUrl:
+                   REMOTE_CA_BUNDLE points at the mounted ezaf-root-ca bundle
+                   (the oidc_sso fetches + the JWT rung's JWKS fetch honor
+                   it — verified TLS, never verification-relaxed). */}}
+            - name: REMOTE_CA_BUNDLE
+              value: {{ printf "%s/%s" .Values.security.oidc.sso.platformCa.mountPath .Values.security.oidc.sso.platformCa.bundleFile | quote }}
+            {{- end }}
+            {{- end }}
             {{- /* Relay attribution verification (security.identity.relayHmac.*).
                    EMPTY default = the relay rung trusts attribution over a
                    key-valid request exactly as before (byte-identical
@@ -305,12 +375,20 @@ spec:
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
           {{- $needCatalog := .Values.semanticCatalog.enabled }}
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
-          {{- $needPolicy := and .Values.security.policy.enabled .Values.security.policy.existingConfigMap }}
+          {{- $needPolicy := and .Values.security.policy.enabled (or .Values.security.policy.existingConfigMap .Values.security.policy.existingClaim) }}
+          {{- /* CLAIM mode whose mountPath lives under the catalog-store
+                 mount: the policy file rides that mount (same live-learned
+                 rule as the admin-keys store — mounting the SAME PVC TWICE
+                 in one pod wedges some CSI drivers). One mount per PVC. */}}
+          {{- $policyOnCatalog := and .Values.security.policy.enabled .Values.security.policy.existingClaim $needStore }}
           {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
           {{- $needSharing := and (eq .Values.backend "sharing") .Values.sharing.enabled .Values.sharing.existingConfigMap }}
           {{- $needAudit := and (.Values.query.auditLog) (ne (dir .Values.query.auditLog) "/") }}
-          {{- $needAdminKeys := .Values.security.adminKeys.existingSecret }}
-          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needSharing $needAudit $needAdminKeys }}
+          {{- $needAdminKeys := or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
+          {{- /* CLAIM mode whose mountPath lives under the catalog-store mount (semanticCatalog.store): the store rides that mount — mounting the SAME PVC TWICE in one pod wedges some CSI drivers on the second publish (live 2026-10-05: v3.4.3 pods stuck in ContainerCreating 30+ min, no pull events, Vast CSI). One mount per PVC per pod. */}}
+          {{- $adminKeysOnCatalog := and .Values.security.adminKeys.existingClaim (not .Values.security.adminKeys.existingSecret) $needStore }}
+          {{- $needPlatformCa := and .Values.security.oidc.enabled .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
+          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needSharing $needAudit $needAdminKeys $needPlatformCa }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
@@ -332,7 +410,14 @@ spec:
               mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
               readOnly: true
             {{- end }}
-            {{- if $needPolicy }}
+            {{- if and $needPolicy $policyOnCatalog .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
+            {{- /* The SEED ConfigMap at its own read-only path (claim mode
+                   only): the server copies it to the claim on first boot. */}}
+            - name: policy-seed
+              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}-seed
+              readOnly: true
+            {{- end }}
+            {{- if and $needPolicy (not $policyOnCatalog) }}
             {{- /* The policy ConfigMap as a DIRECTORY mount (never subPath):
                    the kubelet only propagates ConfigMap edits into
                    non-subPath mounts and PolicyStore hot-reloads on mtime —
@@ -340,7 +425,10 @@ spec:
                    Without this mount the env var names a file that never
                    changes (grants stale until rollout). Child of the
                    semantic-catalog parent mount — MUST follow it (see the
-                   order comment above). */}}
+                   order comment above). CLAIM mode mounts NOTHING here:
+                   the policy file lives under the catalog-store mount
+                   (writable); a second mount of the same PVC wedges some
+                   CSI drivers (live 2026-10-05). */}}
             - name: policy
               mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}
               readOnly: true
@@ -382,12 +470,31 @@ spec:
               mountPath: /etc/sqlhandler-sharing
               readOnly: true
             {{- end }}
-            {{- if $needAdminKeys }}
-            {{- /* Directory mount, NOT subPath — the keys store hot-reloads
-                   on mtime exactly like the policy file; a subPath mount
-                   never sees Secret updates. */}}
+            {{- if and $needAdminKeys (not $adminKeysOnCatalog) }}
+            {{- /* Directory mount, NOT subPath — the store hot-reloads on
+                   mtime exactly like the policy file; a subPath mount never
+                   sees updates. SECRET mode is read-only (the Secret's
+                   lifecycle is kubectl's); standalone CLAIM mode is
+                   READ-WRITE on purpose — the self-mint/frontend-mint API
+                   writes the store file through this mount (that is its
+                   whole point). CLAIM-over-catalog-store mode mounts
+                   NOTHING here (the store path lives under the existing
+                   catalog-store mount — a second mount of the same PVC
+                   wedges some CSI drivers). */}}
             - name: admin-keys
               mountPath: {{ .Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys" }}
+              {{- if .Values.security.adminKeys.existingClaim }}
+              {{- /* Writable store: minted keys survive pod reschedules and
+                     are visible to every replica via the shared RWX claim. */}}
+              {{- else }}
+              readOnly: true
+              {{- end }}
+            {{- end }}
+            {{- if $needPlatformCa }}
+            {{- /* The platform root-CA bundle (values: security.oidc.sso.
+                   platformCa) — read-only; REMOTE_CA_BUNDLE points here. */}}
+            - name: platform-ca
+              mountPath: {{ .Values.security.oidc.sso.platformCa.mountPath }}
               readOnly: true
             {{- end }}
           {{- end }}
@@ -449,20 +556,32 @@ spec:
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
-      {{- $needPolicy := and .Values.security.policy.enabled .Values.security.policy.existingConfigMap }}
+      {{- $needPolicy := and .Values.security.policy.enabled (or .Values.security.policy.existingConfigMap .Values.security.policy.existingClaim) }}
+      {{- $policyOnCatalog := and .Values.security.policy.enabled .Values.security.policy.existingClaim $needStore }}
       {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
-      {{- $needAdminKeys := .Values.security.adminKeys.existingSecret }}
-      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needAudit $needAdminKeys }}
+      {{- $needAdminKeys := or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
+      {{- /* CLAIM mode whose mountPath lives under the catalog-store mount (semanticCatalog.store): the store rides that mount — mounting the SAME PVC TWICE in one pod wedges some CSI drivers on the second publish (live 2026-10-05: v3.4.3 pods stuck in ContainerCreating 30+ min, no pull events, Vast CSI). One mount per PVC per pod. */}}
+      {{- $adminKeysOnCatalog := and .Values.security.adminKeys.existingClaim (not .Values.security.adminKeys.existingSecret) $needStore }}
+      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needAudit $needAdminKeys $needPlatformCa }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
           emptyDir: {}
         {{- end }}
-        {{- if $needPolicy }}
+        {{- if and $needPolicy $policyOnCatalog .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
+        {{- /* The SEED ConfigMap volume (claim mode only). */}}
+        - name: policy-seed
+          configMap:
+            name: {{ .Values.security.policy.existingConfigMap }}
+        {{- end }}
+        {{- if and $needPolicy (not $policyOnCatalog) }}
         {{- /* An out-of-band operator ConfigMap (security.policy.existingConfigMap,
                must carry the policy.existingConfigMapKey key) — directory
                volume so ConfigMap edits propagate to the mounted file and
-               PolicyStore hot-reloads them (the grants-edit workflow). */}}
+               PolicyStore hot-reloads them (the grants-edit workflow).
+               CLAIM mode renders NO volume: the file lives under the
+               catalog-store claim mount (writable; the ConfigMap is the
+               one-time seed only). */}}
         - name: policy
           configMap:
             name: {{ .Values.security.policy.existingConfigMap }}
@@ -511,16 +630,38 @@ spec:
         - name: audit-log
           emptyDir: {}
         {{- end }}
-        {{- if $needAdminKeys }}
+        {{- if .Values.security.adminKeys.existingSecret }}
         {{- /* Operator-owned Secret (security.adminKeys.existingSecret); the
                key must carry the FULL JSON keys file ({"keys": [...]}). The
                mounted file is the store's live backend — the frontend mints
                and revokes through the server's API, which writes the file
                atomically; the Secret is the bootstrap copy. Never a values-
-               rendered credential. */}}
+               rendered credential. Secret WINS when both modes are set. */}}
         - name: admin-keys
           secret:
             secretName: {{ required "security.adminKeys.existingSecret is required for the admin-keys file" .Values.security.adminKeys.existingSecret }}
+        {{- else if and .Values.security.adminKeys.existingClaim (not $adminKeysOnCatalog) }}
+        {{- /* WRITABLE store (self-service minting): an RWX PVC mounted as a
+               DIRECTORY — the API creates/updates the JSON store file in
+               place (atomic writes), shared across replicas, durable across
+               reschedules. Directory mount (never subPath) so the mtime
+               hot-reload sees every write. When the store path rides the
+               catalog-store mount ($adminKeysOnCatalog), NO extra volume —
+               a second mount of the same PVC in one pod wedges some CSI
+               drivers (live 2026-10-05). */}}
+        - name: admin-keys
+          persistentVolumeClaim:
+            claimName: {{ .Values.security.adminKeys.existingClaim }}
+        {{- end }}
+        {{- if and .Values.security.oidc.enabled .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
+        {{- /* The platform root-CA ConfigMap (ezaf-root-ca on PCAI), keyed
+               to the single .crt file the bundle path expects. */}}
+        - name: platform-ca
+          configMap:
+            name: {{ .Values.security.oidc.sso.platformCa.configMapName }}
+            items:
+              - key: {{ .Values.security.oidc.sso.platformCa.configMapKey }}
+                path: {{ .Values.security.oidc.sso.platformCa.bundleFile }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

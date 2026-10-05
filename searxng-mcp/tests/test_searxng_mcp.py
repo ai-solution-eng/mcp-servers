@@ -11,10 +11,12 @@ from typing import Any
 import httpx2
 import pytest
 
+import server
 from fetcher import WebContentFetcher, clean_markdown_cruft, extract_via_bs4
 from searxng_client import (
     SearXNGClient,
     SearXNGError,
+    engines_from_config_hint,
     format_search_response,
     normalize_language,
 )
@@ -169,6 +171,116 @@ def test_search_400_retries_without_language():
     assert len(resp.results) == 2
 
 
+# ---------------------------------------------------------------------------
+# 429 Retry-After (spec: honor the header; per-process cooldown, no valkey)
+# ---------------------------------------------------------------------------
+
+
+def test_429_with_retry_after_seconds_reports_delay_and_cooldowns():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": "17"}, text="slow down")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"429.*retry after ~17s"):
+        asyncio.run(client.search("test"))
+    # The error also pushed a cooldown into the per-process RateLimiter, so
+    # local admission pauses until the server's window resets.
+    assert client.rate_limiter._cooldown_until > time.monotonic()
+
+
+def test_429_with_http_date_retry_after_parses_delay():
+    from email.utils import formatdate
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": formatdate(time.time() + 25, usegmt=True)})
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"429.*retry after ~\d+s"):
+        asyncio.run(client.search("test"))
+    assert client.rate_limiter._cooldown_until > time.monotonic()
+
+
+def test_429_without_retry_after_keeps_generic_message():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, text="slow down")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"429 \(rate limited\); slow down\.$"):
+        asyncio.run(client.search("test"))
+    # No header → no cooldown: nothing invented to wait on.
+    assert client.rate_limiter._cooldown_until <= time.monotonic()
+
+
+def test_429_garbage_retry_after_is_tolerated():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": "soon-ish"}, text="slow down")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"429 \(rate limited\); slow down\.$"):
+        asyncio.run(client.search("test"))
+    assert client.rate_limiter._cooldown_until <= time.monotonic()
+
+
+def test_429_huge_retry_after_is_clamped_for_admission():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": "86400"}, text="come back tomorrow")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"retry after ~86400s"):
+        asyncio.run(client.search("test"))
+    # The message reports the raw value, but local admission is clamped:
+    # blocking the process for a day on one header would hurt more than the
+    # saved request.
+    remaining = client.rate_limiter._cooldown_until - time.monotonic()
+    assert 0 < remaining <= SearXNGClient.MAX_COOLDOWN_SECONDS + 1
+
+
+def test_429_infinite_retry_after_is_tolerated_not_fatal():
+    """Retry-After: inf parses as float('inf') — it must be treated as
+    unparseable garbage (generic 429 message), never an OverflowError."""
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": "inf"}, text="slow down")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match=r"429 \(rate limited\); slow down\.$"):
+        asyncio.run(client.search("test"))
+    assert client.rate_limiter._cooldown_until <= time.monotonic()
+
+
+def test_engine_names_cache_failure_returns_none_and_retries_later():
+    """A failed /config fetch leaves the cache UNKNOWN (None), so a later
+    call retries — no False sentinel pinned for the life of the process."""
+    calls = {"n": 0}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx2.Response(500, text="boom")
+        return httpx2.Response(200, json={"engines": [{"name": "google"}, {"name": "bing"}]})
+
+    client = make_client(handler)
+    assert asyncio.run(client._engine_names_from_config()) is None  # failure
+    assert client._engine_names is None  # unknown, not a pinned sentinel
+    names = asyncio.run(client._engine_names_from_config())  # retried, succeeds
+    assert names == {"google", "bing"}
+    assert calls["n"] == 2
+    # and a successful empty engine list is ALSO unknown (nothing to hint on)
+    def empty_handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"engines": []})
+    client2 = make_client(empty_handler)
+    assert asyncio.run(client2._engine_names_from_config()) is None
+
+
+def test_cooldown_delays_next_acquire():
+    from searxng_client import RateLimiter
+
+    rl = RateLimiter(1000)
+    rl.push_cooldown(0.15)
+    start = time.monotonic()
+    asyncio.run(rl.acquire())
+    assert time.monotonic() - start >= 0.1
+
+
 def test_search_unreachable_raises():
     def handler(request: httpx2.Request) -> httpx2.Response:
         raise httpx2.ConnectError("connection refused")
@@ -176,6 +288,51 @@ def test_search_unreachable_raises():
     client = make_client(handler)
     with pytest.raises(SearXNGError, match="could not reach SearXNG"):
         asyncio.run(client.search("test"))
+
+
+def test_search_404_not_retried_and_named():
+    """A 404 from a misconfigured instance is a request problem: raise the
+    specific status once — never retried (identically) then reported
+    generically like a 400."""
+    calls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(dict(request.url.params))
+        return httpx2.Response(404, text="no such endpoint")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match="404") as exc_info:
+        asyncio.run(client.search("test", language="en-US"))
+    assert len(calls) == 1  # exactly one upstream call — no blind retry
+    assert "not retrying" in str(exc_info.value)
+
+
+def test_search_401_not_retried_and_named():
+    calls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(dict(request.url.params))
+        return httpx2.Response(401, text="unauthorized")
+
+    client = make_client(handler)
+    with pytest.raises(SearXNGError, match="401"):
+        asyncio.run(client.search("test"))
+    assert len(calls) == 1
+
+
+def test_search_400_still_retryable_only_4xx():
+    """400 remains the ONLY 4xx that returns None (retryable) from
+    _request — contract of the language-drop retry."""
+
+    async def exercise():
+        data = await client._request({"q": "x"})
+        assert data is None
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(400, text="bad language")
+
+    client = make_client(handler)
+    asyncio.run(exercise())
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +363,47 @@ def test_format_response_max_results_slice():
 def test_format_response_empty():
     resp = SearXNGClient._parse({"results": []}, "q")
     out = format_search_response(resp, 10)
-    assert out == "No results were found. Try rephrasing your search query."
+    # The leading sentence is BYTE-STABLE (things grep it); the empty branch
+    # now APPENDS explicit next-step guidance after it.
+    assert out.startswith("No results were found. Try rephrasing your search query.")
+    assert "do not re-run the identical query" in out
+    assert "change category, region, or time_range" in out
 
     resp_unresponsive = SearXNGClient._parse({"results": [], "unresponsive_engines": [["bing", "timeout"]]}, "q")
     assert "bing" in format_search_response(resp_unresponsive, 10)
+
+
+def test_format_response_empty_surfaces_corrections_and_suggestions():
+    """The exact retry-loop state: empty results WITH a correction/suggestion
+    available — the formatter used to drop both."""
+    resp = SearXNGClient._parse(
+        {"results": [], "corrections": ["python mpc"], "suggestions": ["python mcp server", "python sdk"]},
+        "q",
+    )
+    out = format_search_response(resp, 10)
+    assert "Did you mean: python mpc?" in out
+    assert "Related searches: python mcp server | python sdk" in out
+    # Guidance is appended even when corrections/suggestions exist.
+    assert "do not re-run the identical query" in out
+    # Byte-stable leading sentence still opens the output.
+    assert out.startswith("No results were found.")
+
+
+def test_format_response_empty_unresponsive_note_stays_before_guidance():
+    resp = SearXNGClient._parse(
+        {
+            "results": [],
+            "corrections": ["pyton"],
+            "unresponsive_engines": [["brave", "suspended"]],
+        },
+        "q",
+    )
+    out = format_search_response(resp, 10)
+    suspended_note = out.index("temporarily suspended/rate-limited")
+    correction = out.index("Did you mean: pyton?")
+    guidance = out.index("do not re-run the identical query")
+    # Existing unresponsive note stays; new content appends after it.
+    assert suspended_note < correction < guidance
 
 
 def test_format_response_answers_and_corrections():
@@ -224,6 +418,117 @@ def test_format_response_answers_and_corrections():
     out = format_search_response(resp, 10)
     assert "Answer: 42" in out
     assert "Did you mean: python mpc?" in out
+
+
+# ---------------------------------------------------------------------------
+# backend engine-name sanity (empty search + typo'd engine allowlist)
+# ---------------------------------------------------------------------------
+
+
+CONFIG_RESPONSE = {
+    "engines": [
+        {"name": "google", "enabled": True},
+        {"name": "brave.images", "enabled": True},
+        {"name": "wikipedia", "enabled": True},
+    ]
+}
+
+
+def test_engine_hint_no_match():
+    hint = engines_from_config_hint("braveimages", {"google", "brave.images", "wikipedia"})
+    assert "braveimages" in hint
+    assert "none match SearXNG's engine list" in hint
+    assert "'brave.images', not 'braveimages'" in hint
+
+
+def test_engine_hint_match_or_unknown_config_is_silent():
+    # Any named engine existing → no hint (partial matches still search).
+    assert engines_from_config_hint("google,braveimages", {"google"}) == ""
+    # Unknown engine list (/config failed) → no hint, never a false alarm.
+    assert engines_from_config_hint("braveimages", None) == ""
+    assert engines_from_config_hint("braveimages", set()) == ""
+    # auto / empty engines param → no hint.
+    assert engines_from_config_hint("", {"google"}) == ""
+
+
+def test_empty_backend_search_surfaces_engine_hint_end_to_end():
+    """backend='braveimages' (typo) returns zero results → the formatter
+    appends the /config-based spelling hint."""
+    calls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(str(request.url.path))
+        if request.url.path == "/config":
+            return httpx2.Response(200, json=CONFIG_RESPONSE)
+        return httpx2.Response(200, json={"results": [], "query": "q"})
+
+    client = make_client(handler)
+
+    async def run():
+        resp = await client.search("q", engines="braveimages")
+        return format_search_response(
+            resp, 10, engine_hint=engines_from_config_hint("braveimages", await client._engine_names_from_config())
+        )
+
+    out = asyncio.run(run())
+    assert "/config" in calls  # fetched once for the engine list
+    assert out.startswith("No results were found.")
+    assert "none match SearXNG's engine list" in out
+    assert "brave.images" in out
+
+
+def test_engine_names_from_config_cached_and_failure_tolerated():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/config":
+            return httpx2.Response(200, json=CONFIG_RESPONSE)
+        return httpx2.Response(200, json={"results": []})
+
+    client = make_client(handler)
+    names = asyncio.run(client._engine_names_from_config())
+    assert names == {"google", "brave.images", "wikipedia"}
+    # Second call serves the cache without a second fetch (same handler, but
+    # assert via the sentinel: swap _engine_names and re-call).
+    client._engine_names = {"cached-only"}
+    assert asyncio.run(client._engine_names_from_config()) == {"cached-only"}
+
+    # Failure tolerance: a 500 /config or a transport error → None, silently.
+    def failing_handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/config":
+            return httpx2.Response(500, text="boom")
+        return httpx2.Response(200, json={"results": []})
+
+    failing = make_client(failing_handler)
+    assert asyncio.run(failing._engine_names_from_config()) is None
+
+    def raising_handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("refused")
+
+    raising = make_client(raising_handler)
+    assert asyncio.run(raising._engine_names_from_config()) is None
+
+
+def test_mcp_search_backend_typo_end_to_end_mocked(monkeypatch):
+    """Full MCP path: search(backend='braveimages') on an empty hit appends
+    the engine-name hint to the tool output."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/config":
+            return httpx2.Response(200, json=CONFIG_RESPONSE)
+        return httpx2.Response(200, json={"results": [], "query": "q"})
+
+    real_client = make_client(handler)
+    monkeypatch.setattr(server, "searcher", real_client)
+
+    async def run():
+        return await server.search(
+            query="anything",
+            ctx=DummyCtx(),
+            backend="braveimages",
+        )
+
+    out = asyncio.run(run())
+    assert out.startswith("No results were found.")
+    assert "none match SearXNG's engine list" in out
 
 
 # ---------------------------------------------------------------------------

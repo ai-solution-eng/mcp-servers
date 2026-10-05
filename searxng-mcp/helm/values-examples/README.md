@@ -27,6 +27,24 @@ Real per-site values — the actual `searxng.secretKey` and any site-specific tu
 3. Pick the closest example, adjust every `# SITE:` line (endpoint host, secretKey, proxy need, browser sidecar).
 4. Paste the **whole document** into the chart's *Helm Values* editor and apply — it is a complete values document, not an overlay, because the PCAI values editor replaces the chart's bundled `values.yaml` entirely.
 
+## DNS-rebinding Host allowlist (`MCP_HOSTNAME` / `MCP_EXTRA_ALLOWED_HOSTS`)
+
+The server pins the Host header (`mcp_auth.transport_security_from_env`, the
+fleet-wide helper): `ezua.virtualService.endpoint` is wired as `MCP_HOSTNAME`,
+and `extraAllowedHosts` (list of strings) joins into
+`MCP_EXTRA_ALLOWED_HOSTS`. With neither set (chart defaults) the SDK's
+implicit loopback-only protection applies — behavior unchanged. When
+transport security IS active, the chart AUTO-prepends the release's own
+service DNS (`searxng-mcp-service.<ns>.svc.cluster.local:*` — the
+LLM-gateway relay hop's Host header) as the first entry, so a site setting
+`extraAllowedHosts` never loses it: that key lists only EXTRA hosts.
+In-cluster callers that address the service by a DIFFERENT svc name (or a
+bare port variant the `host:*` form does not cover) send a Host the
+pinned FQDN does NOT match — list those (use the `host:*` form to
+accept any port) in `extraAllowedHosts`, or they get HTTP 421 after the
+network zone/key gate let them through. Entries are read once at server
+startup: changing either value requires a pod restart.
+
 ## Using with helm (operators)
 
 ```bash

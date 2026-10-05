@@ -35,6 +35,11 @@ Endpoints (the complete API surface — all read-only):
                             APPLYGATE_AUDIT_FILE path — there is no
                             client-selectable path parameter, and any request
                             that tries to smuggle one is refused with 400.
+  GET  /api/audit/verify  -> server.verify_audit_chain over the SAME
+                            configured APPLYGATE_AUDIT_FILE (the hash-chain
+                            verdict JSON). Also parameter-free by design —
+                            a client-selected path is refused with 400
+                            exactly like /api/audit.
 
 Refusals are the product: the endpoints return the tools' exact
 self-describing refusal strings ({"ok": false, "refused": true, "error": ...}
@@ -355,6 +360,26 @@ def build_ui_routes(plan_fn=None, status_fn=None) -> list:
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
         return JSONResponse(payload)
 
+    async def api_audit_verify(request):
+        """The hash-chain verdict for the ONE configured audit file — the
+        same discipline as /api/audit: any client-selected path key is a
+        400 refusal, and the verified path is server configuration only."""
+        params = request.query_params
+        for p in _AUDIT_PATH_PARAMS:
+            if p in params:
+                return JSONResponse(
+                    {
+                        "error": f"query parameter '{p}' is refused — the audit-verify endpoint verifies ONLY the "
+                        "configured APPLYGATE_AUDIT_FILE path; client-selected paths are not supported"
+                    },
+                    status_code=400,
+                )
+        try:
+            verdict = await asyncio.to_thread(lambda: _server().verify_audit_chain(_audit_path()))
+        except Exception as exc:
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+        return JSONResponse(verdict)
+
     return [
         Route("/", ui),
         Route("/ui", ui),
@@ -363,4 +388,5 @@ def build_ui_routes(plan_fn=None, status_fn=None) -> list:
         Route("/api/plan", api_plan, methods=["POST"]),
         Route("/api/resource_status", api_resource_status),
         Route("/api/audit", api_audit),
+        Route("/api/audit/verify", api_audit_verify),
     ]

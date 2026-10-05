@@ -191,7 +191,7 @@ class TestClusterWideFanout:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 3. Cluster-wide list caps (D9): K8S_MCP_MAX_LIST_ITEMS, default 500
+# 3. Cluster-wide list caps (D9): K8S_MCP_MAX_LIST_ITEMS, default 100
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -229,9 +229,9 @@ class TestClusterWideListCaps:
         else:
             self.monkeypatch.setenv("K8S_MCP_MAX_LIST_ITEMS", str(value))
 
-    def test_default_cap_is_500(self):
+    def test_default_cap_is_100(self):
         os.environ.pop("K8S_MCP_MAX_LIST_ITEMS", None)
-        assert self.server._max_list_items() == 500, "default cluster-wide cap is 500"
+        assert self.server._max_list_items() == 100, "default cluster-wide cap is 100"
 
     def test_cap_hit_marker_present(self, monkeypatch):
         self._cap(2)
@@ -375,7 +375,7 @@ class TestClusterWideListCaps:
     def test_malformed_env_falls_back_to_default(self, monkeypatch):
         os.environ["K8S_MCP_MAX_LIST_ITEMS"] = "banana"
         try:
-            assert self.server._max_list_items() == 500, "malformed value keeps the default cap"
+            assert self.server._max_list_items() == 100, "malformed value keeps the default cap"
         finally:
             os.environ.pop("K8S_MCP_MAX_LIST_ITEMS", None)
 

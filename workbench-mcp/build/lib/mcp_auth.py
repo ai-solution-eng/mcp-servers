@@ -120,7 +120,7 @@ class ApiKeyAuthMiddleware:
             return
         keys = configured_keys(self._env_names)
         if not keys:
-            await self.app(scope, receive, send)  # auth disabled (dev mode)
+            await self.app(scope, receive, send)   # auth disabled (dev mode)
             return
         for candidate in presented_keys(scope):
             for valid in keys:
