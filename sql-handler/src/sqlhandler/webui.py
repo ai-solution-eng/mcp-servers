@@ -54,11 +54,14 @@ Endpoints (all JSON unless noted):
   Admin API — the administration plane (admin-designation gated via
   server.require_admin: 401 anonymous / 403 non-admin; the REST twins of
   the admin_* MCP tools):
-  GET    /api/admin/grants     -> admins, datasets doc, assignments, blocked,
-                                  groups, policy_hash, keys (minted KeyEntries
+  GET    /api/admin/grants     -> admins, datasets doc, policy_text (the WHOLE
+                                  authored policy as YAML — the editor's
+                                  prefill), assignments, blocked, groups,
+                                  policy_hash, keys (minted KeyEntries
                                   + Secret keys fp-only, source:"secret")
-  PUT    /api/admin/policy     -> replace the policy document (validated
-                                  first; atomic write; returns the new hash)
+  PUT    /api/admin/policy     -> replace the policy document (JSON or YAML;
+                                  validated first; atomic write; returns the
+                                  new hash)
   POST   /api/admin/keys       -> mint one key {label, assign?} — the raw key
                                   is returned ONCE (201)
   DELETE /api/admin/keys/{fp}  -> revoke one minted key + its assignment
@@ -80,9 +83,11 @@ import re
 import time as _time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from starlette.exceptions import HTTPException
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -113,6 +118,10 @@ from .sqlguard import assert_readonly as _guard_assert_readonly
 from .sqlguard import (
     extract_statement_spans,
 )
+
+#: The MCP tool dispatcher bridged from server.py (``_dispatch_tool``): the
+#: inspector's tool-call route offloads it to a worker thread verbatim.
+ToolDispatcher = Callable[[str, dict, Any], tuple[str, bool]]
 
 _DEFAULT_LIMIT = 100
 # Fallback UI cap when SQLHANDLER_MAX_ROWS is unset or 0 (unlimited for the
@@ -1203,8 +1212,10 @@ def register_ui(app, engine_getter) -> None:
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
         # format="arrow" renders to a plain-text IPC payload, not a dict.
+        # (api_query returns `dict | str`; the arrow branch is the `str` one —
+        # a plain Response, not a JSONResponse, is correct there.)
         if isinstance(result, str):
-            return Response(content=result, media_type="text/plain; charset=utf-8")
+            return Response(content=result, media_type="text/plain; charset=utf-8")  # type: ignore[return-value]
         return JSONResponse(result)
 
     async def preview(request) -> JSONResponse:
@@ -1797,7 +1808,7 @@ def register_ui(app, engine_getter) -> None:
     # engine_getter injection pattern); the default keeps register_ui's
     # existing call sites and tests working by importing the dispatcher
     # lazily (no import cycle at module load).
-    def _tool_dispatcher() -> object:
+    def _tool_dispatcher() -> ToolDispatcher | None:
         try:
             from .server import _dispatch_tool  # lazy: avoids the import cycle
 
@@ -1837,7 +1848,8 @@ def register_ui(app, engine_getter) -> None:
         # presented credential per call (the mutation gate).
         t0 = _time.perf_counter()
         try:
-            text, is_error = await asyncio.to_thread(dispatch, name.strip(), args, request)
+            result: tuple[str, bool] = await asyncio.to_thread(dispatch, name.strip(), args, request)
+            text, is_error = result
         except Exception as exc:  # dispatcher-level failure → MCP-shaped error
             text, is_error = f"Tool dispatch failed: {exc}", True
         # Time-to-result (perf review 2026-09): the inspector displays the
@@ -2052,7 +2064,9 @@ def register_ui(app, engine_getter) -> None:
                 _admin_assign_user_grants,
                 caller,
                 str(request.path_params["subject"]),
-                body.get("globs"),
+                # A missing "globs" is the revoke-all shape: an empty list
+                # takes the same DROP-the-subject path as `[]` downstream.
+                body.get("globs") or [],
             )
             return JSONResponse(result)
         except _AdminHTTPError as exc:

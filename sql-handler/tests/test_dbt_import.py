@@ -221,12 +221,17 @@ def test_manifest_b64_and_invalid_inputs():
 
 
 def test_dtype_without_description_becomes_placeholder():
-    m = {"nodes": {
-        "model.a.t": {
-            "resource_type": "model", "name": "t", "schema": "s", "config": {},
-            "columns": {"a": {"name": "a", "dtype": "INTEGER"}},  # dtype only, no description
+    m = {
+        "nodes": {
+            "model.a.t": {
+                "resource_type": "model",
+                "name": "t",
+                "schema": "s",
+                "config": {},
+                "columns": {"a": {"name": "a", "dtype": "INTEGER"}},  # dtype only, no description
+            }
         }
-    }}
+    }
     r = import_dbt_manifest(m)
     assert r["catalog"]["tables"]["s/t"]["columns"] == {"a": "INTEGER column"}
 
@@ -234,9 +239,11 @@ def test_dtype_without_description_becomes_placeholder():
 def test_undocumented_node_skipped_not_blank_overwritten():
     """A node with nothing to say is skipped: importing empty docs would
     clobber richer hand-written entries with nothing."""
-    m = {"nodes": {
-        "model.a.t": {"resource_type": "model", "name": "t", "schema": "s", "config": {}, "columns": {}},
-    }}
+    m = {
+        "nodes": {
+            "model.a.t": {"resource_type": "model", "name": "t", "schema": "s", "config": {}, "columns": {}},
+        }
+    }
     r = import_dbt_manifest(m)
     assert r["imported"] == 0 and r["skipped"] == 1
     assert any("no description" in w for w in r["warnings"])

@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
 def _make_engine(tmp_path, catalog=None, monkeypatch=None):
@@ -24,7 +24,7 @@ def _make_engine(tmp_path, catalog=None, monkeypatch=None):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self, **kw):
@@ -85,8 +85,7 @@ def test_matched_on_records_the_reasons(tmp_path):
     assert hits[0]["matched_on"][0] == "exact-name"
     assert hits[0]["matched_on"] == list(dict.fromkeys(hits[0]["matched_on"]))  # deduped
     assert all(
-        reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token")
-        for reason in hits[0]["matched_on"]
+        reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token") for reason in hits[0]["matched_on"]
     )
 
 

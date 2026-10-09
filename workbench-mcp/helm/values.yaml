@@ -1,317 +1,173 @@
+# workbench-mcp — persistent per-agent scratch workspaces for agent
+# harnesses (opencode, DSH): named directories on a PVC, path-confined file
+# tools, a per-workspace env store, and bounded argv command execution with
+# audit. Exposed through the PCAI Istio gateway (harnesses run locally):
+# /mcp is the stateless MCP endpoint, / the HPE-branded web UI.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-# Prefer: Slack
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. apiKey.existingSecret — the operator-created key Secret (default name
+#      workbench-mcp-apikey, key api-keys) MUST pre-exist in the release
+#      namespace or the pod sits in CreateContainerConfigError; every route
+#      except /health + /healthz is keyed [chart never creates or inlines the key]
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
+#      default FALSE — set ezua.enabled: true in site values);
+#      templates/virtualservice.yaml calls `required` on it
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Exec governance: workbench.execAllowlist / execDenylist — documentation/DEPLOYMENT.md
+#   Sandbox python exec: executors.* + workbench.sandboxExec (BOTH gates) — README "Sandbox exec" | documentation/DEPLOYMENT.md
+#   Workspace templates: workbench.templates — documentation/DEPLOYMENT.md + the comment block below
+#   Persistence (RWX; workbench.root MUST match persistence.mountPath): persistence.* — documentation/DEPLOYMENT.md
+#   Proxy + MITM CA: proxy.*, caCert.* — documentation/DEPLOYMENT.md | values-examples/values.g2.yaml
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — README "Configuration"
+#   Web console exposure: webui.enabled — documentation/DEPLOYMENT.md (public-but-inert HTML, keyed /api/*)
 
-# workbench-mcp — persistent per-agent scratch workspaces for agent
-# harnesses (opencode, DSH): named directories on a PVC, path-confined
-# file tools, a per-workspace env store, and bounded argv command
-# execution with audit. Exposed through the PCAI Istio gateway so MCP
-# clients outside the cluster (harnesses run locally) can reach it: /mcp
-# is the stateless MCP endpoint, / the HPE-branded web UI (webui.enabled).
+# ============================================================================
+# Deployment / Images
+# ============================================================================
 
-# -- Deployment ----------------------------------------------------------------
 deployment:
   name: workbench-mcp
   appName: workbench-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
-  # this default is what a deploy WITHOUT a site values file uses, and a
-  # stale default is how an "old MCP server" pod happens.
-  tag: v0.4.0
+  tag: v0.4.0   # keep in lockstep with Chart.yaml appVersion
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously, the ddgs-mcp convention).
+# Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).
 imagePullSecrets: []
 
-# -- Web UI -------------------------------------------------------------------------------
-# HPE-branded browser console served at / by the same container: workspace
-# switcher, file tree + viewer/saver, per-workspace env table editor, a
-# run-command console, and an audit tail. The /api/* endpoints call the
-# SAME core functions the MCP tools use — path confinement, size caps, the
-# argv allowlist/denylist and the JSONL audit all still apply; the UI gets
-# NO new powers. Auth posture (K8S-MCP console pattern): the console HTML at
-# / and /ui is public-but-INERT (an in-page unlock bar collects the key — the
-# browser cannot load the page behind a 401); every /api/* data route and
-# /mcp stay API-key-gated at the pod, and the endpoint must ALSO sit behind
-# gateway authn (PCAI Istio gateway). Rendered
-# into the container as WORKBENCH_UI_ENABLED by deployment.yaml.
+# ============================================================================
+# Web UI
+# ============================================================================
+
+# HPE-branded browser console at /; the HTML is public-but-INERT while every
+# /api/* data route and /mcp stay API-key-gated at the pod (plus gateway authn).
 webui:
   enabled: true
 
-# -- Workbench configuration --------------------------------------------------------
-# Rendered into the container env by deployment.yaml (Helm does not template
-# inside values files — the prometheus-mcp lesson). WORKBENCH_ROOT MUST match
-# persistence.mountPath (both default /data): the PVC is where every
-# workspace lives. Full knob documentation in README.md.
+# ============================================================================
+# Workbench Configuration
+# ============================================================================
+
+# Rendered into container env by deployment.yaml; full knob documentation in
+# README.md.
 workbench:
-  # Root directory holding all workspaces (= the PVC mount).
-  root: /data
-  # argv[0] allowlist for run_command (comma-separated). Anything not on
-  # the list is refused — no shells by design.
+  root: /data   # the PVC mount — MUST match persistence.mountPath
+  # argv[0] allowlist — no interpreters/package managers (they sidestep the
+  # argv-level confinement); the legal python path is sandbox_run.
   execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
-  # Hard deny (WINS over the allowlist): network/escalation binaries.
-  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
-  # Per-command timeout bounds (seconds).
-  execTimeoutDefault: 60
+  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"   # hard deny — WINS over the allowlist
+  execTimeoutDefault: 60   # seconds; per-call timeout_s clamps into these bounds
   execTimeoutMax: 600
-  # Dedicated run_command pool width (WORKBENCH_EXEC_MAX_CONCURRENCY, default
-  # 4): long runs (up to execTimeoutMax) can no longer starve the file/env
-  # tools; a saturated pool returns a structured busy response without
-  # executing (no queue) and the busy outcome is audit-logged.
-  execMaxConcurrency: 4
-  # write_file cap (bytes, 8 MiB). Enforced per payload AND cumulatively on
-  # append=true chunked writes (existing + incoming ≤ cap).
-  maxFileBytes: 8388608
-  # stdout/stderr cap per run_command (bytes, 200 KiB).
-  maxOutputBytes: 204800
-  # Max entries per list_files response.
-  maxListEntries: 500
-  # Audit-JSONL rotation threshold (WORKBENCH_AUDIT_MAX_BYTES, bytes —
-  # default 100 MiB = 104857600): the active .audit.jsonl renames to
-  # .audit.jsonl.1 (single generation, previous .1 overwritten) and a fresh
-  # file starts with an audit_rotated provenance entry.
-  auditMaxBytes: 104857600
+  execMaxConcurrency: 4   # saturated pool returns a structured busy response (no queue)
+  maxFileBytes: 8388608   # write_file cap (8 MiB), per payload AND cumulative on append
+  maxOutputBytes: 204800   # stdout/stderr cap per run_command (200 KiB)
+  maxListEntries: 500   # max entries per list_files response
+  auditMaxBytes: 104857600   # .audit.jsonl rotation threshold (100 MiB, single .1 generation)
   logLevel: INFO
-  # -- Sandbox-exec server switches (pair with executors.* above) ------------------
-  # All DEFAULT OFF / defaults: with executors disabled the sandbox_run tool
-  # refuses self-describingly regardless (the fleet refusals-are-answers
-  # doctrine — the tool is registered, the switch gates it).
-  # Master switch: sandbox_run refuses unless "1".
-  sandboxExec: false
-  # Pod label selector sandbox_run balances over (must match executors.appName
-  # if you rename it) — Ready pods only, least-loaded pick.
-  sandboxLabel: "app=workbench-exec"
-  # Target container inside each executor pod (must match
-  # executors.containerName if you rename it).
-  sandboxContainer: python
-  # Per-run wall clock (seconds; the server clamps 1..600).
-  sandboxTimeoutS: 120
-  # stdout/stderr cap per run (chars each, fleet k8s-mcp exec convention of
-  # 50000; the explicit " ...[truncated N chars]" marker is appended when hit).
-  sandboxMaxOutputChars: 50000
-  # -- Workspace templates (Wave-5 F3, ADDITIVE, DEFAULT OFF) ----------------------
-  # Named operator templates for workspace_create(name, template=<name>).
-  # Rendered into the WORKBENCH_TEMPLATES env as JSON — ONLY when the object
-  # is non-empty; the default render below is byte-identical to the
-  # pre-templates baseline (nothing renders, the tool parameter is refused).
-  #
-  # A template may only (a) WIDEN the exec allowlist of the workspaces
-  # created with it — extra_allowed entries are operator-supplied BARE binary
-  # names, and WORKBENCH_EXEC_DENYLIST still wins — and (b) pre-run canned
-  # setup argv commands INSIDE the new workspace through the exact run_command
-  # machinery (D7 confinement, server-PATH allowlist resolution, timeouts,
-  # output caps, audit; each setup run is audited with the template name).
-  # Only the template NAME persists in the workspace; the widened allowlist
-  # is re-derived from this config on every call. Example:
-  #
-  #   templates:
-  #     pytools:
-  #       description: "git scratch with a prepared src/ tree"
-  #       extra_allowed: ["pytest"]
-  #       canned_setup:
-  #         - ["mkdir", "src"]
-  #         - ["git", "init", "-q"]
+  sandboxExec: false   # master switch — renders WORKBENCH_SANDBOX_EXEC=1 (tool refuses without it)
+  sandboxLabel: "app=workbench-exec"   # must match executors.appName if renamed
+  sandboxContainer: python   # must match executors.containerName if renamed
+  sandboxTimeoutS: 120   # per-run wall clock; server clamps 1..600
+  sandboxMaxOutputChars: 50000   # stdout/stderr cap per run, chars each
+  # Operator templates for workspace_create (denylist still wins); e.g.
+  #   templates: {pytools: {description: "git scratch", extra_allowed: ["pytest"], canned_setup: [["mkdir", "src"]]}}
   templates: {}
 
-# -- Sandbox executors (v1, ADDITIVE, DEFAULT OFF) --------------------------------
-# The no-network python execution pool behind the `sandbox_run` MCP tool.
-# When enabled the chart renders (helm/templates/executors.yaml):
-#   - Deployment `workbench-exec`: SAME container image as the workbench
-#     server (one image, different command — no new image to build), 2+
-#     replicas sleeping forever in their own namespace;
-#   - a deny-all NetworkPolicy selecting them (policyTypes [Ingress, Egress],
-#     zero rules — exec rides workbench → API server → kubelet → container
-#     runtime, so the pod needs no network);
-#   - a namespaced Role + RoleBinding giving the workbench SA get/list on
-#     pods + create on pods/exec IN THIS NAMESPACE ONLY.
-# The executors are hardened pods: no SA token (zero credentials), non-root
-# uid 10001, no privilege escalation, all caps dropped, seccomp
-# RuntimeDefault, read-only rootfs + per-pod emptyDir /tmp, modest resources,
-# NO tolerations (control-plane taints self-exclude), control-plane
-# DoesNotExist nodeAffinity (workers only), hostname topologySpread, and NO
-# GPU resource keys anywhere (no request = structurally no GPU).
-#
-# ⚠️ Trust posture (the one change): the workbench SA gains pods/exec in its
-# OWN namespace — RBAC cannot select by label, so this permits exec into any
-# pod of the namespace, which holds only workbench + executor pods by design.
-# Bounded to one namespace; documented in the README.
-#
-# Pair with the server-side kill switch: executors.enabled=true renders the
-# pool, but the TOOL stays refused until the deployment also carries
-# WORKBENCH_SANDBOX_EXEC=1 (workbench.sandboxExec). Default OFF everywhere:
-# the default chart render is byte-identical to the baseline.
+# ============================================================================
+# Sandbox Executors
+# ============================================================================
+
+# No-network python pool (same image, deny-all netpol, namespace-only pods/exec);
+# two gates: executors.enabled renders the pool AND workbench.sandboxExec arms the tool.
 executors:
   enabled: false
   appName: workbench-exec
-  # Name of the single container in each executor pod (the exec target of
-  # sandbox_run). Renaming it means re-pointing WORKBENCH_SANDBOX_CONTAINER.
-  containerName: python
-  # Executor image — defaults to the workbench image (same repo/tag): the
-  # executors need only stdlib python, and reusing the server image means
-  # nothing new is built or published. ⚠️ Helm does NOT template inside
-  # values files (the prometheus-mcp lesson): the {{ }} default is expanded
-  # by the TEMPLATE (executors.yaml runs `tpl` on this value at the
-  # consumption point). A plain "repo:tag" string in a site values file also
-  # works — tpl passes plain strings through unchanged.
+  containerName: python   # exec target container; renaming re-points WORKBENCH_SANDBOX_CONTAINER
+  # Defaults to the workbench image — expanded by the TEMPLATE via `tpl`
+  # (Helm does not template inside values files); a plain "repo:tag" also works.
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
   replicas: 2
-  # CPU-based autoscaling for the pool (default off — a fixed pool of 2 is
-  # the v1 posture; flips render an autoscaling/v2 HPA).
-  autoscaling:
-    enabled: false
-    minReplicas: 2
-    maxReplicas: 4
-    targetCPUUtilizationPercentage: 70
+  autoscaling: {enabled: false, minReplicas: 2, maxReplicas: 4, targetCPUUtilizationPercentage: 70}
 
-# -- Per-key proxy wiring -------------------------------------------------------------------------
-# Each key is wired into the pod only when non-empty, so a corporate-proxy
-# site sets http/https (and usually noProxy), while a direct-egress site
-# leaves proxy: {} (or omits it) and everything renders off:
-#   proxy:
-#     http: http://proxy.corp.example:8080
-#     https: http://proxy.corp.example:8080
-#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
-# Whatever is wired lands on the pod AND the server passes those variables
-# through to run_command children — this is what makes `pip install ...` work
-# inside a workspace on a cluster with no direct internet egress.
+# ============================================================================
+# Egress / In-cluster Access
+# ============================================================================
+
+# Per-key wiring — non-empty keys reach the pod AND run_command children
+# (this is what makes `pip install ...` work behind a corporate proxy).
 proxy: {}
-# Per-key proxy wiring — each key (http/https/noProxy) is wired into the pod
-# only when non-empty, so a corporate-proxy site sets http/https (and usually
-# noProxy), while a direct-egress site leaves proxy: {} and everything renders
-# off. Standard cluster-local noProxy exclusions (searxng-mcp convention):
-# ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
-# -- In-cluster host allowlist (DNS-rebinding additions; K8S-MCP pattern) ---
-# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts, for
-# in-cluster callers that address the server by its service DNS name instead
-# of the public FQDN (e.g. a peer MCP →
-# http://other-mcp.<ns>.svc.cluster.local:9103/mcp). Joined into
-# MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the `host:*`
-# form to accept any port. The pinned public FQDN (ezua.virtualService.endpoint,
-# wired as MCP_HOSTNAME when ezua is enabled) and loopback are always allowed;
-# with neither key set the SDK's implicit dev-mode protection applies (None —
-# behavior unchanged). List of strings.
-#
-# NOTE — the chart AUTO-INCLUDES this release's own service DNS
-# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
-# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
-# endpoint pinned or extraAllowedHosts non-empty): the LLM-gateway relay
-# arrives with Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
-# (pod-log confirmed 2026-10 — the fleet 421 Misdirected Request class), and
-# without that entry every relay hop gets 421. This key only lists hosts
-# BEYOND that; a site setting extraAllowedHosts never loses the own-svc
-# entry (the chart prepends it):
+# EXTRA Host values for the SDK's DNS-rebinding protection (in-cluster callers);
+# own-service DNS + loopback are auto-included — without this knob, unchanged.
 extraAllowedHosts: []
 
-# -- Corporate MITM CA ---------------------------------------------------------------------------
-# INDEPENDENT of the proxy wiring (enable one, both, or neither). Enable
-# caCert simply when the workloads must trust a corporate MITM CA: when
-# enabled, mounts the namespace's `ezaf-root-ca` ConfigMap (present on EzUA
-# clusters — copy it into the release namespace if needed, see searxng-mcp
-# helm/values.yaml for the kubectl recipe) and points SSL_CERT_FILE /
-# REQUESTS_CA_BUNDLE / PIP_CERT at it for the container AND every
-# run_command child. Default false.
+# Corporate MITM CA — independent of the proxy wiring; mounts the namespace's
+# ezaf-root-ca ConfigMap for the container AND every run_command child.
 caCert:
   enabled: false
   configMap: "ezaf-root-ca"
   configMapKey: "ezaf-root-ca.crt"
 
-# -- Kyverno vendor-label policy -------------------------------------------------------------------
-# ClusterPolicy (pre-install hook) that stamps the hpe-ezua/* vendor labels
-# onto Pods/Deployments/Services in the release namespace — the same policy
-# the searxng-mcp and prometheus-mcp charts ship. OFF by default here so
-# the default render is unchanged (and clusters without the kyverno CRD
-# still install); flip on where the EzUA vendor-label convention applies.
+# ============================================================================
+# Kyverno Vendor-Label Policy
+# ============================================================================
+
+# Pre-install ClusterPolicy stamping the hpe-ezua/* vendor labels (same policy
+# the searxng-mcp and prometheus-mcp charts ship); off by default.
 kyverno:
   enabled: false
 
-# -- Service exposure -------------------------------------------------------------------
+# ============================================================================
+# Service Exposure
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9103
   targetPort: 9103
 
-# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
-# Prometheus self-metrics on the MCP container: ONE counter family,
-# workbench_mcp_tool_requests_total{tool,outcome} — per-tool request counts
-# with outcome ok|error (which tools agents call, how often, how often they
-# fail). No arguments, file names, workspace names, env values, or error text
-# are ever exported. DEFAULT false: the chart renders NOTHING extra (no env,
-# no ServiceMonitor) and the server serves no /metrics route — the default
-# render is byte-identical to the pre-metrics baseline. Flip to true per site
-# values to enable; /metrics is then served key-free (like the probes) on the
-# same port so the ServiceMonitor can scrape it — the counters carry nothing
-# sensitive, and the route does not exist unless you opted in.
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# ONE counter family on the MCP container (workbench_mcp_tool_requests_total);
+# true serves /metrics key-free on the same port for the ServiceMonitor scrape.
 metrics:
   enabled: false
-  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
   serviceMonitor: true
-  # Scrape interval rendered into the ServiceMonitor.
   interval: 30s
 
-# -- Fleet audit-JSONL searchability convention (Wave-3 C3, documentation only) -----
-# This server writes a best-effort JSONL audit trail at <root>/.audit.jsonl
-# (root = persistence.mountPath → /data/.audit.jsonl on the PVC by default):
-# one JSON object per audited event — workspace_create / workspace_delete /
-# file_delete / run_command / run_command_refused / run_command_busy — with ts,
-# event, workspace, argv, exit_code, timed_out and duration_ms fields. That file
-# is the fleet's workbench "who ran what" trail, and the fleet convention
-# (fleet-audit item 11, plan §7 C3) is that audit JSONLs must be SEARCHABLE,
-# not just written: operators mount/expose the file for logsearch to search —
-# e.g. a log-tailing sidecar (or node agent) that ships .audit.jsonl lines to a
-# pod's stdout in a namespace the logsearch policy allows, whereupon
-# search_logs / count_matches over that namespace make the workbench trail
-# queryable. Since audit rotation (WORKBENCH_AUDIT_MAX_BYTES, default 100 MiB)
-# the trail ALSO has a previous generation at <root>/.audit.jsonl.1 (single
-# generation, overwritten on each rotation; its successor's first entry is an
-# audit_rotated event carrying rotated_from = sha256 of .1's last line) —
-# ship BOTH paths to the tailer so no generation is silently unsearched.
-# Deliberately documentation-only (NO behavior change): the path is derived by
-# the server from workbench.root (= persistence.mountPath), and nothing in
-# this chart renders from an audit.* key — an unconsumed values key would be
-# dead config, the exact anti-pattern the fleet audit flags. applygate's side
-# of this convention is owned by the applygate chart/agent.
-#
-#   audit:
-#     path: /data/.audit.jsonl      # informational: <persistence.mountPath>/.audit.jsonl
-#     path_prev: /data/.audit.jsonl.1  # previous generation after rotation
+# ============================================================================
+# Audit Trail
+# ============================================================================
 
-# -- Resources (modest: a scratch pad, not a compute node) -------------------------
+# JSONL trail at <root>/.audit.jsonl (+ .1 after rotation) — documentation-only
+# (nothing renders from an audit.* key; ship BOTH paths to a logsearch tailer).
+
+# ============================================================================
+# Resources / Security Context
+# ============================================================================
+
+# Modest: a scratch pad, not a compute node.
 resources:
-  requests:
-    cpu: 250m
-    memory: 256Mi
-  limits:
-    cpu: "1"
-    memory: 512Mi
+  requests: {cpu: 250m, memory: 256Mi}
+  limits: {cpu: "1", memory: 512Mi}
 
-# -- Security context -----------------------------------------------------------------
-# Scratch pad by design: non-root (matches the image's uid-10001 user), and
-# fsGroup 10001 so the mounted PVC is writable by that user.
+# Pod-level: non-root uid 10001, fsGroup 10001 so the mounted PVC is writable.
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   fsGroup: 10001
-  seccompProfile:
-    type: RuntimeDefault
+  seccompProfile: {type: RuntimeDefault}
 
-# Container-level hardening (fleet-audit P0): the pod mounts NO service-account
-# token (the server makes zero k8s calls — an automounted token behind the
-# python3 allowlist entry was a live credential-exfiltration path), the root
-# filesystem is read-only (run_command can then only write the PVC + /tmp), and
-# privilege escalation is impossible. /tmp is a per-pod emptyDir and HOME points
-# there so tempfile usage inside run_command keeps working under the read-only
-# rootfs. NOTE (fleet decision D18, 2026-09-13): pip/python3 are NOT in the
-# default execAllowlist anymore — re-add via this value if your deployment
-# genuinely needs them (an allow-listed interpreter can sidestep the
-# argv-level workspace confinement; see README "Honest limits").
-# rootfs (their writes reset with the pod — the workspaces themselves persist
-# on the PVC).
+# Container-level: NO SA token (zero k8s calls), read-only rootfs (run_command
+# writes only the PVC + /tmp), no privilege escalation.
 containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
@@ -319,84 +175,60 @@ containerSecurityContext:
     drop:
     - ALL
 
-# -- API keys -----------------------------------------------------------------------
-# Every route except /health+/healthz requires a key (fleet pattern: K8S-MCP).
-# The chart NEVER creates a key and NEVER inlines one in values — an envsubst
-# apply once emptied a live key Secret (the K8S-MCP lesson). The deployment
-# references an operator-created Secret and fails loud
-# (CreateContainerConfigError) until it exists:
-#   kubectl -n <ns> create secret generic workbench-mcp-apikey \
-#     --from-literal=api-keys='key-old,key-new'
-# Comma-SEPARATED keys all authenticate: that is the rotation mechanism —
-# append the new key, move clients over, drop the old one, no downtime.
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# Every route except /health + /healthz requires a key (comma-separated keys are
+# the rotation mechanism); the chart never creates one:
 apiKey:
   existingSecret: workbench-mcp-apikey
   existingSecretKey: api-keys
 
-# -- Persistence ---------------------------------------------------------------------
-# THE point of the workbench: workspaces must survive pod restarts. RWX so
-# every replica sees the same workspaces (MCP is stateless — any replica
-# serves any request). Single-replica clusters without an RWX class can
-# drop to ReadWriteOnce with replicaCount: 1.
+# ============================================================================
+# Persistence
+# ============================================================================
+
+# Workspaces survive pod restarts; RWX so every replica sees the same state
+# (single-replica clusters without an RWX class can use ReadWriteOnce).
 persistence:
   enabled: true
   size: 10Gi
   mountPath: /data
+  # storageClass: ""    # uncomment to pin a class; default cluster class otherwise
   accessModes:
     - ReadWriteMany
-  # storageClass: ""    # uncomment to pin a class; default cluster class otherwise
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
-# Deploys the Istio VirtualService through the ezaf-gateway. OFF by default:
-# flip it on in a site values file (helm/local convention) with the literal
-# cluster domain. The /mcp timeout is generous because run_command can
-# legitimately run to WORKBENCH_EXEC_TIMEOUT_MAX (600s default).
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Deploys the Istio VirtualService through the ezaf-gateway; OFF by default.
+# The /mcp timeout is generous (run_command can run to execTimeoutMax).
 ezua:
   enabled: false
   domainName: "${DOMAIN_NAME}"
   virtualService:
-    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
-    # ezua.enabled keeps driving every other gate (kyverno, deployment).
-    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
-    # `default` treats an explicit `false` as empty and would return true.
+    # Gate DIRECTLY on this key — Sprig's `default` treats an explicit false
+    # as empty; false unrenders the VS while ezua.enabled drives the other gates.
     enabled: true
     endpoint: "workbench-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
 
-# -- MCP network zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF) ------------
-# Ingress allowlist for this MCP (kubernetes.io/metadata.name ns selectors).
-# Once enabled, anything not matched below is DENIED (a real posture, not a
-# no-op); egress stays unrestricted (policyTypes: [Ingress] only).
+# Ingress allowlist (ns selectors): once enabled anything not matched is DENIED;
+# include the scrape ns whenever a ServiceMonitor ships, or it dies SILENTLY.
 networkPolicy:
   enabled: false
   sameNamespace: true
-  # The MCP network zone: client namespaces allowed to call this server
-  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
-  # namespace goes here first; add agentic frontends from the hardened-G2
-  # example. `monitoring` belongs here whenever the chart ships a
-  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
-  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
   authorizedClients:
-    namespaces: []
-  # Browser/console path stays OPEN (fleet doctrine 2026-09): the zone exists
-  # to stop RANDOM IN-CLUSTER model access — external traffic keeps flowing
-  # through the SSO-gated edge gateway exactly as pre-zone. Only flip to
-  # false as an explicit, per-chart, per-site decision (e.g. exec/mutation
-  # consoles) — never as a class default.
-  allowEzafGatewayIngress: true
+    namespaces: []   # LLM-gateway relay ns goes here first
+  allowEzafGatewayIngress: true   # browser/console path stays OPEN (external traffic rides the SSO-gated edge)
   ingressGatewayNamespace: istio-system
-  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
-  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
-  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
   ingressGatewayLabels:
-    app: istio-ingressgateway
-  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
-  # with an empty probeExceptCidrs (the template fails the render).
-  probeCidrs: []
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  probeCidrs: []   # node-originated kubelet probes; NEVER 0.0.0.0/0 with empty probeExceptCidrs
   probeExceptCidrs: []
   egress:
-    # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
-    # k8s API / Prometheus / internet legitimately per site).
-    enabled: false
+    enabled: false   # intentionally unrestricted (admin MCPs reach k8s API/Prometheus/internet per site)
     extraEgress: []

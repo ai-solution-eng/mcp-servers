@@ -27,10 +27,10 @@ import pytest
 
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
-class CountingProvider:
+class CountingProvider(DataProvider):
     """Fake provider that counts dataset opens (execution side-effect probe)."""
 
     kind = "fake"
@@ -228,7 +228,7 @@ def test_plan_skip_on_virtual_materialization(tmp_path, monkeypatch):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -244,13 +244,7 @@ def test_plan_skip_on_virtual_materialization(tmp_path, monkeypatch):
 
     cat = tmp_path / "catalog.yaml"
     cat.write_text(
-        yaml.safe_dump(
-            {
-                "tables": {
-                    "open_orders": {"definition": "SELECT id FROM work_order WHERE amount > 15"}
-                }
-            }
-        )
+        yaml.safe_dump({"tables": {"open_orders": {"definition": "SELECT id FROM work_order WHERE amount > 15"}}})
     )
     monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))
     eng2 = SqlEngine(P(), cache_ttl=0)
@@ -299,7 +293,7 @@ def sqlite_attached(tmp_path_factory):
     monkey.undo()
 
 
-class _NoTablesProvider:
+class _NoTablesProvider(DataProvider):
     kind = "stub"
 
     def list_tables(self):
@@ -321,9 +315,7 @@ def test_attached_db_degrades_to_confidence_none(sqlite_attached):
 
 
 def test_mixed_lake_and_attached_query_degrades(sqlite_attached):
-    r = sqlite_attached.explain_query(
-        "SELECT * FROM sdb.main.agent_test a JOIN work_order w ON a.k = w.id"
-    )
+    r = sqlite_attached.explain_query("SELECT * FROM sdb.main.agent_test a JOIN work_order w ON a.k = w.id")
     assert r["touches_external"] is True
     assert r["tables"] == []
 

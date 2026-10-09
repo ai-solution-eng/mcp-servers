@@ -872,9 +872,11 @@ _TOOLS = [
         name="admin_grants",
         description=(
             "ADMIN (policy-designated admins only). The whole grants view: "
-            "designated admins, the raw datasets document (or null), the "
-            "assignments map (identity -> globs), the blocked globs, group "
-            "names, the policy hash, and every API key (minted keys with "
+            "designated admins, the raw datasets document (or null), "
+            "policy_text (the WHOLE authored policy document as YAML — the "
+            "editable truth the UI editor prefills from), the assignments "
+            "map (identity -> globs), the blocked globs, group names, the "
+            "policy hash, and every API key (minted keys with "
             "label/created_at/created_by/source:file; bootstrap Secret keys "
             "fp-only with source:secret — not removable here). Never returns "
             "a raw key."
@@ -885,11 +887,12 @@ _TOOLS = [
         name="admin_policy_set",
         description=(
             "ADMIN (policy-designated admins only). Replace the policy "
-            "document: pass the FULL document as a JSON string (datasets "
-            "form AND/OR groups form + optional admins list — the same "
-            "shapes the policy file accepts). Validated FIRST (an invalid "
-            "document is refused with the loader's message and the previous "
-            "policy keeps enforcing), then written atomically; the mtime "
+            "document: pass the FULL document as a JSON or YAML string "
+            "(datasets form AND/OR groups form + optional admins list — the "
+            "same shapes the policy file accepts; admin_grants' policy_text "
+            "round-trips as-is). Validated FIRST (an invalid document is "
+            "refused with the loader's message and the previous policy "
+            "keeps enforcing), then written atomically; the mtime "
             "hot-reload picks it up. Returns the new policy hash."
         ),
         input_schema={
@@ -898,9 +901,11 @@ _TOOLS = [
                 "policy": {
                     "type": "string",
                     "description": (
-                        "The FULL policy document as a JSON string, e.g. "
-                        '\'{"datasets": {"global": ["workorder/*"], '
-                        '"assignments": {...}}, "admins": ["sha256:..."]}\'.'
+                        "The FULL policy document as a JSON or YAML string, "
+                        'e.g. \'{"datasets": {"global": ["workorder/*"], '
+                        '"assignments": {...}}, "admins": ["sha256:..."]}\' '
+                        "or the same document in YAML (as admin_grants' "
+                        "policy_text serves it)."
                     ),
                 },
             },
@@ -2642,7 +2647,11 @@ def _admin_presented_key(request) -> str:
     call sites/tests) — see :func:`_admin_presented_keys` for the real
     multi-credential resolution."""
     candidates = _admin_presented_keys(request)
-    return candidates[0] if candidates else ""
+    # The dict's two lists in order (bearer first, then api_key); a plain
+    # concatenation keeps the candidate order mypy can't see behind the
+    # dict[str, list[str]] index.
+    ordered = candidates["bearer"] + candidates["api_key"]
+    return ordered[0] if ordered else ""
 
 
 def _admin_resolve_caller(request, presented: dict[str, list[str]]):
@@ -2859,6 +2868,13 @@ def _admin_grants_payload() -> dict:
     ``admins`` is read DEFENSIVELY (``getattr(pol, "admins", ())``): the
     field lands with the policy-side change and older snapshots of the
     module must not break the route.
+
+    ``policy_text`` is the WHOLE authored document (the parsed policy file
+    — datasets doc AND the top-level admins list, or the hand-written
+    groups form) serialized as editable YAML, so the UI's policy editor
+    prefills with what is actually enforcing instead of a fragment. The
+    ``datasets``-only mirror stays in the payload for the older clients and
+    the programmatic twins; new code should present ``policy_text``.
     """
     pol = _policy.policy_store().get()
     entries: list[dict] = []
@@ -2867,9 +2883,17 @@ def _admin_grants_payload() -> dict:
         # so a caller mutating the payload can never touch the cache.
         entries.append(dict(e) if isinstance(e, dict) else {"fp": str(e)})
     entries.extend(_admin_secret_keys())
+    authored = getattr(pol, "authored", None)
+    datasets_mirror = getattr(pol, "datasets", None)
     return {
         "admins": list(getattr(pol, "admins", ()) or ()),
-        "datasets": getattr(pol, "datasets", None),
+        "datasets": datasets_mirror,
+        # The editable truth (YAML). Defensive getattr like ``admins``:
+        # a Policy snapshot from before the ``authored`` field must not
+        # break the route — fall back to the datasets mirror, else empty.
+        "policy_text": _policy.dump_doc(authored)
+        if isinstance(authored, dict)
+        else (_policy.dump_doc(datasets_mirror) if isinstance(datasets_mirror, dict) else ""),
         "assignments": _policy_assignments_view(pol),
         "blocked": list((getattr(pol, "datasets", None) or {}).get("blocked") or []),
         "groups": _policy_groups_view(pol),
@@ -3231,7 +3255,13 @@ def _admin_write_policy(text: str) -> dict:
     with store._lock:
         store._policy = pol
         st = os.stat(path) if path else None
-        store._stat = (path, st.st_mtime, st.st_size) if st is not None else None
+        # Explicit guard rather than a one-line conditional: the tuple
+        # literal would otherwise carry `path`'s Optional into a
+        # tuple[str, float, int] slot.
+        if st is not None and path is not None:
+            store._stat = (path, st.st_mtime, st.st_size)
+        else:
+            store._stat = None
         store._broken_since = None
     return {"ok": True, "policy_hash": pol.hash, "admins": list(getattr(pol, "admins", ()) or ())}
 
@@ -3314,9 +3344,10 @@ def admin_grants(*, caller=None) -> str:
     """MCP twin of GET /api/admin/grants (admin-gated at the tool level).
 
     Returns the whole grants view: the designated admins, the raw datasets
-    document (or null), the assignments map, the blocked globs, the group
-    names, the policy hash, and every key (minted: full KeyEntry; Secret
-    keys: fp-only, source "secret", not removable).
+    document (or null), policy_text (the WHOLE authored policy document as
+    YAML — feeds admin_policy_set back verbatim), the assignments map, the
+    blocked globs, the group names, the policy hash, and every key (minted:
+    full KeyEntry; Secret keys: fp-only, source "secret", not removable).
 
     The gate raises AdminHTTPError — _dispatch_tool's catch-all renders it
     (via __str__) as the structured 403-shaped isError result. NEVER a bare
@@ -3334,9 +3365,10 @@ def admin_grants(*, caller=None) -> str:
 def admin_policy_set(policy: str, *, caller=None) -> str:
     """MCP twin of PUT /api/admin/policy (admin-gated at the tool level).
 
-    ``policy`` is the FULL policy document as a JSON string. Validated first
-    (an invalid document → the loader's message as an isError result, the
-    previous policy untouched and enforcing); written atomically; the
+    ``policy`` is the FULL policy document as a JSON or YAML string (the
+    YAML admin_grants' policy_text serves round-trips as-is). Validated
+    first (an invalid document → the loader's message as an isError result,
+    the previous policy untouched and enforcing); written atomically; the
     hot-reload picks it up. Returns the new policy hash.
     """
     _admin_gate(caller)
@@ -3644,49 +3676,89 @@ class _McpApiKeyMiddleware:
                 # is one env read).
                 gate_on = _admin_keys.keys_file_path() is not None and bool(_admin_keys.list_keys())
             if gate_on:
-                provided = ""
+                # D19 explicit-over-ambient (parity with _admin_presented_keys
+                # on /api and with MultimodalRAG's mcp_auth): collect EVERY
+                # presented credential — explicit X-API-Key/X-API-Token claims
+                # first, then the ambient Authorization Bearer — and resolve
+                # the first RECOGNIZED one. Picking the wire-order FIRST of
+                # authorization/x-api-key let a relay's own server-level
+                # Bearer shadow a per-key X-API-KEY override riding the same
+                # request (pcai-llm-gateway's resolve_mcp_headers emits
+                # exactly that pair: the server-level auth as Bearer, then
+                # the calling key's stored overrides merged last-wins under
+                # their own header names) — the explicit claim was never
+                # read, so every relayed call resolved as the shared server
+                # identity.
+                api_claims: list[str] = []
+                bearer_claims: list[str] = []
                 for k, v in scope.get("headers", []):
                     lk = k.lower() if isinstance(k, bytes) else k
-                    if lk == b"authorization":
+                    if lk in (b"x-api-key", b"x-api-token"):
+                        value = v.decode("latin-1").strip()
+                        if value and value not in api_claims:
+                            api_claims.append(value)
+                    elif lk == b"authorization":
                         scheme, _, token = v.decode("latin-1").partition(" ")
                         if scheme.lower() == "bearer":
-                            provided = token.strip()
+                            value = token.strip()
+                            if value and value not in bearer_claims:
+                                bearer_claims.append(value)
+                matched: str | None = None
+                store_entry: dict | None = None
+                # Explicit phase: a recognized claim wins; an UNRECOGNIZED
+                # explicit claim is a hard refusal — never redeemed as the
+                # ambient Bearer behind it (the _admin_resolve_caller
+                # posture: a wrong key is never 'the caller behind it').
+                for candidate in api_claims:
+                    if keys:
+                        matched = _identity.match_api_key(candidate, keys)
+                        if matched is not None:
+                            store_entry = None
+                            break
+                    # Store fallback per candidate: a minted key (keys file)
+                    # when no env key matched. No-op (None, zero I/O) when
+                    # the store is disabled.
+                    store_entry = _admin_keys.match_presentation(candidate)
+                    if store_entry is not None:
+                        matched = None
                         break
-                    if lk == b"x-api-key":
-                        provided = v.decode("latin-1").strip()
-                        break
-                matched = _identity.match_api_key(provided, keys) if keys else None
-                if matched is None:
-                    # Store fallback: a minted key (keys file) when no env
-                    # key matched. No-op (None, zero I/O) when the store is
-                    # disabled or nothing was presented — the env-only
-                    # deployments keep their exact behavior.
-                    entry = _admin_keys.match_presentation(provided)
-                    if entry is None:
-                        resp = JSONResponse(
-                            {"error": "unauthorized: missing or invalid API key"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": "Bearer"},
-                        )
-                        await resp(scope, receive, send)
-                        return
-                    # A store match records the minted fingerprint the SAME
-                    # way an env match records the static one (identity
-                    # spine unchanged: key-class caller). A SUBJECT-BOUND
-                    # key (self-minted by an SSO user) additionally records
-                    # its subject: the key rung then resolves a
-                    # subject-carrying Caller and policy grants BY NAME
-                    # apply to the human, not just to the fp.
-                    state = scope.setdefault("state", {})
-                    state[self.KEY_FP_STATE] = entry.get("fp")
-                    if entry.get("subject"):
-                        state[self.KEY_SUBJECT_STATE] = str(entry["subject"])
-                    await self.app(scope, receive, send)
+                if matched is None and store_entry is None and not api_claims:
+                    # Ambient phase: reached only when NOTHING explicit was
+                    # claimed — bearer-only and keyless requests keep their
+                    # exact pre-change behavior.
+                    for candidate in bearer_claims:
+                        if keys:
+                            matched = _identity.match_api_key(candidate, keys)
+                            if matched is not None:
+                                store_entry = None
+                                break
+                        store_entry = _admin_keys.match_presentation(candidate)
+                        if store_entry is not None:
+                            matched = None
+                            break
+                if matched is None and store_entry is None:
+                    resp = JSONResponse(
+                        {"error": "unauthorized: missing or invalid API key"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await resp(scope, receive, send)
                     return
                 # ADDITIVE identity feed: record WHICH key matched (its
-                # fingerprint, never the key) for the inner middleware.
+                # fingerprint, never the key) for the inner middleware. A
+                # store match records the minted fingerprint the SAME way an
+                # env match records the static one (identity spine unchanged:
+                # key-class caller). A SUBJECT-BOUND key (self-minted by an
+                # SSO user) additionally records its subject: the key rung
+                # then resolves a subject-carrying Caller and policy grants
+                # BY NAME apply to the human, not just to the fp.
                 state = scope.setdefault("state", {})
-                state[self.KEY_FP_STATE] = _identity.key_fp(matched)
+                if store_entry is not None:
+                    state[self.KEY_FP_STATE] = store_entry.get("fp")
+                    if store_entry.get("subject"):
+                        state[self.KEY_SUBJECT_STATE] = str(store_entry["subject"])
+                else:
+                    state[self.KEY_FP_STATE] = _identity.key_fp(matched)
         await self.app(scope, receive, send)
 
 

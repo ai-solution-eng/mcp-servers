@@ -77,6 +77,10 @@ class DbtImportError(ValueError):
 
 def _decode_manifest(body: object) -> dict:
     """Accept an inline manifest dict, raw JSON text, or base64 of that JSON."""
+    # `manifest` is `object` until the final isinstance(dict) check narrows
+    # it: json.loads() is typed Any and a str-typed variable would keep the
+    # reassignments unprovable to the checker.
+    manifest: object
     if isinstance(body, dict):
         manifest = body
     elif isinstance(body, (str, bytes)):
@@ -95,9 +99,7 @@ def _decode_manifest(body: object) -> dict:
             try:
                 decoded = base64.b64decode(text, validate=True).decode("utf-8")
             except Exception:
-                raise DbtImportError(
-                    f"manifest is not valid JSON or base64 (JSON error: {exc})"
-                ) from None
+                raise DbtImportError(f"manifest is not valid JSON or base64 (JSON error: {exc})") from None
             try:
                 manifest = json.loads(decoded)
             except json.JSONDecodeError as exc:
@@ -110,8 +112,10 @@ def _decode_manifest(body: object) -> dict:
 
 
 def _meta(node: dict) -> dict:
+    """The node's ``meta.<META_PREFIX>`` sub-dict, or ``{}`` when absent."""
     meta = node.get("meta")
-    return meta.get(META_PREFIX) if isinstance(meta, dict) and isinstance(meta.get(META_PREFIX), dict) else {}
+    sub = meta.get(META_PREFIX) if isinstance(meta, dict) else None
+    return sub if isinstance(sub, dict) else {}
 
 
 def _description(node: dict, meta: dict, name: str) -> str | None:
@@ -188,7 +192,12 @@ def _importable_nodes(manifest: dict, source_filter: str | None, warnings: list[
     if ephemeral:
         # Pull ephemeral models back in ONLY when an included node depends on
         # them — a virtual definition referencing them would otherwise break.
-        needed = {dep for node in included.values() for dep in node.get("depends_on", {}).get("nodes", []) if isinstance(dep, str)}
+        needed = {
+            dep
+            for node in included.values()
+            for dep in node.get("depends_on", {}).get("nodes", [])
+            if isinstance(dep, str)
+        }
         for uid in ephemeral:
             if uid in needed:
                 node = nodes[uid]
@@ -236,7 +245,9 @@ def _columns_for(node: dict) -> dict[str, str] | None:
     return out or None
 
 
-def _definition_for(node: dict, meta: dict, virtual_enabled: bool, warnings: list[str], skipped: dict[str, str]) -> str | None:
+def _definition_for(
+    node: dict, meta: dict, virtual_enabled: bool, warnings: list[str], skipped: dict[str, str]
+) -> str | None:
     """The virtual-table definition, honoring the double gate.
 
     Returns None (no definition) for anything not both requested and safe;
@@ -277,7 +288,10 @@ def _entry_for(node: dict, warnings: list[str]) -> dict:
     raw_aliases = meta.get("aliases")
     if isinstance(raw_aliases, list) and all(isinstance(a, str) and a.strip() for a in raw_aliases) and raw_aliases:
         entry["aliases"] = [a.strip() for a in raw_aliases]
-    elif raw_aliases not in (None, [],) and not isinstance(raw_aliases, list):
+    elif raw_aliases not in (
+        None,
+        [],
+    ) and not isinstance(raw_aliases, list):
         warnings.append(f"{name}: meta.sqlhandler.aliases ignored — must be a list of strings")
     return entry
 
@@ -333,7 +347,11 @@ def import_dbt_manifest(
             # would overwrite a richer hand-written one with nothing.
             skipped[name or uid] = "no description and no columns documented"
             continue
-        key = alias_map.get(name) if alias_map else None
+        # Catalog key for this node, filled from the alias override or the
+        # generated candidates; "" only while unresolved (the branches below
+        # always leave a non-empty key — name/dotted/keys[-1] are non-empty
+        # by construction, so `tables[key]` at the bottom is a str index).
+        key = (alias_map.get(name) if alias_map else "") or ""
         if definition and not (key and _VIRTUAL_NAME_RE.match(key)):
             # The engine registers virtual tables ONLY from bare-identifier
             # catalog keys — a definition under "analytics/vw_big" would be
@@ -391,7 +409,8 @@ def _validated_tables(catalog: dict) -> dict:
             raise DbtImportError(f"tables[{key!r}]: 'aliases' must be a list of strings")
         columns = entry.get("columns")
         if columns is not None and (
-            not isinstance(columns, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in columns.items())
+            not isinstance(columns, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in columns.items())
         ):
             raise DbtImportError(f"tables[{key!r}]: 'columns' must map column names to string descriptions")
         definition = entry.get("definition")

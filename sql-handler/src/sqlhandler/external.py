@@ -493,9 +493,7 @@ def _validate_params(raw: object, where: str) -> tuple[tuple[str, str], ...]:
             )
         value = raw_val if isinstance(raw_val, str) else str(raw_val)
         if len(value) > _PARAM_VALUE_MAX_LEN:
-            raise ValueError(
-                f"{where}: params value for {key!r} exceeds {_PARAM_VALUE_MAX_LEN} characters"
-            )
+            raise ValueError(f"{where}: params value for {key!r} exceeds {_PARAM_VALUE_MAX_LEN} characters")
         if not _PARAM_VALUE_RE.match(value):
             raise ValueError(
                 f"{where}: params value for {key!r} contains characters outside the allowed "
@@ -520,9 +518,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
     file_path = env.get("SQLHANDLER_ATTACH_FILE", "").strip()
     if file_path:
         with open(file_path, encoding="utf-8") as fh:
-            raw_entries.extend(
-                _entries_from_json(fh.read(), f"SQLHANDLER_ATTACH_FILE ({file_path})")
-            )
+            raw_entries.extend(_entries_from_json(fh.read(), f"SQLHANDLER_ATTACH_FILE ({file_path})"))
     inline = env.get("SQLHANDLER_ATTACH", "").strip()
     if inline:
         raw_entries.extend(_entries_from_json(inline, "SQLHANDLER_ATTACH"))
@@ -548,9 +544,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
 
         db_type = str(entry.get("type", "")).strip().lower()
         if db_type not in ATTACH_TYPES:
-            raise ValueError(
-                f"{where}: type {db_type!r} not supported (use one of {', '.join(ATTACH_TYPES)})"
-            )
+            raise ValueError(f"{where}: type {db_type!r} not supported (use one of {', '.join(ATTACH_TYPES)})")
         is_sqlite = db_type == "sqlite"
         is_ducklake = db_type == "ducklake"
         is_mongo = db_type == "mongodb"
@@ -561,9 +555,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
             # billing_project is a bigquery-only field (the extension's
             # billing/quota-project ATTACH option) — reject it everywhere
             # else rather than silently ignoring it.
-            raise ValueError(
-                f"{where}: 'billing_project' is only valid for type 'bigquery'"
-            )
+            raise ValueError(f"{where}: 'billing_project' is only valid for type 'bigquery'")
         billing_project = ""
         if is_bigquery:
             # bigquery attaches a PROJECT or PROJECT.DATASET scope — there is
@@ -577,13 +569,10 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
                 )
             if not database:
                 raise ValueError(
-                    f"{where}: database is required (for bigquery: the GCP project ID "
-                    "or 'project.dataset')"
+                    f"{where}: database is required (for bigquery: the GCP project ID or 'project.dataset')"
                 )
             parts = database.split(".")
-            if not 1 <= len(parts) <= 2 or not all(
-                re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in parts
-            ):
+            if not 1 <= len(parts) <= 2 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in parts):
                 raise ValueError(
                     f"{where}: bigquery database {database!r} must be a GCP project ID "
                     "or 'project.dataset' (letters/digits/dash/underscore)"
@@ -623,9 +612,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
             # validated one.
             catalog = str(entry.get("catalog", ""))
             if _CATALOG_CONTROL_RE.search(catalog):
-                raise ValueError(
-                    f"{where}: ducklake catalog connect string contains NUL/control characters"
-                )
+                raise ValueError(f"{where}: ducklake catalog connect string contains NUL/control characters")
             catalog = catalog.strip()
             if not catalog:
                 raise ValueError(
@@ -635,8 +622,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
                 )
             if host:
                 raise ValueError(
-                    f"{where}: 'host' is not valid for type 'ducklake' — the endpoint is "
-                    "the 'catalog' connect string"
+                    f"{where}: 'host' is not valid for type 'ducklake' — the endpoint is the 'catalog' connect string"
                 )
             if database:
                 raise ValueError(
@@ -653,9 +639,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
                     "file; 'database' is the sqlite FILE PATH"
                 )
             if not database:
-                raise ValueError(
-                    f"{where}: database is required (for sqlite: the sqlite FILE PATH)"
-                )
+                raise ValueError(f"{where}: database is required (for sqlite: the sqlite FILE PATH)")
             if any(ord(ch) < 32 or ord(ch) == 127 for ch in database):  # NUL & control chars
                 raise ValueError(f"{where}: sqlite database path contains NUL/control characters")
         else:
@@ -753,9 +737,7 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
             # silently-different path, not a validated one).
             data_path = str(entry.get("data_path", ""))
             if _CATALOG_CONTROL_RE.search(data_path):
-                raise ValueError(
-                    f"{where}: ducklake data_path contains NUL/control characters"
-                )
+                raise ValueError(f"{where}: ducklake data_path contains NUL/control characters")
             data_path = data_path.strip()
 
         params = _validate_params(entry.get("params", {}), where)
@@ -950,7 +932,9 @@ def build_attach_sql(spec: AttachSpec, password: str | None) -> str:
         # free at parse time, and the password is checked below, never
         # echoed. An SRV/Atlas attach passes the host through unchanged and
         # sets srv=true via params.
-        pairs: list[tuple[str, str]] = [
+        # (Rebound, not redeclared — `pairs` was first bound in the mysql
+        # branch above; a second annotation there would be a no-redef.)
+        pairs = [
             ("host", spec.host),
             ("port", str(spec.port)),
             ("dbname", spec.database),
@@ -1029,8 +1013,7 @@ def build_pre_attach_sql(spec: AttachSpec, password: str | None) -> str | None:
         # One statement per attached project; '' doubled for the SQL literal.
         token = password.replace("'", "''")
         return (
-            f"CREATE OR REPLACE SECRET \"{spec.name}\" (TYPE bigquery, "
-            f"SCOPE 'bq://{project}', ACCESS_TOKEN '{token}')"
+            f"CREATE OR REPLACE SECRET \"{spec.name}\" (TYPE bigquery, SCOPE 'bq://{project}', ACCESS_TOKEN '{token}')"
         )
     return None
 
@@ -1057,9 +1040,7 @@ def ensure_extensions(con, types: set[str]) -> None:
         try:
             ext = _EXTENSIONS[t]
         except KeyError:
-            raise ValueError(
-                f"unknown attach type {t!r} (use one of {', '.join(sorted(_EXTENSIONS))})"
-            ) from None
+            raise ValueError(f"unknown attach type {t!r} (use one of {', '.join(sorted(_EXTENSIONS))})") from None
         try:
             con.execute(f"LOAD {ext}")
         except Exception as exc:
@@ -1116,9 +1097,7 @@ def sql_references_attach(sql: str, specs: list[AttachSpec]) -> list[AttachSpec]
     return matched
 
 
-def scrub_secrets(
-    text: str, specs: list[AttachSpec], environ: Mapping[str, str] | None = None
-) -> str:
+def scrub_secrets(text: str, specs: list[AttachSpec], environ: Mapping[str, str] | None = None) -> str:
     """Remove resolved passwords (and a failure's DSN echoes) from ``text``."""
     env = os.environ if environ is None else environ
     for spec in specs:

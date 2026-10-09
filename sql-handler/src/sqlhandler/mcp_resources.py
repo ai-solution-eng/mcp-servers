@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.parse
+from typing import Any
 
 from mcp_types import (
     GetPromptResult,
@@ -149,14 +150,14 @@ def _parse_table_uri(uri: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def handle_list_resources(ctx, params) -> ListResourcesResult:
+async def handle_list_resources(ctx: Any, params: Any) -> ListResourcesResult:
     """resources/list: static per-table schemas + the catalog + query memory."""
     from . import identity as _identity
     from .server import _handler  # local import: avoids a server<->module cycle
 
     caller = _identity.caller_from_request_state(getattr(ctx, "request", None))
 
-    def _build():
+    def _build() -> list[Resource]:
         engine = _handler()
         resources: list[Resource] = [
             Resource(
@@ -187,7 +188,7 @@ async def handle_list_resources(ctx, params) -> ListResourcesResult:
     return ListResourcesResult(resources=await asyncio.to_thread(_build))
 
 
-async def handle_list_resource_templates(ctx, params) -> ListResourceTemplatesResult:
+async def handle_list_resource_templates(ctx: Any, params: Any) -> ListResourceTemplatesResult:
     return ListResourceTemplatesResult(
         resource_templates=[
             ResourceTemplate(
@@ -203,7 +204,7 @@ async def handle_list_resource_templates(ctx, params) -> ListResourceTemplatesRe
     )
 
 
-async def handle_read_resource(ctx, params) -> ReadResourceResult:
+async def handle_read_resource(ctx: Any, params: Any) -> ReadResourceResult:
     """resources/read for the sqlhandler:// scheme."""
     from . import identity as _identity
     from .server import _handler
@@ -232,9 +233,7 @@ async def handle_read_resource(ctx, params) -> ReadResourceResult:
 
         code = INVALID_PARAMS if isinstance(exc, LookupError) else INTERNAL_ERROR
         raise MCPError(code=code, message=str(exc)) from exc
-    return ReadResourceResult(
-        contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)]
-    )
+    return ReadResourceResult(contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)])
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +266,11 @@ _PROMPTS = [
 ]
 
 
-async def handle_list_prompts(ctx, params) -> ListPromptsResult:
+async def handle_list_prompts(ctx: Any, params: Any) -> ListPromptsResult:
     return ListPromptsResult(prompts=_PROMPTS)
 
 
-async def handle_get_prompt(ctx, params) -> GetPromptResult:
+async def handle_get_prompt(ctx: Any, params: Any) -> GetPromptResult:
     from mcp.shared.exceptions import MCPError
     from mcp_types import INVALID_PARAMS
 
@@ -316,6 +315,4 @@ async def handle_get_prompt(ctx, params) -> GetPromptResult:
         )
     else:
         raise _bad(f"Unknown prompt: {name}")
-    return GetPromptResult(
-        messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))]
-    )
+    return GetPromptResult(messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))])

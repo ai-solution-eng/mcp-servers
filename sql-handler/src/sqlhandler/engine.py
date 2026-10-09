@@ -176,7 +176,7 @@ class _QueryGate:
     is safe with a plain Semaphore.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._sem: threading.Semaphore | None = None
         self._size = -1
         self._lock = threading.Lock()
@@ -2498,8 +2498,9 @@ class SqlEngine:
         shared_key = self._metadata_shared_key(
             ["profile", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
         )
-        if shared_key is not None:
-            shared = self._l2_meta.get(shared_key)
+        l2_meta = self._l2_meta
+        if shared_key is not None and l2_meta is not None:
+            shared = l2_meta.get(shared_key)
             if shared is not None:
                 with self._lock:
                     self._profile_hits += 1
@@ -2589,11 +2590,12 @@ class SqlEngine:
             self._profile_misses += 1
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
-        if shared_key is not None:
+        l2_meta = self._l2_meta
+        if shared_key is not None and l2_meta is not None:
             # tables recorded for write-tier eviction (the profile/colstats
             # tier shares the CTAS version-regression hole the result tier
             # fixed — cross-review finding).
-            self._l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
+            l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
         return result
 
     @staticmethod
@@ -2745,8 +2747,9 @@ class SqlEngine:
         shared_key = self._metadata_shared_key(
             ["colstats", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
         )
-        if shared_key is not None:
-            shared = self._l2_meta.get(shared_key)
+        l2_meta = self._l2_meta
+        if shared_key is not None and l2_meta is not None:
+            shared = l2_meta.get(shared_key)
             if shared is not None:
                 with self._lock:
                     self._profile_hits += 1
@@ -2815,11 +2818,12 @@ class SqlEngine:
             self._profile_misses += 1
             if self.cache_ttl > 0:
                 self._profile_cache[key] = (time.monotonic(), result)
-        if shared_key is not None:
+        l2_meta = self._l2_meta
+        if shared_key is not None and l2_meta is not None:
             # tables recorded for write-tier eviction (the profile/colstats
             # tier shares the CTAS version-regression hole the result tier
             # fixed — cross-review finding).
-            self._l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
+            l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
         return result
 
     def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:

@@ -97,9 +97,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
         re.compile(r"[Cc]olumn ['\"]?([\w ]+?)['\"]? does not exist on table"),
         E_COLUMN_NOT_FOUND,
         [
-            (
-                "Call describe_table to see the real column names (case matters only in quoted identifiers)."
-            ),
+            ("Call describe_table to see the real column names (case matters only in quoted identifiers)."),
             ("Column '{}' is not in the table's schema — check for typos or reordered names."),
         ],
     ),
@@ -110,9 +108,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
         E_COLUMN_NOT_FOUND,
         [
             "Use the exact column names from describe_table.",
-            (
-                "Column '{}' is not in the referenced table(s) — check for typos or a missing table alias."
-            ),
+            ("Column '{}' is not in the referenced table(s) — check for typos or a missing table alias."),
         ],
     ),
     # Query timeout: engine.query_duckdb's watchdog sentence (verbatim).
@@ -121,9 +117,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
         E_TIMEOUT,
         [
             "Raise SQLHANDLER_QUERY_TIMEOUT if the workload legitimately needs longer.",
-            (
-                "Trim the query: add WHERE filters / column projections, or split aggregations into steps."
-            ),
+            ("Trim the query: add WHERE filters / column projections, or split aggregations into steps."),
             "For long-running queries use query_submit (async job) and poll query_status.",
         ],
     ),
@@ -144,9 +138,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
         re.compile(r"Too many active query jobs \(\d+"),
         E_CONCURRENCY_GATE,
         [
-            (
-                "Poll query_status and fetch finished results with query_result (fetch-once frees the registry slot)."
-            ),
+            ("Poll query_status and fetch finished results with query_result (fetch-once frees the registry slot)."),
             "Raise SQLHANDLER_MAX_JOBS if this pod legitimately tracks more jobs.",
         ],
     ),
@@ -159,9 +151,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
                 'Pass params as an object ({"name": value} for $placeholders) '
                 "or an array (positional ?) of scalar values."
             ),
-            (
-                "Nested objects/arrays are not valid bind values — flatten them into the SQL instead."
-            ),
+            ("Nested objects/arrays are not valid bind values — flatten them into the SQL instead."),
         ],
     ),
     # explain_query / ask_data argument validation (agent pack): a missing
@@ -170,10 +160,7 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
         re.compile(r"Provide the (?:SQL|question) to "),
         E_PARAM_INVALID,
         [
-            (
-                'explain_query needs {"sql": "<SELECT ...>"}; ask_data needs '
-                '{"question": "<plain-language question>"}.'
-            ),
+            ('explain_query needs {"sql": "<SELECT ...>"}; ask_data needs {"question": "<plain-language question>"}.'),
             "An empty or whitespace-only value is not a valid argument.",
         ],
     ),
@@ -272,9 +259,7 @@ def structured_errors_enabled(environ: dict[str, str] | None = None) -> bool:
     )
 
 
-def structured(
-    code: str, fix_hints: list[str] | None = None, environ: dict[str, str] | None = None
-) -> str:
+def structured(code: str, fix_hints: list[str] | None = None, environ: dict[str, str] | None = None) -> str:
     """Render the JSON tail line for one code (empty string when disabled).
 
     Callers append it to the human message: ``msg + structured(...)``. When

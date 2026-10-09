@@ -35,9 +35,7 @@ _PRAGMA_FUNCTION_RE = re.compile(r"\bpragma_[a-z0-9_]*\s*\(", re.IGNORECASE)
 
 _MCP_READONLY_ENV = "SQLHANDLER_MCP_READONLY"
 
-_MCP_OPT_OUT_NOTE = (
-    f" Set {_MCP_READONLY_ENV}=0 to restore multi-statement/DDL execution for trusted callers."
-)
+_MCP_OPT_OUT_NOTE = f" Set {_MCP_READONLY_ENV}=0 to restore multi-statement/DDL execution for trusted callers."
 
 
 def extract_statement_spans(sql: str) -> list[tuple[str, str]]:
@@ -152,7 +150,5 @@ def assert_attached_readonly(sql: str) -> str:
     return assert_readonly(
         sql,
         context="Read-only (attached external databases)",
-        env_note=(
-            f" {_MCP_READONLY_ENV}=0 does not apply here: attached catalogs are read-only by design."
-        ),
+        env_note=(f" {_MCP_READONLY_ENV}=0 does not apply here: attached catalogs are read-only by design."),
     )

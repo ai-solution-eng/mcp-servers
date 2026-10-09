@@ -16,6 +16,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.dataset as pad
@@ -24,7 +25,7 @@ import pytest
 
 from sqlhandler.engine import SqlEngine
 from sqlhandler.l2cache import DEFAULT_MAX_BYTES, DEFAULT_MIN_BYTES, L2ResultCache, load_l2_config
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 TABLES = [TableInfo(name="sales", schema="shop", format="parquet")]
 
@@ -41,7 +42,7 @@ def _sync_l2_writes(monkeypatch):
     monkeypatch.setenv("SQLHANDLER_L2_WRITE_ASYNC", "0")
 
 
-class FakeProvider:
+class FakeProvider(DataProvider):
     """Same local-parquet provider shape test_virtual.py uses (no L2 baggage)."""
 
     kind = "fake"
@@ -110,19 +111,20 @@ def test_two_engines_share_one_l2_dir(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     r1 = a.query_duckdb(QUERY)
     assert a._l2_cache is not None
-    assert a._l2_cache.stats()["writes"] == 1  # published to the shared dir
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 1  # published to the shared dir
     assert sorted(p.suffix for p in Path(l2).iterdir()) == [".json", ".parquet"]
 
     b = _make_engine(l2, root, monkeypatch)
     assert b._result_cache_writes == 0  # nothing in ITS memory
+    assert b._l2_cache is not None  # the engine built its cache from the dir
     r2 = b.query_duckdb(QUERY)
     assert r2.to_pylist() == r1.to_pylist()  # byte-identical result...
-    assert b._l2_cache.stats()["hits"] == 1  # ...served from the SHARED dir
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 1  # ...served from the SHARED dir
     assert b._result_cache_writes == 1  # and L1 warmed for the next call
     # the warmed L1 entry now serves replica 2 without touching disk again
     r3 = b.query_duckdb(QUERY)
     assert r3.to_pylist() == r1.to_pylist()
-    assert b._l2_cache.stats()["hits"] == 1
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 1
     assert b._result_cache_hits == 1
 
 
@@ -135,11 +137,13 @@ def test_l2_hit_falls_back_to_l1_on_next_query(tmp_path, monkeypatch):
     a.query_duckdb(QUERY)
     b = _make_engine(l2, root, monkeypatch)
     key = b._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
+    assert key is not None  # the L2 dir is configured → a key always resolves
     b.query_duckdb(QUERY)  # L2 hit, warms L1
     assert b._result_cache.get(key) is not None
     b.query_duckdb(QUERY)  # now an L1 hit
     assert b._result_cache_hits == 1
-    assert b._l2_cache.stats()["hits"] == 1  # unchanged — L1 answered
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 1  # unchanged — L1 answered
 
 
 def test_l2_hit_returns_identical_arrow_roundtrip(tmp_path, monkeypatch):
@@ -149,7 +153,10 @@ def test_l2_hit_returns_identical_arrow_roundtrip(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch)
     r1 = a.query_duckdb(QUERY)
-    stored = L2ResultCache(l2, ttl=3600).lookup(a._result_cache_key(QUERY, None, None, None, None))
+    stored_key = a._result_cache_key(QUERY, None, None, None, None)
+    assert stored_key is not None
+    stored = L2ResultCache(l2, ttl=3600).lookup(stored_key)
+    assert stored is not None
     assert stored.schema == r1.schema
     assert stored.to_pylist() == r1.to_pylist()
 
@@ -167,7 +174,8 @@ def test_below_min_bytes_l1_only(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_MIN_BYTES": str(1024**3)})
     a.query_duckdb(QUERY)
     assert a._result_cache_writes == 1
-    assert a._l2_cache.stats()["writes"] == 0
+    assert a._l2_cache is not None  # built from the configured dir
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 0
     assert not Path(l2).exists() or not list(Path(l2).iterdir())
 
 
@@ -184,23 +192,24 @@ def test_above_max_bytes_l1_only(tmp_path, monkeypatch):
         env={"SQLHANDLER_RESULT_CACHE_MAX_BYTES": "1", "SQLHANDLER_L2_MIN_BYTES": "1"},
     )
     a.query_duckdb(QUERY)
-    assert a._l2_cache.stats()["writes"] == 0
+    assert a._l2_cache is not None  # built from the configured dir
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 0
     # L1 uncapped but L2 max = 1 byte: the band check skips publication.
     # Separate TEST PROCESSES aren't needed — just a fresh engine AFTER the
     # cap env is gone (monkeypatch tracks each setenv, so the loop below
     # deletes engine A's cap before B is built).
     monkeypatch.delenv("SQLHANDLER_RESULT_CACHE_MAX_BYTES", raising=False)
-    b = _make_engine(
-        l2, root, monkeypatch, env={"SQLHANDLER_L2_MIN_BYTES": "0", "SQLHANDLER_L2_MAX_BYTES": "1"}
-    )
+    b = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_MIN_BYTES": "0", "SQLHANDLER_L2_MAX_BYTES": "1"})
     b.query_duckdb(QUERY)
     assert b._result_cache_writes == 1
-    assert b._l2_cache.stats()["writes"] == 0
+    assert b._l2_cache is not None  # built from the configured dir
+    assert b._l2_cache is not None and b._l2_cache.stats()["writes"] == 0
 
 
 def test_min_max_defaults(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_L2_DIR", str(tmp_path / "l2"))
     cfg = load_l2_config()
+    assert cfg is not None
     assert cfg["min_bytes"] == DEFAULT_MIN_BYTES == 256 * 1024
     assert cfg["max_bytes"] == DEFAULT_MAX_BYTES == 2 * 1024**3
 
@@ -217,6 +226,8 @@ def _publish_and_break(tmp_path, monkeypatch, mode: str):
     a = _make_engine(l2, root, monkeypatch)
     r1 = a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
+    assert key is not None  # the L2 dir is configured → a key always resolves
     sidecar = Path(l2) / f"{key[:16]}.json"
     artifact = Path(l2) / f"{key[:16]}.parquet"
     if mode == "corrupt-sidecar":
@@ -230,7 +241,7 @@ def _publish_and_break(tmp_path, monkeypatch, mode: str):
     b = _make_engine(l2, root, monkeypatch)
     r2 = b.query_duckdb(QUERY)
     assert r2.to_pylist() == r1.to_pylist()  # degrades to a live recompute
-    assert b._l2_cache.stats()["hits"] == 0
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 0
     return b, key
 
 
@@ -256,7 +267,7 @@ def test_corrupt_parquet_removed_and_missed(tmp_path, monkeypatch):
     artifact and the query still served correct data.
     """
     b, _key = _publish_and_break(tmp_path, monkeypatch, "corrupt-parquet")
-    assert b._l2_cache.stats()["hits"] == 0
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 0
     # after the failed read, a fresh lookup of the republished pair hits
     r = b.query_duckdb(QUERY)
     assert r.num_rows > 0
@@ -271,7 +282,7 @@ def test_store_failure_never_raises(tmp_path, monkeypatch):
     a = _make_engine(str(blocker), root, monkeypatch)
     out = a.query_duckdb(QUERY)  # must not raise
     assert out.num_rows > 0
-    assert a._l2_cache.stats()["writes"] == 0
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 0
 
 
 def test_concurrent_same_key_publish(tmp_path, monkeypatch):
@@ -284,11 +295,14 @@ def test_concurrent_same_key_publish(tmp_path, monkeypatch):
     table = pa.table({"id": pa.array(range(5000), type=pa.int64())})
 
     errors: list[Exception] = []
+    engine_for_threads = a
+    assert engine_for_threads._l2_cache is not None  # built before threads start
+    publish_cache = engine_for_threads._l2_cache
 
-    def publish():
+    def publish() -> None:
         try:
             for _ in range(5):
-                a._l2_cache.store(key, table)
+                publish_cache.store(key, table)
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
@@ -355,6 +369,7 @@ def test_key_golden_with_policy_hash(tmp_path, monkeypatch):
     expected_with = hashlib.sha256("\x1f".join(base + [f"policy={ph}"]).encode()).hexdigest()
     a._policy_hash = lambda caller=None: ph  # type: ignore[method-assign]
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     assert key == expected_with
     # and it differs from the no-policy key (never share masked/unmasked)
     _bind_policy(a, "")
@@ -414,7 +429,9 @@ def test_disabled_by_default_zero_behavior_change(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_L2_ENABLED", "0")
     assert load_l2_config() is None
     monkeypatch.setenv("SQLHANDLER_L2_ENABLED", "1")
-    assert load_l2_config()["dir"] == str(tmp_path / "l2")
+    cfg_dir = load_l2_config()
+    assert cfg_dir is not None
+    assert cfg_dir["dir"] == str(tmp_path / "l2")
 
 
 def test_enabled_false_env_garbage_falls_back_to_default(tmp_path, monkeypatch):
@@ -427,6 +444,7 @@ def test_enabled_false_env_garbage_falls_back_to_default(tmp_path, monkeypatch):
         monkeypatch.setenv("SQLHANDLER_L2_MAX_BYTES", garbage)
         monkeypatch.setenv("SQLHANDLER_L2_TTL", garbage)
         cfg = load_l2_config()
+        assert cfg is not None
         assert cfg["min_bytes"] == DEFAULT_MIN_BYTES
         assert cfg["max_bytes"] == DEFAULT_MAX_BYTES
         assert cfg["ttl"] == 3600.0
@@ -434,12 +452,14 @@ def test_enabled_false_env_garbage_falls_back_to_default(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_L2_MAX_BYTES", "-5")
     monkeypatch.setenv("SQLHANDLER_L2_TTL", "-5")
     cfg = load_l2_config()
+    assert cfg is not None
     assert cfg["min_bytes"] == 0 and cfg["max_bytes"] == 0 and cfg["ttl"] == 0.0
     # "0" is a REAL value (not garbage): min 0 = publish everything, max 0 =
     # unlimited ceiling (both the engine's band check and load_l2_config).
     monkeypatch.setenv("SQLHANDLER_L2_MIN_BYTES", "0")
     monkeypatch.setenv("SQLHANDLER_L2_MAX_BYTES", "0")
     cfg = load_l2_config()
+    assert cfg is not None
     assert cfg["min_bytes"] == 0 and cfg["max_bytes"] == 0
 
 
@@ -456,7 +476,8 @@ def test_ttl_zero_disables_l2_expiry_checks(tmp_path, monkeypatch):
     b = _make_engine(l2, root, monkeypatch)
     time.sleep(0.01)
     key = b._result_cache_key(QUERY, None, None, None, None)
-    assert b._l2_cache.lookup(key) is not None  # not expired
+    assert key is not None
+    assert b._l2_cache is not None and b._l2_cache.lookup(key) is not None  # not expired
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +493,7 @@ def test_lazy_delete_on_expired_lookup(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_TTL": "0.05"})
     a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     cache = L2ResultCache(l2, ttl=0.05)
     assert cache.lookup(key) is not None  # fresh
     time.sleep(0.1)
@@ -487,6 +509,7 @@ def test_expired_lookup_does_not_clobber_fresh(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_TTL": "0.05"})
     a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     cache = L2ResultCache(l2, ttl=3600)
     time.sleep(0.1)
     assert cache.lookup(key) is not None  # ITS ttl is fresh — file kept
@@ -500,10 +523,10 @@ def test_sweep_removes_expired_sidecars(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_MIN_BYTES": "1"})
     a.query_duckdb(QUERY)  # one entry in the dir
     old_key = a._result_cache_key(QUERY, None, None, None, None)
+    assert old_key is not None
     a.query_duckdb("SELECT count(*) AS c FROM sales WHERE amount > 90")  # second entry
-    new_key = a._result_cache_key(
-        "SELECT count(*) AS c FROM sales WHERE amount > 90", None, None, None, None
-    )
+    new_key = a._result_cache_key("SELECT count(*) AS c FROM sales WHERE amount > 90", None, None, None, None)
+    assert new_key is not None
     # age only the FIRST entry's sidecar beyond the ttl (mtime pass)
     past = time.time() - 7200
     os.utime(Path(l2) / f"{old_key[:16]}.json", (past, past))
@@ -522,6 +545,7 @@ def test_sweep_handles_corrupt_sidecar(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     sidecar = Path(l2) / f"{key[:16]}.json"
     past = time.time() - 7200
     sidecar.write_text("garbage{", encoding="utf-8")  # corrupt CONTENT
@@ -623,21 +647,14 @@ def test_virtual_tables_stay_out_of_both_layers(tmp_path, monkeypatch):
 
     cat = tmp_path / "catalog.yaml"
     cat.write_text(
-        yaml.safe_dump(
-            {
-                "tables": {
-                    "vw_sales": {"definition": "SELECT id, amount FROM sales WHERE amount > 90"}
-                }
-            }
-        ),
+        yaml.safe_dump({"tables": {"vw_sales": {"definition": "SELECT id, amount FROM sales WHERE amount > 90"}}}),
         encoding="utf-8",
     )
     monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))
     a = _make_engine(str(tmp_path / "l2"), root, monkeypatch)
     a.query_duckdb("SELECT count(*) AS c FROM vw_sales")
     assert a._result_cache_writes == 0  # L1 exclusion preserved
-    assert a._l2_cache.stats()["writes"] == 0  # L2 exclusion preserved
-
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 0  # L2 exclusion preserved
 
 
 # ---------------------------------------------------- async write-out (HA 2026-09)
@@ -657,10 +674,11 @@ def test_async_store_publishes_after_return(tmp_path, monkeypatch):
     _seed_table(root)
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
-    assert a._l2_cache._write_queue is not None
+    assert a._l2_cache is not None and a._l2_cache._write_queue is not None
     r1 = a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
-    assert a._l2_cache.flush_async_stores() is True
+    assert key is not None
+    assert a._l2_cache is not None and a._l2_cache.flush_async_stores() is True
     assert sorted(p.suffix for p in Path(l2).iterdir()) == [".json", ".parquet"]
     stored = L2ResultCache(l2, ttl=3600).lookup(key)
     assert stored.to_pylist() == r1.to_pylist()
@@ -677,11 +695,11 @@ def test_async_cross_replica_sharing(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
     r1 = a.query_duckdb(QUERY)
-    assert a._l2_cache.flush_async_stores() is True
+    assert a._l2_cache is not None and a._l2_cache.flush_async_stores() is True
     b = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "1"})
     r2 = b.query_duckdb(QUERY)
     assert r2.to_pylist() == r1.to_pylist()
-    assert b._l2_cache.stats()["hits"] == 1
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 1
     assert b._result_cache_writes == 1  # L1 warmed for the next call
 
 
@@ -693,9 +711,9 @@ def test_async_disabled_falls_back_to_sync(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_L2_WRITE_ASYNC": "0"})
     a.query_duckdb(QUERY)
-    assert a._l2_cache._write_queue is None
+    assert a._l2_cache is not None and a._l2_cache._write_queue is None
     assert sorted(p.suffix for p in Path(l2).iterdir()) == [".json", ".parquet"]
-    assert a._l2_cache.stats()["write_mode"] == "sync"
+    assert a._l2_cache is not None and a._l2_cache.stats()["write_mode"] == "sync"
 
 
 def test_async_queue_full_drops_and_counts(tmp_path, monkeypatch):
@@ -734,7 +752,6 @@ def test_write_worker_started_once(tmp_path):
     assert cache._write_worker is w1
 
 
-
 # --------------------------------------------- shared metadata tier (2026-09)
 
 # profile_table / column_stats outputs join the shared tier: a few KB of
@@ -752,7 +769,7 @@ def test_profile_shared_across_engines(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch)
     r1 = a.profile_table("sales")
-    assert a._l2_meta.stats()["writes"] == 1
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
     b = _make_engine(l2, root, monkeypatch)
     r2 = b.profile_table("sales")
     # Compare the JSON-fidelity forms: DuckDB SUMMARIZE hands back Decimal
@@ -760,7 +777,7 @@ def test_profile_shared_across_engines(tmp_path, monkeypatch):
     # — which is exactly what every JSON/markdown consumer renders anyway
     # (str(Decimal("0.00")) == "0.00", identical display).
     assert json.loads(json.dumps(r2, default=str)) == json.loads(json.dumps(r1, default=str))
-    assert b._l2_meta.stats()["hits"] == 1
+    assert b._l2_meta is not None and b._l2_meta.stats()["hits"] == 1
     assert b._profile_misses == 0  # B never scanned anything
     b.profile_table("sales")
     assert b._profile_hits == 2  # shared hit + L1 hit
@@ -773,10 +790,11 @@ def test_profile_shared_invalidated_by_snapshot(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch)
     a.profile_table("sales")
-    assert a._l2_meta.stats()["writes"] == 1
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
+    assert isinstance(a.provider, FakeProvider)
     a.provider.versions["shop/sales"] = 7  # ETL commit
     a.profile_table("sales")
-    assert a._l2_meta.stats()["writes"] == 2  # new key → recompute + republish
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 2  # new key → recompute + republish
 
 
 def test_column_stats_shared_across_engines(tmp_path, monkeypatch):
@@ -785,11 +803,11 @@ def test_column_stats_shared_across_engines(tmp_path, monkeypatch):
     l2 = str(tmp_path / "l2")
     a = _make_engine(l2, root, monkeypatch)
     r1 = a.column_stats("sales", "amount")
-    assert a._l2_meta.stats()["writes"] == 1
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
     b = _make_engine(l2, root, monkeypatch)
     r2 = b.column_stats("sales", "amount")
     assert r2 == r1
-    assert b._l2_meta.stats()["hits"] == 1
+    assert b._l2_meta is not None and b._l2_meta.stats()["hits"] == 1
     assert b._profile_misses == 0
 
 
@@ -818,6 +836,7 @@ def test_meta_tier_never_breaks_profile(tmp_path, monkeypatch):
 
 # ---------------------------------------------------- preview result sharing
 
+
 def test_preview_cached_on_repeat(tmp_path, monkeypatch):
     """The 2026-09 fix: a bare-LIMIT preview is cached — the second identical
     call is an L1 hit instead of another object-store read."""
@@ -841,11 +860,11 @@ def test_preview_shared_across_engines(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     sql = "SELECT * FROM sales LIMIT 5"
     r1 = a.query_duckdb(sql)
-    assert a._l2_cache.flush_async_stores() is True
+    assert a._l2_cache is not None and a._l2_cache.flush_async_stores() is True
     b = _make_engine(l2, root, monkeypatch)
     r2 = b.query_duckdb(sql)
     assert r2.to_pylist() == r1.to_pylist()
-    assert b._l2_cache.stats()["hits"] == 1  # served from the SHARED dir
+    assert b._l2_cache is not None and b._l2_cache.stats()["hits"] == 1  # served from the SHARED dir
 
 
 # ------------------------------------------- selective drop_for_table (2026-10)
@@ -858,13 +877,13 @@ def test_preview_shared_across_engines(tmp_path, monkeypatch):
 # selective drop matched nothing.
 
 
-def _mk_table(**overrides):
-    defaults = {"name": "sales", "schema": "shop", "format": "parquet"}
+def _mk_table(**overrides: Any) -> TableInfo:
+    defaults: dict[str, Any] = {"name": "sales", "schema": "shop", "format": "parquet"}
     defaults.update(overrides)
     return TableInfo(**defaults)
 
 
-def _write_sidecar(l2_dir: Path, key: str, tables=None, created=None) -> None:
+def _write_sidecar(l2_dir: Path, key: str, tables: list[str] | None = None, created: float | None = None) -> None:
     """Publish a minimal VALID pair (sidecar + parquet) directly on disk."""
     table = pa.table({"a": pa.array([1, 2, 3], type=pa.int64())})
     pq.write_table(table, str(l2_dir / f"{key[:16]}.parquet"))
@@ -883,6 +902,7 @@ def test_store_records_referenced_tables_in_sidecar(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     meta = json.loads((Path(l2) / f"{key[:16]}.json").read_text(encoding="utf-8"))
     assert meta["key"] == key
     assert "sales" in meta["tables"]
@@ -997,8 +1017,9 @@ def test_drop_for_table_store_drop_lookup_flow(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     a.query_duckdb(QUERY)
     key = a._result_cache_key(QUERY, None, None, None, None)
+    assert key is not None
     assert L2ResultCache(l2, ttl=3600).lookup(key) is not None  # stored
-    assert a._l2_cache.drop_for_table("shop/sales", "sales") == 1
+    assert a._l2_cache is not None and a._l2_cache.drop_for_table("shop/sales", "sales") == 1
     assert not (Path(l2) / f"{key[:16]}.json").exists()
     assert L2ResultCache(l2, ttl=3600).lookup(key) is None  # miss
     assert not (Path(l2) / f"{key[:16]}.parquet").exists()  # pair removed
@@ -1044,13 +1065,17 @@ def test_engine_write_evicts_only_written_table_l2(tmp_path, monkeypatch):
     a = _make_engine(l2, root, monkeypatch)
     r_a = a.query_duckdb(QUERY)  # references sales
     a.query_duckdb("SELECT sku FROM inventory WHERE sku > 10")  # references inventory
-    assert a._l2_cache.stats()["writes"] == 2
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 2
     key_a = a._result_cache_key(QUERY, None, None, None, None)
+    assert key_a is not None
     key_b = a._result_cache_key("SELECT sku FROM inventory WHERE sku > 10", None, None, None, None)
+    assert key_b is not None
     # a scratch write to inventory evicts ITS entry only
     a._evict_result_cache_for_write("duckdb", str(root / "scratch" / "inventory"))
-    assert a._l2_cache.stats()["writes"] == 2  # no full wipe happened
+    assert a._l2_cache is not None and a._l2_cache.stats()["writes"] == 2  # no full wipe happened
     assert (Path(l2) / f"{key_a[:16]}.json").exists()  # sales entry SURVIVES
     assert not (Path(l2) / f"{key_b[:16]}.json").exists()  # inventory entry gone
     assert L2ResultCache(l2, ttl=3600).lookup(key_a) is not None
-    assert L2ResultCache(l2, ttl=3600).lookup(key_a).to_pylist() == r_a.to_pylist()
+    stored_a = L2ResultCache(l2, ttl=3600).lookup(key_a)
+    assert stored_a is not None
+    assert stored_a.to_pylist() == r_a.to_pylist()

@@ -2,93 +2,85 @@
 # secret-free). Cluster: <cluster-domain> (HPE-network style — corporate
 # proxy required; browser sidecar + MITM CA enabled). Replace every
 # <cluster-domain> placeholder with the site's literal domain.
-# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
-# Paste-ready: this file alone is the full values document (helm deep-merges
-# it over identical chart defaults; PCAI's values editor replaces the chart's
-# bundled values.yaml entirely, so every key must be present here).
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. searxng.secretKey OR searxng.existingSecret — seeds SEARXNG_SECRET; the
+#      render FAILS when both are empty (templates/deployment.yaml gate). Never
+#      put a real secret in values: prefer existingSecret at a pre-created
+#      Secret [key: secret]
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
+#      default true); templates/virtualservice.yaml calls `required` on it
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Corporate egress: proxy.{http,https,noProxy}, caCert.*, fetch.*, browser.* (+ browser.caCert)
+#     — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
+#   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth" | values-examples/values.g2.yaml
+#   Engine tuning: searxng.disabledEngines — documentation/DEPLOYMENT.md (chart default: corporate dead-engine list)
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — README "Prometheus self-metrics"
+#   DNS-rebinding hosts: extraAllowedHosts — documentation/DEPLOYMENT.md
+#
+# FULL VALUES — complete copy of helm/values.yaml with site edits called out
+# inline; the deep WHY for each key lives in helm/values.yaml.
 
-# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
-# SearXNG sidecar, for PCAI (HPE Ezmeral Unified Analytics). The
-# VirtualService root serves the SearXNG web UI; /mcp routes to the MCP
-# server (streamable-http + SSE) through the PCAI Istio gateway.
+# ============================================================================
+# Deployment / Images
+# ============================================================================
 
-# -- Deployment ----------------------------------------------------------------
 deployment:
   name: searxng-mcp
   appName: searxng-mcp
   replicaCount: 1
 
-# -- Images ------------------------------------------------------------------------
 image:
-  # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
-  # tags) — a stale default is how an "old MCP + new sidecar" pod happens.
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.7.0
+  tag: v1.7.0   # keep in lockstep with Chart.yaml appVersion
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE. Public packages (the
-# ddgs-mcp convention) pull anonymously. Create with:
-#   kubectl create secret docker-registry ghcr-pull -n searxng-mcp \
-#     --docker-server=ghcr.io --docker-username=<gh-user> \
-#     --docker-password=<gh-PAT-with-read:packages>
+# Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).
 imagePullSecrets: []
 
 # Bundled SearXNG sidecar.
 searxng:
   image:
     repository: docker.io/searxng/searxng
-    # Pinned to the dated tag that Docker Hub 'latest' resolved to when the
-    # chart was updated — a mutable 'latest' tag would give different images
-    # per node/restart. Refresh the pin by editing the tag and re-applying.
-    tag: "2026.9.8-3fdc6d753"
+    tag: "2026.9.8-3fdc6d753"   # dated pin, not mutable 'latest'; refresh by editing the tag
     pullPolicy: IfNotPresent
-  # SITE: session/crypto secret — MUST be replaced for any real deployment
-  # (e.g. openssl rand -hex 32). This example file never carries a real one.
-  # Preferred alternative: pre-create the Secret and point existingSecret
-  # below at it — the literal secretKey is then ignored ("" = literal wiring).
-  #   kubectl -n <ns> create secret generic searxng-secret --from-literal=secret=$(openssl rand -hex 32)
+  # Replace <SECRET_KEY> for any real deployment (openssl rand -hex 32);
+  # preferred: pre-create a Secret and point existingSecret at it.
   secretKey: "<SECRET_KEY>"
   existingSecret: ""
   existingSecretKey: secret
-  # SITE: public base URL of the SearXNG UI (rendered into settings.yml
-  # server.base_url); set the literal https://<endpoint>/ for correct UI links.
-  baseUrl: "https://searxng-mcp.<cluster-domain>/"
-  # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
-  language: "en-US"
-  # Engines to disable via settings.yml (top-level engines key). Default: []
-  # — every default SearXNG engine stays enabled. SearXNG auto-suspends
-  # engines that fail repeatedly and the search tool reports per-query which
-  # engines did not respond; only hard-disable one that is consistently dead
-  # on the site's network (e.g. startpage behind the HPE proxy).
+  baseUrl: "https://searxng-mcp.<cluster-domain>/"   # settings.yml server.base_url
+  language: "en-US"   # SEARXNG_LANGUAGE
+  # [] = every default engine stays enabled (SearXNG auto-suspends the
+  # consistently dead); hard-disable one only if it is consistently dead here.
   disabledEngines: []
   resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-    limits:
-      cpu: "1"
-      memory: 1Gi
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
 
-# -- Service exposure -------------------------------------------------------------------
+# ============================================================================
+# Resources / Service Exposure
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9090        # MCP server (streamable-http + SSE at /mcp)
   targetPort: 9090
   searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
 
-# -- Resources (MCP container) ----------------------------------------------------------------
 resources:
-  requests:
-    cpu: 200m
-    memory: 200Mi
-  limits:
-    cpu: "1"
-    memory: 512Mi
+  requests: {cpu: 200m, memory: 200Mi}
+  limits: {cpu: "1", memory: 512Mi}
 
-# -- Headless-browser sidecar (optional) ----------------------------------------------------------
-# SITE: enabled on SE-G2 — fetch_content can render JS-only pages and take
-# screenshots. The image is built from ./browser/Dockerfile (Playwright
-# Chromium headless shell) and must be pushed before enabling.
+# ============================================================================
+# Headless-browser Sidecar
+# ============================================================================
+
+# Enabled on SE-G2 — fetch_content can render JS-only pages and take
+# screenshots; the image (browser/Dockerfile) must be pushed before enabling.
 browser:
   enabled: true
   image:
@@ -96,32 +88,27 @@ browser:
     tag: v1.6.1
     pullPolicy: IfNotPresent
   resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
-    limits:
-      memory: 1Gi
-  # Corporate MITM CA: the entrypoint installs *.crt files from this
-  # ConfigMap into the container trust store at startup (Chromium does not
-  # honor SSL_CERT_FILE / NODE_EXTRA_CA_CERTS). The ConfigMap must exist in
-  # the release namespace — copy the cluster-wide ezaf-root-ca if needed.
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 1Gi}
   caCert:
-    # SITE: on for SE-G2 — Chromium needs the corporate MITM CA to trust
-    # https fetches through the proxy.
-    enabled: true
+    enabled: true   # Chromium needs the corporate MITM CA (must carry the proxy root too)
     configMap: "ezaf-root-ca"
-  # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
-  extraArgs: ""
+  extraArgs: ""   # extra Chromium command-line flags, e.g. "--disable-features=x"
 
-# -- Environment ------------------------------------------------------------------------------------
+# ============================================================================
+# Environment
+# ============================================================================
+
 env:
   - name: SEARXNG_URL
     value: "http://localhost:8080"
 
-# -- fetch_content SSRF policy (fleet decision D6 — guard default-ON) ----------
-# Escapes/caps for the fetch SSRF guard. Empty strings keep the built-in
-# defaults (see chart values.yaml 'fetch'); loopback/pod-local/metadata
-# targets are never fetchable regardless. SITE: chart defaults.
+# ============================================================================
+# fetch_content SSRF Policy
+# ============================================================================
+
+# Chart defaults ("" = built-in values; loopback/pod-local/metadata targets
+# are never fetchable regardless).
 fetch:
   allowHosts: ""
   denyExtra: ""
@@ -130,27 +117,26 @@ fetch:
   maxScreenshotKb: ""
   maxRedirects: ""
 
-# -- Egress proxy ---------------------------------------------------------------------------------------
-# SITE: ON — this cluster has no direct internet egress: SearXNG engine
-# requests and fetch_content must go through the corporate proxy. Each key
-# is wired into the pod only when non-empty; non-empty keys configure BOTH
-# env proxies for the MCP container (fetch_content) and SearXNG's
-# outgoing.proxies (engine requests).
+# ============================================================================
+# Egress Proxy
+# ============================================================================
+
+# ON — no direct internet egress; each key is wired only when non-empty.
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,localhost"
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
-# SITE: literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
+# ============================================================================
+# PCAI (HPE Ezmeral Unified Analytics) Integration
+# ============================================================================
+
+# Literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
 ezua:
   enabled: true
   domainName: "<cluster-domain>"   # informational only — no template reads it
   virtualService:
-    # SITE: literal host for the lab site. Root of this host serves the normal
-    # SearXNG web page; /mcp is routed to the MCP server (streamable-http + SSE).
-    # Doubles as MCP_HOSTNAME — the DNS-rebinding Host pin (read once at
-    # server startup; changing it requires a restart).
+    # Literal host — doubles as MCP_HOSTNAME (read once at startup).
     endpoint: "searxng-mcp.<cluster-domain>"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
@@ -159,25 +145,30 @@ ezua:
     namespace: "istio-system"
     providerName: "oauth2-proxy"
 
+# ============================================================================
+# API Keys
+# ============================================================================
+
 # Fleet API-key auth: the shared fleet key Secret (key: api-keys).
 apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
 
-# EXTRA in-cluster MCP callers (svc DNS) — DNS-rebinding allowlist additions,
-# joined into MCP_EXTRA_ALLOWED_HOSTS (entries verbatim or `host:*`). The
-# pinned public FQDN and loopback are always allowed; [] = behaviour
-# unchanged. The chart AUTO-prepends the release's own service DNS
-# (searxng-mcp-service.<ns>.svc.cluster.local:*) whenever transport security
-# is active — the gateway relay's Host header — so this list is for hosts
-# BEYOND that. Note: in-cluster callers on this site reach the service on
-# port 9090 — MCP_HOSTNAME alone does NOT cover them (they send no Host
-# matching the pinned FQDN).
+# ============================================================================
+# Networking
+# ============================================================================
+
+# EXTRA in-cluster MCP callers (svc DNS) beyond the chart's auto-included
+# own-service entry — see helm/values.yaml.
 extraAllowedHosts: []
 # extraAllowedHosts:
 #   - searxng-mcp-service.<release-namespace>.svc.cluster.local:*
 
-# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# Per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
   serviceMonitor: true

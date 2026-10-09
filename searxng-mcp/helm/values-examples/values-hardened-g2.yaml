@@ -1,14 +1,18 @@
 # searxng-mcp — HARDENED example: the MCP network zone ON.
-# USER-FACING MCP: the browser path stays ON (allowEzafGatewayIngress: true +
-# the VirtualService still rendered) — the SearXNG web UI must keep working.
-# In-cluster callers are allowlisted explicitly; everyone else is denied.
+# USER-FACING MCP: the browser path stays ON — the SearXNG web UI must keep
+# working; in-cluster callers are allowlisted explicitly, everyone else denied.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# OVERLAY: merge onto the base/g2 values document — nothing here is standalone
+# (keys absent here inherit the base document/chart defaults).
+# Pointer: documentation/DEPLOYMENT.md + helm/values.yaml (networkPolicy block).
 #
 # ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
 # with the zone on, every unlisted caller times out (deny by absence).
 #
-# Zone list: least-privilege — the namespaces the LIVE gateway netpol names
-# as authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
-# Widen deliberately, one ns at a time.
+# Zone list: least-privilege — the namespaces the gateway netpol names as
+# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
 networkPolicy:
   enabled: true
   sameNamespace: true
@@ -18,43 +22,25 @@ networkPolicy:
       - dsh-web-helm        # DSH web (gateway allowlist)
       - owebui0-11-0        # OWUI instance on the gateway allowlist
       - opencode-web-helm   # OpenCode web
-      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
-                            # ns `prometheus`) — the monitoring ns holds otel/UA,
-                            # NOT the scraper; omit and up=0 within one interval
-      - monitoring          # Prometheus scraping /metrics (ServiceMonitor) —
-                            # omit and metrics scraping dies SILENTLY
-                            # (check Prometheus targets after enabling)
-  # USER-FACING: the gateway rule stays ON — SearXNG web UI (8080) + /mcp
-  # (9090) both arrive via the VirtualService.
-  allowEzafGatewayIngress: true
+      - prometheus          # the ACTUAL Prometheus scraper — the monitoring ns
+                            # holds otel/UA, NOT the scraper; omit and up=0
+      - monitoring          # ServiceMonitor scrape ns — omit and it dies SILENTLY
+  allowEzafGatewayIngress: true   # gateway rule stays ON (SearXNG UI + /mcp via the VS)
   ingressGatewayNamespace: istio-system
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
-  # Kubelet probes originate at the NODE: allow the site's node IPs only
-  # (SITE: replace with the cluster's master/worker node IPs — /32 allows),
-  # with the pod CIDR carved out so pod traffic stays governed by the zone
-  # rules above.
+  # Kubelet probes originate at the NODE.
   probeCidrs:
-    - 10.0.0.1/32           # SITE: node IP example — replace per cluster
-    - 10.0.0.2/32           # SITE: node IP example — replace per cluster
-  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
-  # be a STRICT SUBSET of the cidr — pod IPs are not inside a node /32, so
-  # there is nothing to carve out. Only a BROAD probe allow (e.g. 0.0.0.0/0)
-  # pairs with a carve-out.
-  probeExceptCidrs: []
+    - 10.0.0.1/32           # node IP example — replace per cluster
+    - 10.0.0.2/32           # node IP example — replace per cluster
+  probeExceptCidrs: []   # only a BROAD probe allow (0.0.0.0/0) pairs with a carve-out
 
-# USER-FACING: the VirtualService stays rendered (browser path unchanged).
+# The VirtualService stays rendered (browser path unchanged).
 ezua:
   virtualService:
     enabled: true
 
-# In-cluster MCP callers reach /mcp on the local service DNS; the SDK's
-# DNS-rebinding protection otherwise 421s them after the network zone lets
-# them through. The chart AUTO-includes the release's own service DNS
-# (searxng-mcp-service.<ns>.svc.cluster.local:*) as the first entry whenever
-# transport security is active; list only EXTRA svc host(s) here — `host:*`
-# accepts any port. The pinned public FQDN (ezua.virtualService.endpoint) and
-# loopback are always allowed. This example OVERLAYS the chart defaults
-# (chart default: []).
+# The SDK's DNS-rebinding protection 421s in-cluster callers on the local
+# service DNS — the chart auto-includes the own-service entry; list EXTRA only.
 extraAllowedHosts:
-  - searxng-mcp-service.<release-namespace>.svc.cluster.local:*   # SITE: replace <release-namespace>
+  - searxng-mcp-service.<release-namespace>.svc.cluster.local:*   # replace <release-namespace>

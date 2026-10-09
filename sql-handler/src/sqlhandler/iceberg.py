@@ -42,7 +42,9 @@ from .s3 import build_s3fs
 
 logger = logging.getLogger("sqlhandler.iceberg")
 
-_MISSING_MSG = "Iceberg support requires the optional 'pyiceberg' package. Install with:  pip install 'sqlhandler[iceberg]'"
+_MISSING_MSG = (
+    "Iceberg support requires the optional 'pyiceberg' package. Install with:  pip install 'sqlhandler[iceberg]'"
+)
 
 # The glue/hive catalog classes import boto3/thrift at module load — pyiceberg
 # raises its own NotInstalledError when the extra is missing; we translate it
@@ -53,8 +55,7 @@ _GLUE_MISSING_MSG = (
     "standard AWS_* environment variables / instance role / IRSA — never config values)"
 )
 _HIVE_MISSING_MSG = (
-    "Iceberg catalog type 'hive' requires the pyiceberg thrift extra. "
-    "Install with:  pip install 'pyiceberg[hive]'"
+    "Iceberg catalog type 'hive' requires the pyiceberg thrift extra. Install with:  pip install 'pyiceberg[hive]'"
 )
 
 _SCHEMES = ("s3://", "file://", "gs://", "abfs://", "abfss://")
@@ -227,9 +228,7 @@ class IcebergProvider(DataProvider):
         """
         table = self._load_table(info)
         scan = (
-            table.scan()
-            if version is None
-            else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
+            table.scan() if version is None else table.scan(snapshot_id=_validate_snapshot_version(version, "Iceberg"))
         )
         try:
             files = [f.file.file_path for f in scan.plan_files()]

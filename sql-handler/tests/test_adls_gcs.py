@@ -79,7 +79,9 @@ def _patch_delta(monkeypatch) -> None:
     import types
 
     fake = types.ModuleType("deltalake")
-    fake.DeltaTable = _FakeDeltaTable
+    # ModuleType has no declared attributes; __dict__ is the checked way to
+    # hang one on a freshly minted module object.
+    fake.__dict__["DeltaTable"] = _FakeDeltaTable
     monkeypatch.setitem(sys.modules, "deltalake", fake)
 
 
@@ -88,8 +90,14 @@ def _patch_delta(monkeypatch) -> None:
 
 def test_load_adls_config_env_only(monkeypatch):
     for var in (
-        "ADLS_ACCOUNT", "ADLS_CONTAINER", "ADLS_PREFIX", "ADLS_AUTH", "ADLS_TENANT_ID",
-        "ADLS_CLIENT_ID", "ADLS_CLIENT_SECRET_ENV", "ADLS_ENDPOINT_SUFFIX",
+        "ADLS_ACCOUNT",
+        "ADLS_CONTAINER",
+        "ADLS_PREFIX",
+        "ADLS_AUTH",
+        "ADLS_TENANT_ID",
+        "ADLS_CLIENT_ID",
+        "ADLS_CLIENT_SECRET_ENV",
+        "ADLS_ENDPOINT_SUFFIX",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = load_adls_config(
@@ -160,9 +168,7 @@ def test_load_adls_config_client_secret_without_trio_is_unconfigured():
 
 
 def test_load_gcs_config_env_only():
-    cfg = load_gcs_config(
-        {"GCS_BUCKET": "bkt", "GCS_PREFIX": "lake", "GCS_CREDENTIALS_FILE": "/mnt/key.json"}
-    )
+    cfg = load_gcs_config({"GCS_BUCKET": "bkt", "GCS_PREFIX": "lake", "GCS_CREDENTIALS_FILE": "/mnt/key.json"})
     assert (cfg.bucket, cfg.prefix, cfg.credentials_file) == ("bkt", "lake", "/mnt/key.json")
     assert not cfg.anonymous and cfg.is_configured
 
@@ -764,9 +770,7 @@ def test_engine_run_sql_over_adls_gcs_tables(tmp_path):
             root / "orders.parquet",
         )
         eng = SqlEngine(prov, cache_ttl=0)
-        result = eng.query_duckdb(
-            "SELECT id FROM orders WHERE region = 'e' ORDER BY id"
-        )
+        result = eng.query_duckdb("SELECT id FROM orders WHERE region = 'e' ORDER BY id")
         assert result.to_pydict() == {"id": [1, 2]}, backend
         desc = eng.describe_table("orders")
         assert desc["uri"].endswith("orders.parquet") and desc["n_columns"] == 2, backend

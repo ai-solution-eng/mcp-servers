@@ -739,7 +739,7 @@
           </div>
         </div>
         <div class="panel">
-          <h2>Policy document <span class="hint" id="adm-policy-hash"></span><span class="hint"> — JSON or YAML</span></h2>
+          <h2>Policy document <span class="hint" id="adm-policy-hash"></span><span class="hint"> — the whole authored file (YAML; JSON accepted too)</span></h2>
           <textarea id="adm-policy" spellcheck="false" style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:12px;padding:10px;min-height:220px;resize:vertical;line-height:1.5"></textarea>
           <div class="query-actions">
             <button id="adm-policy-save">Save policy</button>
@@ -1835,11 +1835,15 @@ async function accessRefresh() {
   try {
     const g = await api("/api/admin/grants", { headers: admHeaders() });
     admRenderGrants(g);
-    // The same payload carries the dataset doc — prefill the policy editor
-    // from it unless the operator has unsaved edits (dirty flag).
+    // The same payload carries policy_text — the WHOLE authored policy
+    // document (datasets doc + top-level admins, or the groups form) as
+    // YAML, so the editor shows what is actually enforcing. Older servers
+    // without the field fall back to the datasets-only JSON mirror (the
+    // historic prefill). Unsaved edits (dirty flag) are never overwritten.
     if (!$("adm-policy")._dirty) {
-      $("adm-policy").value = g.datasets === null || g.datasets === undefined
-        ? "" : JSON.stringify(g.datasets, null, 2);
+      $("adm-policy").value = (g.policy_text !== undefined && g.policy_text !== null)
+        ? g.policy_text
+        : (g.datasets === null || g.datasets === undefined ? "" : JSON.stringify(g.datasets, null, 2));
       $("adm-policy")._dirty = false;
     }
     $("adm-policy-hash").textContent = g.policy_hash ? ("policy_hash: " + g.policy_hash) : "";

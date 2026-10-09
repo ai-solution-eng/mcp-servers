@@ -52,11 +52,12 @@ from __future__ import annotations
 import json as _stdlib_json
 import math
 from datetime import datetime as _datetime
+from typing import Any, cast
 
 try:  # optional dependency — fallback is stdlib json
     import orjson as _orjson
 except ImportError:  # pragma: no cover - exercised only without the wheel
-    _orjson = None
+    _orjson = None  # type: ignore[assignment]
 
 import pyarrow as pa
 
@@ -66,6 +67,7 @@ __all__ = ["arrow_to_markdown_fast", "dumps", "loads", "profile_to_markdown"]
 # ---------------------------------------------------------------------------
 # orjson-or-stdlib
 # ---------------------------------------------------------------------------
+
 
 def dumps(obj, *, default=None, indent: bool = False) -> str:
     """JSON-serialize like ``json.dumps`` but through orjson when available.
@@ -104,29 +106,33 @@ try:
     from tabulate import _type as _tab_type
     from tabulate import _visible_width as _tab_width
 except Exception:  # pragma: no cover - upstream refactor → pandas path
-    _tab_afterpoint = _tab_type = _tab_width = None
+    _tab_afterpoint = _tab_type = _tab_width = None  # type: ignore[assignment]
 
 try:  # numpy: values-matrix dtype promotion (pandas dependency, always present in practice)
     import numpy as _np
 except ImportError:  # pragma: no cover - stripped deployment → pandas path
-    _np = None
+    _np = None  # type: ignore[assignment]
 
 
 # Arrow → numpy dtype map for the values-matrix promotion below.
-_ARROW_TO_NUMPY = None if _np is None else {
-    pa.int8(): _np.dtype("int8"),
-    pa.int16(): _np.dtype("int16"),
-    pa.int32(): _np.dtype("int32"),
-    pa.int64(): _np.dtype("int64"),
-    pa.uint8(): _np.dtype("uint8"),
-    pa.uint16(): _np.dtype("uint16"),
-    pa.uint32(): _np.dtype("uint32"),
-    pa.uint64(): _np.dtype("uint64"),
-    pa.float16(): _np.dtype("float16"),
-    pa.float32(): _np.dtype("float32"),
-    pa.float64(): _np.dtype("float64"),
-    pa.bool_(): _np.dtype("bool"),
-}
+_ARROW_TO_NUMPY = (
+    None
+    if _np is None
+    else {
+        pa.int8(): _np.dtype("int8"),
+        pa.int16(): _np.dtype("int16"),
+        pa.int32(): _np.dtype("int32"),
+        pa.int64(): _np.dtype("int64"),
+        pa.uint8(): _np.dtype("uint8"),
+        pa.uint16(): _np.dtype("uint16"),
+        pa.uint32(): _np.dtype("uint32"),
+        pa.uint64(): _np.dtype("uint64"),
+        pa.float16(): _np.dtype("float16"),
+        pa.float32(): _np.dtype("float32"),
+        pa.float64(): _np.dtype("float64"),
+        pa.bool_(): _np.dtype("bool"),
+    }
+)
 
 
 def _fmt_float(v: float) -> str:
@@ -186,15 +192,23 @@ class _ColumnSpec:
 
     __slots__ = ("fmt", "is_ts_naive", "null_token", "nullable_int", "numeric", "numparse", "uint")
 
-    def __init__(self, fmt, null_token: str, numeric: bool, numparse: bool = False,
-                 is_ts_naive: bool = False, nullable_int: bool = False, uint: bool = False):
+    def __init__(
+        self,
+        fmt,
+        null_token: str,
+        numeric: bool,
+        numparse: bool = False,
+        is_ts_naive: bool = False,
+        nullable_int: bool = False,
+        uint: bool = False,
+    ):
         self.fmt = fmt
         self.null_token = null_token
-        self.numeric = numeric      # Arrow-level numeric → tabulate decimal-aligns
-        self.numparse = numparse    # string column: typing via tabulate._type
+        self.numeric = numeric  # Arrow-level numeric → tabulate decimal-aligns
+        self.numparse = numparse  # string column: typing via tabulate._type
         self.is_ts_naive = is_ts_naive
         self.nullable_int = nullable_int
-        self.uint = uint            # unsigned-int column (object-matrix flip below)
+        self.uint = uint  # unsigned-int column (object-matrix flip below)
 
 
 def _spec_for(t):
@@ -246,12 +260,8 @@ def _spec_for(t):
     return None
 
 
-_SINT_TYPES = frozenset(
-    (pa.int8(), pa.int16(), pa.int32(), pa.int64())
-)
-_UINT_TYPES = frozenset(
-    (pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64())
-)
+_SINT_TYPES = frozenset((pa.int8(), pa.int16(), pa.int32(), pa.int64()))
+_UINT_TYPES = frozenset((pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64()))
 _FLOAT_TYPES = frozenset((pa.float16(), pa.float32(), pa.float64()))
 _STR_TYPES = frozenset((pa.string(), pa.large_string()))
 
@@ -379,11 +389,15 @@ def arrow_to_markdown_fast(arrow, max_rows: int | None = None) -> str | None:
             else:
                 # bool mixed with any other numeric type → object matrix
                 if not any(pa.types.is_boolean(f.type) for f in arrow.schema):
+                    # _ARROW_TO_NUMPY's values are declared `object` to mypy
+                    # (dict built over an optional numpy import); every value
+                    # IS an np.dtype by construction — the comprehension guard
+                    # narrows, the cast only states that for the checker.
                     dtypes = [
-                        _np.dtype("float64") if cn else _ARROW_TO_NUMPY[f.type]
+                        _np.dtype("float64") if cn else cast("_np.dtype", _ARROW_TO_NUMPY[f.type])
                         for f, cn in zip(arrow.schema, col_has_null)
                     ]
-                    m = dtypes[0]
+                    m: _np.dtype = dtypes[0]
                     for dt in dtypes[1:]:
                         m = _np.promote_types(m, dt)
                     matrix = m
@@ -399,25 +413,19 @@ def arrow_to_markdown_fast(arrow, max_rows: int | None = None) -> str | None:
             # and fails _isint, so it lands in the float branch of tabulate's _type.)
             int_exact = _np.issubdtype(matrix, _np.signedinteger)
             specs = [
-                _ColumnSpec(str if int_exact else _fmt_float, s.null_token,
-                            numeric=True, is_ts_naive=s.is_ts_naive)
+                _ColumnSpec(str if int_exact else _fmt_float, s.null_token, numeric=True, is_ts_naive=s.is_ts_naive)
                 for s in specs
             ]
     else:
         # Object matrix: only the all-bool-no-null special case differs from the
         # per-column specs (numpy bools type float and render 1/0).
-        all_bool_no_null = (
-            all(s is _BOOL_SPEC for s in specs)
-            and sum(c.null_count for c in arrow.columns) == 0
-        )
+        all_bool_no_null = all(s is _BOOL_SPEC for s in specs) and sum(c.null_count for c in arrow.columns) == 0
         if all_bool_no_null:
             specs = [_BOOL_ONEZERO_SPEC] * len(specs)
 
     # Render all columns to final cell strings first (column-wise, the fast
     # part), then run tabulate's typing/alignment on the strings.
-    columns_cells: list[list[str]] = [
-        _column_cells(col, spec) for col, spec in zip(arrow.columns, specs)
-    ]
+    columns_cells: list[list[str]] = [_column_cells(col, spec) for col, spec in zip(arrow.columns, specs)]
 
     # Contract refusals: multiline or CJK-wide content takes tabulate's
     # multiline/wcwidth rendering paths this renderer does not implement.
@@ -439,9 +447,7 @@ def arrow_to_markdown_fast(arrow, max_rows: int | None = None) -> str | None:
         if not spec.numparse:
             continue
         typed = _column_type_tabulate(cells, spec.numeric, spec.numparse)
-        if typed is float and not all(
-            _string_cell_float_stable(c) for c in cells
-        ):
+        if typed is float and not all(_string_cell_float_stable(c) for c in cells):
             return None
 
     # Per-column type (tabulate semantics) → alignment decision. Under the
@@ -449,8 +455,7 @@ def arrow_to_markdown_fast(arrow, max_rows: int | None = None) -> str | None:
     # those float (its numparse), which is exactly the alignment numpy-bool
     # columns get. The base_numeric flag must follow the SUBSTITUTED spec,
     # not the original one.
-    types = [_column_type_tabulate(cells, spec.numeric, spec.numparse)
-             for cells, spec in zip(columns_cells, specs)]
+    types = [_column_type_tabulate(cells, spec.numeric, spec.numparse) for cells, spec in zip(columns_cells, specs)]
     aligns = ["decimal" if t in (int, float) else "left" for t in types]
 
     # tabulate._align_column, replicated on the final strings:
@@ -524,6 +529,7 @@ def arrow_to_markdown_fast(arrow, max_rows: int | None = None) -> str | None:
 # profile rendering (list-of-dicts → markdown, pandas-dtype faithful)
 # ---------------------------------------------------------------------------
 
+
 def _float_g(v) -> str | None:
     """tabulate's float-typed cell transform: format(float(v), 'g').
     None when v is not float-parseable (tabulate then renders it verbatim)."""
@@ -533,7 +539,7 @@ def _float_g(v) -> str | None:
         return None
 
 
-def profile_to_markdown(rows: list[dict]) -> str | None:
+def profile_to_markdown(rows: list[dict[str, Any]]) -> str | None:
     """Render SUMMARIZE-style rows (list of dicts) as pandas-identical markdown.
 
     The profile path renders heterogeneous dicts (one dict per source column:
@@ -591,9 +597,7 @@ def profile_to_markdown(rows: list[dict]) -> str | None:
         if s["other"]:
             return None  # bool col → pandas (object-col quirks)
         if s["str"] and (s["int"] or s["float"]):
-            kinds[k] = "fobj" if all(
-                _float_g(r.get(k)) is not None for r in rows if r.get(k) is not None
-            ) else "vobj"
+            kinds[k] = "fobj" if all(_float_g(r.get(k)) is not None for r in rows if r.get(k) is not None) else "vobj"
         elif s["str"]:
             kinds[k] = "str"
         elif s["float"]:
@@ -614,9 +618,11 @@ def profile_to_markdown(rows: list[dict]) -> str | None:
     for k in keys:
         kind = kinds[k]
         if kind == "int":
-            data[k] = pa.array([int(r.get(k)) for r in rows], pa.int64())
+            # kind=="int" proves every non-null cell is an int (the stats pass
+            # above); index r[k] so mypy sees the non-None value.
+            data[k] = pa.array([int(r[k]) for r in rows if r.get(k) is not None], pa.int64())
         elif kind == "float":
-            data[k] = pa.array([None if r.get(k) is None else float(r.get(k)) for r in rows], pa.float64())
+            data[k] = pa.array([None if r.get(k) is None else float(r[k]) for r in rows], pa.float64())
         elif kind == "none":
             if any_numeric:
                 return None  # shape-sensitive promotion → pandas path

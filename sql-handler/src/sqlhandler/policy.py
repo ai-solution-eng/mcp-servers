@@ -103,6 +103,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,6 +128,7 @@ __all__ = [
     "TableRule",
     "build_mask_select",
     "canonical_hash",
+    "dump_doc",
     "load_policy",
     "owner_key",
     "policy_enabled",
@@ -470,7 +472,7 @@ def _compile_datasets(data: dict, origin: str) -> tuple[dict, dict, dict, str, d
         # that LOOKS like a fingerprint attempt (either prefix) but fails
         # the real format refuses the file — fail-closed, never "just a
         # weird subject name".
-        fp_body = key[4:] if key.startswith("key:") else key
+        fp_body = key.removeprefix("key:")
         fp_shaped = fp_body.startswith("sha256:") or key.startswith("key:sha256:")
         if fp_shaped:
             if not _KEY_FP_RE.match(fp_body):
@@ -536,7 +538,7 @@ def _validate_admins(data: dict, origin: str) -> tuple[str, ...]:
         # datasets.assignments (the 2026-09-30 fail-closed rule): a value
         # that LOOKS like a fingerprint attempt must match the real format
         # or the file refuses — a typo'd fp never silently becomes a subject.
-        fp_body = e[4:] if e.startswith("key:") else e
+        fp_body = e.removeprefix("key:")
         if fp_body.startswith("sha256:") or e.startswith("key:sha256:"):
             if not _KEY_FP_RE.match(fp_body):
                 raise PolicyError(
@@ -569,6 +571,28 @@ def _parse_text(text: str, origin: str) -> dict:
     if not isinstance(data, dict):
         raise PolicyError(f"{origin}: policy must be an object")
     return data
+
+
+def dump_doc(data: dict, fmt: str = "yaml") -> str:
+    """The inverse of :func:`_parse_text` — a policy document as editable text.
+
+    YAML is the user-facing default (the admin UI's policy editor prefills
+    from it); JSON is the one-format fallback when pyyaml is missing — the
+    editor must always show text :func:`_parse_text` parses back. Same
+    serializer conventions as the semantic catalog's editor
+    (``engine._serialize_doc``): ``sort_keys=False`` keeps the operator's
+    key order, ``allow_unicode`` keeps non-ASCII subjects readable,
+    ``default_flow_style=False`` keeps it block-style (diff-friendly).
+    """
+    if fmt not in ("yaml", "json"):
+        raise ValueError(f"format must be 'yaml' or 'json', got {fmt!r}")
+    if fmt == "json":
+        return json.dumps(data, indent=2, default=str) + "\n"
+    try:
+        import yaml
+    except ImportError:
+        return json.dumps(data, indent=2, default=str) + "\n"
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
 def _mask_sql(col: str, spec: str, available: set[str]) -> str:
@@ -742,6 +766,10 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
     # sees what); when present it REPLACES the groups/subjects/key_fps/
     # default_group parsed from the file.
     datasets_doc: dict | None = None
+    # Pre-declared so both branches bind the same `str | None` shape: the
+    # compiled path yields a str, the hand-written path re-reads it from the
+    # document (where `data.get` is Optional).
+    default_group: str | None = None
     if "datasets" in data:
         if data.get("groups"):
             raise PolicyError(
@@ -757,12 +785,11 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         if not isinstance(spec, dict):
             raise PolicyError(f"{origin}: group {name!r} must be an object")
         vis = spec.get("visible_tables")
-        if vis is not None:
-            # The dataset-ACL vocabulary at the GROUP level: same shape rules
-            # as hidden_tables (fail-closed on bad globs), for the
-            # hand-written-groups path and the compiled one alike.
-            if not isinstance(vis, list) or not all(isinstance(g, str) and g.strip() for g in vis):
-                raise PolicyError(f"{origin}: group {name!r}.visible_tables must be a list of non-empty glob strings")
+        # The dataset-ACL vocabulary at the GROUP level: same shape rules
+        # as hidden_tables (fail-closed on bad globs), for the
+        # hand-written-groups path and the compiled one alike.
+        if vis is not None and (not isinstance(vis, list) or not all(isinstance(g, str) and g.strip() for g in vis)):
+            raise PolicyError(f"{origin}: group {name!r}.visible_tables must be a list of non-empty glob strings")
         tables = spec.get("tables") or {}
         if not isinstance(tables, dict):
             raise PolicyError(f"{origin}: group {name!r}.tables must be an object")
@@ -817,12 +844,11 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         # The compiled document owns identity + default_group; the file's
         # hand-written spelling of either alongside datasets would silently
         # conflict with the compilation, so it is refused (fail-closed).
+        # subjects/key_fps/default_group stay what _compile_datasets
+        # returned (the compiled vocabulary).
         for extra in ("subjects", "key_fps", "default_group"):
             if data.get(extra):
                 raise PolicyError(f"{origin}: 'datasets' and {extra!r} are mutually exclusive")
-        subjects = subjects  # compiled above by _compile_datasets
-        key_fps = key_fps
-        default_group = default_group
 
     # The admin designation: validated INDEPENDENTLY of the authoring shape
     # (groups or the datasets document — it composes with both; the only
@@ -853,6 +879,11 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         hash=pol_hash,
         datasets=datasets_doc,
         admins=admins,
+        # The authored mirror: the WHOLE parsed document (either form), so
+        # the grants payload / UI editor can show the file as the operator
+        # wrote it — top-level admins list included, groups form included.
+        # Hash-neutral (hashing folds the compiled fields above, not this).
+        authored=data,
     )
 
 
@@ -881,7 +912,7 @@ class PolicyStore:
     All state swaps are atomic (one reference assignment under a lock).
     """
 
-    def __init__(self, table_columns_provider=None):
+    def __init__(self, table_columns_provider: Callable[[], dict[str, list[str]] | None] | None = None) -> None:
         self._lock = threading.Lock()
         self._policy: Policy | None = None
         self._stat: tuple[str, float, int] | None = None
@@ -893,7 +924,7 @@ class PolicyStore:
     def configured() -> bool:
         return policy_file_path() is not None and policy_enabled()
 
-    def set_table_columns_provider(self, provider) -> None:
+    def set_table_columns_provider(self, provider: Callable[[], dict[str, list[str]] | None]) -> None:
         self._table_columns_provider = provider
 
     # -- reload ---------------------------------------------------------------

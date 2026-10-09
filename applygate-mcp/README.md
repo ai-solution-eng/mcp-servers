@@ -473,6 +473,7 @@ helm template test helm/
 helm template site helm/ -f helm/local/values.example.yaml   # after filling it in
 # Or render with the sanitized paste-ready examples (values-examples/README.md):
 helm template g2 helm/ -f helm/values-examples/values.g2.yaml
+helm template hardened helm/ -f helm/values-examples/values-hardened-g2.yaml   # MCP network zone ON
 helm template trial helm/ -f helm/values-examples/values.hosted-trial.yaml
 ```
 

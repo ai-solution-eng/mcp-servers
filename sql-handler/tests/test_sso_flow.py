@@ -127,15 +127,18 @@ def _claims(sub="1d2fee26-12d7-4167-bfc2-e781ff52fb54", preferred="andrew-bydlon
 
 
 class _JwksServer:
-    def __init__(self):
+    def __init__(self) -> None:
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         holder = self
         self._doc: dict = {"keys": []}
+        # The minted key material the fixtures stash for _mint(); declared so
+        # `server._rsa = _rsa` is a normal attribute write, not a new attr.
+        self._rsa: dict | None = None
 
         class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
+            def do_GET(self) -> None:
                 body = json.dumps(holder._doc).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

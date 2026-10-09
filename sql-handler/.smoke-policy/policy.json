@@ -1,0 +1,11 @@
+{
+  "datasets": {
+    "global": ["workorder/*", "reports/*"],
+    "assignments": {
+      "andrew-bydlon": ["workorder/*", "reports/*"],
+      "sha256:0123456789ab": ["reports/*"]
+    },
+    "blocked": ["*_pii"]
+  },
+  "admins": ["andrew-bydlon"]
+}

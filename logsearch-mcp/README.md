@@ -234,6 +234,7 @@ surface is exercised without a cluster.
 helm lint helm/
 helm template test helm/ -f helm/local/values.example.yaml   # example render
 helm template g2 helm/ -f helm/values-examples/values.g2.yaml     # sanitized examples
+helm template hardened helm/ -f helm/values-examples/values-hardened-g2.yaml   # MCP network zone ON
 helm template trial helm/ -f helm/values-examples/values.hosted-trial.yaml
 helm upgrade --install logsearch-mcp helm/ -n <namespace> -f helm/local/values.<site>.yaml
 ```

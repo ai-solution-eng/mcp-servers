@@ -14,7 +14,7 @@ import pytest
 
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
 def _make_engine(tmp_path):
@@ -31,7 +31,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):

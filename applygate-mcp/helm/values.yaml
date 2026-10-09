@@ -1,130 +1,97 @@
+# applygate-mcp — the governed Kubernetes WRITE-path MCP server (PCAI Helm values)
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — the chart NEVER creates or inlines it; the pod
+#      sits in CreateContainerConfigError until it exists (default ref:
+#      applygate-mcp-apikey, key api-keys; /mcp 401s without keys).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard
+#      (templates/virtualservice.yaml); must resolve ${DOMAIN_NAME}; unique per release.
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Write surface (default-deny!): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+#   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
+#   Audit trail + persistence (hash-chained; logsearch-searchable) — README 'Audit trail'
+#   Caller attribution: clients.existingSecret + callerPassthrough.trustedCidrs — README
+#   Cross-namespace writes: per-namespace RBAC bootstrap — documentation/DEPLOYMENT.md
+
 deployment:
   name: applygate-mcp
   appName: applygate-mcp
   replicaCount: 1
+
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
   tag: v0.5.0
   pullPolicy: IfNotPresent
+
 imagePullSecrets: []
-# -- Transport security (DNS-rebinding protection; fleet pattern: K8S-MCP) --
-# The server builds TransportSecuritySettings via the SHARED
-# mcp_auth.transport_security_from_env(). With NEITHER key set (default) it
-# returns None → the SDK's implicit LOOPBACK-ONLY Host protection applies
-# untouched (local dev; in-cluster callers via svc DNS still work because
-# the SDK auto-protection is loopback-allowlist based... in-cluster callers
-# reaching the pod through the Service DO need the extra host below).
-#
-# mcpHostname: the public FQDN clients use to reach /mcp (DNS-rebinding
-# pin). Usually the same value as ezua.virtualService.endpoint — set it
-# explicitly (or template it there) whenever the gateway fronts this
-# server: WITHOUT it, every gateway request gets 421 "Invalid Host header".
-# MUST be unique per release on the shared gateway (the K8S-MCP lesson).
-#
-# extraAllowedHosts: EXTRA in-cluster callers that address the server by its
-# service DNS name (e.g. a peer MCP →
-# http://other-mcp.<ns>.svc.cluster.local:9102/mcp). Entries are matched
-# verbatim, or use the `host:*` form to accept any port. The pinned FQDN
-# (mcpHostname) and loopback are always allowed; without this knob the
-# behavior is unchanged. List of strings.
-#
-# NOTE — the chart AUTO-INCLUDES this release's own service DNS
-# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
-# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active
-# (mcpHostname set or extraAllowedHosts non-empty): the LLM-gateway relay
-# arrives with Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>,
-# and without that entry every relay hop gets 421 Misdirected Request. This
-# key only lists hosts BEYOND that; a site setting extraAllowedHosts never
-# loses the own-svc entry (the chart prepends it):
+
+# ============================================================================
+# Transport Security (DNS-rebinding protection; fleet pattern: K8S-MCP)
+# ============================================================================
+# mcpHostname: the public FQDN pin — set in lockstep with ezua.virtualService
+# .endpoint, or every gateway-fronted request 421s. extraAllowedHosts: EXTRA
+# in-cluster svc-DNS hosts (verbatim or host:*; own-svc DNS auto-prepended).
 mcpHostname: ''
 extraAllowedHosts: []
-# API keys for the /mcp endpoint (fleet pattern: K8S-MCP). The chart NEVER
-# creates a key and NEVER inlines one in values — an envsubst apply once
-# emptied a live key Secret (the K8S-MCP lesson). The deployment references
-# an operator-created Secret and fails loud (CreateContainerConfigError)
-# until it exists:
-#   kubectl -n <ns> create secret generic applygate-mcp-apikey \
-#     --from-literal=api-keys='key-old,key-new'
-# Comma-SEPARATED keys all authenticate: that is the rotation mechanism —
-# append the new key, move clients over, drop the old one, no downtime.
+
+# Operator-created Secret (never inline a key in values); the Deployment
+# fails loud until it exists. Comma-separated keys all authenticate (rotation).
 apiKey:
   existingSecret: applygate-mcp-apikey
   existingSecretKey: api-keys
+
 clients:
-  # Per-request caller-name registry (fleet Item A4): APPLYGATE_CLIENTS =
-  # "name:key;name:key;..." — it NAMES keys the API-key middleware already
-  # matched (audit attribution: caller.name). The registry can NEVER
-  # authenticate anything: an unregistered key behaves exactly as today.
-  # Keys are Secret material — existingSecret-only (the K8S-MCP invariant,
-  # the chart never creates or inlines a key):
-  #   kubectl -n <ns> create secret generic applygate-mcp-clients \
-  #     --from-literal=clients='pipeline-bot:key-1;deploy-bot:key-2'
-  # Omitted (default) → the env is not rendered → fp-only caller audit,
-  # byte-identical behavior to the pre-attribution baseline.
+  # Caller-name registry "name:key;name:key;..." — NAMES only (already-matched
+  # keys); NEVER authenticates. Omitted (default) → fp-only caller audit.
   existingSecret: ''
   existingSecretKey: clients
+
 callerPassthrough:
-  # X-MCP-Caller honoring (fleet Item A2): the header is accepted ONLY from
-  # direct peers inside these CIDRs (comma-separated, e.g. the gateway/sidecar
-  # pod CIDR) and lands in the audit as caller.via. UNSET/EMPTY = fail-closed:
-  # the header is IGNORED from every peer (the default render — a deployment
-  # without an explicitly trusted relay never trusts the header). Behind an
-  # Istio sidecar scope["client"] is the sidecar's address, so tune the list
-  # per deployment. Attribution-never-authorization: via and name NEVER
-  # unlock anything (not namespaces, not kinds, not the D11 plan binding,
-  # not confirm_apply) — key_fp remains the credential truth.
+  # X-MCP-Caller honored ONLY from peers in these CIDRs; empty = fail-closed.
+  # Attribution-never-authorization: via/name NEVER unlock anything.
   trustedCidrs: ''
+
 webui:
   enabled: true
+
 namespaces:
   allowed: ''
   blocked: ''
+
 kinds:
   allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
+
 audit:
-  # Hash-chained, caller-attributed JSONL audit trail — see README
-  # ("Audit trail: hash chain + caller identity"). Every entry carries
-  # prev_sha256 (sha256 of the previous line; 64-zero genesis on an empty
-  # trail) and a non-secret caller fingerprint, making the trail
-  # tamper-evident (verify with server.verify_audit_chain() or the README
-  # procedure). Fleet convention for observability: this audit.path is
-  # documented for ops mount/expose — mount THIS SAME path/PVC into the
-  # logsearch pod (shared PVC or extraVolumes) so the governed write path's
-  # "who did what" becomes logsearch-searchable (FLEET-AUDIT §3.3, C3/C4
-  # Wave-3 convention).
+  # Hash-chained, tamper-evident JSONL trail (README "Audit trail") — mount
+  # the SAME path/PVC into the logsearch pod to make "who did what" searchable.
   file: /data/audit.jsonl
+
 planBinding:
-  # Decision D11 (ratified 2026-09): apply_manifest is sha256-bound to the
-  # EXACT bytes plan_apply recorded — missing plan or tampered bytes refuse
-  # BY DEFAULT (the server's built-in default is deny). This knob renders
-  # the APPLYGATE_UNPLANNED_APPLY env ONLY when set, so the DEFAULT render
-  # stays byte-identical and the strictest mode applies out of the box:
-  #   unplannedApply: ''     # (default; renders nothing → deny enforced)
-  #   unplannedApply: warn   # migration path: applies without a plan but
-  #                          # logs loudly (stderr + audit "plan_binding")
-  #   unplannedApply: allow  # pre-D11 behavior (automation unaffected)
-  # Any other value fails closed to deny. Intentionally breaks apply-without-
-  # plan automation — that is the ratified point; warn is the migration path.
+  # apply_manifest is sha256-bound to the planned bytes; missing/tampered plan
+  # refuses BY DEFAULT. ''=deny (default) | warn=logged | allow=legacy.
   unplannedApply: ''
+
 metrics:
-  # /metrics + ServiceMonitor — ADDITIVE and OFF by default (fleet
-  # convention): enabled=false renders NOTHING, keeping the default render
-  # byte-identical to the Wave-0 baseline. When true, the deployment gets
-  # APPLYGATE_METRICS_ENABLED=on (the server serves /metrics on the SAME
-  # container port; prometheus-client is import-guarded — a slim image
-  # serves an honest fallback text) and the ServiceMonitor below ships.
-  # Requires the prometheus-operator ServiceMonitor CRD in-cluster.
+  # /metrics + ServiceMonitor — additive, OFF by default; true serves /metrics
+  # on the SAME container port and ships the ServiceMonitor (prom-op CRD needed).
   enabled: false
   interval: 30s
+
 persistence:
   enabled: true
   size: 1Gi
   accessModes:
   - ReadWriteOnce
+
 service:
   type: ClusterIP
   port: 9102
   targetPort: 9102
+
 resources:
   requests:
     cpu: 100m
@@ -132,76 +99,66 @@ resources:
   limits:
     cpu: '1'
     memory: 512Mi
+
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   runAsGroup: 10001
   fsGroup: 10001
+
 podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
+
 containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
   capabilities:
     drop:
     - ALL
+
 serviceAccount:
   create: true
   name: applygate-mcp
+
 rbac:
   create: true
-# Per-key proxy wiring (fleet convention: searxng-mcp) — each key is wired
-# into the pod only when non-empty, so a corporate-proxy site sets http/https
-# (and usually noProxy), while a direct-egress site leaves proxy: {} (or
-# omits it) and everything renders off:
-#   proxy:
-#     http: http://proxy.corp.example:8080
-#     https: http://proxy.corp.example:8080
-#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
-# The k8s API is in-cluster and covered by the standard NO_PROXY cluster-local
-# entries, so the proxy block is fleet consistency only.
+# Per-key proxy wiring — each key wired only when non-empty; proxy: {} = off
+# (the in-cluster k8s API is covered by the standard NO_PROXY entries).
 proxy: {}
+
 kyverno:
   enabled: false
+
 ezua:
   enabled: false
   domainName: ${DOMAIN_NAME}
   virtualService:
-    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
-    # ezua.enabled keeps driving every other gate (kyverno, deployment).
-    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
-    # `default` treats an explicit `false` as empty and would return true.
+    # false unrenders the VS (no browser path) while ezua.enabled keeps driving
+    # every other gate. Gate DIRECTLY on this key — Sprig `default` flips it.
     enabled: true
     endpoint: applygate-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 120s
 
-# -- MCP network zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF) ------------
-# Ingress allowlist for this MCP (kubernetes.io/metadata.name ns selectors).
-# Once enabled, anything not matched below is DENIED (a real posture, not a
-# no-op); egress stays unrestricted (policyTypes: [Ingress] only).
+# ============================================================================
+# MCP Network Zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF)
+# ============================================================================
+# Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
+# egress stays unrestricted (policyTypes: [Ingress] only).
 networkPolicy:
   enabled: false
   sameNamespace: true
-  # The MCP network zone: client namespaces allowed to call this server
-  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
-  # namespace goes here first; add agentic frontends from the hardened-G2
-  # example. `monitoring` belongs here whenever the chart ships a
-  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
-  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
+  # In-cluster caller namespaces (relay ns first; + `monitoring` when a
+  # ServiceMonitor ships — an unlisted scrape ns dies silently).
   authorizedClients:
     namespaces: []
-  # Browser/console path stays OPEN (fleet doctrine 2026-09): the zone exists
-  # to stop RANDOM IN-CLUSTER model access — external traffic keeps flowing
-  # through the SSO-gated edge gateway exactly as pre-zone. Only flip to
-  # false as an explicit, per-chart, per-site decision (e.g. exec/mutation
-  # consoles) — never as a class default.
+  # Browser/console path stays OPEN — the zone stops RANDOM IN-CLUSTER access
+  # only; flip to false only as an explicit per-site decision.
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
-  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
-  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
-  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
+  # Live-verified edge-pod label — `ezaf-gateway` is the Gateway CR NAME;
+  # do not "fix" this back to app=ezaf-gateway.
   ingressGatewayLabels:
     app: istio-ingressgateway
   # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0

@@ -1,114 +1,120 @@
+# k8s-mcp-customer — customer distribution of the Kubernetes ops MCP server,
+# for PCAI (HPE Ezmeral Unified Analytics).
+#
+# STRUCTURALLY LOCKED — the locked twin of helm/ (the trusted-operator chart).
+# The security knobs — exec, namespace policy, per-user keys, RBAC scope and
+# extra groups — DO NOT EXIST in these values and the templates never read
+# them: pasting `exec: {enabled: true}` in the frontend is inert. Day-2
+# security changes are a platform action from the kube command line (NOTES.txt
+# prints the exact commands); the exec Role is never minted, so exec stays
+# impossible until the operator creates it deliberately.
+#
+# The frontend can configure only benign wiring: image, naming, service,
+# exposure endpoint, API-key Secret reference, console toggle.
+#
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-# Prefer: Slack
-
-# k8s-mcp-customer — customer distribution of the Kubernetes ops MCP
-# server, for PCAI (HPE Ezmeral Unified Analytics).
+# Owner: Francesco Caliva
+# Email: francesco.caliva@hpe.com
 #
-# CUSTOMER DISTRIBUTION — STRUCTURALLY LOCKED. This chart is the locked
-# twin of helm/ (the trusted-operator chart). The security knobs — exec,
-# namespace policy, per-user keys, RBAC scope and extra groups — DO NOT
-# EXIST in these values, and the templates never read them. Pasting
-# `exec: {enabled: true}` into the PCAI frontend is inert: nothing in this
-# chart consumes that key. Day-2 security changes are a platform action,
-# from the kube command line (NOTES.txt prints the exact commands); the
-# exec Role is NOT minted by this chart, so exec stays impossible until
-# the operator creates it deliberately.
-#
-# What the frontend CAN configure below is deliberately limited to benign
-# wiring: image, naming, service, exposure endpoint, API-key Secret
-# reference, console toggle.
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — never created/inlined by the chart;
+#      CreateContainerConfigError until it exists (ref: <name>-apikey / api-key).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` in the
+#      VirtualService + AuthorizationPolicy templates; doubles as MCP_HOSTNAME.
+# ### OPTIONAL ### — the LOCKED chart tunes only benign wiring; security changes are a
+#   platform action (the chart's NOTES.txt prints every command):
+#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md Deployment profiles
+#   Console shell: console.enabled — documentation/DEPLOYMENT.md
+#   In-cluster callers: extraAllowedHosts (svc-DNS; never bypasses the key gate) — documentation/DEPLOYMENT.md
+#   Listing caps / metrics: listing.* / metrics.enabled — documentation/DEPLOYMENT.md
+#   Gateway SSO gate: ezua.authorizationPolicy.enabled (tokens ON TOP of the key) — documentation/DEPLOYMENT.md
 
-# -- Deployment ----------------------------------------------------------------
+# ============================================================================
+# Deployment / Image / Service / Resources
+# ============================================================================
+
 deployment:
   name: k8s-mcp-customer
   appName: k8s-mcp-customer
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  # Keep in lockstep with Chart.yaml appVersion (same image as the internal
-  # chart — the locking lives in this chart, not the binary).
+  # Lockstep with Chart.yaml appVersion (same image as the internal chart —
+  # the locking lives in this chart, not the binary).
   tag: v1.2.0
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously). Per-namespace secret:
-#   kubectl create secret docker-registry ghcr-pull -n <ns> \
-#     --docker-server=ghcr.io --docker-username=<gh-user> \
-#     --docker-password=<gh-PAT-with-read:packages>
+# Only for a PRIVATE GHCR package (public pulls are anonymous):
+#   kubectl create secret docker-registry ghcr-pull -n <ns> --docker-server=ghcr.io ...
 imagePullSecrets: []
 
-# -- Service exposure -------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9090        # MCP (streamable-http at /mcp) + ops console (/ui/)
   targetPort: 9090
 
-# -- Resources -------------------------------------------------------------------------------
 resources:
   requests:
     cpu: 100m
     memory: 128Mi
   limits:
     cpu: 500m
-    # 2026-10-05: 512Mi OOMKilled x4 during heavy get_resource listing bursts
-    # (full-YAML renders + concurrent kubectl fan-out spike RSS; steady-state is
-    # only ~136Mi but the burst is what counts — see wave report POST-DEPLOY
-    # VERIFICATION). 2Gi matches the live G2 deployment; ~15x steady-state.
+    # 512Mi OOMKilled ×4 in heavy get_resource listing bursts (steady-state
+    # ~136Mi — the burst is what counts); 2Gi matches live G2.
     memory: 2Gi
 
-# -- Service account ------------------------------------------------------------------------------
 serviceAccount:
   create: true
   name: ""                   # empty = deployment.name (it is the RBAC subject)
 
-# -- MCP server app config (benign keys only) --------------------------------------------------------
+# ============================================================================
+# MCP Server App Config (benign keys only)
+# ============================================================================
 # The API key is NEVER created by this chart and NEVER inlined in values —
 # reference an out-of-band Secret; the Deployment fails loud until it exists.
+
 apiKey:
   existingSecret: ""         # empty = "<deployment.name>-apikey"
   existingSecretKey: api-key
 
-# -- In-cluster host allowlist (benign connectivity wiring) ---------------------------------
-# Extra Host header values the MCP SDK's DNS-rebinding protection accepts, for
-# in-cluster callers that address the server by its service DNS name instead of
-# the public FQDN (e.g. Open WebUI →
-# http://<name>-service.<ns>.svc.cluster.local:9090/mcp). Joined into
-# MCP_EXTRA_ALLOWED_HOSTS; entries match verbatim or as `host:*` for any port.
-# This never bypasses the API-key gate — it only decides which Host headers the
-# rebinding protection accepts. Empty = behaviour unchanged.
+# Extra Host headers the SDK's DNS-rebinding protection accepts for in-cluster
+# svc-DNS callers (e.g. Open WebUI); verbatim or `host:*`; never bypasses the key gate.
 extraAllowedHosts: []
 
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
 
-# -- Cluster-wide listing guardrails (benign wiring) ------------------------------------------------------------
+# ============================================================================
+# Cluster-wide Listing Guardrails
+# ============================================================================
 # Performance guardrails only — NOT security knobs. "" = the server's own
-# default (an unset key renders NO env var; the default render is unchanged).
+# default (no env rendered; default render unchanged).
+
 listing:
   maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 100): cap on -A/cluster-wide list results, with a truncation marker naming the env
   concurrency: ""            # K8S_MCP_LIST_CONCURRENCY (server default 8): bounded-semaphore width for the per-namespace -A fan-out
   maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
   maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
 
-# -- Observability (opt-in; default off = byte-identical render) --------------------------------------------
+# ============================================================================
+# Metrics
+# ============================================================================
+# Opt-in; default off = byte-identical render.
+
 metrics:
   enabled: false             # K8S_MCP_METRICS_ENABLED=true: serve GET /metrics (counters only, no key) + the ServiceMonitor below
   interval: 30s              # ServiceMonitor scrape interval
 
-# -- RBAC: BAKED, NOT VALUES-DRIVEN ---------------------------------------------------------------------
-# templates/rbac-readonly.yaml carries a $scope chart constant ("cluster") —
-# read-only, cluster-wide, the same posture validated on the internal
-# cluster. To clamp a tenant to its own namespace, switch that constant to
-# "namespace" and repackage: a deliberate platform action, deliberately NOT
-# a frontend edit. This chart never mints exec RBAC.
+# RBAC is BAKED, NOT VALUES-DRIVEN: templates/rbac-readonly.yaml carries a
+# $scope chart constant; clamping a tenant = switch it + repackage (platform action).
 
-# -- Pod annotations / node placement ------------------------------------------------------------------------
-# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
-# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
-# — it is the audited baseline.
+# ============================================================================
+# Pod Annotations / Node Placement
+# ============================================================================
+# (container hardening — non-root, read-only rootfs, dropped caps, seccomp —
+# is NOT values-overridable: the audited baseline)
 podAnnotations:
   sidecar.istio.io/inject: "false"
 
@@ -116,10 +122,11 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------------------------------------------
-# Deploys the Istio VirtualService so MCP clients reach the server through
-# the ezaf-gateway. The endpoint doubles as MCP_HOSTNAME (DNS-rebinding
-# pin) — MUST be unique per release on the shared gateway.
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+# Deploys the Istio VirtualService through the ezaf-gateway; the endpoint
+# doubles as MCP_HOSTNAME — unique per release on the shared gateway.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
@@ -127,8 +134,8 @@ ezua:
     endpoint: "k8s-mcp-customer.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
-  # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default —
-  # flipping it on enforces PCAI tokens for this host, on TOP of the API key.
+  # Gateway-level auth gate (oauth2-proxy / SSO bearer) — OFF by default;
+  # on = PCAI tokens for this host, on TOP of the API key.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"

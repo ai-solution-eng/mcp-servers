@@ -30,9 +30,7 @@ import pytest
 # point XDG_RUNTIME_DIR at a writable location BEFORE the (lazy) import.
 def _pg_runtime_dir() -> str:
     """A creatable XDG_RUNTIME_DIR (sandboxed CIs may pre-set an unwritable one)."""
-    candidate = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
-        tempfile.gettempdir(), "sqlhandler-pg-runtime"
-    )
+    candidate = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(tempfile.gettempdir(), "sqlhandler-pg-runtime")
     try:
         os.makedirs(candidate, exist_ok=True)
         return candidate
@@ -95,7 +93,7 @@ class _OneLakeTable(_NoTables):
 class _FakeCon:
     """Records execute() calls; optionally raises on the Nth call."""
 
-    def __init__(self, fail_on=None, error=Exception("boom")):
+    def __init__(self, fail_on: int | None = None, error: Exception = Exception("boom")) -> None:
         self.calls: list[str] = []
         self._fail_on = fail_on
         self._error = error
@@ -107,7 +105,9 @@ class _FakeCon:
         return self
 
 
-def _attach_env(host: str, tmp_path: Path, password_env: str = "") -> dict:
+def _attach_env(host: str, tmp_path: Path | None = None, password_env: str = "") -> dict:
+    """The ATTACH env for one postgres host. ``tmp_path`` is unused by the
+    inline-config shape (kept for call-site compatibility)."""
     return {
         "SQLHANDLER_ATTACH": json.dumps(
             [
@@ -187,9 +187,7 @@ def test_parse_file_config_with_defaults(monkeypatch, tmp_path):
 def test_rejects_literal_password_key(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "ops", "type": "postgres", "host": "h", "database": "d", "password": "oops"}]
-        ),
+        json.dumps([{"name": "ops", "type": "postgres", "host": "h", "database": "d", "password": "oops"}]),
     )
     with pytest.raises(ValueError, match="password_env"):
         parse_attach_config()
@@ -216,9 +214,7 @@ def test_rejects_missing_password_env_var(monkeypatch):
 
 
 def test_rejects_bad_and_duplicate_aliases(monkeypatch):
-    bad = json.dumps(
-        [{"name": "9ops", "type": "postgres", "host": "h", "database": "d", "password_env": ""}]
-    )
+    bad = json.dumps([{"name": "9ops", "type": "postgres", "host": "h", "database": "d", "password_env": ""}])
     monkeypatch.setenv("SQLHANDLER_ATTACH", bad)
     with pytest.raises(ValueError, match="alias"):
         parse_attach_config()
@@ -260,9 +256,7 @@ def test_rejects_bad_and_duplicate_aliases(monkeypatch):
 def test_rejects_unknown_type(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "x", "type": "oracle", "host": "h", "database": "d", "password_env": ""}]
-        ),
+        json.dumps([{"name": "x", "type": "oracle", "host": "h", "database": "d", "password_env": ""}]),
     )
     with pytest.raises(ValueError, match="type"):
         parse_attach_config()
@@ -280,9 +274,7 @@ def test_empty_config_is_empty_list():
 def test_postgresql_spelling_not_accepted(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "x", "type": "postgresql", "host": "h", "database": "d", "password_env": ""}]
-        ),
+        json.dumps([{"name": "x", "type": "postgresql", "host": "h", "database": "d", "password_env": ""}]),
     )
     with pytest.raises(ValueError, match="type.*not supported"):
         parse_attach_config()
@@ -291,9 +283,7 @@ def test_postgresql_spelling_not_accepted(monkeypatch):
 def test_parse_mariadb_alias_keeps_type_and_defaults_to_root(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "mr", "type": "mariadb", "host": "db", "database": "d", "password_env": "PW"}]
-        ),
+        json.dumps([{"name": "mr", "type": "mariadb", "host": "db", "database": "d", "password_env": "PW"}]),
     )
     monkeypatch.setenv("PW", "pw")
     spec = parse_attach_config()[0]
@@ -305,9 +295,7 @@ def test_parse_mariadb_alias_keeps_type_and_defaults_to_root(monkeypatch):
 def test_parse_sqlserver_requires_explicit_user(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "ms", "type": "sqlserver", "host": "h", "database": "d", "password_env": ""}]
-        ),
+        json.dumps([{"name": "ms", "type": "sqlserver", "host": "h", "database": "d", "password_env": ""}]),
     )
     with pytest.raises(ValueError, match="sqlserver.*'user'"):
         parse_attach_config()  # no default user — never fall back to 'sa'
@@ -334,9 +322,7 @@ def test_parse_sqlserver_requires_explicit_user(monkeypatch):
 def test_parse_sqlite_happy_path(monkeypatch):
     monkeypatch.setenv(
         "SQLHANDLER_ATTACH",
-        json.dumps(
-            [{"name": "sdb", "type": "sqlite", "database": "/data/ops.db"}]
-        ),  # password_env omitted
+        json.dumps([{"name": "sdb", "type": "sqlite", "database": "/data/ops.db"}]),  # password_env omitted
     )
     spec = parse_attach_config()[0]
     assert (spec.host, spec.port, spec.user, spec.password_env) == ("", 0, "", "")
@@ -367,9 +353,7 @@ def test_sqlite_database_is_minimally_validated_file_path(monkeypatch):
     monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, "database": "/data/op\x00s.db"}]))
     with pytest.raises(ValueError, match="NUL/control"):
         parse_attach_config()
-    monkeypatch.setenv(
-        "SQLHANDLER_ATTACH", json.dumps([{**base, "database": "/data/ops db (v2).db"}])
-    )
+    monkeypatch.setenv("SQLHANDLER_ATTACH", json.dumps([{**base, "database": "/data/ops db (v2).db"}]))
     assert parse_attach_config()[0].database == "/data/ops db (v2).db"  # spaces/parens are fine
 
 
@@ -517,9 +501,7 @@ def test_apply_external_loads_before_attach_and_scrubs_errors():
 
     failing = _FakeCon(fail_on=2, error=Exception("conn failed host=h password=pw1 port=5432"))
     with pytest.raises(ExternalAttachError) as ei:
-        apply_external(
-            failing, [spec], {"PW": "pw1"}
-        )  # no extension dir -> LOAD is call 1, ATTACH call 2
+        apply_external(failing, [spec], {"PW": "pw1"})  # no extension dir -> LOAD is call 1, ATTACH call 2
     assert "pw1" not in str(ei.value) and "***" in str(ei.value)
 
 
@@ -552,18 +534,14 @@ def test_build_attach_sql_postgres_params_merge_without_duplicates():
 
 
 def test_build_attach_sql_params_override_defaults():
-    spec = AttachSpec(
-        "ops", "postgres", "h", 5432, "db", "u", "PW", True, (("connect_timeout", "30"),)
-    )
+    spec = AttachSpec("ops", "postgres", "h", 5432, "db", "u", "PW", True, (("connect_timeout", "30"),))
     sql = build_attach_sql(spec, None)
     assert "connect_timeout=''30''" in sql and sql.count("connect_timeout") == 1
     assert "connect_timeout=10" not in sql  # the default was replaced, not duplicated
 
 
 def test_build_attach_sql_mysql_tls_param_forwarded_verbatim():
-    spec = AttachSpec(
-        "mx", "mysql", "h", 3306, "db", "u", "PW", True, (("ssl_mode", "verify_identity"),)
-    )
+    spec = AttachSpec("mx", "mysql", "h", 3306, "db", "u", "PW", True, (("ssl_mode", "verify_identity"),))
     sql = build_attach_sql(spec, "pw")
     assert "ssl_mode=verify_identity" in sql  # libmariadb TLS key — NOT postgres' sslmode
     assert "passwd=pw" in sql and "database=db" in sql and "dbname=" not in sql
@@ -645,10 +623,7 @@ def test_build_attach_sql_sqlserver_conn_string_defaults():
     spec = AttachSpec("ms", "sqlserver", "sql.internal", 1433, "adw", "ro", "MS_PW")
     sql = build_attach_sql(spec, "pw1")
     assert 'AS "ms" (TYPE mssql, READ_ONLY)' in sql
-    assert (
-        "Server=sql.internal,1433;Database=adw;Uid=ro;Pwd=pw1;Encrypt=yes;TrustServerCertificate=yes"
-        in sql
-    )
+    assert "Server=sql.internal,1433;Database=adw;Uid=ro;Pwd=pw1;Encrypt=yes;TrustServerCertificate=yes" in sql
 
 
 def test_build_attach_sql_sqlserver_params_overlay_case_insensitive():
@@ -668,9 +643,7 @@ def test_build_attach_sql_sqlserver_params_overlay_case_insensitive():
     )
     sql = build_attach_sql(spec, "pw")
     assert "application_name=sqlhandler" in sql
-    assert (
-        sql.count("Encrypt=") + sql.count("encrypt=") == 1
-    )  # override replaced the default in place
+    assert sql.count("Encrypt=") + sql.count("encrypt=") == 1  # override replaced the default in place
     assert sql.count("Pwd=") == 1
 
 
@@ -754,9 +727,7 @@ def test_engine_reads_attached_pg_under_lockdown(pg_attached):
 
 def test_engine_mixed_lake_and_pg_join(pg_attached):
     engine = pg_attached
-    table = engine.query_duckdb(
-        "SELECT count(*) AS n FROM lake_tbl l JOIN ops.pg_catalog.pg_type p ON p.oid > 0"
-    )
+    table = engine.query_duckdb("SELECT count(*) AS n FROM lake_tbl l JOIN ops.pg_catalog.pg_type p ON p.oid > 0")
     assert table.column("n").to_pylist()[0] > 0
 
 
@@ -803,9 +774,7 @@ def test_attached_databases_lists_tables(pg_attached, pg_server):
     import duckdb
 
     con = duckdb.connect()
-    con.execute(
-        f"SET extension_directory='{Path(__file__).resolve().parent.parent / 'duckdb-ext'}'"
-    )
+    con.execute(f"SET extension_directory='{Path(__file__).resolve().parent.parent / 'duckdb-ext'}'")
     con.execute("LOAD postgres_scanner")
     host = engine.attaches[0].host
     con.execute(f"ATTACH 'host={host} dbname=postgres user=postgres' AS w (TYPE postgres)")
@@ -853,9 +822,7 @@ def sqlite_attached(tmp_path_factory):
         probe.execute(f"SET extension_directory='{extdir}'")
         probe.execute("LOAD sqlite_scanner")
     except Exception as exc:
-        pytest.skip(
-            f"sqlite_scanner extension not baked in <repo>/duckdb-ext yet (parallel bake step): {exc}"
-        )
+        pytest.skip(f"sqlite_scanner extension not baked in <repo>/duckdb-ext yet (parallel bake step): {exc}")
     finally:
         probe.close()
 
@@ -878,9 +845,7 @@ def test_engine_reads_attached_sqlite_under_lockdown(sqlite_attached):
 
 def test_engine_mixed_lake_and_sqlite_join(sqlite_attached):
     engine = sqlite_attached
-    table = engine.query_duckdb(
-        "SELECT count(*) AS n FROM lake_tbl l JOIN sdb.main.agent_test a ON a.k > 0"
-    )
+    table = engine.query_duckdb("SELECT count(*) AS n FROM lake_tbl l JOIN sdb.main.agent_test a ON a.k > 0")
     assert table.column("n").to_pylist()[0] > 0
 
 

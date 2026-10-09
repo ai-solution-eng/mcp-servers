@@ -195,7 +195,7 @@ def test_admin_designation_via_subject(app, monkeypatch, policy_file):
         "/api/admin/grants",
         headers={"X-API-Key": raw, "X-MCP-Caller-Subject": "ops-lead"},
     )
-    assert r.status_code == 403  # key without relay header stays fp-anonymous... 
+    assert r.status_code == 403  # key without relay header stays fp-anonymous...
     # (the /api route resolves the CALLER from the presented key itself; a
     # relay subject header rides the identity spine's /mcp machinery, not
     # the admin route's own resolution — subject designation works for
@@ -211,13 +211,97 @@ def test_grants_view_shape(app, policy_file):
     r = app.get("/api/admin/grants", headers=_admin_headers())
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"admins", "datasets", "assignments", "blocked", "groups", "policy_hash", "keys"}
+    assert set(body) == {
+        "admins",
+        "datasets",
+        "policy_text",
+        "assignments",
+        "blocked",
+        "groups",
+        "policy_hash",
+        "keys",
+    }
     assert body["admins"] == [ADMIN_FP]
     assert body["datasets"]["global"] == ["workorder/*"]
     assert body["assignments"] == {USER_FP: ["reports/*"]}
     assert body["blocked"] == ["scratch/*"]
     assert body["groups"] == []  # the datasets form compiles, no hand-written groups
     assert isinstance(body["policy_hash"], str) and len(body["policy_hash"]) == 64
+
+
+def test_grants_policy_text_is_the_whole_authored_document(app, policy_file):
+    """policy_text serves the WHOLE authored policy document as YAML — the
+    datasets doc AND the top-level admins list — so the UI editor shows
+    what is actually enforcing (not a datasets-only fragment)."""
+    import yaml
+
+    r = app.get("/api/admin/grants", headers=_admin_headers())
+    assert r.status_code == 200
+    text = r.json()["policy_text"]
+    assert text.strip(), "policy_text must never be empty while a policy is enforcing"
+    doc = yaml.safe_load(text)
+    assert doc == POLICY_DOC
+    assert doc["admins"] == [ADMIN_FP]  # the piece the datasets mirror always dropped
+    assert doc["datasets"]["assignments"] == {USER_FP: ["reports/*"]}
+
+
+def test_grants_policy_text_covers_the_groups_form(app, policy_file):
+    """The hand-written groups form (datasets: null) still prefills the
+    editor with the file as written — the historic empty-editor prefill is
+    what let a Save wipe a groups-form policy."""
+    import yaml
+
+    groups_doc = {
+        "groups": {"analysts": {"tables": {"payroll*": {"column_masks": {"amount": "redact"}}}}},
+        "admins": [ADMIN_FP],
+    }
+    policy_file.write_text(json.dumps(groups_doc, indent=2) + "\n", encoding="utf-8")
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    body = app.get("/api/admin/grants", headers=_admin_headers()).json()
+    assert body["datasets"] is None
+    doc = yaml.safe_load(body["policy_text"])
+    assert doc == groups_doc
+    assert "analysts" in body["policy_text"]
+
+
+def test_grants_policy_text_empty_without_a_policy(monkeypatch, tmp_path, keys_file):
+    """No policy file configured → the editor prefills empty (nothing is
+    enforcing; the payload stays shape-stable for the UI). The HTTP route
+    cannot serve this state (no policy file = no admins = the fail-closed
+    403 gate), so the payload builder is asserted directly."""
+    monkeypatch.setenv("MCP_API_KEYS", ADMIN_KEY)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    _policy.reset_policy_store()
+    try:
+        body = server_module._admin_grants_payload()
+        assert body["policy_text"] == ""
+        assert body["datasets"] is None
+        assert body["admins"] == []
+    finally:
+        _policy.reset_policy_store()
+
+
+def test_policy_put_yaml_roundtrip(app, policy_file):
+    """Save what you see: the YAML the grants view served PUTs back verbatim
+    (the route sniffs YAML) and the next grants view serves the same
+    document — the admin loop closes with no format conversion in sight."""
+    import yaml
+
+    served = app.get("/api/admin/grants", headers=_admin_headers()).json()["policy_text"]
+    doc = yaml.safe_load(served)
+    doc["datasets"]["global"] = ["workorder/*", "reports/*"]
+    yaml_edit = yaml.safe_dump(doc, sort_keys=False)
+    old_hash = app.get("/api/admin/grants", headers=_admin_headers()).json()["policy_hash"]
+    r = app.put("/api/admin/policy", json={"policy": yaml_edit}, headers=_admin_headers())
+    assert r.status_code == 200, r.text
+    assert r.json()["policy_hash"] != old_hash
+    # The file WAS written as the YAML the admin saw (no JSON rewrite).
+    assert policy_file.read_text(encoding="utf-8") == yaml_edit
+    again = app.get("/api/admin/grants", headers=_admin_headers()).json()
+    assert yaml.safe_load(again["policy_text"])["datasets"]["global"] == ["workorder/*", "reports/*"]
+    assert again["admins"] == [ADMIN_FP]
 
 
 def test_grants_view_reports_minted_and_secret_keys(app, keys_file, policy_file):
@@ -358,8 +442,9 @@ def test_policy_hot_reloads_grants(app, policy_file):
     r = app.put("/api/admin/policy", json={"policy": json.dumps(new_doc)}, headers=_admin_headers())
     assert r.status_code == 200
     assert _wait_until(
-        lambda: app.get("/api/admin/grants", headers=_admin_headers()).json()["assignments"].get(ADMIN_FP)
-        == ["payroll/*"]
+        lambda: (
+            app.get("/api/admin/grants", headers=_admin_headers()).json()["assignments"].get(ADMIN_FP) == ["payroll/*"]
+        )
     )
 
 
@@ -433,11 +518,14 @@ def test_minted_key_401s_after_revoke(app, keys_file, policy_file):
     assert not any(e["fp"] == fp for e in _admin_keys.list_keys())
     assert fp not in _read_policy(policy_file)["datasets"]["assignments"]
     # the revoked key is refused immediately (store match is live)
-    assert app.post(
-        "/mcp",
-        json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-        headers={"Accept": "application/json, text/event-stream", "X-API-Key": raw},
-    ).status_code == 401
+    assert (
+        app.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Accept": "application/json, text/event-stream", "X-API-Key": raw},
+        ).status_code
+        == 401
+    )
 
 
 def test_key_mint_groups_form_refused_503(app, keys_file, policy_file):
@@ -619,6 +707,33 @@ def test_mcp_admin_grants_admin_happy_path(app, policy_file):
     assert payload["admins"] == [ADMIN_FP]
     assert payload["assignments"] == {USER_FP: ["reports/*"]}
     assert any(e["fp"] == ADMIN_FP and e["source"] == "secret" for e in payload["keys"])
+    # The MCP twin carries the same editable truth as the REST route: the
+    # WHOLE authored document as YAML (admins list included).
+    assert payload["policy_text"].strip()
+    assert "admins" in payload["policy_text"]
+
+
+def test_mcp_admin_policy_set_accepts_yaml(app, policy_file):
+    """The twin accepts the YAML its grants twin serves — the doc an agent
+    round-trips through policy_text → admin_policy_set lands verbatim."""
+    import yaml
+
+    served = json.loads(_mcp_call(app, "admin_grants", {})[1])["policy_text"]
+    doc = yaml.safe_load(served)
+    doc["datasets"]["blocked"] = ["scratch/*", "tmp/*"]
+    yaml_edit = yaml.safe_dump(doc, sort_keys=False)
+    is_err, text = _mcp_call(app, "admin_policy_set", {"policy": yaml_edit})
+    assert is_err is False, text
+    out = json.loads(text)
+    assert out["ok"] is True
+    # The file was written as the YAML the twin was given (no JSON rewrite)
+    # — parse it through the loader's own JSON/YAML sniffer.
+    assert _policy._parse_text(policy_file.read_text(encoding="utf-8"), "t")["datasets"]["blocked"] == [
+        "scratch/*",
+        "tmp/*",
+    ]
+    is_err, text = _mcp_call(app, "admin_grants", {})
+    assert yaml.safe_load(json.loads(text)["policy_text"])["datasets"]["blocked"] == ["scratch/*", "tmp/*"]
 
 
 def test_mcp_admin_policy_set_roundtrip(app, policy_file):
@@ -767,6 +882,7 @@ def test_minted_key_survives_in_store_for_grants(app, keys_file):
 # user behind it).
 # ---------------------------------------------------------------------------
 
+
 def _designate(monkeypatch, policy_file, admins):
     """Rewrite the policy_file fixture's document with the given admins list."""
     policy_file.write_text(json.dumps({"admins": admins, "datasets": {"global": ["*"]}}) + "\n", encoding="utf-8")
@@ -809,8 +925,7 @@ def test_unrecognized_key_still_401_not_redeemed_as_browser(app, monkeypatch, po
     session rides the same request: a wrong key is never redeemed as the
     browser user behind it."""
     _designate(monkeypatch, policy_file, ["andrew"])
-    r = app.get("/api/admin/grants", headers={
-        "X-Auth-Request-User": "andrew", "X-API-Key": "totally-wrong-key"})
+    r = app.get("/api/admin/grants", headers={"X-Auth-Request-User": "andrew", "X-API-Key": "totally-wrong-key"})
     assert r.status_code == 401, r.text
 
 
@@ -821,12 +936,15 @@ def test_valid_key_not_shadowed_by_forwarded_sso_bearer(app, policy_file):
     Authorization → the SSO token won the race → 401 with a perfectly valid
     key in the field. The key must win: api_key candidates resolve FIRST,
     and an unrecognized Bearer never shadows a recognized key."""
-    policy_file.write_text(json.dumps({
-        "admins": [ADMIN_FP], "datasets": {"global": ["*"]}}) + "\n")
+    policy_file.write_text(json.dumps({"admins": [ADMIN_FP], "datasets": {"global": ["*"]}}) + "\n")
     _policy.reset_policy_store()
-    r = app.get("/api/admin/grants", headers={
-        "X-API-Key": ADMIN_KEY,                       # valid, designated
-        "Authorization": "Bearer <forwarded-sso-token>"})  # not a key, not valid
+    r = app.get(
+        "/api/admin/grants",
+        headers={
+            "X-API-Key": ADMIN_KEY,  # valid, designated
+            "Authorization": "Bearer <forwarded-sso-token>",
+        },
+    )  # not a key, not valid
     assert r.status_code == 200, r.text
     assert ADMIN_FP in r.json()["admins"]
 
@@ -837,9 +955,7 @@ def test_sso_bearer_token_in_authorization_resolves_via_ladder(app, monkeypatch,
     JWT rung gets a chance; in the test environment there is no issuer so it
     declines → 401 (with the test pinning that this path, not the key path,
     was taken: the refusal is a 401, never a 200-by-accident)."""
-    policy_file.write_text(json.dumps({
-        "admins": ["key:sha256:b1a47ad2d71c"], "datasets": {"global": ["*"]}}) + "\n")
+    policy_file.write_text(json.dumps({"admins": ["key:sha256:b1a47ad2d71c"], "datasets": {"global": ["*"]}}) + "\n")
     _policy.reset_policy_store()
-    r = app.get("/api/admin/grants", headers={
-        "Authorization": "Bearer <sso-token-not-a-key>"})
+    r = app.get("/api/admin/grants", headers={"Authorization": "Bearer <sso-token-not-a-key>"})
     assert r.status_code == 401, r.text

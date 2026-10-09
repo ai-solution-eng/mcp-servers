@@ -109,7 +109,7 @@ def app_with_big_table(monkeypatch, tmp_path):
     """
     from sqlhandler import server
     from sqlhandler.engine import SqlEngine
-    from sqlhandler.provider import TableInfo
+    from sqlhandler.provider import DataProvider, TableInfo
 
     d = tmp_path / "big" / "wide_table"
     d.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,7 @@ def app_with_big_table(monkeypatch, tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):

@@ -1,16 +1,23 @@
 # k8s-mcp — HARDENED-G2 example: the MCP network zone ON.
-# Admin-surface MCP (cluster credentials!): the zone locks IN-CLUSTER access;
-# browser path stays OPEN (fleet doctrine 2026-09) — no VirtualService
-# rendered), reachable ONLY from the authorized client namespaces in-cluster
-# + same-namespace ops + kubelet probes.
+
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Owner: Francesco Caliva
+# Email: francesco.caliva@hpe.com
 #
+# OVERLAY: merge onto the base/G2 values document — nothing here is standalone.
+# Turns the MCP network zone ON (in-cluster callers locked to the allowlist;
+# browser path stays open) — documentation/DEPLOYMENT.md Deployment profiles.
+# Admin-surface MCP (cluster credentials!): the zone locks IN-CLUSTER access —
+# reachable only from the authorized client namespaces + same-namespace ops +
+# kubelet probes; the browser path stays OPEN through the SSO-gated edge
+# gateway (fleet doctrine 2026-09).
 # ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
-# with the zone on, every unlisted caller times out (deny by absence).
-#
+# every unlisted caller times out (deny by absence).
 # Zone list (G2 live facts, inventory §6): least-privilege — the namespaces
 # the LIVE gateway netpol already names as authorized MCP callers, plus
-# monitoring for the ServiceMonitor scrape. Widen deliberately via the
-# operator recipe in the RUNBOOK, one ns at a time.
+# monitoring for the ServiceMonitor scrape; widen one ns at a time via the
+# operator recipe in the RUNBOOK.
 networkPolicy:
   enabled: true
   sameNamespace: true
@@ -20,32 +27,24 @@ networkPolicy:
       - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
       - owebui0-11-0        # OWUI instance on the live gateway allowlist
       - opencode-web-helm   # OpenCode web
-      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
-                            # ns `prometheus`) — the monitoring ns holds otel/UA,
-                            # NOT the scraper; omit and up=0 within one interval
-      - monitoring          # Prometheus scraping /metrics (ServiceMonitor) —
-                            # omit and metrics scraping dies SILENTLY
-                            # (check Prometheus targets after enabling)
+      - prometheus         # the ACTUAL scraper (ns `prometheus`); `monitoring` holds otel/UA
+      - monitoring          # ServiceMonitor scrape target — omit and it dies SILENTLY
   # Browser path stays OPEN (fleet doctrine 2026-09): the zone restricts
-  # IN-CLUSTER callers only; external traffic rides the SSO-gated edge gateway
-  # exactly as pre-zone (the browser is behind admin sign-ins).
+  # IN-CLUSTER callers only; external traffic rides the SSO-gated edge gateway.
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
-  # Kubelet probes originate at the NODE: allow node IPs only (inventory §4:
-  # node IPs 172.28.1.61-63 masters, .161-.162 workers), with the pod CIDR
-  # carved out so pod traffic stays governed by the zone rules above.
+  # Kubelet probes originate at the NODE: per-node /32 allows only (G2:
+  # 172.28.1.61-63 masters, .161-.162 workers) — pod traffic follows the zone rules.
   probeCidrs:
     - 172.28.1.61/32
     - 172.28.1.62/32
     - 172.28.1.63/32
     - 172.28.1.161/32
     - 172.28.1.162/32
-  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
-  # be a STRICT SUBSET of the cidr — pod IPs (10.224.x) are not inside a node
-  # /32 (172.28.1.x), so there is nothing to carve out. Only a BROAD probe
-  # allow (e.g. 0.0.0.0/0) pairs with a carve-out.
+  # Stays EMPTY with per-node /32s (ipBlock.except must be a strict subset);
+  # only a BROAD probe allow (e.g. 0.0.0.0/0) pairs with a carve-out.
   probeExceptCidrs: []
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted

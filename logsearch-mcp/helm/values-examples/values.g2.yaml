@@ -1,57 +1,71 @@
 # logsearch-mcp — values for the SE-G2 lab cluster
-# (SITE: your-cluster.example — proxied corporate PCAI site)
+# (your-cluster.example — proxied corporate PCAI site)
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document (PCAI's Helm Values editor replaces the
-# chart's bundled values.yaml). Site edits are marked '# SITE:'.
-# Sanitized for publication: no credentials, no personal namespaces — real
-# site values live in helm/local/ (never committed, never packaged).
+# chart's bundled values.yaml). Secret-free; real site values live in
+# helm/local/ (never committed, never packaged).
 
-# -- Deployment ----------------------------------------------------------------
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — never created/inlined by the chart; the pod
+#      sits in CreateContainerConfigError until it exists (ref: logsearch-mcp-apikey,
+#      key api-keys; pod logs are sensitive — /mcp must never trust network position).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard;
+#      must resolve ${DOMAIN_NAME}; unique per release.
+
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Namespace policy (THE access control; default-deny): logsearch.allowedNamespaces /
+#     blockedNamespaces, or the emptyAllowsAll lab escape hatch — documentation/DEPLOYMENT.md
+#   RBAC scope: rbac.clusterWide (release-ns default; cluster-wide = lab only) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/serviceMonitor — documentation/DEPLOYMENT.md
+#   export_matches destination: logsearch.exportRoot (workbench-shared) — documentation/DEPLOYMENT.md
+#   Blast-radius caps: logsearch.maxPods/maxLinesPerPod/maxTotalLines/maxLineChars — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
 deployment:
   name: logsearch-mcp
   appName: logsearch-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
-# repository/tag/pullPolicy are release-managed (kept in lockstep with
-# Chart.yaml by the release tooling) — leave at the chart default.
+# Release-managed (lockstep with Chart.yaml) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
   tag: v0.4.0
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously).
-imagePullSecrets: []
+imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
 
-# -- Namespace policy (LOUD — this is the server's ONLY access control) --------
-# READ-ONLY by design, but pod logs routinely contain sensitive strings
-# (tokens in stack traces, PII, internal hostnames). The namespace policy is
-# the control that bounds what an agent harness can reach.
-#   allowedNamespaces: comma-separated fnmatch globs. EMPTY = DENY ALL
-#   namespaces (default-deny, fleet decision D8) unless emptyAllowsAll: true.
-#   Set it EXPLICITLY for anything beyond a lab cluster.
-#   blockedNamespaces: ALWAYS wins over the allowed list.
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# Shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# ============================================================================
+# Namespace Policy
+# ============================================================================
+
+# THE server's only access control: pod logs routinely carry sensitive
+# strings, and an EMPTY allowedNamespaces DENIES ALL namespaces (default-deny).
 logsearch:
-  # SITE: the chart default is now deny-all (D8); this lab cluster keeps the
-  # pre-D8 open default via the explicit escape hatch below. Tighten for prod:
-  #   emptyAllowsAll: false
-  #   allowedNamespaces: "team-a,team-b-*"
+  # Lab keeps the open default EXPLICITLY. Tighten for prod:
+  #   emptyAllowsAll: false + allowedNamespaces: "team-a,team-b-*"
   allowedNamespaces: ""
-  # SITE: punch holes back out of a broad allow-list here
-  blockedNamespaces: ""
-  # SITE (lab): pre-D8 open default, set EXPLICITLY — remove for prod
-  emptyAllowsAll: true
+  blockedNamespaces: ""     # punch holes back out of a broad allow-list here
+  emptyAllowsAll: true      # lab: open default, set EXPLICITLY — remove for prod
   exportRoot: ""            # default: export_matches refuses with setup instructions;
                             # convention: point at a workbench-shared dir (see DEPLOYMENT.md)
-
-# -- Caps (blast-radius limits for agent harnesses) -----------------------------
-# A fan-out search touches up to maxPods pods, tailing maxLinesPerPod lines
-# each, and stops FETCHING once maxTotalLines merged matches are in hand
-# (budget enforced during the fan-out). Returned lines are capped at
-# maxLineChars chars with a truncation marker; user regexes are ReDoS-screened
-# above maxRegexChars chars; fetchConcurrency is the parallel fan-out width.
+  # Blast-radius caps: fetch width/budget/line + regex-size limits per fan-out.
   maxPods: 50
   maxLinesPerPod: 1000
   maxTotalLines: 300
@@ -59,88 +73,94 @@ logsearch:
   fetchConcurrency: 8
   maxRegexChars: 512
 
-# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
-# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts for
-# IN-CLUSTER callers addressing the server by svc DNS (joined into
-# MCP_EXTRA_ALLOWED_HOSTS; verbatim or `host:*`). The pinned public FQDN
-# (ezua.virtualService.endpoint) and loopback are always allowed; empty =
-# behaviour unchanged (fleet pattern: K8S-MCP). The chart AUTO-prepends the
-# release's own service DNS (<deployment.name>-service.<ns>.svc.cluster.local:*)
-# whenever transport security is active — sites list only EXTRA hosts.
-extraAllowedHosts: []
+extraAllowedHosts: []   # EXTRA Host headers for in-cluster svc-DNS callers (`host:*` form)
 
-# -- Service exposure ---------------------------------------------------------------------
+# ============================================================================
+# Metrics
+# ============================================================================
+
+metrics:
+  enabled: true             # per-tool counters + ServiceMonitor
+  interval: 30s             # ServiceMonitor scrape interval (chart default, now explicit)
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor
+
+# ============================================================================
+# Web Console
+# ============================================================================
+
+# Human front-end over the SAME seams/policy/caps as the MCP tools.
+webui:
+  enabled: true   # false = MCP-only surface (/health, /healthz, /mcp only)
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 512Mi}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+# ============================================================================
+# RBAC
+# ============================================================================
+
+# clusterWide: false = release namespace only; a one-time admin bootstrap is
+# the alternative for targeted cross-namespace grants — documentation/DEPLOYMENT.md.
+rbac:
+  create: true
+  clusterWide: true   # G2 lab: cluster-wide reads via the opt-in knob
+
+# ============================================================================
+# Networking
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9101
   targetPort: 9101
 
-# -- Web console (fleet pattern: prometheus-mcp's webui) --------------------------------------------
-# The HPE-branded log-search console at / and the /api/* JSON endpoints are a
-# HUMAN front-end over the SAME seams, namespace policy, and caps that back
-# the MCP tools — the UI has no powers the tools don't. false = MCP-only
-# surface (only /health, /healthz, /mcp are served).
-webui:
-  enabled: true
-
-# -- Resources --------------------------------------------------------------------------------
-resources:
-  requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    memory: 512Mi
-
-# -- Security ---------------------------------------------------------------------------------
-securityContext:
-  runAsNonRoot: true
-  runAsUser: 10001
-
-# -- RBAC --------------------------------------------------------------------------------------
-# READ-ONLY, deliberately minimal: pods get/list + pods/log get — nothing
-# else (no secrets, no exec, no write verbs — see templates/rbac.yaml).
-#   clusterWide: false (chart default) = release namespace ONLY (a one-time
-#     admin bootstrap is the alternative for targeted cross-namespace grants
-#     — see documentation/DEPLOYMENT.md).
-# SITE (G2 lab): cluster-wide reads via the opt-in knob below.
-rbac:
-  create: true
-  clusterWide: true
-
-# -- Per-key proxy wiring (fleet convention: searxng-mcp) ----------------------------------------
-# The only network peer is the IN-CLUSTER Kubernetes API, covered by the
-# NO_PROXY cluster-local entries — the proxy env is effectively inert here;
-# it exists for fleet consistency and any future egress need. Each key is
-# wired only when non-empty.
+# Per-key proxy wiring (fleet convention: searxng-mcp); the only peer is the
+# in-cluster Kubernetes API, so the block is fleet consistency only.
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost"
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
-# Deploys the Istio VirtualService through the ezaf-gateway. /mcp is the agent
-# path; the web console rides the root route when webui.enabled. Enabling ezua
-# also renders the fleet's vendor-label Kyverno policy (gated on ezua in this
-# chart).
-# SITE: gateway exposure on — with the literal host (this file must not rely
-# on ${DOMAIN_NAME} resolution).
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Gateway exposure on, with literal hosts (this file must not rely on
+# ${DOMAIN_NAME} resolution).
 ezua:
-  enabled: true   # SITE: deploy the VirtualService on this cluster
-  # SITE: literal domain
+  enabled: true   # deploy the VirtualService on this cluster
   domainName: your-cluster.example   # informational only — no template reads it
   virtualService:
-    # SITE: literal host — /mcp -> MCP server (9101); / -> web console
-    endpoint: logsearch-mcp.your-cluster.example
+    endpoint: logsearch-mcp.your-cluster.example   # /mcp -> MCP server (9101); / -> web console
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
 
-# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
-apiKey:
-  existingSecret: "mcp-fleet-apikeys"
-  existingSecretKey: "api-keys"
+# ============================================================================
+# Network Zone
+# ============================================================================
 
-# Observability (Wave-3+): per-tool counters + ServiceMonitor.
-metrics:
-  enabled: true
-  interval: 30s             # ServiceMonitor scrape interval (chart default, now explicit)
-  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor
+# MCP network zone — ADDITIVE, DEFAULT OFF. Ingress allowlist (ns selectors):
+# once on, anything not matched is DENIED. Zone OFF in this plain G2 profile.
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    enabled: false
+    extraEgress: []

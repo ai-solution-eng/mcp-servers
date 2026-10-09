@@ -2,52 +2,71 @@
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document for the PCAI Helm Values editor. Adjust the
-# '# SITE:' lines, then apply.
-# Secret-free by construction: nothing here needs credentials. If your PCAI
-# build resolves ${DOMAIN_NAME} in ezua values, the placeholders below work as
-# pasted; otherwise replace them with the literal cluster domain — an
-# unresolved placeholder registers a gateway host that matches nothing.
+# fill-in lines, then apply. Secret-free: if your PCAI build resolves
+# ${DOMAIN_NAME} in ezua values the placeholders work as pasted; otherwise
+# substitute the literal cluster domain (an unresolved placeholder registers
+# a gateway host that matches nothing).
 
-# -- Deployment ----------------------------------------------------------------
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — never created/inlined by the chart; the pod
+#      sits in CreateContainerConfigError until it exists (ref: logsearch-mcp-apikey,
+#      key api-keys; pod logs are sensitive — /mcp must never trust network position).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard;
+#      must resolve ${DOMAIN_NAME}; unique per release.
+
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Namespace policy (THE access control; default-deny): logsearch.allowedNamespaces /
+#     blockedNamespaces, or the emptyAllowsAll lab escape hatch — documentation/DEPLOYMENT.md
+#   RBAC scope: rbac.clusterWide (release-ns default; cluster-wide = lab only) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/serviceMonitor — documentation/DEPLOYMENT.md
+#   export_matches destination: logsearch.exportRoot (workbench-shared) — documentation/DEPLOYMENT.md
+#   Blast-radius caps: logsearch.maxPods/maxLinesPerPod/maxTotalLines/maxLineChars — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
 deployment:
   name: logsearch-mcp
   appName: logsearch-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
-# repository/tag/pullPolicy are release-managed — leave at the chart default.
+# Release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
   tag: v0.4.0
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously).
-imagePullSecrets: []
+imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
 
-# -- Namespace policy (LOUD — this is the server's ONLY access control) --------
-# READ-ONLY by design, but pod logs routinely contain sensitive strings
-# (tokens in stack traces, PII, internal hostnames). The chart is
-# DEFAULT-DENY (fleet decision D8): an empty allowlist denies ALL namespaces —
-# a trial MUST set an explicit allowlist (do NOT reach for emptyAllowsAll).
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# Shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# ============================================================================
+# Namespace Policy
+# ============================================================================
+
+# THE server's only access control: pod logs routinely carry sensitive
+# strings, and an EMPTY allowedNamespaces DENIES ALL namespaces (default-deny).
 logsearch:
-  # SITE: namespaces the trial agent may search (fnmatch globs OK) — REQUIRED
-  # under the default-deny policy
+  # Namespaces the trial agent may search (fnmatch globs OK) — REQUIRED.
   allowedNamespaces: <ALLOWED_NAMESPACES>
-  # SITE: ALWAYS wins over the allowed list — keep the platform namespaces out
-  blockedNamespaces: kube-system,kube-public,kube-node-lease
-  # Leave FALSE: the pre-D8 open default must never come back on a trial.
-  emptyAllowsAll: false
-  # export_matches destination: "" renders NO env var → the tool refuses with
-  # setup instructions (writes nothing). Point at an ABSOLUTE dir on a
-  # writable volume agents can read back — fleet convention: a workbench-shared
-  # PVC path (e.g. /data/exports plus workbench's WORKBENCH_SHARED_PATHS).
+  blockedNamespaces: kube-system,kube-public,kube-node-lease   # keep platform namespaces out
+  emptyAllowsAll: false   # the open default must never come back on a trial
+  # export_matches destination: "" = no env, tool refuses with setup
+  # instructions; set an ABSOLUTE dir agents can read back (workbench-shared).
   exportRoot: ""
-
-# -- Caps (blast-radius limits for agent harnesses) -----------------------------
-# Bound both API-server load and the MCP response size (an agent's context
-# window); search stops fetching once maxTotalLines matches are in hand.
-# Defaults are sane for a trial.
+  # Blast-radius caps: fetch width/budget/line + regex-size limits per fan-out.
   maxPods: 50
   maxLinesPerPod: 1000
   maxTotalLines: 300
@@ -55,83 +74,93 @@ logsearch:
   fetchConcurrency: 8
   maxRegexChars: 512
 
-# -- In-cluster host allowlist (DNS-rebinding additions) -----------------------------------
-# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts for
-# IN-CLUSTER callers addressing the server by svc DNS (joined into
-# MCP_EXTRA_ALLOWED_HOSTS; verbatim or `host:*`). The pinned public FQDN
-# (ezua.virtualService.endpoint) and loopback are always allowed; empty =
-# behaviour unchanged (fleet pattern: K8S-MCP). The chart AUTO-prepends the
-# release's own service DNS (<deployment.name>-service.<ns>.svc.cluster.local:*)
-# whenever transport security is active — sites list only EXTRA hosts.
-extraAllowedHosts: []
+extraAllowedHosts: []   # EXTRA Host headers for in-cluster svc-DNS callers (`host:*` form)
 
-# -- Service exposure ---------------------------------------------------------------------
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# Flip to true where the trial wants per-tool counters (requires the
+# prometheus-operator ServiceMonitor CRD).
+metrics:
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval
+
+# ============================================================================
+# Web Console
+# ============================================================================
+
+# HPE-branded console at / — keep on for the trial.
+webui:
+  enabled: true
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 512Mi}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+# ============================================================================
+# RBAC
+# ============================================================================
+
+# clusterWide: false on a trial — blast radius exactly one namespace; true
+# renders ClusterRole/ClusterRoleBinding (lab/trusted clusters only).
+rbac:
+  create: true
+  clusterWide: false
+
+# ============================================================================
+# Networking
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9101
   targetPort: 9101
 
-# -- Web console ---------------------------------------------------------------------------
-# HPE-branded log-search console at / — a human front-end over the SAME
-# seams, namespace policy, and caps as the MCP tools. Keep on for the trial.
-webui:
-  enabled: true
-
-# -- Resources --------------------------------------------------------------------------------
-resources:
-  requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    memory: 512Mi
-
-# -- Security ---------------------------------------------------------------------------------
-securityContext:
-  runAsNonRoot: true
-  runAsUser: 10001
-
-# -- RBAC --------------------------------------------------------------------------------------
-# READ-ONLY, deliberately minimal (pods get/list + pods/log get — nothing
-# else). SITE: clusterWide: false (chart default) on a trial — blast radius
-# exactly one namespace. Searching OTHER trial namespaces needs a one-time
-# admin-applied read-only bootstrap per namespace (see
-# documentation/DEPLOYMENT.md). true renders ClusterRole/ClusterRoleBinding
-# (lab/trusted clusters only).
-rbac:
-  create: true
-  clusterWide: false
-
-# -- Per-key proxy wiring -------------------------------------------------------------------------
-# SITE: off unless the trial cluster sits behind a corporate proxy — the k8s
-# API is in-cluster and covered by the NO_PROXY entries either way (fleet
-# consistency only). Each key is wired only when non-empty; `proxy: {}`
-# (or omitting the block entirely) means fully off.
+# Proxy off unless the trial cluster sits behind a corporate proxy; the k8s
+# API is in-cluster (covered by NO_PROXY) either way.
 proxy: {}
-#   http: http://proxy.corp.example:8080
-#   https: http://proxy.corp.example:8080
-#   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
-# SITE: gateway exposure — /mcp for agents, / for the web console.
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Gateway exposure — /mcp for agents, / for the web console. Current PCAI
+# builds resolve ${DOMAIN_NAME}; otherwise substitute the literal domain.
 ezua:
-  enabled: true   # SITE: deploy the VirtualService
-  # SITE: current PCAI builds resolve ${DOMAIN_NAME} in ezua values; if yours
-  # does not, replace both placeholders with the literal cluster domain.
+  enabled: true   # deploy the VirtualService
   domainName: ${DOMAIN_NAME}   # informational only — no template reads it
   virtualService:
     endpoint: logsearch-mcp.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
 
-# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
-apiKey:
-  existingSecret: "mcp-fleet-apikeys"
-  existingSecretKey: "api-keys"
+# ============================================================================
+# Network Zone
+# ============================================================================
 
-# Observability (Wave-3+): per-tool counters + ServiceMonitor.
-metrics:
-  # SITE: flip to true where the trial wants per-tool counters (requires the
-  # prometheus-operator ServiceMonitor CRD).
+# MCP network zone — ADDITIVE, DEFAULT OFF. Ingress allowlist (ns selectors):
+# once on, anything not matched is DENIED. Zone OFF on a trial.
+networkPolicy:
   enabled: false
-  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
-  interval: 30s             # ServiceMonitor scrape interval
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    enabled: false
+    extraEgress: []

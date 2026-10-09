@@ -203,16 +203,22 @@ class SharingClient:
         """
         if self._conn is None:
             parsed = urllib.parse.urlsplit(self.config.endpoint)
+            # urlsplit().hostname is Optional (a URL without a host); the
+            # endpoint is validated http(s) before use, so the host is always
+            # present in practice — "" keeps the Optional out of the
+            # HTTP(S)Connection arg (an empty host fails the connect loudly,
+            # exactly like the invalid endpoint it would be).
+            host = parsed.hostname or ""
             if parsed.scheme == "https":
                 self._conn = http.client.HTTPSConnection(
-                    parsed.hostname,
+                    host,
                     parsed.port or 443,
                     context=ssl.create_default_context(),
                     timeout=self.config.timeout_seconds,
                 )
             elif parsed.scheme == "http":
                 self._conn = http.client.HTTPConnection(
-                    parsed.hostname,
+                    host,
                     parsed.port or 80,
                     timeout=self.config.timeout_seconds,
                 )
@@ -636,7 +642,9 @@ class _HTTPRandomAccessFile:
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
-        return parsed.hostname, port, path, https
+        # hostname is Optional per urlsplit; the presigned-URL construction
+        # always carries a host — "" degrades to a loud connect failure.
+        return parsed.hostname or "", port, path, https
 
     def _connection(self):
         if self._conn is None:
@@ -693,7 +701,12 @@ class _HTTPRandomAccessFile:
     def read(self, n: int = -1) -> bytes:
         if self._resp is None or self._pos != self._resp_start:
             self._open_at(self._pos)
-        chunk = self._resp.read(n)
+        # _open_at always leaves _resp set (it raises otherwise); alias to a
+        # local so the checker sees the narrowing past the method call.
+        resp = self._resp
+        if resp is None:  # pragma: no cover - _open_at guarantees a response
+            raise OSError(f"GET {self._safe_url()} returned no response")
+        chunk = resp.read(n)
         self._pos += len(chunk)
         return chunk
 

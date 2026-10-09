@@ -32,16 +32,16 @@ class FakeProvider(DataProvider):
 
     kind = "fake"
 
-    def __init__(self, root):
+    def __init__(self, root: Path) -> None:
         self.root = root
         self.list_calls = 0
         self.open_calls: list[str] = []
 
-    def list_tables(self):
+    def list_tables(self) -> list[TableInfo]:
         self.list_calls += 1
         return TABLES
 
-    def table_uri(self, info):
+    def table_uri(self, info: TableInfo) -> str:
         return f"fake://{info.path}"
 
     def open_dataset(self, info, version=None):

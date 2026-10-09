@@ -301,7 +301,7 @@ above and in `documentation/DEPLOYMENT.md`.)
 | Key | Default | Effect |
 |---|---|---|
 | `deployment.appName` | `workbench-mcp` | Kubernetes object + pod/container name and label. |
-| `image.tag` | `v0.2.1` | Image tag — kept in lockstep with `Chart.yaml` `appVersion`; a stale tag in a site values file is how an "old MCP server" pod happens. |
+| `image.tag` | `v0.4.0` | Image tag — kept in lockstep with `Chart.yaml` `appVersion`; a stale tag in a site values file is how an "old MCP server" pod happens. |
 | `resources.requests.cpu` / `resources.limits.cpu` | `250m` / `1` | Container CPU requests/limits (memory: `256Mi` / `512Mi`). |
 | `securityContext.runAsNonRoot` / `securityContext.runAsUser` | `true` / `10001` | Pod-level non-root posture; uid 10001 matches the image user, and `fsGroup: 10001` keeps the mounted PVC writable. |
 | `containerSecurityContext.readOnlyRootFilesystem` | `true` | Root filesystem is read-only — `run_command` children can write only the PVC and `/tmp` (fleet-audit P0). |
@@ -401,6 +401,15 @@ K8S-MCP-console pattern): the console HTML at `/` and `/ui` is
 the browser cannot load the page behind a 401 — while every `/api/*` data
 route (and `/mcp`) stays API-key-gated at the pod; the endpoint must also
 sit behind gateway authn (PCAI Istio gateway).
+
+> **Behavior change (2026-10, W7 fix — caught live during deploy
+> observation):** before this fix the key middleware covered the console
+> HTML too, so a keyed deployment served the browser **raw 401 JSON at
+> `/`** and the console was unreachable. Now `GET /` and `/ui` always serve
+> the (inert) HTML with the unlock bar; every `/api/*` data route still
+> answers 401 to an unkeyed call when a key is configured, and the mutation
+> surface (file writes, env edits, `run_command`, deletes) is unchanged —
+> same routes, same core functions, same audit.
 
 ## Run
 

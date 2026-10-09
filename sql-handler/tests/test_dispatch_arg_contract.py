@@ -47,9 +47,9 @@ def stub_engine(tmp_path, monkeypatch):
     )
 
     from sqlhandler.engine import SqlEngine
-    from sqlhandler.provider import TableInfo
+    from sqlhandler.provider import DataProvider, TableInfo
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):

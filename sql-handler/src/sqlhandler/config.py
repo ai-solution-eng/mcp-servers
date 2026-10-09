@@ -823,8 +823,7 @@ def load_adls_config(env: dict | None = None) -> AdlsConfig:
     auth = _getenv("ADLS_AUTH", e.get("ADLS_AUTH", "anon")).lower() or "anon"
     if auth not in ("anon", "client-secret"):
         raise LakehouseError(
-            f"Invalid ADLS_AUTH {auth!r}: use 'anon' (public container) or "
-            "'client-secret' (Entra service principal)."
+            f"Invalid ADLS_AUTH {auth!r}: use 'anon' (public container) or 'client-secret' (Entra service principal)."
         )
     secret_env_name = _getenv("ADLS_CLIENT_SECRET_ENV", e.get("ADLS_CLIENT_SECRET_ENV", ""))
     secret = ""
@@ -845,9 +844,7 @@ def load_adls_config(env: dict | None = None) -> AdlsConfig:
         client_id=_getenv("ADLS_CLIENT_ID", e.get("ADLS_CLIENT_ID", "")),
         client_secret=secret,
         client_secret_env=secret_env_name,
-        endpoint_suffix=_getenv(
-            "ADLS_ENDPOINT_SUFFIX", e.get("ADLS_ENDPOINT_SUFFIX", "core.windows.net")
-        ),
+        endpoint_suffix=_getenv("ADLS_ENDPOINT_SUFFIX", e.get("ADLS_ENDPOINT_SUFFIX", "core.windows.net")),
     )
 
 

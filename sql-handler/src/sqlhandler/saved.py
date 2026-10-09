@@ -48,7 +48,7 @@ from pathlib import Path
 try:  # cross-process file locking (POSIX); elsewhere the store stays thread-safe only
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
-    fcntl = None
+    fcntl = None  # type: ignore[assignment]
 
 from .engine import _validate_params
 from .sqlguard import assert_mcp_readonly, extract_statement_spans, mcp_readonly_enabled
@@ -107,6 +107,7 @@ def _process_lock(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS):
             pass
         os.close(fd)
 
+
 # A saved query is a JSON-file entry, not a filesystem path: forbid path
 # separators, control characters and surrounding whitespace, cap the length.
 # ("/" is forbidden too so every name stays a single REST path segment.)
@@ -137,9 +138,7 @@ def validate_query_name(name: object) -> str:
         raise ValueError("Saved-query name must be a string.")  # noqa: TRY004
     cleaned = name.strip()
     if not cleaned or not _NAME_RE.fullmatch(cleaned):
-        raise ValueError(
-            "Saved-query name must be 1-128 characters with no path separators or control characters."
-        )
+        raise ValueError("Saved-query name must be 1-128 characters with no path separators or control characters.")
     return cleaned
 
 
@@ -181,7 +180,12 @@ def presented_credential(request) -> str:
     """The caller's credential from an ASGI/Starlette request ('' when none).
 
     Same header conventions as the /mcp and /api middlewares: ``Authorization:
-    Bearer <key>``, ``X-API-Key`` or ``X-API-Token``.
+    Bearer <key>``, ``X-API-Key`` or ``X-API-Token`` — resolved
+    explicit-over-ambient (D19): an explicit X-API-Key/X-API-Token claim
+    outranks a co-forwarded Authorization Bearer. The /mcp key gate and the
+    /api admin surface already resolve the explicit claim first; ownership
+    attribution must agree, or a request authenticated as one key would
+    record its saved-query ownership under the ambient relay credential.
     """
     if request is None:
         return ""
@@ -189,10 +193,13 @@ def presented_credential(request) -> str:
         headers = request.headers
     except Exception:
         return ""
+    explicit = (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
+    if explicit:
+        return explicit
     auth = headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
+    return ""
 
 
 def credential_ok(provided: str) -> bool:
@@ -200,10 +207,7 @@ def credential_ok(provided: str) -> bool:
     creds = _configured_credentials()
     if not creds or not provided:
         return False
-    return any(
-        hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8"))
-        for candidate in creds
-    )
+    return any(hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in creds)
 
 
 class NotAuthorized(Exception):
@@ -276,9 +280,7 @@ class SavedQueryStore:
         except FileNotFoundError:
             return {"version": _STORE_VERSION, "queries": {}}
         except (OSError, json.JSONDecodeError):
-            logger.warning(
-                "saved-query store %s unreadable; starting from an empty store", self._path
-            )
+            logger.warning("saved-query store %s unreadable; starting from an empty store", self._path)
             return {"version": _STORE_VERSION, "queries": {}}
         if not isinstance(data, dict) or not isinstance(data.get("queries"), dict):
             logger.warning("saved-query store %s has an unexpected shape; ignoring it", self._path)
@@ -373,9 +375,7 @@ class SavedQueryStore:
             if owner is not None:
                 entry["owner"] = owner
             entry = {
-                k: v
-                for k, v in entry.items()
-                if v is not None or k in ("sql", "params", "created_at", "updated_at")
+                k: v for k, v in entry.items() if v is not None or k in ("sql", "params", "created_at", "updated_at")
             }
             queries[clean] = entry
             self._write(data)

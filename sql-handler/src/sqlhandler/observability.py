@@ -118,12 +118,8 @@ class Metrics:
         # ADDITIVE (write tier, review §4): writes by backend + outcome.
         # Backend label: delta | iceberg (DuckLake is a later wave) —
         # bounded vocabulary, like caller_class.
-        self.writes = _Counter(
-            "sqlhandler_writes_total", "Scratch writes executed, by backend and outcome.", "backend"
-        )
-        self.write_outcomes = _Counter(
-            "sqlhandler_writes_total_outcome", "Scratch write outcomes.", "outcome"
-        )
+        self.writes = _Counter("sqlhandler_writes_total", "Scratch writes executed, by backend and outcome.", "backend")
+        self.write_outcomes = _Counter("sqlhandler_writes_total_outcome", "Scratch write outcomes.", "outcome")
 
     def record_query(self, outcome: str, duration_s: float, n_rows: int | None, table: str = "") -> None:
         """One query outcome (called from the engine's record path)."""
@@ -166,7 +162,7 @@ class Metrics:
         """Prometheus text exposition (engine gauges included when given)."""
         lines: list[str] = []
 
-        def emit(name: str, help_text: str, typ: str, series: list[tuple[str, str]]) -> None:
+        def emit(name: str, help_text: str, typ: str, series: list[tuple[str, float]]) -> None:
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} {typ}")
             for labels, value in series:

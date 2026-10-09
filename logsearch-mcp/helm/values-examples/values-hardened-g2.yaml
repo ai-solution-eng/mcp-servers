@@ -1,65 +1,44 @@
 # logsearch-mcp — HARDENED-G2 example: the MCP network zone ON.
-# Admin-surface MCP: the zone locks IN-CLUSTER access to the allowlisted
-# namespaces; the browser/console path stays OPEN through the SSO-gated edge
-# gateway (fleet doctrine 2026-09 — the browser is behind admin sign-ins).
-#
-# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
-# with the zone on, every unlisted caller times out (deny by absence).
-#
-# Zone list (G2 live facts, inventory §6): least-privilege — the namespaces
-# the LIVE gateway netpol already names as authorized MCP callers, plus
-# monitoring for the ServiceMonitor scrape. Widen deliberately via the
-# operator recipe in the RUNBOOK, one ns at a time.
+
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+
+# OVERLAY: merge onto the base/G2 values document — nothing here is standalone.
+# Zone list (G2 live facts): the namespaces the LIVE gateway netpol names as
+# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
+
 networkPolicy:
   enabled: true
   sameNamespace: true
   authorizedClients:
     namespaces:
       - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
-      - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
+      - dsh-web-helm        # DSH web (live gateway allowlist)
       - owebui0-11-0        # OWUI instance on the live gateway allowlist
       - opencode-web-helm   # OpenCode web
-      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
-                            # ns `prometheus`) — the monitoring ns holds otel/UA,
-                            # NOT the scraper; omit and up=0 within one interval
-      - monitoring          # Prometheus scraping /metrics (ServiceMonitor) —
-                            # omit and metrics scraping dies SILENTLY
-                            # (check Prometheus targets after enabling)
-  # Browser path stays OPEN (fleet doctrine 2026-09): the zone restricts
-  # IN-CLUSTER callers only; external traffic rides the SSO-gated edge gateway
-  # exactly as pre-zone (the browser is behind admin sign-ins).
-  allowEzafGatewayIngress: true
+      - prometheus          # the ACTUAL Prometheus scraper (kubeprom stack, ns `prometheus`)
+      - monitoring          # ServiceMonitor scrape ns; omit and scraping dies SILENTLY
+  allowEzafGatewayIngress: true   # browser path stays on the SSO-gated edge gateway
   ingressGatewayNamespace: istio-system
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
-  # Kubelet probes originate at the NODE: allow node IPs only (inventory §4:
-  # node IPs 172.28.1.61-63 masters, .161-.162 workers), with the pod CIDR
-  # carved out so pod traffic stays governed by the zone rules above.
+  # Per-node /32 kubelet-probe allows (masters .61-.63, workers .161-.162).
   probeCidrs:
     - 172.28.1.61/32
     - 172.28.1.62/32
     - 172.28.1.63/32
     - 172.28.1.161/32
     - 172.28.1.162/32
-  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
-  # be a STRICT SUBSET of the cidr — pod IPs (10.224.x) are not inside a node
-  # /32 (172.28.1.x), so there is nothing to carve out. Only a BROAD probe
-  # allow (e.g. 0.0.0.0/0) pairs with a carve-out.
+  # Stays EMPTY: ipBlock.except must be a STRICT SUBSET of the cidr, and pod
+  # IPs are not inside a node /32 — nothing to carve out.
   probeExceptCidrs: []
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []
 
-# The VirtualService STAYS rendered (fleet doctrine 2026-09): external/browser
-# traffic keeps flowing through the SSO-gated edge gateway exactly as pre-zone.
+# The VirtualService STAYS rendered: external/browser traffic keeps flowing
+# through the SSO-gated edge gateway exactly as pre-zone.
 
-# -- In-cluster host allowlist (DNS-rebinding additions, fleet pattern: K8S-MCP) ---
-# EXTRA in-cluster callers that bypass the gateway address the server by svc
-# DNS — the transport-security Host allowlist must name those too, or they
-# get 421. The hardened posture pins everything: MCP_HOSTNAME comes from
-# ezua.virtualService.endpoint (always set in this example), and the chart
-# AUTO-includes the release's own service DNS
-# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the first entry —
-# list only the OTHER svc-DNS names real in-cluster callers use (verbatim or
-# `host:*`).
+# EXTRA Host headers for in-cluster svc-DNS callers bypassing the gateway
+# (the release's own service DNS is auto-included; list only OTHER callers).
 extraAllowedHosts: []

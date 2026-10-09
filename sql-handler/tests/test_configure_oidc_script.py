@@ -149,8 +149,10 @@ def test_missing_tools_fail_fast(script_env):
     empty = patched.parent / "bin-empty"
     empty.mkdir(exist_ok=True)
 
+    bash = shutil.which("bash")
+    assert bash is not None  # the test box always has bash
     proc = subprocess.run(
-        [shutil.which("bash"), str(patched)],
+        [bash, str(patched)],
         capture_output=True,
         text=True,
         env={"PATH": str(empty)},  # NO jq, NO kubectl, NO curl
@@ -237,17 +239,19 @@ def test_failure_of_verification_aborts(script_env, fake_kc, monkeypatch):
 
     def _stub_start(self):
         original_start(self)
-        # Wrap: capture and drop PUT effects.
-        real_handler = self.httpd.RequestHandlerClass
+        # Wrap: capture and drop PUT effects. `real_handler` is whatever
+        # BaseHTTPRequestHandler subclass the fake mounted at start time —
+        # a dynamic base class, so the mypy suppressions are the contract.
+        real_handler = self.httpd.RequestHandlerClass  # type: ignore[attr-defined]
 
-        class _NoPut(real_handler):
+        class _NoPut(real_handler):  # type: ignore[misc,valid-type]
             def do_PUT(self_inner):
                 self_inner.rfile.read(int(self_inner.headers.get("Content-Length", 0)))
                 self_inner.send_response(200)
                 self_inner.send_header("Content-Length", "0")
                 self_inner.end_headers()
 
-        self.httpd.RequestHandlerClass = _NoPut
+        self.httpd.RequestHandlerClass = _NoPut  # type: ignore[attr-defined]
         return self
 
     monkeypatch.setattr(_FakeKeycloak, "start", _stub_start)

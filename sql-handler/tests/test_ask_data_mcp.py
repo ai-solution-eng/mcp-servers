@@ -14,21 +14,21 @@ import pytest
 
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 from sqlhandler.sqlguard import extract_statement_spans
 
 
-def _make_engine(tmp_path, n_cols=3):
+def _make_engine(tmp_path, n_cols: int = 3):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)
-    cols = {
+    cols: dict[str, list] = {
         "id": [1, 2, 3, 4, 5],
         "kind": ["a", None, "a", "b", "a"],
         "amount": [10.0, 20.0, 30.0, 40.0, 50.0],
     }
     pq.write_table(pa.table({k: v[:5] for k, v in list(cols.items())[:n_cols]}), d / "part.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -120,7 +120,7 @@ def test_ask_data_default_never_executes(call_tool, monkeypatch, tmp_path):
     executed_sqls: list[str] = []
     real_query = eng.query_duckdb
 
-    def spy_query(sql, *a, **k):
+    def spy_query(sql: str, *a: object, **k: object):
         executed_sqls.append(str(sql))
         return real_query(sql, *a, **k)
 
@@ -146,9 +146,7 @@ def test_ask_data_default_never_executes(call_tool, monkeypatch, tmp_path):
 
 def test_ask_data_execute_true_is_symmetric_noop(call_tool):
     _err_default, text_default = call_tool("ask_data", {"question": "work order amounts"})
-    _err_true, text_true = call_tool(
-        "ask_data", {"question": "work order amounts", "execute": True}
-    )
+    _err_true, text_true = call_tool("ask_data", {"question": "work order amounts", "execute": True})
     # Byte-identical output: execute changes nothing.
     assert text_default == text_true
 
@@ -182,10 +180,10 @@ def test_ask_data_token_budget_caps(call_tool, monkeypatch, tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
-        def list_tables(self):
+        def list_tables(self) -> list[TableInfo]:
             return [TableInfo(name="wide_table", schema="wide", format="parquet")]
 
         def table_uri(self, info):
@@ -198,7 +196,7 @@ def test_ask_data_token_budget_caps(call_tool, monkeypatch, tmp_path):
     profiled: list[list[str]] = []
     real_profile = eng.profile_table
 
-    def spy_profile(table, columns=None):
+    def spy_profile(table: str, columns: list[str] | None = None):
         if columns:
             profiled.append(list(columns))
         return real_profile(table, columns=columns)
@@ -253,9 +251,7 @@ def test_ask_data_empty_question_param_invalid(monkeypatch, tmp_path):
 def test_ask_data_non_bool_execute_refused(monkeypatch, tmp_path):
     eng = _make_engine(tmp_path)
     monkeypatch.setattr(server, "_handler", lambda: eng)
-    text, _is_error = server._dispatch_tool(
-        "ask_data", {"question": "work order", "execute": "yes please"}
-    )
+    text, _is_error = server._dispatch_tool("ask_data", {"question": "work order", "execute": "yes please"})
     assert text.startswith("Error planning question:")
     assert "E_PARAM_INVALID" in text
 

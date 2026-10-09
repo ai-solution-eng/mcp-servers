@@ -3,6 +3,7 @@
 import datetime
 import json
 from decimal import Decimal
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -204,7 +205,7 @@ def test_api_describe(engine):
 
 
 def test_api_query(engine):
-    payload = api_query(engine, "SELECT id, name FROM orders WHERE qty > 2")
+    payload = cast(dict[str, Any], api_query(engine, "SELECT id, name FROM orders WHERE qty > 2"))
     assert payload["columns"] == ["id", "name"]
     assert payload["rows"] == [[2, "y"], [3, "z"]]
     assert payload["n_rows"] == 2
@@ -212,7 +213,7 @@ def test_api_query(engine):
 
 
 def test_api_query_limiting(engine):
-    payload = api_query(engine, "SELECT * FROM orders", limit=2)
+    payload = cast(dict[str, Any], api_query(engine, "SELECT * FROM orders", limit=2))
     assert len(payload["rows"]) == 2
     assert payload["n_rows"] == 2
     assert payload["truncated"] is True
@@ -308,9 +309,7 @@ def test_export_limit_clamped_to_env_cap(tmp_path, monkeypatch):
 def _engine(tmp_path):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet"
-    )
+    pq.write_table(pa.table({"a": [1, 2, 3, 4, 5], "s": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
     return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
 
 
@@ -319,7 +318,9 @@ def _engine(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-_YAML_CATALOG = b"tables:\n  orders:\n    description: Order headers (uploaded)\n    columns:\n      qty: Quantity in units\n"
+_YAML_CATALOG = (
+    b"tables:\n  orders:\n    description: Order headers (uploaded)\n    columns:\n      qty: Quantity in units\n"
+)
 
 
 def test_catalog_upload_yaml_then_json_roundtrip(engine, tmp_path):
@@ -402,14 +403,8 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
     assert client.post("/api/semantic-catalog", content=b"tables: {}").status_code == 401
 
     yaml_catalog = b"tables:\n  orders:\n    description: over HTTP\n"
-    assert (
-        client.post("/api/semantic-catalog", content=yaml_catalog, headers=auth).json()["tables"]
-        == 1
-    )
-    assert (
-        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
-        == "over HTTP"
-    )
+    assert client.post("/api/semantic-catalog", content=yaml_catalog, headers=auth).json()["tables"] == 1
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "over HTTP"
     assert client.get("/api/semantic-catalog", headers=auth).json()["active_source"] == "upload"
 
     assert (
@@ -420,17 +415,11 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
         ).status_code
         == 200
     )
-    assert (
-        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
-        == "v2"
-    )
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "v2"
 
     assert client.post("/api/semantic-catalog", content=b"{broken", headers=auth).status_code == 400
     assert client.delete("/api/semantic-catalog", headers=auth).json()["removed"] is True
-    assert (
-        "description"
-        not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
-    )
+    assert "description" not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
 
 
 # ---------------------------------------------------------------------------
@@ -441,9 +430,7 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
 def _catalog_engine(tmp_path, monkeypatch):
     """A file-backend engine with an isolated catalog store."""
     monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
-    pq.write_table(
-        pa.table({"id": [1, 2, 3], "qty": [1.0, 2.0, 3.0]}), str(tmp_path / "orders.parquet")
-    )
+    pq.write_table(pa.table({"id": [1, 2, 3], "qty": [1.0, 2.0, 3.0]}), str(tmp_path / "orders.parquet"))
     return SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
 
 
@@ -548,20 +535,12 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
         headers=auth,
     )
     assert r.status_code == 200 and r.json()["ok"] is True
+    assert client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"] == "via http"
     assert (
-        client.post("/api/describe", json={"table": "orders"}, headers=auth).json()["description"]
-        == "via http"
-    )
-    assert (
-        client.post(
-            "/api/semantic-catalog/table", json={"table": "orders"}, headers=auth
-        ).status_code
-        == 400
+        client.post("/api/semantic-catalog/table", json={"table": "orders"}, headers=auth).status_code == 400
     )  # missing content
 
-    r = client.post(
-        "/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth
-    )
+    r = client.post("/api/highlight", json={"text": "description: x\n", "theme": "dark"}, headers=auth)
     assert r.status_code == 200
     body = r.json()
     assert body["highlighted"] in (True, False)  # pygments is optional by design
@@ -570,10 +549,7 @@ def test_semantic_editor_http_routes(tmp_path, monkeypatch):
 
     r = client.delete("/api/semantic-catalog/table?table=orders", headers=auth)
     assert r.status_code == 200 and r.json()["removed"] is True
-    assert (
-        client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"]
-        is False
-    )
+    assert client.get("/api/semantic-catalog/table?table=orders", headers=auth).json()["found"] is False
 
 
 def test_export_csv_arrow_semantics(tmp_path):
@@ -680,7 +656,7 @@ def test_api_export_masks_like_api_query(engine, tmp_path, monkeypatch):
     caller: same row filter, same column mask (export is not a side door)."""
     alice = _masked_policy(tmp_path, monkeypatch)
     sql = "SELECT * FROM work_order ORDER BY id"
-    query_payload = api_query(engine, sql, caller=alice)
+    query_payload = cast(dict[str, Any], api_query(engine, sql, caller=alice))
     out = webui_module.api_export(engine, {"sql": sql, "format": "csv"}, caller=alice)
     lines = out["content"].decode().strip().splitlines()
     assert query_payload["rows"] == [[0, "***", "a"], [2, "***", "a"]]
@@ -712,21 +688,21 @@ def test_export_and_saved_run_engine_calls_carry_the_caller(monkeypatch, tmp_pat
     alice = Caller(cls="user", subject="alice", via="relay")
 
     class SpyEngine:
-        def __init__(self):
-            self.query_callers = []
-            self.scan_callers = []
+        def __init__(self) -> None:
+            self.query_callers: list[Caller | None] = []
+            self.scan_callers: list[Caller | None] = []
 
-        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+        def query_duckdb(self, sql: str, limit=None, params=None, version_as_of=None, **kw):
             self.query_callers.append(kw.get("caller"))
             return pa.table({"one": [1]})
 
-        def scan_arrow(self, table, limit=None, **kw):
+        def scan_arrow(self, table: str, limit=None, **kw):
             self.scan_callers.append(kw.get("caller"))
             return pa.table({"a": [1]})
 
     spy = SpyEngine()
-    webui_module.api_export(spy, {"sql": "SELECT 1 AS one"}, caller=alice)
-    webui_module.api_export(spy, {"table": "t"}, caller=alice)
+    webui_module.api_export(cast(SqlEngine, spy), {"sql": "SELECT 1 AS one"}, caller=alice)
+    webui_module.api_export(cast(SqlEngine, spy), {"table": "t"}, caller=alice)
     assert spy.query_callers == [alice]
     assert spy.scan_callers == [alice]
     # api_query forwards the caller exactly the same way (the baseline the
@@ -738,7 +714,7 @@ def test_export_and_saved_run_engine_calls_carry_the_caller(monkeypatch, tmp_pat
             seen.append(kw.get("caller"))
             return pa.table({"one": [1]})
 
-    api_query(QueryStub(), "SELECT 1 AS one", caller=alice)
+    api_query(cast(SqlEngine, QueryStub()), "SELECT 1 AS one", caller=alice)
     assert seen == [alice]
 
 
@@ -782,16 +758,16 @@ def test_webui_saved_run_passes_caller_like_api_query(tmp_path, monkeypatch):
     reset_policy_store()
 
     class SpyEngine:
-        def __init__(self):
-            self.callers = []
+        def __init__(self) -> None:
+            self.callers: list[Caller | None] = []
 
-        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+        def query_duckdb(self, sql: str, limit=None, params=None, version_as_of=None, **kw):
             self.callers.append(kw.get("caller"))
             return pa.table({"one": [1]})
 
     alice = Caller(cls="user", subject="alice", via="relay")
     spy = SpyEngine()
-    caller_holder = [alice]
+    caller_holder: list[Caller | None] = [alice]
     monkeypatch.setattr(
         webui_module._identity, "caller_from_request_state", lambda request: caller_holder[0], raising=False
     )
@@ -799,7 +775,7 @@ def test_webui_saved_run_passes_caller_like_api_query(tmp_path, monkeypatch):
     webui_module.register_ui(app, lambda: spy)
     saved_query_store().save("q", "SELECT 1 AS one")
     handler = next(
-        r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
+        r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
     )
 
     def make_request():
@@ -834,26 +810,24 @@ def test_webui_export_route_passes_caller_like_api_query(tmp_path, monkeypatch):
     reset_policy_store()
 
     class SpyEngine:
-        def __init__(self):
-            self.query_callers = []
-            self.scan_callers = []
+        def __init__(self) -> None:
+            self.query_callers: list[Caller | None] = []
+            self.scan_callers: list[Caller | None] = []
 
-        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
+        def query_duckdb(self, sql: str, limit=None, params=None, version_as_of=None, **kw):
             self.query_callers.append(kw.get("caller"))
             return pa.table({"a": [1]})
 
-        def scan_arrow(self, table, limit=None, **kw):
+        def scan_arrow(self, table: str, limit=None, **kw):
             self.scan_callers.append(kw.get("caller"))
             return pa.table({"a": [1]})
 
     alice = Caller(cls="user", subject="alice", via="relay")
     spy = SpyEngine()
-    monkeypatch.setattr(
-        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
-    )
+    monkeypatch.setattr(webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False)
     app = Starlette()
     webui_module.register_ui(app, lambda: spy)
-    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/export")
+    handler = next(r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/export")
 
     resp = asyncio.run(handler(_ui_request("/api/export", b'{"sql": "SELECT 1 AS a", "format": "csv"}')))
     assert resp.status_code == 200
@@ -1030,8 +1004,7 @@ def test_webui_async_query_route_passes_caller(tmp_path, monkeypatch):
     real_submit = QueryJobManager.submit
 
     def spy_submit(self, engine, sql, limit=None, params=None, version_as_of=None, caller=None):
-        result = real_submit(self, engine, sql, limit=limit, params=params,
-                             version_as_of=version_as_of, caller=caller)
+        result = real_submit(self, engine, sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller)
         qid = result.get("query_id")
         if qid:
             job, _ = self._jobs[qid]
@@ -1040,9 +1013,7 @@ def test_webui_async_query_route_passes_caller(tmp_path, monkeypatch):
 
     monkeypatch.setattr(QueryJobManager, "submit", spy_submit, raising=True)
     alice = Caller(cls="user", subject="alice", via="relay")
-    monkeypatch.setattr(
-        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
-    )
+    monkeypatch.setattr(webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False)
     app = Starlette()
 
     class Engine:  # never executed at submit time; the job thread may run it
@@ -1050,7 +1021,7 @@ def test_webui_async_query_route_passes_caller(tmp_path, monkeypatch):
             return pa.table({"one": [1]})
 
     webui_module.register_ui(app, lambda: Engine())
-    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/query/async")
+    handler = next(r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/query/async")
     resp = asyncio.run(handler(_ui_request("/api/query/async", b'{"sql": "SELECT 1 AS one"}')))
     assert resp.status_code == 200
     assert captured["caller"] == alice
@@ -1073,23 +1044,19 @@ def test_webui_jobs_submit_passes_caller_and_owner(tmp_path, monkeypatch):
             return {"query_id": "job123", "state": "running"}
 
     alice = Caller(cls="user", subject="alice", via="relay")
-    monkeypatch.setattr(
-        webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False
-    )
+    monkeypatch.setattr(webui_module._identity, "caller_from_request_state", lambda request: alice, raising=False)
     # Policy enforcement ON so the owner derivation is active (same gate the
     # MCP dispatch uses: policy.owner_key under enforcement, None otherwise).
     monkeypatch.setattr(webui_module._policy, "policy_enabled", lambda: True, raising=False)
-    monkeypatch.setattr(
-        webui_module._policy, "owner_key", lambda c: f"subject:{c.subject}", raising=False
-    )
+    monkeypatch.setattr(webui_module._policy, "owner_key", lambda c: f"subject:{c.subject}", raising=False)
     app = Starlette()
     webui_module.register_ui(app, lambda: object())
-    webui_module._QueryJobManagerSingleton = None  # unused; patch the manager getter below
+    webui_module._QueryJobManagerSingleton = None  # type: ignore[attr-defined]  # unused; patch the manager getter below
     # Patch the manager the route closes over: jobs_submit uses job_manager().
     import sqlhandler.jobs as jobs_mod
 
     monkeypatch.setattr(jobs_mod, "job_manager", lambda: SpyManager(), raising=False)
-    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/jobs")
+    handler = next(r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/jobs")
     resp = asyncio.run(handler(_ui_request("/api/jobs", b'{"sql": "SELECT 1"}')))
     assert resp.status_code == 200
     assert captured["caller"] == alice
@@ -1114,9 +1081,7 @@ def test_webui_saved_routes_scope_by_caller(tmp_path, monkeypatch):
 
     alice = Caller(cls="user", subject="alice", via="relay")
     holder = [alice]
-    monkeypatch.setattr(
-        webui_module._identity, "caller_from_request_state", lambda request: holder[0], raising=False
-    )
+    monkeypatch.setattr(webui_module._identity, "caller_from_request_state", lambda request: holder[0], raising=False)
     app = Starlette()
     webui_module.register_ui(app, lambda: object())
     store = saved_query_store()
@@ -1125,7 +1090,9 @@ def test_webui_saved_routes_scope_by_caller(tmp_path, monkeypatch):
     # Anonymous list: enforcement on + caller None → owner derivation is
     # None, which saved.list() treats as "see everything" — but alice's
     # caller MUST scope it to her own entries.
-    list_handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries")
+    list_handler = next(
+        r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/saved-queries"
+    )
     resp = asyncio.run(list_handler(_ui_request("/api/saved-queries", b"")))
     assert resp.status_code == 200
     body = json.loads(resp.body)
@@ -1135,7 +1102,7 @@ def test_webui_saved_routes_scope_by_caller(tmp_path, monkeypatch):
     # subject's entry is asserted at the saved.py layer; here we pin that
     # the ROUTE actually forwards a caller — spy on api_saved_run).
     run_handler = next(
-        r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
+        r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/saved-queries/{name}/run"
     )
     seen = {}
     real_run = webui_module.api_saved_run
@@ -1164,21 +1131,17 @@ def test_webui_export_filename_header_is_sanitized(tmp_path, monkeypatch):
         def scan_arrow(self, table, limit=None, **kw):
             return pa.table({"a": [1]})
 
-    monkeypatch.setattr(
-        webui_module._identity, "caller_from_request_state", lambda request: None, raising=False
-    )
+    monkeypatch.setattr(webui_module._identity, "caller_from_request_state", lambda request: None, raising=False)
     app = Starlette()
     webui_module.register_ui(app, lambda: SpyEngine())
-    handler = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/export")
+    handler = next(r.endpoint for r in cast(list[Any], app.routes) if getattr(r, "path", "") == "/api/export")
     crafted = 'x".csv\r\nX-Injected: yes'
-    resp = asyncio.run(
-        handler(_ui_request("/api/export", json.dumps({"table": crafted, "format": "csv"}).encode()))
-    )
+    resp = asyncio.run(handler(_ui_request("/api/export", json.dumps({"table": crafted, "format": "csv"}).encode())))
     assert resp.status_code == 200
     disposition = resp.headers["content-disposition"]
     # Security property: the value stays INSIDE the quoted token — no CRLF
     # (header injection) and no unescaped quote (value breakout). The label
     # text may survive as filename characters; that is not an injection.
     assert "\r" not in disposition and "\n" not in disposition
-    inner = disposition[len('attachment; filename="'):-1]
+    inner = disposition[len('attachment; filename="') : -1]
     assert '"' not in inner and "\\" not in inner

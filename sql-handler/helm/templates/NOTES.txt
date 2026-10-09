@@ -18,16 +18,20 @@ sqlhandler {{ .Chart.Version }} deployed to namespace {{ $ns }}.
   helm upgrade <release> . -n {{ $ns }} --reuse-values \
     --set security.apiKey.existingSecret=sqlhandler-apikey
 
-   ROTATION (zero downtime once enabled): the value is a
+   ROTATION (near-zero downtime once enabled): the value is a
    COMMA-SEPARATED list of valid keys — append the new one, move
-   clients over, drop the old. The server re-reads the env per request
-   — no restart needed. The fleet-universal MCP_API_KEYS env is honored
-   too (either var works).
+   clients over, drop the old. The secretKeyRef env is frozen at
+   container start: the new list reaches the pods via a ROLLOUT (the
+   chart's checksum/secret annotation automates it on the next helm
+   upgrade; between the Secret apply and that upgrade the pods keep
+   authenticating with the OLD list). The fleet-universal MCP_API_KEYS
+   env is honored too (either var works).
 
    DATASET ACLs: mint a per-identity key with `python scripts/mint_key.py`,
-   append it to the same Secret, and add its fingerprint assignment
-   (key:sha256:<fp>) to the policy ConfigMap's datasets.assignments — both
-   hot-reload, no restart (see documentation/DEPLOYMENT.md §4.7.1).
+   append it to the same Secret (a Secret append reaches the pods via the
+   checksum-annotated rollout above), and add its fingerprint assignment
+   (key:sha256:<fp>) to the policy ConfigMap's datasets.assignments — the
+   policy file hot-reloads on mtime (see documentation/DEPLOYMENT.md §4.7.1).
 
 ════════════════════════════════════════════════════════════════════
 2. Endpoints:

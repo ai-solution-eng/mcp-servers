@@ -1,71 +1,87 @@
 # k8s-mcp (trusted-operator chart) — proxied corporate PCAI site values
-# (values-examples, secret-free). SITE: your-cluster.example.
-# FULL VALUES — complete copy of helm/values.yaml with site edits marked '# SITE:'.
+# (values-examples, secret-free); cluster domain your-cluster.example.
+# FULL VALUES — complete copy of helm/values.yaml with the site edits inline.
 # Paste-ready: this file alone is the full values document (helm deep-merges
 # it over identical chart defaults; PCAI's values editor replaces the chart's
 # bundled values.yaml entirely, so every key must be present here).
-
-# k8s-mcp — Kubernetes ops MCP server for PCAI (HPE Ezmeral Unified
-# Analytics): read-only cluster inspection, hardened exec (opt-in),
-# namespace governance, and an HPE ops console, exposed at /mcp and /ui/
-# through the PCAI Istio gateway.
 #
-# This is the TRUSTED-OPERATOR chart: every knob below is frontend- and
-# values-configurable. Customer deliveries use the separate helm-customer/
-# chart, where the security knobs do not exist at all.
+# k8s-mcp — read-only cluster inspection, hardened exec (opt-in), namespace
+# governance, ops console. TRUSTED-OPERATOR chart: every knob configurable;
+# customer deliveries use helm-customer/ (security knobs absent there).
+#
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# Owner: Francesco Caliva
+# Email: francesco.caliva@hpe.com
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — the chart NEVER creates or inlines it (an envsubst
+#      apply once emptied a live key Secret); CreateContainerConfigError until it
+#      exists (default ref: <deployment.name>-apikey, key api-key).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` in BOTH the
+#      VirtualService and AuthorizationPolicy templates; doubles as MCP_HOSTNAME;
+#      unique per release (two VSes on one host split traffic — observed live).
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Namespace governance: namespaces.allowed/blocked — documentation/DEPLOYMENT.md Day-2
+#   Hardened exec posture: exec.* (allowlist, requireLabel, autoRbac) — documentation/DEPLOYMENT.md Exec
+#   Per-user keys + exec assignments: clients.existingSecret — documentation/DEPLOYMENT.md
+#   RBAC scope + CRD reads (never ['*']): rbac.scope/extraResourceGroups — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled — documentation/DEPLOYMENT.md
+#   In-cluster callers: extraAllowedHosts (svc-DNS; 421s otherwise) — documentation/DEPLOYMENT.md
+#   Cluster-wide listing caps: listing.* ('' = server default) — documentation/DEPLOYMENT.md
 
-# -- Deployment ----------------------------------------------------------------
+# ============================================================================
+# Deployment / Image / Service / Resources
+# ============================================================================
+
 deployment:
   name: k8s-mcp
   appName: k8s-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
 image:
-  # SITE: keep in lockstep with Chart.yaml appVersion (and the pushed image
-  # tags) — a stale default is how an "old MCP + new chart" pod happens.
-  # SITE: pinned at chart 1.1.0.
+  # Keep in lockstep with Chart.yaml appVersion — a stale default ships an old MCP.
   repository: ghcr.io/ai-solution-eng/k8s-mcp
   tag: v1.2.0
   pullPolicy: IfNotPresent
 
-# SITE: private-GHCR pull secret — omit ([]) when the package is public.
+# Private-GHCR pull secret: omit ([]) when the package is public.
 imagePullSecrets:
   - name: ghcr-pull
 
-# -- Service exposure -------------------------------------------------------------------
 service:
   type: ClusterIP
   port: 9090        # MCP (streamable-http at /mcp) + ops console (/ui/)
   targetPort: 9090
 
-# -- Resources -------------------------------------------------------------------------------
 resources:
   requests:
     cpu: 100m
     memory: 128Mi
   limits:
     cpu: 500m
-    memory: 512Mi
+    # 512Mi OOMKilled ×4 in heavy get_resource listing bursts (steady-state
+    # ~136Mi — the burst is what counts); chart default 2Gi.
+    memory: 2Gi
 
-# -- Service account ------------------------------------------------------------------------------
 serviceAccount:
   create: true
   name: ""                   # empty = deployment.name (it is the RBAC subject)
 
-# -- MCP server app config ---------------------------------------------------------------------------
-# SECURITY INVARIANTS (do not weaken):
-#  * The API key is NEVER created by this chart and NEVER inlined in values —
-#    reference an out-of-band Secret (create it before applying; the Deployment
-#    fails loud until it exists). This example carries only the SECRET NAME.
+# ============================================================================
+# MCP Server App Config
+# ============================================================================
+# (the API key is NEVER created or inlined by the chart — out-of-band Secret
+# only; this example carries just the SECRET NAME)
+
 apiKey:
-  # SITE: name of the pre-created API-key Secret (kubectl create secret generic …).
+  # The pre-created API-key Secret (kubectl create secret generic …).
   existingSecret: "k8s-mcp-2-0-apikey"
   existingSecretKey: api-key
 
-# In-cluster callers (e.g. Open WebUI) reach /mcp on the local service DNS;
-# the SDK's DNS-rebinding protection otherwise 421s them after auth. List the
-# svc host(s) here — `host:*` accepts any port. Omit for gateway-only callers.
+# In-cluster svc-DNS callers (e.g. Open WebUI) 421 without an entry here
+# (`host:*` = any port). Omit for gateway-only callers.
 extraAllowedHosts: []
 # extraAllowedHosts:
 #   - k8s-mcp-service.<namespace>.svc.cluster.local:*
@@ -73,30 +89,34 @@ extraAllowedHosts: []
 console:
   enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
 
-# -- Cluster access (read-only RBAC — this chart talks to the K8s API) --------------------------------------
+# ============================================================================
+# Cluster Access (read-only RBAC — this chart talks to the K8s API)
+# ============================================================================
+
 rbac:
   create: true
-  # SITE: cluster scope (read-only ClusterRole). Use "namespace" to clamp every
-  # read to the release namespace via the API server.
-  scope: cluster
-  # SITE: CRD apiGroups the tools may read (resources: "*", verbs get/list/watch).
-  # Add one entry per installed operator. NEVER ["*"] — refused at render time
-  # (it would re-grant secrets read). networking.istio.io/virtualservices is
-  # always granted.
+  scope: cluster              # "namespace" clamps every read to the release namespace
+  # One entry per installed operator. NEVER ["*"] — refused at render.
   extraResourceGroups:
     - serving.kserve.io
     - genai.hpe.com
 
-# -- Namespace governance (app layer; RBAC remains the true boundary) ------------------------------------------
-# SITE: lab posture — everything readable except the system namespaces.
+# ============================================================================
+# Namespace Governance
+# ============================================================================
+# App layer; RBAC remains the true boundary. Lab posture — everything
+# readable except the system namespaces.
+
 namespaces:
   allowed: ""
   blocked: "kube-system,kube-public,k8s-mcp-ops"
 
-# -- Hardened exec (opt-in) --------------------------------------------------------------------------------------
-# SITE: lab posture — exec ON cluster-wide with the per-pod label gate OFF.
-# Tighter default for shared/customer clusters: enabled: false, or
+# ============================================================================
+# Hardened Exec
+# ============================================================================
+# Opt-in. Lab posture — exec ON cluster-wide with the per-pod label gate OFF. Tighter for shared/customer clusters: enabled: false, or
 # namespaces: "debug-*,team-a" with requireLabel: true.
+
 exec:
   enabled: true
   namespaces: "*"
@@ -104,18 +124,22 @@ exec:
   allowedCommands: ""
   autoRbac: true
 
-# -- Per-user keys with per-user exec assignments --------------------------------------------------------------------
-# "name:key[:ns-patterns];…" — CONTAINS SECRETS; prefer existingSecret (a Secret
-# holding the whole K8S_MCP_CLIENTS string). Never put real keys in this file.
+# ============================================================================
+# Per-user Keys
+# ============================================================================
+# Per-user keys with per-user exec assignments: "name:key[:ns-patterns];…" is
+# SECRET MATERIAL — prefer existingSecret (whole K8S_MCP_CLIENTS string).
+
 clients:
   value: ""
   existingSecret: ""
   existingSecretKey: clients
 
-# -- Pod annotations / node placement -------------------------------------------------------------------------------------
-# Container hardening (non-root 10001, read-only rootfs, dropped capabilities,
-# RuntimeDefault seccomp, /tmp emptyDir) is deliberately NOT values-overridable
-# — it is the audited baseline.
+# ============================================================================
+# Pod Annotations / Node Placement
+# ============================================================================
+# (container hardening — non-root, read-only rootfs, dropped caps, seccomp —
+# is NOT values-overridable: the audited baseline)
 podAnnotations:
   sidecar.istio.io/inject: "false"
 
@@ -123,32 +147,60 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration -------------------------------------------------------------------------
-# SITE: literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+# Literal cluster domain on the lab site (chart default: "${DOMAIN_NAME}").
 ezua:
   enabled: true
   domainName: "your-cluster.example"   # informational only — no template reads it
   virtualService:
-    # SITE: literal host for SE-G2 — unique per release on the shared gateway;
+    # Literal host for SE-G2 — unique per release on the shared gateway;
     # doubles as MCP_HOSTNAME (DNS-rebinding pin).
     endpoint: "k8s-mcp-2-0-server.your-cluster.example"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
-  # SITE: gateway oauth2 gate OFF (lab trade — the built-in API key is the gate);
+  # Gateway oauth2 gate OFF (lab trade — the built-in API key is the gate);
   # flip enabled to true to enforce PCAI tokens on top of the API key.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"
     providerName: "oauth2-proxy"
 
-# -- Cluster-wide listing guardrails (performance; 1.1.0) ----------------------
+# ============================================================================
+# Cluster-wide Listing Guardrails
+# ============================================================================
 # Performance guardrails only. "" = the server's own default (100 items /
-# concurrency 8) and renders NO env var. SITE: kept at the server defaults.
+# concurrency 8) and renders NO env var; kept at the server defaults.
+
 listing:
   maxItems: ""
   concurrency: ""
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
 
-# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+# Observability: per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
   interval: 30s
+
+# ============================================================================
+# MCP Network Zone
+# ============================================================================
+# (ADDITIVE, DEFAULT OFF: once enabled, anything not matched is DENIED; egress
+# stays unrestricted. Zone OFF here — the hardened posture: values-hardened-g2.yaml)
+
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    enabled: false
+    extraEgress: []

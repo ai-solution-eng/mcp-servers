@@ -35,6 +35,7 @@ import json
 import logging
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -279,7 +280,7 @@ def test_concurrent_adds_are_lock_safe(tmp_path, monkeypatch):
     monkeypatch.setenv(KEYS_ENV, str(kf))
     errors: list[Exception] = []
 
-    def mint(i):
+    def mint(i: int) -> None:
         try:
             add_key(f"concurrent-{i}", label=f"l{i}", created_by="t")
         except Exception as exc:  # pragma: no cover - surfaced below
@@ -375,9 +376,9 @@ def test_admins_with_datasets_doc_coexists(tmp_path, monkeypatch):
     assert pol.default_group == "_acl_global"
 
 
-def test_admins_validates_fail_closed(tmp_path):
-    base = {"version": 1, "groups": {"g": {}}, "default_group": "g"}
-    cases = [
+def test_admins_validates_fail_closed(tmp_path: Path) -> None:
+    base: dict[str, Any] = {"version": 1, "groups": {"g": {}}, "default_group": "g"}
+    cases: list[dict[str, Any]] = [
         {"admins": "alice"},  # not a list
         {"admins": [42]},  # non-string entry
         {"admins": [""]},  # empty entry
@@ -399,8 +400,8 @@ def test_admins_absent_or_empty_means_none(tmp_path):
     assert load_policy(str(pf2)).admins == ()  # explicit empty = nobody
 
 
-def test_admins_folds_into_file_hash(tmp_path):
-    base = {"version": 1, "groups": {"g": {}}, "default_group": "g"}
+def test_admins_folds_into_file_hash(tmp_path: Path) -> None:
+    base: dict[str, Any] = {"version": 1, "groups": {"g": {}}, "default_group": "g"}
     h0 = load_policy(str(_policy_file(tmp_path, base))).hash
     h1 = load_policy(str(_policy_file(tmp_path, {**base, "admins": ["alice"]}))).hash
     h2 = load_policy(str(_policy_file(tmp_path, {**base, "admins": ["alice", "bob"]}))).hash
@@ -556,7 +557,7 @@ def test_union_env_first_precedence(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv(KEYS_ENV, str(kf))
     add_key("shared-key", label="minted-prec", created_by="a")
     with caplog.at_level(logging.INFO, logger="sqlhandler.admin_keys"):
-        status, caller, state = _stack_request("shared-key", kf, [(b"x-api-key", b"shared-key")], monkeypatch)
+        status, caller, _state = _stack_request("shared-key", kf, [(b"x-api-key", b"shared-key")], monkeypatch)
     assert status is None
     assert caller.key_fp == key_fingerprint("shared-key")
     # admin_keys logs nothing on a plain match — silence here means the env
@@ -570,7 +571,7 @@ def test_union_store_only_deployment_arms_gate(tmp_path, monkeypatch):
     kf = _keys_file(tmp_path)
     monkeypatch.setenv(KEYS_ENV, str(kf))
     entry = add_key("only-store-key", label="l", created_by="a")
-    status, caller, state = _stack_request(None, kf, [(b"x-api-key", b"only-store-key")], monkeypatch)
+    status, caller, _state = _stack_request(None, kf, [(b"x-api-key", b"only-store-key")], monkeypatch)
     assert status is None
     assert caller.cls == "key" and caller.key_fp == entry["fp"]
     status, _, _ = _stack_request(None, kf, [(b"x-api-key", b"stranger")], monkeypatch)

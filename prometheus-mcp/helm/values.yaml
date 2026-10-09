@@ -1,296 +1,174 @@
+# ============================================================================
+# prometheus-mcp — read-only Prometheus observation over MCP (PromQL
+# queries, series discovery, alerts, rules) for PCAI, exposed at /mcp
+# through the PCAI Istio gateway (MCP clients run outside the cluster).
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-# Prefer: Slack
 
-# prometheus-mcp — read-only Prometheus observation over MCP (PromQL
-# queries, series discovery, alerts, rules) for PCAI (HPE Ezmeral Unified
-# Analytics), exposed at /mcp through the PCAI Istio gateway so MCP clients
-# outside the cluster (DSH runs locally on the operator's laptop) can
-# reach it.
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. prometheusUrl — the in-cluster Prometheus this deployment IS [no render
+#      guard: the default targets the kube-prometheus-stack service, verified on
+#      G2 — set it to your cluster's Prometheus deliberately]
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
+#      default true); templates call `required` on it — the render aborts without it
 
-# -- Deployment ----------------------------------------------------------------
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   GPU/NVLink tab: gpuNvlinkDomains, nvlinkAutodetect.* — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
+#   Gateway auth (oauth2-proxy/SSO): ezua.authorizationPolicy.* — documentation/DEPLOYMENT.md "Gateway exposure"
+#   Saved-query persistence: persistence.* — documentation/DEPLOYMENT.md | values-examples/values.hosted-trial.yaml
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — documentation/DEPLOYMENT.md
+#   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth"
+#   Nodes-tab default filter: nodeFilter — documentation/DEPLOYMENT.md "Optional values"
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
 deployment:
   name: prometheus-mcp
   appName: prometheus-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  # REALITY NOTE: tag v0.1.0 was OVERWRITTEN in the registry with the
-  # lifespan-fixed build ("replace in place"), so the tag is mutable and
-  # pullPolicy must stay Always until a fresh immutable tag (v0.1.1+) is
-  # pushed — with IfNotPresent, nodes holding the cached old digest would
-  # silently serve the broken image. To cut a proper release: push
-  # prometheus-mcp:v0.1.1, set tag: v0.1.1 here + pullPolicy: IfNotPresent.
+  # Registry tags are mutable — pullPolicy MUST stay Always (IfNotPresent
+  # silently serves a cached old digest); cut releases with immutable tags.
   tag: v0.7.0
   pullPolicy: Always
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously, the ddgs-mcp convention).
-imagePullSecrets: []
+imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
 
-# -- Prometheus target ------------------------------------------------------------------
-# Default: the kube-prometheus-stack's Prometheus service (verified present
-# on the G2 cluster in the `prometheus` namespace). In-cluster plain HTTP;
-# no RBAC needed (raw HTTP API, read-only endpoints).
+# ============================================================================
+# Prometheus Target
+# ============================================================================
+
+# The kube-prometheus-stack service (verified on G2); PROM_URL renders from
+# this key.
 prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
 
-# PROM_URL is rendered by deployment.yaml from .Values.prometheusUrl (Helm
-# does not template inside values files — see the template comment).
+# ============================================================================
+# GPU Tab
+# ============================================================================
 
-# -- GPU tab: NVLink domain grouping ----------------------------------------------
-# The UI's GPU tab groups each node's GPUs into NVLink islands (domains).
-# DCGM exposes NVLink TRAFFIC, not topology, so the grouping comes from a
-# per-node GPU-index map — with the auto-detector below (enabled by
-# default) the map comes from the hardware itself. Precedence:
-#   1. this override (explicit operator escape hatch)
-#   2. auto-detected islands (nvlinkAutodetect, from nvidia-smi topo -m)
-#   3. built-in default: two 4-GPU islands (0-3, 4-7) per 8-GPU node —
-#      matches H200 NVL-class hosts, verified on the SE-G2 cluster.
-#
-# Accepts either a JSON string or a native YAML list of index groups:
-#   gpuNvlinkDomains: "[[0, 1, 2, 3], [4, 5, 6, 7]]"   # the default, explicit
-#   gpuNvlinkDomains: [[0, 1, 2, 3], [4, 5, 6, 7]]     # same, as YAML
-#   gpuNvlinkDomains: "[[0, 1, 2, 3, 4, 5, 6, 7]]"     # e.g. one 8-way NVSwitch island
-# Empty/omitted -> fall through to detection/default. GPUs outside any group
-# still render in the "All GPUs" table with domain "—"; an invalid value
-# falls back to the default server-side (it never breaks the pod).
+# NVLink domain grouping: precedence override > auto-detection > built-in
+# default; accepts a JSON string or YAML list; invalid values fall back.
 gpuNvlinkDomains: ""
 
-# -- Nodes tab: which nodes are shown by default --------------------------------------
-# The Nodes tab (per-node CPU/memory: allocatable vs requests vs limits vs
-# active usage) needs a default selection on a cluster with many nodes.
-# Precedence:
-#   1. the browser filter input (?filter=<regex> — per-view, not persisted)
-#   2. this regex, applied to node names (rendered as PROM_UI_NODE_FILTER)
-#   3. built-in default: the GPU nodes, auto-detected from the nvidia GPU
-#      allocatable (kube_node_status_allocatable{resource="nvidia_com_gpu"})
-#      — they are the sizing targets. No GPU nodes detected -> every node.
-#   nodeFilter: "scs"        # show every node matching /scs/i
-#   nodeFilter: "all"        # always show every node
-#   nodeFilter: ""           # default (GPU nodes)
-# An invalid regex, or one matching nothing, falls back to the default
-# selection server-side (it never breaks the pod or empties the tab).
-nodeFilter: ""
-
-# -- GPU tab: NVLink topology auto-detection ----------------------------------------
-# Detects the REAL NVLink islands on every GPU node: a TWO-container
-# DaemonSet pod — initContainer (the cluster's NVIDIA driver image,
-# privileged) writes `nvidia-smi topo -m` to a shared emptyDir, and the
-# python sidecar parses it and pushes
-# nvidia_gpu_nvlink_domain{gpu,domain,peers,hostname} to the pushgateway,
-# where the GPU tab picks it up. DaemonSet pods only support
-# restartPolicy: Always, so the python sidecar supervises itself: retry
-# every 60s on failure, sleep for the pod's lifetime on success. Detection
-# happens once per pod lifetime (= node boot — the pod is recreated on
-# reboot, which re-detects; topology is hardware-fixed). Steady state: one
-# ~0-CPU Running pod per GPU node; a node whose pod logs failures every
-# 60s needs its driver access looked at — the UI keeps working with the
-# default/override grouping regardless, so this sidecar can never break
-# the page.
+# NVLink topology auto-detection: DaemonSet on GPU nodes — init runs the
+# HOST-INSTALLED driver's nvidia-smi topo -m; sidecar pushes the metric.
 nvlinkAutodetect:
   enabled: true
-  # TWO-container pod, ONE image (python:3.12-slim) — NO driver-image
-  # pinning anywhere:
-  #   initContainer `topo`: runs the HOST-INSTALLED driver's nvidia-smi —
-  #   the GPU operator installs the full user-space into host
-  #   /run/nvidia/driver on every GPU node it manages (its own privileged
-  #   validator depends on that exact tree), and privileged: true exposes
-  #   the host /dev/nvidia* device nodes NVML needs (same pattern as the
-  #   operator's own dcgm-exporter pods). Writes `topo -m` to a shared
-  #   emptyDir. Fails loudly (pod restart w/ backoff) if the driver tree
-  #   is missing.
-  #   container `push`: parses topo.txt and pushes the metric; retries
-  #   every 60s on failure. LIFECYCLE — the CHECK is once per node boot
-  #   (the init container terminates permanently after one run; the
-  #   architecture never changes, so there is no re-detection). The POD
-  #   itself cannot die: DaemonSets force restartPolicy: Always, and the
-  #   platform pushgateway's --metric.timetolive=30s means a dead pod's
-  #   metric evaporates — so `push` idles at ~0 CPU re-stating the
-  #   unchanged answer every pushInterval seconds. That is the entire
-  #   steady state; it performs no detection of its own.
-  # Version story: PCAI/AIE upgrades reinstall the driver into
-  # /run/nvidia/driver via the operator's own DaemonSet, and the detector
-  # uses whatever is there at pod start — nothing to update in this chart.
   image: python:3.12-slim
   privileged: true
-  # Host path of the GPU operator's driver install (mounted read-only;
-  # probed for usr/bin/nvidia-smi, nvidia-smi, plus host /usr/bin).
   driverInstallDir: /run/nvidia/driver
-  # Refresh cadence for the push container. IMPORTANT: the G2 pushgateway
-  # runs with --metric.timetolive=30s — pushed groups VANISH unless
-  # re-pushed, so this MUST stay well under 30s (HPE's own license pusher
-  # refreshes every ~60s with a longer allowance; 20s is safe margin).
   pushInterval: 20
-  # Defaults match the kube-prometheus-stack pushgateway service name.
   pushgatewayUrl: http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091
-  # Targets GPU-operator-labeled nodes. Set to {} to run everywhere (the
-  # script exits 0, quietly, on nodes without an NVIDIA driver).
   nodeSelector:
-    nvidia.com/gpu.present: "true"
+    nvidia.com/gpu.present: "true"   # {} runs everywhere (script exits 0 without NVIDIA)
 
-# -- Service exposure ---------------------------------------------------------------------
+# ============================================================================
+# Nodes Tab
+# ============================================================================
+
+# Default selection: precedence browser ?filter= > this regex (PROM_UI_NODE_FILTER)
+# > built-in default (GPU nodes); "all" shows every node.
+nodeFilter: ""
+
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# /mcp requires a key ONLY when existingSecret is set; everything else stays
+# key-free. Comma-separated keys = zero-downtime rotation; never inline a key.
+apiKey:
+  existingSecret: ""
+  existingSecretKey: api-keys
+
+extraAllowedHosts: []   # EXTRA Host headers for in-cluster svc-DNS callers (`host:*` form)
+
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# The server's OWN self-metrics (tool/outcome only — no PromQL text or error
+# strings); false renders nothing, true serves /metrics key-free.
+metrics:
+  enabled: false
+  serviceMonitor: true
+  interval: 30s
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+# ============================================================================
+# Networking
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9095
   targetPort: 9095
 
-# -- MCP network zone (ADDITIVE, DEFAULT OFF — fleet contract) --------------------
-# Ingress default-deny for the MCP pods, admitting ONLY the listed sources.
-# OFF by default: the default render is byte-identical to the baseline. Enable
-# deliberately per the runbook ("Enabling the network zone" in the README).
+# MCP network zone — ADDITIVE, DEFAULT OFF. Ingress default-deny admitting
+# ONLY the listed sources (an unlisted scrape ns dies SILENTLY).
 networkPolicy:
   enabled: false
   sameNamespace: true
-  # The MCP network zone: client namespaces allowed to call this server
-  # IN-CLUSTER (kubernetes.io/metadata.name labels). The LLM gateway's relay
-  # namespace goes here first; add agentic frontends from the hardened-G2
-  # example. `monitoring` belongs here whenever the chart ships a
-  # ServiceMonitor — Prometheus scrapes /metrics on the SAME port, and an
-  # unlisted scrape ns dies SILENTLY (check Prometheus targets after enabling).
+  # In-cluster caller namespaces; the LLM gateway's relay namespace goes first.
   authorizedClients:
     namespaces: []
-  # Browser/console path stays OPEN (fleet doctrine 2026-09): the zone exists
-  # to stop RANDOM IN-CLUSTER model access — external traffic keeps flowing
-  # through the SSO-gated edge gateway exactly as pre-zone. Only flip to
-  # false as an explicit, per-chart, per-site decision (e.g. exec/mutation
-  # consoles) — never as a class default.
-  allowEzafGatewayIngress: true
+  allowEzafGatewayIngress: true   # browser path stays on the SSO-gated edge gateway
   ingressGatewayNamespace: istio-system
-  # LIVE-VERIFIED (G2 inventory §3): the edge pods serving VS hosts carry
-  # app=istio-ingressgateway — `ezaf-gateway` is the Gateway CR NAME; no pod
-  # carries it as a label. Do not "fix" this back to app=ezaf-gateway.
+  # Edge pods carry app=istio-ingressgateway; `ezaf-gateway` is the Gateway CR NAME.
   ingressGatewayLabels:
     app: istio-ingressgateway
-  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
-  # with an empty probeExceptCidrs (the template fails the render).
+  # Node-originated kubelet probes; NEVER 0.0.0.0/0 with an empty probeExceptCidrs.
   probeCidrs: []
   probeExceptCidrs: []
   egress:
-    # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
-    # k8s API / Prometheus / internet legitimately per site).
-    enabled: false
+    enabled: false   # admin MCPs reach the k8s API / Prometheus / internet legitimately
     extraEgress: []
 
-# -- Saved-query persistence (Wave-5 F4 — ADDITIVE, DEFAULT OFF) --------------------
-# `query_save`/`query_list`/`query_delete`/`query_saved` keep user-defined
-# queries in one JSON store. The store's path comes from
-# PROMETHEUS_SAVED_QUERIES_PATH: UNSET (chart default) → in-memory for the
-# session — every pod update/reschedule silently forgets every saved query
-# (the observed "the system forgets my queries" complaint). persistence.enabled
-# wires the env to a file on a dedicated PVC instead, so saved queries survive
-# pod updates. The JSON store is atomic (temp+rename). replicaCount > 1 with a
-# RWO class strands extra replicas Pending — flip accessModes to a class that
-# supports it (gl4f-filesystem RWX on G2), or keep 1 replica (this chart's
-# fleet default).
+# ============================================================================
+# Saved-Query Persistence
+# ============================================================================
+
+# ADDITIVE, DEFAULT OFF: durable JSON store at PROMETHEUS_SAVED_QUERIES_PATH —
+# UNSET = in-memory, forgotten on reschedule (RWO + replicas > 1 strands Pending).
 persistence:
   enabled: false
-  # Where the store volume mounts; the rendered env points
-  # PROMETHEUS_SAVED_QUERIES_PATH at <mountPath>/<savedQueriesFile>.
   mountPath: /data
   size: 1Gi
-  # "" = cluster default StorageClass.
-  storageClass: ""
+  storageClass: ""   # "" = cluster default StorageClass
   accessModes:
     - ReadWriteOnce
-  # Store file INSIDE the mount, pinned explicitly so a moved mountPath
-  # cannot silently orphan an existing store.
-  savedQueriesFile: saved-queries.json
-  # PER-REPLICA honesty (default OFF): the saved-query store is per-replica —
-  # replicaCount > 1 fragments stores (each replica keeps its own memory/file)
-  # and the server cannot know its own replica count. Set to true ONLY when
-  # the store is genuinely shared across replicas (single replica, or a RWX
-  # volume every replica mounts); it renders PROMETHEUS_SAVED_QUERIES_SHARED=1
-  # and silences the per-replica warning that query_save otherwise attaches.
-  # It is a declaration about the deployment, NOT concurrency control — no
-  # cross-process locking exists (a multi-writer JSON store would lose updates
-  # silently; see README).
+  savedQueriesFile: saved-queries.json   # pinned INSIDE the mount
+  # shared: true declares the store genuinely shared (single replica or RWX);
+  # a declaration, NOT concurrency control — fragmented stores should stay loud.
   shared: false
 
-# -- /metrics + ServiceMonitor (Wave-3 C3 — ADDITIVE, DEFAULT OFF) -------------------
+# ============================================================================
+# PCAI Networking
+# ============================================================================
 
-# The MCP server's OWN self-metrics (it observes Prometheus all day; this is
-# the one counter family about the server itself): prometheus_mcp_tool_
-# requests_total{tool,outcome} — per-tool request counts with outcome ok|error
-# (which tools agents call, how often, how often they fail). No PromQL text,
-# label names, or error strings are ever exported. DEFAULT false: the chart
-# renders NOTHING extra (no env, no ServiceMonitor) and the server serves no
-# /metrics route — the default render is byte-identical to the pre-metrics
-# baseline. Flip to true per site values to enable; /metrics is then served
-# key-free on the same port as /mcp (this server has no auth middleware —
-# read-only surface behind the gateway) so the ServiceMonitor can scrape it.
-metrics:
-  enabled: false
-  # Render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled).
-  serviceMonitor: true
-  # Scrape interval rendered into the ServiceMonitor.
-  interval: 30s
-
-# -- MCP API keys (OPTIONAL — fleet decision 2026-09, fleet pattern: searxng) ---
-# /mcp requires a key ONLY when existingSecret is set; /health, /healthz,
-# the web console and its /api/* routes stay key-free (the auth scope is
-# exactly the /mcp prefix — the ServiceMonitor scrape and kubelet probes are
-# unaffected). Leave empty for gateway-fronted deployments (the server then
-# runs open, with a loud startup warning). The chart NEVER inlines a key in
-# values — pre-deploy the Secret, then point the values at it (no pod
-# restart needed; the server re-reads the env per request). Comma-separated
-# keys all authenticate: that is the rotation mechanism — append the new
-# key, move clients over, drop the old one, no downtime. The fleet-universal
-# MCP_API_KEYS env is honored too (either var authenticates).
-apiKey:
-  existingSecret: ""
-  existingSecretKey: api-keys
-
-# -- In-cluster host allowlist (DNS-rebinding additions, fleet pattern: K8S-MCP) -
-# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts,
-# for in-cluster callers that address the server by its service DNS name
-# instead of the public FQDN (e.g. a peer MCP →
-# http://other-mcp.<ns>.svc.cluster.local:9095/mcp). Joined
-# into MCP_EXTRA_ALLOWED_HOSTS. Entries are matched verbatim, or use the
-# `host:*` form to accept any port. The pinned public FQDN
-# (ezua.virtualService.endpoint, rendered as MCP_HOSTNAME) and loopback are
-# always allowed; with NEITHER knob set the server's transport security is
-# unset — the SDK's implicit loopback-only protection applies unchanged
-# (local-dev behavior). List of strings.
-#
-# NOTE — the chart AUTO-INCLUDES this release's own service DNS
-# (<deployment.name>-service.<ns>.svc.cluster.local:*) as the FIRST entry of
-# MCP_EXTRA_ALLOWED_HOSTS whenever transport security is active (ezua
-# endpoint pinned or extraAllowedHosts non-empty — the DEFAULT render has
-# both, since ezua ships enabled): the LLM-gateway relay arrives with Host:
-# <deployment.name>-service.<ns>.svc.cluster.local:<port>, and without that
-# entry every relay hop gets 421 Misdirected Request. This key only lists
-# hosts BEYOND that; a site setting extraAllowedHosts never loses the
-# own-svc entry (the chart prepends it):
-extraAllowedHosts: []
-
-# -- Resources --------------------------------------------------------------------------------
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    memory: 512Mi
-
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
-# Deploys the Istio VirtualService through the ezaf-gateway. The MCP path
-# uses a long timeout (range queries over wide windows can run for minutes).
+# Deploys the Istio VirtualService through the ezaf-gateway; the long MCP
+# timeout is deliberate (wide range queries run for minutes).
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
   virtualService:
-    # HARDENED-ADMIN knob: false unrenders the VS (no browser path) while
-    # ezua.enabled keeps driving every other gate (kyverno, deployment).
-    # ⚠️ Gate DIRECTLY on this key, never `(default true .enabled)` — Sprig's
-    # `default` treats an explicit `false` as empty and would return true.
-    enabled: true
+    enabled: true   # false unrenders the VS while ezua.enabled keeps driving other gates
     endpoint: "prometheus-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
   # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
-  # rotating-token pain for machine MCP callers is an accepted lab trade; the
-  # template is real, so flipping it on enforces tokens for this host.
+  # rotating SSO token is a known pain for machine MCP callers.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"

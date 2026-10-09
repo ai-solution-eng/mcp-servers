@@ -11,18 +11,16 @@ import pytest
 from sqlhandler import observability
 from sqlhandler.engine import LakehouseError, QueryJob, SqlEngine
 from sqlhandler.observability import Metrics, audit_query, token_matches
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 from sqlhandler.server import _ApiTokenMiddleware
 
 
 def _make_engine(tmp_path, **kw):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}), d / "part.parquet"
-    )
+    pq.write_table(pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -224,7 +222,6 @@ def test_token_middleware_blocks_and_allows():
     assert _run_middleware(None, "/ui", {}) == 200
     assert _run_middleware(None, "/mcp", {}) == 200
     assert _run_middleware(None, "/health", {}) == 200
-
 
 
 # --------------------------------------------------- readiness drift rollup

@@ -207,7 +207,7 @@ Build & push (separate image; the MCP image stays slim — only the ~40 MB playw
 
 ```bash
 docker buildx build \
-  -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+  -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.6.1 \
   mcp_servers/searxng_mcp/browser --push
 ```
 
@@ -278,7 +278,7 @@ Boilerplate sizing/identity/probe values — every path is settable in the PCAI 
 | `resources.requests.cpu` / `resources.limits.cpu` | `200m` / `1` | MCP container CPU requests/limits. |
 | `searxng.image.pullPolicy` | `IfNotPresent` | Pull policy of the SearXNG sidecar image. |
 | `searxng.resources.requests.cpu` / `searxng.resources.limits.cpu` | `100m` / `1` | SearXNG sidecar CPU requests/limits. |
-| `browser.image.tag` / `browser.image.pullPolicy` | `v1.4.0` / `IfNotPresent` | Optional headless-browser sidecar image pin and pull policy (used when `browser.enabled`). |
+| `browser.image.tag` / `browser.image.pullPolicy` | `v1.6.1` / `IfNotPresent` | Optional headless-browser sidecar image pin and pull policy (used when `browser.enabled`). |
 | `browser.resources.requests.cpu` | `250m` | Headless-browser sidecar CPU request (memory limit 1Gi). |
 | `service.targetPort` | `9090` | Container port the Service's `mcp` port forwards to (also the `/mcp` VirtualService backend). |
 | `metrics.serviceMonitor` | `true` | Render the ServiceMonitor when `metrics.enabled: true`. |
@@ -286,10 +286,10 @@ Boilerplate sizing/identity/probe values — every path is settable in the PCAI 
 
 ```bash
 # Build & push the MCP image (playwright client included via the browser extra)
-docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v1.1.0 -f Dockerfile . --push
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v1.7.0 -f Dockerfile . --push
 
 # Optional: build & push the headless-browser sidecar (see the section above)
-docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.6.1 \
     mcp_servers/searxng_mcp/browser --push
 
 # Render & inspect, then install (per-site values from helm/local/)
@@ -297,6 +297,17 @@ helm template searxng-mcp helm/ -f helm/local/values.<site>.yaml
 helm upgrade --install searxng-mcp helm/ -n searxng-mcp --create-namespace \
     -f helm/local/values.<site>.yaml
 ```
+
+**Rebuild safety (W7 fixes, 2026-10):** the images neutralize two
+crash-loop classes at build time — (1) a **permission neutralizer**
+(`chmod -R a+rX /app` after the code COPY; `/ms-playwright` in the browser
+image), because agents' files land `0600` on the ops box, COPY preserves
+modes, and a non-root container dies on the first unreadable module; and
+(2) a **build-time import gate** that imports every declared loose
+py-module (`mcp_auth`, `mcp_metrics`, `url_policy`, …) from the installed
+wheel — the non-editable install silently omits a declared module whose
+file is not COPYed, which otherwise surfaces as a first-query
+`ModuleNotFoundError` in a pod instead of in the build log.
 
 ### API-key auth — OPTIONAL (fleet pattern)
 

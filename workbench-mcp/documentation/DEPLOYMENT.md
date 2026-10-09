@@ -1,5 +1,18 @@
 # Deployment — workbench-mcp
 
+> **What changed (2026-10-07 doc wave):** the W7 console exposure change is
+> documented as a behavior change — `GET /` and `/ui` are now
+> **public-but-inert** (the unlock bar lives in the served HTML; previously
+> a keyed deployment served raw 401 JSON to the browser, making the console
+> unreachable), while every `/api/*` data route stays API-key-gated and the
+> mutation surface is unchanged; the `workbench.execAllowlist` default was
+> corrected to the D18 narrow list (the row still showed the pre-D18
+> interpreter/package-manager default); the missing env rows
+> (`WORKBENCH_EXEC_MAX_CONCURRENCY`, `WORKBENCH_AUDIT_MAX_BYTES`) were added;
+> and the profile bullets were re-verified against `helm/values-examples/`
+> (fleet `mcp-fleet-apikeys` Secret in both, D18-narrow allowlist in both,
+> proxy + CA + Kyverno + metrics G2-only).
+
 Deployment is a values problem: import the packaged chart into PCAI once,
 then everything below is edited in the chart's values (PCAI **Helm Values**
 editor, or the PCAI API) and re-applied. Operators running plain Helm do the
@@ -29,11 +42,13 @@ ezua:
 |---|---|---|
 | `persistence.enabled` / `size` / `mountPath` / `accessModes` / `storageClass` | `true` / `10Gi` / `/data` / `ReadWriteMany` | THE point of the workbench: workspaces must survive pod restarts. RWX so every replica sees the same workspaces; single-replica clusters without an RWX class can drop to `ReadWriteOnce` with `replicaCount: 1`. `workbench.root` MUST equal `persistence.mountPath` (both default `/data`). |
 | `workbench.root` | `/data` | PVC mount holding all workspaces. |
-| `workbench.execAllowlist` | `python3,pip,pip3,ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq` | argv[0] allowlist for `run_command` — anything not listed is refused; no shells by design. |
+| `workbench.execAllowlist` | `ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq` | argv[0] allowlist for `run_command` — anything not listed is refused; no shells by design. **Fleet decision D18 (2026-09-13): no interpreters (`python3`) and no package managers (`pip`/`pip3`) in the default** — an allow-listed interpreter can compute paths at runtime and sidestep the argv-level workspace confinement, and pip executes python code. Re-add explicitly per site (or via a template's `extra_allowed`) when the threat model accepts the documented residual; the D18-legal python path is `sandbox_run` (`executors.*` + `workbench.sandboxExec`). |
 | `workbench.execDenylist` | `curl,wget,sudo,su,nc,ncat,ssh,scp,setsid` | Hard deny — WINS over the allowlist. |
 | `workbench.execTimeoutDefault` / `execTimeoutMax` | `60` / `600` s | Per-command bounds (per-call `timeout_s` is clamped into these). |
 | `workbench.maxFileBytes` | `8388608` (8 MiB) | `write_file` cap. |
 | `workbench.maxOutputBytes` | `204800` (200 KiB) | stdout/stderr cap per `run_command`. |
+| `workbench.execMaxConcurrency` | `4` | Worker width of the dedicated `run_command` pool (env re-read per call) — long runs (up to `execTimeoutMax`) can no longer starve the file/env tools; a saturated pool returns a structured busy response without executing, audited as `run_command_busy`. |
+| `workbench.auditMaxBytes` | `104857600` (100 MiB) | Rotation threshold for the audit JSONL (`<root>/.audit.jsonl` → `.audit.jsonl.1`, single generation; the fresh file starts with an `audit_rotated` event carrying `rotated_from` — the sha256 bridge across generations). Mount BOTH paths into logsearch per the fleet convention. |
 | `workbench.maxListEntries` | `500` | Entries per `list_files` response. |
 | `workbench.logLevel` | `INFO` | Server logging level. |
 | `workbench.templates` | `{}` | Workspace templates for `workspace_create(name, template=<name>)` — **default OFF: an empty object renders no env at all and the tool's `template` parameter is refused**, exactly the pre-templates behavior. Each named template may only (a) **widen** that workspace's exec allowlist with operator-supplied *bare binary names* (`extra_allowed` — the denylist still wins, so a template can never re-enable a denied binary) and (b) pre-run `canned_setup` argv commands **inside the new workspace through the exact `run_command` machinery** (confinement, server-PATH allowlist resolution, timeouts, output caps, audit — each setup run is audited as a `workspace_template_setup` event carrying the template name). Only the template *name* persists in the workspace; the widened allowlist is re-derived from the current values on every call, so removing a template shrinks its workspaces back to the base allowlist. See the `helm/values.yaml` comment block for a worked example. |
@@ -63,6 +78,8 @@ these directly):
 | `WORKBENCH_EXEC_ALLOWLIST` / `WORKBENCH_EXEC_DENYLIST` | `workbench.execAllowlist` / `execDenylist` |
 | `WORKBENCH_EXEC_TIMEOUT_DEFAULT` / `WORKBENCH_EXEC_TIMEOUT_MAX` | `workbench.execTimeoutDefault` / `execTimeoutMax` |
 | `WORKBENCH_MAX_FILE_BYTES` / `WORKBENCH_MAX_OUTPUT_BYTES` / `WORKBENCH_MAX_LIST_ENTRIES` | `workbench.maxFileBytes` / `maxOutputBytes` / `maxListEntries` |
+| `WORKBENCH_EXEC_MAX_CONCURRENCY` | `workbench.execMaxConcurrency` (default `4`) |
+| `WORKBENCH_AUDIT_MAX_BYTES` | `workbench.auditMaxBytes` (default `104857600` = 100 MiB) |
 | `WORKBENCH_UI_ENABLED` | `webui.enabled` |
 | `WORKBENCH_LOG_LEVEL` | `workbench.logLevel` |
 | `WORKBENCH_TEMPLATES` | `workbench.templates` as JSON — rendered ONLY when the object is non-empty (default: no env at all, template parameter refused) |
@@ -111,9 +128,10 @@ Behavior that differs by target, and the paste-ready values for each
   namespace; the former `hpe_proxies` flag is removed — see "Migrating from
   hpe_proxies" in the README): this is what lets `pip install ...` inside
   `run_command` reach PyPI through the corporate proxy. Note the interplay
-  with fleet decision D18: `pip` must also be allow-listed
-  (`workbench.execAllowlist`) for it to run at all — the G2 site chooses its
-  allowlist deliberately.
+  with fleet decision D18: the shipped G2 example keeps the **D18-narrow
+  allowlist (no `pip`)**, so the proxy wiring alone is not enough — an
+  operator must explicitly widen `workbench.execAllowlist` (or use a
+  template's `extra_allowed`) before `pip install` runs at all.
 - Fleet API key (Secret `mcp-fleet-apikeys`, key `api-keys`), Kyverno
   vendor-label policy on, metrics + ServiceMonitor on.
 - Sanitized example:
@@ -133,9 +151,14 @@ Behavior that differs by target, and the paste-ready values for each
   proxy; `kyverno.enabled: false` unless the platform enforces vendor labels;
   metrics off keeps the render minimal.
 - API-key Secret provisioned out of band per the customer's key process
-  (`mcp-fleet-apikeys` convention or the customer's own Secret name) — every
-  route except `/health`/`/healthz` is keyed, so the read/write web UI also
-  sits behind the key plus the gateway authn.
+  (`mcp-fleet-apikeys` convention or the customer's own Secret name — the
+  shipped example points at `mcp-fleet-apikeys`): every data route except
+  `/health`/`/healthz` is keyed. Console exposure posture: the HTML at `/`
+  and `/ui` is public-but-inert (an in-page unlock bar collects the key —
+  the browser cannot load the page behind a 401), while every `/api/*`
+  route and `/mcp` stay API-key-gated at the pod AND behind the gateway
+  authn; the read/write surface never widens beyond the MCP tools' own
+  confirm gates and audit.
 - Sanitized example:
   [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
 

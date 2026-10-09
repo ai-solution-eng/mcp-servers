@@ -1,5 +1,16 @@
 # Deployment — prometheus-mcp
 
+> **What changed (2026-10-07 doc wave):** the `nodeFilter` key and its
+> `PROM_UI_NODE_FILTER` env are now documented (the Nodes-tab default
+> selection shipped earlier but was missing from this walkthrough); a new
+> "Rebuilding the image" note documents the W7 packaging fix — `mcp_metrics.py`
+> was absent from published images (new pods crash-looped; caught live during
+> the 2026-10 deploy observation) and now ships as a py-module + explicit
+> Dockerfile COPY with a build-time import gate; and every G2/Hosted profile
+> claim was re-verified against `helm/values.yaml` +
+> `helm/values-examples/` (metrics on/off, persistence RWX + `shared`,
+> NVLink detector off, literal-vs-`${DOMAIN_NAME}` domains).
+
 Deployment is a values problem: import the packaged chart into PCAI once,
 then everything below is edited in the chart's values (PCAI **Helm Values**
 editor, or the PCAI API) and re-applied. Operators running plain Helm do the
@@ -30,6 +41,7 @@ ezua:
 | Key | Default | Notes |
 |---|---|---|
 | `gpuNvlinkDomains` | `""` | GPU-tab NVLink island grouping — JSON string or YAML list of GPU-index groups (`"[[0,1,2,3],[4,5,6,7]]"`). Precedence: this override > auto-detection > built-in default (two 4-GPU islands per 8-GPU node). Invalid values fall back server-side; they never break the pod. |
+| `nodeFilter` | `""` | Nodes-tab default selection regex, applied to node names (rendered as `PROM_UI_NODE_FILTER`). Precedence: the browser `?filter=` input > this regex > built-in default (GPU nodes, auto-detected from the nvidia GPU allocatable; none detected → every node). `all` shows every node; an invalid or empty-matching regex falls back server-side — it never empties the tab. |
 | `nvlinkAutodetect.enabled` | `true` | The two-container DaemonSet that detects real NVLink islands at GPU-node boot (`nvidia-smi topo -m` from the host-installed driver → pushgateway → GPU tab). Disable when you pin `gpuNvlinkDomains` and want no resident detector pods. Fails soft: a node without a working driver mount never breaks the page. |
 | `nvlinkAutodetect.pushInterval` | `20` | Re-push cadence — MUST stay under the pushgateway's `--metric.timetolive=30s` or the metric evaporates. |
 | `nvlinkAutodetect.pushgatewayUrl` / `nodeSelector` / `image` / `privileged` / `driverInstallDir` | pushgateway service DNS / `nvidia.com/gpu.present: "true"` / `python:3.12-slim` / `true` / `/run/nvidia/driver` | Defaults match kube-prometheus-stack + GPU-operator clusters; no driver-image pinning anywhere. |
@@ -56,6 +68,7 @@ these directly):
 |---|---|
 | `PROM_URL` | `prometheusUrl` |
 | `PROM_UI_GPU_NVLINK_DOMAINS` | `gpuNvlinkDomains` (JSON string or YAML list — both render to the same value; omitted when empty) |
+| `PROM_UI_NODE_FILTER` | `nodeFilter` (omitted when empty — the built-in GPU-nodes default applies) |
 | `PROMETHEUS_METRICS_ENABLED` | rendered `"true"` only when `metrics.enabled=true` (otherwise absent — no `/metrics` route) |
 | `PROMETHEUS_API_KEYS` | rendered from the `apiKey.existingSecret` Secret reference ONLY when set (otherwise absent — `/mcp` runs open with the startup warning) |
 | `MCP_HOSTNAME` | `ezua.virtualService.endpoint` whenever `ezua.enabled` + endpoint are set (DNS-rebinding Host pin) |
@@ -99,6 +112,23 @@ service. The vendor-label Kyverno ClusterPolicy ships ungated in this chart
   provider; external MCP callers must then present a valid PCAI SSO/bearer
   token (the rotating-token trade is documented above).
 
+## Rebuilding the image (W7 packaging fix — 2026-10)
+
+Site operators rarely rebuild, but if you do, know the failure mode this
+chart just fixed: `server.py` imports `mcp_metrics` (the Wave-3
+instrumentation), and the loose-scripts packaging (`[tool.setuptools]
+py-modules`) **silently omits a declared module whose file is not in the
+build context** — a rebuilt image without the explicit COPY crash-looped at
+startup (`ModuleNotFoundError`) while probes looked fine on the old pods.
+The fix, now in the Dockerfile, is threefold: `mcp_metrics.py` is declared in
+pyproject `py-modules` AND copied explicitly (`COPY mcp_metrics.py
+./mcp_metrics.py`), and a build-time sanity gate imports every shipped module
+so packaging drift fails in the build log instead of in a pod. The image also
+carries the fleet's build-time permission neutralizer (`chmod -R a+rX /app`)
+— files created by agents land `0600` on the ops box and COPY preserves
+modes, so a non-root container would otherwise fail on the first unreadable
+module. If your rebuild crash-loops, check both before touching values.
+
 ## Deployment targets
 
 Behavior that differs by target, and the paste-ready values for each
@@ -114,8 +144,10 @@ posture is entirely the `ezua.authorizationPolicy` gate above.
   it already; `ezua.domainName` is informational).
 - GPU wiring: `gpuNvlinkDomains` pinned to the operator-confirmed two
   4-GPU islands, `nvlinkAutodetect.enabled: false` (no resident detector
-  pods); `persistence.enabled: true` (RWX `gl4f-filesystem`) so saved
-  queries survive pod updates; metrics + ServiceMonitor on.
+  pods); `persistence.enabled: true` (RWX `gl4f-filesystem`, `shared: true`
+  — single replica) so saved queries survive pod updates; metrics +
+  ServiceMonitor on; no `apiKey` block (the server runs open behind the
+  SSO-gated edge, per the optional-by-design decision above).
 - Sanitized example:
   [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
 

@@ -1,5 +1,18 @@
 # Deployment — applygate-mcp
 
+> **What changed (2026-10-07 doc wave):**
+> - The **MCP network zone** (`networkPolicy.*`, fleet decision 2026-09 —
+>   default-off ingress allowlist) is now in the Optional-values table and both
+>   target profiles, with the new hardened-G2 example
+>   ([helm/values-examples/values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml)).
+> - **Transport security** (`mcpHostname` / `extraAllowedHosts`) is now a
+>   values-table row, and the 421-on-gateway-requests failure mode is named in
+>   both target profiles (keep `mcpHostname` in lockstep with the endpoint).
+> - Currency pass against `helm/values.yaml` + `helm/values-examples/*` at
+>   chart **0.5.0**: the fleet `mcp-fleet-apikeys` Secret wiring, D11
+>   `planBinding.unplannedApply: ''` = deny-by-default, and the image build's
+>   permission neutralizer (`chmod -R a+rX /app`) are all verified current.
+
 Deployment is a values problem: import the packaged chart into PCAI once,
 then everything below is edited in the chart's values (PCAI **Helm Values**
 editor, or the PCAI API) and re-applied. Operators running plain Helm do the
@@ -42,13 +55,15 @@ ezua:
 | `clients.existingSecret` / `existingSecretKey` | `''` (renders nothing) | Wave-6 caller attribution, optional: the per-request caller-name registry `APPLYGATE_CLIENTS` (`name:key;name:key;...` — NAMES keys the API-key middleware already matched → audit `caller.name`; never authenticates anything). Secret material — existingSecret-only, the chart never creates or inlines it: `kubectl -n <ns> create secret generic applygate-mcp-clients --from-literal=clients='pipeline-bot:key-1;deploy-bot:key-2'`. Omitted ⇒ fp-only caller audit, unchanged behavior. |
 | `callerPassthrough.trustedCidrs` | `''` (renders nothing) | Wave-6, optional: comma-separated CIDRs of trusted direct peers whose `X-MCP-Caller` claim is recorded → audit `caller.via` (sanitized, ≤200 chars; non-secret account names, never tokens). **Empty = fail-closed: the header is ignored from every peer.** Attribution-never-authorization: neither knob unlocks anything (not namespaces, kinds, the D11 plan binding, or confirm gates). |
 | `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request. |
-| `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml`/`pyproject.toml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. |
+| `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml`/`pyproject.toml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. The image build ends with a permission neutralizer (`RUN chmod -R a+rX /app`) so files that land mode-0600 on the ops box cannot brick the non-root (10001) pod at boot. |
+| `mcpHostname` / `extraAllowedHosts` | `''` / `[]` | DNS-rebinding transport security (the K8S-MCP knob pattern): `mcpHostname` is the public FQDN clients use to reach `/mcp` — **set it in lockstep with `ezua.virtualService.endpoint`**; with neither set (dev) the SDK's implicit loopback-only protection applies untouched. `extraAllowedHosts` lists EXTRA in-cluster svc-DNS Host values (verbatim or `host:*`); whenever transport security is active the chart AUTO-prepends the release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*` — the gateway relay's Host header), so sites never list that one. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
 | `resources` | `100m`/`256Mi` requests, `1`/`512Mi` limits | Modest; this is a policy gate, not a compute node. |
 | `securityContext`, `podSecurityContext`, `containerSecurityContext` | non-root uid/gid 10001, `readOnlyRootFilesystem`, drop ALL caps, RuntimeDefault seccomp | Keep. The k8s client needs a writable `/tmp` — the chart mounts an `emptyDir` there. |
 | `serviceAccount.create` / `name`, `rbac.create` | `true` / `applygate-mcp` / `true` | Creates the ServiceAccount + the namespaced writer Role/RoleBinding. |
 | `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring (fleet convention): each key is wired only when non-empty, and `proxy: {}` (or omitting the block) means fully off. Fleet-consistency block — the only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
 | `kyverno.enabled` | `false` | Pre-install ClusterPolicy stamping `hpe-ezua/*` vendor labels. Cluster-scoped, so off by default — enable where EZUA labeling is enforced. |
+| `networkPolicy.enabled` (+ `authorizedClients.namespaces`, `allowEzafGatewayIngress`, `probeCidrs`) | `false` | **The MCP network zone** (fleet decision 2026-09): a default-off ingress allowlist — once on, anything not matched below is DENIED (deny by absence; egress stays unrestricted). Namespace selectors (`kubernetes.io/metadata.name`) for in-cluster callers — the LLM gateway's relay namespace goes first, and `monitoring` belongs there whenever metrics are on (Prometheus scrapes `/metrics` on the SAME port; an unlisted scrape ns dies **silently**). The browser path stays OPEN by fleet doctrine (`allowEzafGatewayIngress: true` — external traffic rides the SSO-gated edge gateway exactly as pre-zone; the edge-pod label is live-verified as `app: istio-ingressgateway`, NOT `app=ezaf-gateway`). Full hardened profile: [helm/values-examples/values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml). |
 | `service.type` / `port` / `targetPort` | `ClusterIP` / `9102` | Don't move the port without moving the probes' target. |
 
 ## Underlying detail: values → environment variables
@@ -124,10 +139,21 @@ Behavior that differs by target, and the paste-ready values for each
   tool namespaces on the allowlist) need the one-time
   `helm/local/rbac-bootstrap.se-g2.yaml` applied by an admin per target
   namespace — see the section above.
+- **Transport security.** The G2 file sets `mcpHostname` to the literal FQDN
+  (`applygate-mcp.your-cluster.example`), in lockstep with
+  `ezua.virtualService.endpoint` — without the pin every gateway-fronted
+  request gets HTTP 421 "Invalid Host header".
 - explicit `proxy` block wired (each key non-empty; the former
   `hpe_proxies` flag is removed — see "Migrating from hpe_proxies" in the
   README), `kyverno.enabled: true` (EZUA labeling enforced), metrics +
-  ServiceMonitor on.
+  ServiceMonitor shipped OFF (additive — flip `metrics.enabled: true` to turn
+  them on; needs the prometheus-operator CRDs).
+- **Network zone optional.** The plain G2 file leaves `networkPolicy.enabled:
+  false`; the hardened variant
+  ([values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml))
+  turns the ingress allowlist on for the admin-surface posture (in-cluster
+  callers locked to the gateway-relay + agentic-frontend namespaces; browser
+  path stays open).
 - Sanitized example:
   [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
 
@@ -142,9 +168,14 @@ Behavior that differs by target, and the paste-ready values for each
   never creates or inlines keys); keep the default-deny write surface
   (`namespaces.allowed` = only the trial namespaces) and expose the host only
   where the ezaf-gateway enforces real auth.
+- **Transport security.** The trial file pins
+  `mcpHostname: applygate-mcp.${DOMAIN_NAME}` — the placeholder resolves in
+  the PCAI values editor exactly like the endpoint; on a plain-Helm site
+  substitute the literal domain in BOTH keys (gateway requests 421 otherwise).
 - `proxy: {}` (fully off — the old `hpe_proxies` flag is removed),
   `kyverno.enabled: false` unless the platform enforces vendor labels;
-  metrics off keeps the render minimal.
+  metrics off keeps the render minimal, and the network zone stays off
+  (the gateway relay's netpol governs in-cluster access on a trial).
 - Cross-namespace writes need the same per-namespace admin bootstrap as on
   G2 (the release Role is namespace-scoped everywhere).
 - Sanitized example:

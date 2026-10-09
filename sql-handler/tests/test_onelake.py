@@ -1,5 +1,6 @@
 """Regression tests for the OneLake token lifecycle (refresh, retry, 401)."""
 
+import email.message
 import json
 import time
 import urllib.error
@@ -14,6 +15,9 @@ _CFG = FabricConfig(
     client_secret="s",
     lakehouse_abfss_url="abfss://ws@onelake.dfs.fabric.microsoft.com/lh",
 )
+
+#: HTTPError's hdrs slot wants an email Message; these fakes carry none.
+_EMPTY_HEADERS = email.message.Message()
 
 
 class _FakeResp:
@@ -55,18 +59,14 @@ def test_cached_token_reused_until_expiry():
     p = _provider()
     with mock.patch(
         "urllib.request.urlopen",
-        side_effect=lambda req, timeout=None: _FakeResp(
-            {"access_token": "tok-1", "expires_in": 3600}
-        ),
+        side_effect=lambda req, timeout=None: _FakeResp({"access_token": "tok-1", "expires_in": 3600}),
     ):
         assert p._dfs_access_token() == "tok-1"
         assert p._dfs_access_token() == "tok-1"
     p._token_expires_at = 0
     with mock.patch(
         "urllib.request.urlopen",
-        side_effect=lambda req, timeout=None: _FakeResp(
-            {"access_token": "tok-2", "expires_in": 3600}
-        ),
+        side_effect=lambda req, timeout=None: _FakeResp({"access_token": "tok-2", "expires_in": 3600}),
     ):
         assert p._dfs_access_token() == "tok-2"
 
@@ -77,7 +77,7 @@ def test_deterministic_401_not_retried():
     p._token_expires_at = 0
 
     def bad401(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", _EMPTY_HEADERS, None)
 
     with mock.patch("urllib.request.urlopen", side_effect=bad401):
         try:
@@ -93,7 +93,7 @@ def test_429_retries_then_falls_back_to_cached_token():
     p._token_expires_at = time.time() + 600
 
     def throttled(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 429, "throttled", {}, None)
+        raise urllib.error.HTTPError(req.full_url, 429, "throttled", _EMPTY_HEADERS, None)
 
     with mock.patch("urllib.request.urlopen", side_effect=throttled):
         assert p._dfs_access_token() == "old-token"
@@ -107,7 +107,7 @@ def test_dfs_list_refreshes_once_on_401():
     def dfs(req, timeout=None):
         if req.full_url.startswith("https://login.microsoftonline.com"):
             return _FakeResp({"access_token": "fresh", "expires_in": 3600})
-        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+        raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", _EMPTY_HEADERS, None)
 
     with mock.patch("urllib.request.urlopen", side_effect=dfs):
         try:

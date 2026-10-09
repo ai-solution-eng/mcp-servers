@@ -282,8 +282,9 @@ def test_relay_sig_valid_pure_function():
     # A non-finite timestamp must never slip past the replay window
     # (float("nan") compares False against every bound without this guard).
     for bogus in ("nan", "inf", "-inf"):
-        assert not identity._relay_sig_valid(SECRET, bogus, "alice", "user",
-                                             _sig(SECRET, bogus, "alice", "user")), bogus
+        assert not identity._relay_sig_valid(SECRET, bogus, "alice", "user", _sig(SECRET, bogus, "alice", "user")), (
+            bogus
+        )
 
 
 def test_relay_signed_subject_accepted_under_secret(app, monkeypatch):
@@ -398,8 +399,10 @@ def test_relay_missing_sig_headers_when_secret_set(app, monkeypatch):
 def test_relay_incomplete_proof_headers_when_secret_set(app, monkeypatch):
     """BOTH headers are required — a lone sig (or lone ts) is refused."""
     ts = str(int(time.time()))
-    for partial in ([(b"x-mcp-caller-sig", _sig(SECRET, ts, "alice", "user").encode())],
-                    [(b"x-mcp-caller-ts", ts.encode())]):
+    for partial in (
+        [(b"x-mcp-caller-sig", _sig(SECRET, ts, "alice", "user").encode())],
+        [(b"x-mcp-caller-ts", ts.encode())],
+    ):
         c, _state = _resolve_through_stack(
             monkeypatch,
             "k1",
@@ -471,8 +474,13 @@ def test_relay_header_names_exported():
     assert identity.HEADER_CALLER_SIG == "X-MCP-Caller-Sig"
     assert identity.HEADER_CALLER_TS == "X-MCP-Caller-Ts"
     assert identity.RELAY_HMAC_SECRET_ENV == "SQLHANDLER_RELAY_HMAC_SECRET"
-    for name in ("HEADER_CALLER_SIG", "HEADER_CALLER_TS", "RELAY_HMAC_SECRET_ENV",
-                 "resolve_relay_caller", "relay_signature_headers"):
+    for name in (
+        "HEADER_CALLER_SIG",
+        "HEADER_CALLER_TS",
+        "RELAY_HMAC_SECRET_ENV",
+        "resolve_relay_caller",
+        "relay_signature_headers",
+    ):
         assert name in identity.__all__, name
 
 

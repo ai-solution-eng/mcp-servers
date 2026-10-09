@@ -2,19 +2,42 @@
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document for the PCAI Helm Values editor. Adjust the
-# '# SITE:' lines, then apply.
-# Secret-free by construction: nothing here needs credentials. If your PCAI
-# build resolves ${DOMAIN_NAME} in ezua values, the placeholders below work as
-# pasted; otherwise replace them with the literal cluster domain — an
-# unresolved placeholder registers a gateway host that matches nothing.
+# site-specific lines, then apply. Secret-free: if your PCAI build resolves
+# ${DOMAIN_NAME} in ezua values the placeholders work as pasted; otherwise
+# substitute the literal cluster domain (an unresolved placeholder registers
+# a gateway host that matches nothing).
 
-# -- Deployment ----------------------------------------------------------------
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. API-key Secret, out of band — the chart NEVER creates or inlines it; the pod
+#      sits in CreateContainerConfigError until it exists (default ref:
+#      applygate-mcp-apikey, key api-keys; /mcp 401s without keys).
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard
+#      (templates/virtualservice.yaml); must resolve ${DOMAIN_NAME}; unique per release.
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Write surface (default-deny!): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+#   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
+#   Audit trail + persistence (hash-chained; logsearch-searchable) — README 'Audit trail'
+#   Caller attribution: clients.existingSecret + callerPassthrough.trustedCidrs — README
+#   Cross-namespace writes: per-namespace RBAC bootstrap — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment
+# ============================================================================
+
 deployment:
   name: applygate-mcp
   appName: applygate-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
+# ============================================================================
+# Image
+# ============================================================================
+
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/applygate-mcp
@@ -25,74 +48,87 @@ image:
 # anonymously).
 imagePullSecrets: []
 
-# -- Transport security (DNS-rebinding protection) ----------------------------------
-# SITE: mcpHostname is the public FQDN clients use to reach /mcp — the
-# DNS-rebinding pin. Keep in lockstep with ezua.virtualService.endpoint
-# below: WITHOUT it every gateway-fronted request gets 421 "Invalid Host
-# header". extraAllowedHosts lists EXTRA in-cluster svc-DNS hosts for callers
-# that bypass the gateway (verbatim or host:* form; loopback is always
-# allowed; empty = unchanged behavior). The chart AUTO-prepends the release's
-# own service DNS (<deployment.name>-service.<ns>.svc.cluster.local:*) when
-# transport security is active — the gateway relay's Host header — so this
-# list is for hosts BEYOND that. ${DOMAIN_NAME} resolves at deploy time in
-# the PCAI values editor.
+# ============================================================================
+# Transport Security (DNS-rebinding protection)
+# ============================================================================
+
+# mcpHostname = public FQDN (${DOMAIN_NAME} resolves in the PCAI values
+# editor), in lockstep with the endpoint below (421s without it).
 mcpHostname: applygate-mcp.${DOMAIN_NAME}
+
 extraAllowedHosts: []
 
-# -- Web console ---------------------------------------------------------------------------
-# Strictly READ-ONLY console at / (plan previews always dry-run; no
-# apply/delete endpoints). Keep on for the trial so evaluators can watch the
-# plan/audit flow in a browser.
+# ============================================================================
+# Web Console
+# ============================================================================
+
+# Strictly READ-ONLY console (plan previews always dry-run; no apply/delete
+# endpoints). Keep on for the trial — evaluators watch the plan/audit flow.
 webui:
   enabled: true
 
-# -- Namespace policy ------------------------------------------------------------------------
+# ============================================================================
+# Namespace Policy
+# ============================================================================
+
 # THE guardrail: a trial deploy with '' here is a no-op writer by design.
 namespaces:
-  # SITE: namespaces the trial agent may write in (globs OK) — REQUIRED
+  # Namespaces the trial agent may write in (globs OK) — REQUIRED
   allowed: <ALLOWED_NAMESPACES>
-  # SITE: ALWAYS wins over allowed — keep the platform namespaces blocked
+  # ALWAYS wins over allowed — keep the platform namespaces blocked
   blocked: kube-system,kube-public,kube-node-lease
 
-# -- Write surface ----------------------------------------------------------------------------
+# ============================================================================
+# Write Surface
+# ============================================================================
+
 kinds:
-  # SITE: chart default — narrow (e.g. ConfigMap,Service,Deployment,Job) if the
-  # trial only demos a subset
+  # Chart default — narrow (e.g. ConfigMap,Service,Deployment,Job) if
+  # the trial only demos a subset
   allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
 
-# -- Audit ------------------------------------------------------------------------------------
+# ============================================================================
+# Audit Trail
+# ============================================================================
+
 audit:
-  # Hash-chained, caller-attributed JSONL audit trail (README: "Audit
-  # trail: hash chain + caller identity"). Tamper-evident: each entry
-  # carries prev_sha256. Fleet convention: this audit.path is documented
-  # for ops mount/expose — mount THIS SAME path/PVC into the logsearch pod
-  # so the governed write path's "who did what" becomes searchable.
+  # Hash-chained JSONL trail (README "Audit trail") — mount the SAME path/PVC
+  # into the logsearch pod so the write path's "who did what" is searchable.
   file: /data/audit.jsonl
+
 planBinding:
-  # D11 (ratified 2026-09): apply_manifest is sha256-bound to the planned
-  # bytes; missing plan/tampered bytes refuse BY DEFAULT (server default
-  # deny). Migration path for automation that predates the binding:
-  unplannedApply: ''          # deny (default) | warn (logged) | allow (pre-D11)
+  # Missing/tampered plan refuses BY DEFAULT (server default deny).
+  unplannedApply: ''          # deny (default) | warn (logged) | allow (legacy)
+
 metrics:
-  # /metrics + ServiceMonitor — additive, OFF by default (default render
-  # byte-identical to the Wave-0 baseline); requires prometheus-operator CRDs.
+  # Additive, OFF by default (byte-identical render); needs the
+  # prometheus-operator CRDs.
   enabled: false
   interval: 30s
 
-# -- Persistence ------------------------------------------------------------------------------
+# ============================================================================
+# Persistence
+# ============================================================================
+
 persistence:
   enabled: true
   size: 1Gi
   accessModes:
   - ReadWriteOnce
 
-# -- Service exposure -------------------------------------------------------------------------
+# ============================================================================
+# Service Exposure
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9102
   targetPort: 9102
 
-# -- Resources --------------------------------------------------------------------------------
+# ============================================================================
+# Resources
+# ============================================================================
+
 resources:
   requests:
     cpu: 100m
@@ -101,7 +137,10 @@ resources:
     cpu: '1'
     memory: 512Mi
 
-# -- Security contexts -------------------------------------------------------------------------
+# ============================================================================
+# Security Contexts
+# ============================================================================
+
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
@@ -119,10 +158,12 @@ containerSecurityContext:
     drop:
     - ALL
 
-# -- Service account / RBAC ---------------------------------------------------------------------
-# The chart's Role/RoleBinding cover the RELEASE namespace only. Writes into
-# other trial namespaces need a one-time admin-applied RBAC bootstrap per
-# namespace (see documentation/DEPLOYMENT.md).
+# ============================================================================
+# Service Account / RBAC
+# ============================================================================
+
+# The chart's Role/RoleBinding cover the RELEASE namespace only — writes into
+# other trial namespaces need a one-time admin RBAC bootstrap (DEPLOYMENT.md).
 serviceAccount:
   create: true
   name: applygate-mcp
@@ -130,26 +171,34 @@ serviceAccount:
 rbac:
   create: true
 
-# -- Per-key proxy wiring --------------------------------------------------------------------------
-# On unless the site wants it off — each key is wired only when non-empty
-# (proxy: {} = fully off); the k8s API is in-cluster and covered by the
-# NO_PROXY entries either way.
+# ============================================================================
+# Per-Key Proxy Wiring
+# ============================================================================
+
+# On unless the site wants it off — each key wired only when non-empty
+# (proxy: {} = fully off); the in-cluster k8s API is covered by NO_PROXY.
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
   noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost
 
-# -- Kyverno vendor-label policy ------------------------------------------------------------------
+# ============================================================================
+# Kyverno Vendor-Label Policy
+# ============================================================================
+
 # Enable only where the trial platform enforces the hpe-ezua/* vendor labels.
 kyverno:
   enabled: true
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration ---------------------------------------------
-# SITE: gateway exposure — applygate-mcp is a WRITE-path MCP; expose it only
-# where the ezaf-gateway enforces real auth (SSO/bearer).
+# ============================================================================
+# PCAI (HPE Ezmeral Unified Analytics) Integration
+# ============================================================================
+
+# Gateway exposure — a WRITE-path MCP; expose it only where the
+# ezaf-gateway enforces real auth (SSO/bearer).
 ezua:
-  enabled: true   # SITE: deploy the VirtualService
-  # SITE: current PCAI builds resolve ${DOMAIN_NAME} in ezua values; if yours
+  enabled: true   # deploy the VirtualService
+  # Current PCAI builds resolve ${DOMAIN_NAME} in ezua values; if yours
   # does not, replace both placeholders with the literal cluster domain.
   domainName: ${DOMAIN_NAME}   # informational only — no template reads it
   virtualService:
@@ -162,12 +211,32 @@ apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
 
-# Wave-6 caller attribution — both optional; chart defaults (unset = fp-only
-# audit, byte-identical render). Flip on only when a trusted relay emits
-# X-MCP-Caller (set callerPassthrough.trustedCidrs to its CIDRs) and/or a
-# caller-name registry is wanted (create the clients Secret out of band):
+# Caller attribution — unset = fp-only audit; enable when a trusted relay
+# emits X-MCP-Caller (set trustedCidrs to its CIDRs) or a registry is wanted:
 clients:
   existingSecret: ''
   existingSecretKey: clients
+
 callerPassthrough:
   trustedCidrs: ''
+
+# ============================================================================
+# MCP Network Zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF)
+# ============================================================================
+
+# Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
+# egress unrestricted. Zone OFF on a trial — the relay's netpol governs access.
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  probeCidrs: []
+  probeExceptCidrs: []
+  egress:
+    enabled: false
+    extraEgress: []

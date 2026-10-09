@@ -1,167 +1,155 @@
 # workbench-mcp — values for the SE-G2 lab cluster
-# (SITE: your-cluster.example — proxied corporate PCAI site)
+# (your-cluster.example — proxied corporate PCAI site)
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. apiKey.existingSecret — the operator-created key Secret (default name
+#      workbench-mcp-apikey, key api-keys) MUST pre-exist in the release
+#      namespace or the pod sits in CreateContainerConfigError; every route
+#      except /health + /healthz is keyed [chart never creates or inlines the key]
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
+#      default FALSE — set ezua.enabled: true in site values);
+#      templates/virtualservice.yaml calls `required` on it
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Exec governance: workbench.execAllowlist / execDenylist — documentation/DEPLOYMENT.md
+#   Sandbox python exec: executors.* + workbench.sandboxExec (BOTH gates) — README "Sandbox exec" | documentation/DEPLOYMENT.md
+#   Workspace templates: workbench.templates — documentation/DEPLOYMENT.md + the comment block in helm/values.yaml
+#   Persistence (RWX; workbench.root MUST match persistence.mountPath): persistence.* — documentation/DEPLOYMENT.md
+#   Proxy + MITM CA: proxy.*, caCert.* — documentation/DEPLOYMENT.md | values-examples/values.g2.yaml
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — README "Configuration"
+#   Web console exposure: webui.enabled — documentation/DEPLOYMENT.md (public-but-inert HTML, keyed /api/*)
 #
 # FULL VALUES — every key from helm/values.yaml is present, so this file alone
 # is the complete values document (PCAI's Helm Values editor replaces the
-# chart's bundled values.yaml). Site edits are marked '# SITE:'.
-# Sanitized for publication: no credentials — real site values live in
-# helm/local/ (never committed, never packaged).
+# chart's bundled values.yaml). Adjust the site-specific lines, then apply.
+# The deep WHY for each key lives in helm/values.yaml. Sanitized: no
+# credentials — real site values live in helm/local/ (never committed/packaged).
 
-# -- Deployment ----------------------------------------------------------------
+# ============================================================================
+# Deployment / Images
+# ============================================================================
+
 deployment:
   name: workbench-mcp
   appName: workbench-mcp
   replicaCount: 1
 
-# -- Image ------------------------------------------------------------------------
-# repository/tag/pullPolicy are release-managed (kept in lockstep with
-# Chart.yaml by the release tooling) — leave at the chart default.
+# repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
   tag: v0.4.0
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE (public packages pull
-# anonymously).
+# Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).
 imagePullSecrets: []
 
-# -- Web UI -------------------------------------------------------------------------------
-# HPE-branded browser console at / — read/write, calls the SAME core functions
-# the MCP tools use (path confinement, caps, argv allowlist, audit all still
-# apply). The console HTML (/ and /ui) is public-but-inert (an in-page unlock
-# bar collects the key); every /api/* data route stays key-gated — and the
-# endpoint must sit behind gateway authn (the ezaf-gateway VirtualService
-# below).
+# ============================================================================
+# Web UI
+# ============================================================================
+
+# Read/write console; the HTML is public-but-inert and every /api/* data route
+# stays key-gated — the endpoint must sit behind gateway authn (the VS below).
 webui:
   enabled: true
 
-# -- Workbench configuration --------------------------------------------------------
+# ============================================================================
+# Workbench Configuration
+# ============================================================================
+
 workbench:
-  # Root directory holding all workspaces — MUST match persistence.mountPath.
-  root: /data
-  # argv[0] allowlist for run_command (comma-separated); no shells by design.
-  # Fleet decision D18: NO interpreters (python3) and no package managers
-  # (pip/pip3) in the default — an allow-listed interpreter can sidestep the
-  # argv-level workspace confinement. Re-add deliberately if the threat model
-  # accepts the documented residual (README "Honest limits").
+  root: /data   # MUST match persistence.mountPath
+  # argv[0] allowlist; no shells by design; NO interpreters/package managers
+  # in the default (they can sidestep argv-level confinement) — re-add deliberately.
   execAllowlist: "ls,cat,head,tail,grep,find,wc,du,df,mkdir,touch,cp,mv,tar,git,diff,sort,uniq"
-  # Hard deny (WINS over the allowlist): network/escalation binaries.
-  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"
-  # Per-command timeout bounds (seconds).
-  execTimeoutDefault: 60
+  execDenylist: "curl,wget,sudo,su,nc,ncat,ssh,scp,setsid"   # hard deny — WINS over the allowlist
+  execTimeoutDefault: 60   # seconds
   execTimeoutMax: 600
-  # Dedicated run_command pool width (default 4): a saturated pool
-  # returns a structured busy response without executing (no queue).
-  execMaxConcurrency: 4
-  # Audit-JSONL rotation threshold (bytes; default 100 MiB): the active
-  # .audit.jsonl renames to .audit.jsonl.1 (single generation) and a
-  # fresh file starts with an audit_rotated provenance entry.
-  auditMaxBytes: 104857600
-  # write_file cap (bytes, 8 MiB).
-  maxFileBytes: 8388608
-  # stdout/stderr cap per run_command (bytes, 200 KiB).
-  maxOutputBytes: 204800
-  # Max entries per list_files response.
-  maxListEntries: 500
+  execMaxConcurrency: 4   # saturated pool returns a structured busy response (no queue)
+  auditMaxBytes: 104857600   # .audit.jsonl rotation threshold (100 MiB, single .1 generation)
+  maxFileBytes: 8388608   # write_file cap (8 MiB)
+  maxOutputBytes: 204800   # stdout/stderr cap per run_command (200 KiB)
+  maxListEntries: 500   # max entries per list_files response
   logLevel: INFO
-  # sandbox_exec tool (v1, opt-in): python file execution in the
-  # no-network executor pool — OFF here; flip with executors.enabled.
-  sandboxExec: false
+  sandboxExec: false   # sandbox_run tool (opt-in) — OFF here; flip with executors.enabled
   sandboxLabel: "app=workbench-exec"
   sandboxContainer: python
   sandboxTimeoutS: 120
   sandboxMaxOutputChars: 50000
-  # Workspace templates (Wave-5 F3) — SITE: chart default ({} = the
-  # workspace_create tool's template parameter is refused; nothing renders).
-  # See the helm/values.yaml comment block for a worked example.
-  templates: {}
+  templates: {}   # chart default — the workspace_create template parameter is refused
 
-# -- In-cluster host allowlist (DNS-rebinding additions; K8S-MCP pattern) ---
-# EXTRA Host header values the MCP SDK's DNS-rebinding protection accepts for
-# in-cluster callers addressing the server by service DNS instead of the
-# public FQDN. Joined into MCP_EXTRA_ALLOWED_HOSTS (matched verbatim or as
-# `host:*`). The pinned public FQDN (ezua.virtualService.endpoint, wired as
-# MCP_HOSTNAME when ezua is enabled) and loopback are always allowed; with
-# neither key set the SDK's implicit dev-mode protection applies (unchanged).
-# The chart AUTO-prepends the release's own service DNS
-# (<deployment.name>-service.<ns>.svc.cluster.local:*) whenever transport
-# security is active — the gateway relay's Host header — so this list is
-# for hosts BEYOND that.
-extraAllowedHosts: []
+# ============================================================================
+# Sandbox Executor Pool
+# ============================================================================
 
-# -- Sandbox executor pool (sandbox-exec v1) ------------------------------------------------------
-# No-network python executor pods for the sandbox_run tool: same image as the
-# server (stdlib-only needs), deny-all NetworkPolicy, no SA token, non-root,
-# caps dropped, seccomp, read-only rootfs, no GPU resource request, and NO
-# tolerations (control-plane taints self-exclude). The MCP tool refuses until
-# BOTH executors.enabled AND workbench.sandboxExec are true.
+# No-network python executor pods (same image, deny-all netpol, no SA token,
+# no GPU request); the MCP tool refuses until BOTH gates are true.
 executors:
   enabled: false
   appName: workbench-exec
   containerName: python
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
   replicas: 2
-  autoscaling:
-    enabled: false
-    minReplicas: 2
-    maxReplicas: 4
-    targetCPUUtilizationPercentage: 70
+  autoscaling: {enabled: false, minReplicas: 2, maxReplicas: 4, targetCPUUtilizationPercentage: 70}
 
-# -- Per-key proxy wiring --------------------------------------------------------------------------
-# SITE: this cluster sits behind a corporate proxy — wiring it is what makes
-# `pip install ...` inside run_command reach PyPI through the MITM proxy.
-# NO_PROXY keeps cluster-local traffic direct. Each key is wired only when
-# non-empty.
+# ============================================================================
+# Egress / In-cluster Access
+# ============================================================================
+
+# EXTRA svc-DNS hosts beyond the chart's auto-included own-service entry —
+# see helm/values.yaml (matched verbatim or `host:*`).
+extraAllowedHosts: []
+
+# This cluster sits behind a corporate proxy — wiring it is what makes
+# `pip install ...` reach PyPI (pip is NOT in the allowlist — widen it first).
 proxy:
   http: http://proxy.corp.example:8080
   https: http://proxy.corp.example:8080
   noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost"
 
-# -- Corporate MITM CA (independent of the proxy wiring) ------------------------------------------
-# SITE: on — workloads here must trust the corporate MITM CA (the proxy
-# re-terminates TLS, so pip/requests inside run_command need the PCAI root CA,
-# mounted from the ezaf-root-ca ConfigMap; copy it into the release namespace
-# if absent).
+# Corporate MITM CA — ON; the proxy re-terminates TLS so pip/requests inside
+# run_command need the root CA (copy the ConfigMap into the release ns if absent).
 caCert:
   enabled: true
   configMap: "ezaf-root-ca"
   configMapKey: "ezaf-root-ca.crt"
 
-# -- Kyverno vendor-label policy -------------------------------------------------------------------
-# Cluster-scoped — off by default so the default render stays unchanged (and
-# clusters without the kyverno CRD still install).
+# ============================================================================
+# Kyverno Vendor-Label Policy
+# ============================================================================
+
+# Cluster-scoped; ON here (off by default so the default render stays unchanged).
 kyverno:
   enabled: true
 
-# -- Service exposure -------------------------------------------------------------------
+# ============================================================================
+# Service Exposure
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9103
   targetPort: 9103
 
-# -- Resources (modest: a scratch pad, not a compute node) -------------------------
-resources:
-  requests:
-    cpu: 250m
-    memory: 256Mi
-  limits:
-    cpu: "1"
-    memory: 512Mi
+# ============================================================================
+# Resources / Security Context
+# ============================================================================
 
-# -- Security context -----------------------------------------------------------------
-# Non-root uid + fsGroup 10001 (PVC writable by the server user), RuntimeDefault
-# seccomp at the pod level.
+# Modest: a scratch pad, not a compute node.
+resources:
+  requests: {cpu: 250m, memory: 256Mi}
+  limits: {cpu: "1", memory: 512Mi}
+
+# Non-root uid + fsGroup 10001 (PVC writable by the server user).
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
   fsGroup: 10001
-  seccompProfile:
-    type: RuntimeDefault
+  seccompProfile: {type: RuntimeDefault}
 
-# Container-level hardening (fleet-audit P0): read-only rootfs (run_command
-# children can write only the PVC + /tmp), no privilege escalation, caps
-# dropped. The pod also mounts NO service-account token (automount
-# explicitly off in the chart — the server makes zero k8s calls).
+# Container-level: read-only rootfs (run_command children write only the PVC +
+# /tmp), no privilege escalation, caps dropped; NO SA token (zero k8s calls).
 containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
@@ -169,11 +157,12 @@ containerSecurityContext:
     drop:
     - ALL
 
-# -- Persistence ---------------------------------------------------------------------
-# THE point of the workbench: workspaces survive pod restarts. RWX so every
-# replica sees the same workspaces (MCP is stateless — any replica serves any
-# request). Single-replica clusters without an RWX class can drop to
-# ReadWriteOnce with replicaCount: 1.
+# ============================================================================
+# Persistence
+# ============================================================================
+
+# Workspaces survive pod restarts; RWX so every replica sees the same state
+# (single-replica clusters without an RWX class can use ReadWriteOnce).
 persistence:
   enabled: true
   size: 10Gi
@@ -181,25 +170,35 @@ persistence:
   accessModes:
     - ReadWriteMany
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration --------------------------------------------
-# SITE: gateway exposure on with the literal host. The /mcp timeout is
-# generous because run_command can legitimately run to its max (600 s).
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Gateway exposure ON with the literal host (this file must not rely on
+# ${DOMAIN_NAME} resolution); the /mcp timeout covers run_command's 600s max.
 ezua:
-  enabled: true   # SITE: deploy the VirtualService on this cluster
-  # SITE: literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
+  enabled: true   # deploy the VirtualService on this cluster
   domainName: your-cluster.example   # informational only — no template reads it
   virtualService:
-    # SITE: literal host — /mcp -> MCP server (9103); / -> web UI
+    # Literal host — /mcp -> MCP server (9103); / -> web UI.
     endpoint: workbench-mcp.your-cluster.example
     istioGateway: istio-system/ezaf-gateway
     timeout: 660s
+
+# ============================================================================
+# API Keys
+# ============================================================================
 
 # Fleet API-key auth: the shared fleet key Secret (key: api-keys).
 apiKey:
   existingSecret: "mcp-fleet-apikeys"
   existingSecretKey: "api-keys"
 
-# Observability (Wave-3+): per-tool counters + ServiceMonitor.
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# Per-tool counters + ServiceMonitor.
 metrics:
   enabled: true
   serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)

@@ -7,14 +7,16 @@ where rendering requires describe/list behavior.
 """
 
 import asyncio
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from mcp_types import TextContent
 
 from sqlhandler import mcp_resources as mr
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import LakehouseError, TableInfo
+from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
 
 TABLES = [
     TableInfo(name="work_order", schema="workorder", format="parquet"),
@@ -84,7 +86,7 @@ def test_list_resource_templates_exposes_schema_template():
 def test_read_resource_table_schema(stub_engine):
     params = type("P", (), {"uri": "sqlhandler://table/workorder%2Fwork_order/schema"})()
     result = asyncio.run(mr.handle_read_resource(None, params))
-    text = result.contents[0].text
+    text = cast(TextContent, result.contents[0]).text
     assert result.contents[0].mime_type == "text/markdown"
     assert "Work order headers" in text
     assert "| id | int64 |" in text
@@ -92,14 +94,10 @@ def test_read_resource_table_schema(stub_engine):
 
 
 def test_read_resource_catalog_and_query_memory(stub_engine):
-    cat = asyncio.run(
-        mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://catalog"})())
-    )
-    assert "Work order headers" in cat.contents[0].text
-    mem = asyncio.run(
-        mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://query-memory"})())
-    )
-    assert "SELECT 1" in mem.contents[0].text
+    cat = asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://catalog"})()))
+    assert "Work order headers" in cast(TextContent, cat.contents[0]).text
+    mem = asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://query-memory"})()))
+    assert "SELECT 1" in cast(TextContent, mem.contents[0]).text
 
 
 def test_read_resource_unknown_raises_mcp_error(stub_engine):
@@ -108,16 +106,12 @@ def test_read_resource_unknown_raises_mcp_error(stub_engine):
     with pytest.raises(MCPError):
         asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://nope"})()))
     with pytest.raises(MCPError):
-        asyncio.run(
-            mr.handle_read_resource(
-                None, type("P", (), {"uri": "sqlhandler://table/missing/schema"})()
-            )
-        )
+        asyncio.run(mr.handle_read_resource(None, type("P", (), {"uri": "sqlhandler://table/missing/schema"})()))
 
 
 def test_catalog_resource_mentions_missing_catalog(stub_engine):
     eng = CatalogStubEngine({})  # no descriptions anywhere
-    text = mr._catalog_text(eng)
+    text = mr._catalog_text(cast(SqlEngine, eng))
     assert "No semantic-catalog descriptions" in text
 
 
@@ -132,26 +126,22 @@ def test_list_prompts():
 def test_get_prompt_explore_data(stub_engine):
     params = type("P", (), {"name": "explore-data", "arguments": {"goal": "churn by month"}})()
     result = asyncio.run(mr.handle_get_prompt(None, params))
-    text = result.messages[0].content.text
+    text = cast(TextContent, result.messages[0].content).text
     assert "churn by month" in text
     assert "profile_table" in text
 
 
 def test_get_prompt_analyze_table(stub_engine):
-    params = type(
-        "P", (), {"name": "analyze-table", "arguments": {"table": "workorder/work_order"}}
-    )()
+    params = type("P", (), {"name": "analyze-table", "arguments": {"table": "workorder/work_order"}})()
     result = asyncio.run(mr.handle_get_prompt(None, params))
-    assert "workorder/work_order" in result.messages[0].content.text
+    assert "workorder/work_order" in cast(TextContent, result.messages[0].content).text
 
 
 def test_get_prompt_errors(stub_engine):
     from mcp.shared.exceptions import MCPError
 
     with pytest.raises(MCPError):
-        asyncio.run(
-            mr.handle_get_prompt(None, type("P", (), {"name": "analyze-table", "arguments": {}})())
-        )
+        asyncio.run(mr.handle_get_prompt(None, type("P", (), {"name": "analyze-table", "arguments": {}})()))
     with pytest.raises(MCPError):
         asyncio.run(mr.handle_get_prompt(None, type("P", (), {"name": "nope", "arguments": {}})()))
 
@@ -167,7 +157,7 @@ def _make_engine(tmp_path, **kw):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self, **kw):

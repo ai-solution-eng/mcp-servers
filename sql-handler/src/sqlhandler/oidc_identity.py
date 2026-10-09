@@ -202,8 +202,16 @@ def _b64url_json(segment: str) -> dict | None:
 
 
 def _fail(reason: str, detail: str | None = None) -> None:
-    """Fail closed with a short reason code (never any token material).
-    DEBUG level: a per-request rung decline must not spam the log."""
+    """Log a short reason code (never any token material) and give the
+    caller its ``None`` verdict.
+
+    DEBUG level: a per-request rung decline must not spam the log. The
+    function is a REASON LOGGER, not an exception: callers ``_fail(...)``
+    then ``return None`` themselves (fail-closed), so the log line and the
+    decline always travel together. Historically a few call sites wrote
+    ``return _fail(...) or None`` — same verdict, but mypy rightly flags a
+    value taken from a ``-> None`` function, so the split form is canonical.
+    """
     logger.debug("OIDC JWT rejected: %s%s", reason, f" ({detail})" if detail else "")
 
 
@@ -239,9 +247,10 @@ def _fetch_jwks(url: str, timeout: float) -> dict[str, tuple[int, int]]:
     """
     import ssl
     import urllib.parse
+    import urllib.request
 
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "sqlhandler"})
-    handlers: list = []
+    handlers: list[urllib.request.BaseHandler] = []
     ca_bundle = os.environ.get("REMOTE_CA_BUNDLE", "").strip()
     if url.lower().startswith("https://") and ca_bundle and os.path.exists(ca_bundle):
         try:
@@ -409,33 +418,41 @@ def verify_and_decode(token: str) -> dict | None:
     logs a short reason code; token material is never logged or stored.
     """
     if not oidc_enabled() or not is_jwt_format(token):
-        return _fail("disabled-or-format")
+        _fail("disabled-or-format")
+        return None
     header, payload_segment, signature_segment = token.split(".")
     header_doc = _b64url_json(header)
     claims = _b64url_json(payload_segment)
     if header_doc is None or claims is None:
-        return _fail("format")
+        _fail("format")
+        return None
     alg = header_doc.get("alg")
     if alg != "RS256":
-        return _fail("alg", f"rejected alg {alg!r} (RS256 only — alg-confusion guard)")
+        _fail("alg", f"rejected alg {alg!r} (RS256 only — alg-confusion guard)")
+        return None
     kid = header_doc.get("kid")
     if not isinstance(kid, str) or not kid:
-        return _fail("kid", "header carries no kid")
+        _fail("kid", "header carries no kid")
+        return None
     try:
         signature = _b64url_bytes(signature_segment)
     except ValueError:
-        return _fail("format")
+        _fail("format")
+        return None
     keys = _jwks_keys(_jwks_url())
     if not keys:
-        return _fail("jwks", "no usable JWKS (fetch failed or negative-cached)")
+        _fail("jwks", "no usable JWKS (fetch failed or negative-cached)")
+        return None
     key = keys.get(kid)
     if key is None:
         # Unknown kid: ONE immediate refetch before failing (rotation pickup).
         key = (_jwks_keys(_jwks_url(), force=True) or {}).get(kid)
     if key is None:
-        return _fail("kid")
+        _fail("kid")
+        return None
     if not _verify_rs256(f"{header}.{payload_segment}".encode("ascii"), signature, key):
-        return _fail("signature")
+        _fail("signature")
+        return None
     if not _claims_valid(claims):
         return None
     return claims
@@ -458,15 +475,18 @@ def subject_from_claims(claims: dict) -> str | None:
     if isinstance(primary, str) and primary.strip():
         name = primary.strip()
         if not _name_ok(name):
-            return _fail("identity", f"{claim_name} value does not satisfy the name rules") or None
+            _fail("identity", f"{claim_name} value does not satisfy the name rules")
+            return None
         return name
     sub = claims.get(_FALLBACK_CLAIM)
     if isinstance(sub, str) and sub.strip():
         name = sub.strip()
         if not _name_ok(name):
-            return _fail("identity", "sub value does not satisfy the name rules") or None
+            _fail("identity", "sub value does not satisfy the name rules")
+            return None
         return name
-    return _fail("identity", f"neither {claim_name} nor {_FALLBACK_CLAIM} is a usable string") or None
+    _fail("identity", f"neither {claim_name} nor {_FALLBACK_CLAIM} is a usable string")
+    return None
 
 
 def _name_ok(name: str) -> bool:

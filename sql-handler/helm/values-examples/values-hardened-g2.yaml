@@ -1,39 +1,28 @@
 # sqlhandler — MCP NETWORK ZONE add-on for values.g2.yaml (HARDENED-G2).
-# ⚠️ This is a FRAGMENT, not a full document: merge this block ONTO the end of
-# values.g2.yaml (or paste both into the PCAI Helm Values editor — later keys
-# win, so paste this file AFTER the base). It turns the W6 ingress
-# NetworkPolicy on AND adds the fleet network-zone rules:
-#   authorizedClients (agentic frontends + the Prometheus scrape) and — for
-#   direct SQL workbench clients — the OPTIONAL sqlLocalAccess CIDR list
-#   (disabled here by default, fleet decision: SQL local access is opt-in).
-#
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ### OVERLAY ### — FRAGMENT: merge ONTO values.g2.yaml (later keys win — paste
+# this file AFTER the base). Turns the W6 ingress NetworkPolicy on and adds the
+# fleet network-zone rules: authorizedClients + the OPTIONAL sqlLocalAccess
+# CIDR list (disabled here by default — SQL local access is opt-in).
 # ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
 # with the zone on, every unlisted caller times out (deny by absence).
-# Prometheus scrapes /metrics via the PodMonitor from `monitoring` on the SAME
-# port: omit it and metrics scraping dies SILENTLY (check Prometheus targets
-# after enabling).
 security:
   networkPolicy:
     enabled: true
     gatewayNamespace: istio-system
     allowedNamespaces: []          # W6 keys stay as-is (empty; the zone list below is the allowlist)
     additionalIngress: []
-    # MCP network zone (fleet decision 2026-09) — appends to the W6 rules:
-    # the gateway ns + same-namespace pods stay allowed; these ADD the
-    # in-cluster zone callers on kubernetes.io/metadata.name (G2 live facts,
-    # inventory §6).
+    # MCP network zone — appends in-cluster caller namespaces on
+    # kubernetes.io/metadata.name to the W6 rules above.
     authorizedClients:
       - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
       - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
       - owebui0-11-0        # OWUI instance on the live gateway allowlist
       - opencode-web-helm   # OpenCode web
-      - monitoring          # Prometheus scraping /metrics (PodMonitor) — omit
-                            # and metrics scraping dies SILENTLY (check
-                            # Prometheus targets after enabling)
-    # SQL local access — OPTIONAL, DEFAULT OFF (fleet decision). Uncomment to
-    # let an operator desktop subnet reach the service port directly (bypasses
-    # the gateway; the port is then reachable ONLY from that CIDR in-cluster —
-    # expect 5432-free behavior: the MCP port answers, everything else stays
-    # governed by the rules above). Requires a helm upgrade per chart.
+      - monitoring          # Prometheus scraping /metrics — omit and scraping
+                            # dies SILENTLY (check Prometheus targets after enabling)
+    # SQL local access — OPTIONAL, DEFAULT OFF: uncomment to let an operator
+    # desktop subnet reach the service port directly (bypassing the gateway).
     # sqlLocalAccess:
     #   - 10.11.12.0/23   # Andrew's desktop subnet (operator-supplied)

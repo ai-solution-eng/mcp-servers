@@ -1,6 +1,6 @@
 # FEATURES — Hardening & Capability changelog (v0.0.1 → v0.2.13)
 
-This file summarizes everything that changed across the hardening session that took `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl, `cluster-admin`, unauthenticated endpoint) to v0.2.13 — deployed, verified live, and in daily use from DSH. The chart line has since moved on (current: `helm/` 1.1.0 + `helm-customer/` 1.1.0-customer, see `helm/Chart.yaml`); the invariants below still hold.
+This file summarizes everything that changed across the hardening session that took `k8s-mcp-2-0-server` from the original pre-audit build (v0.0.1: `shell=True` kubectl, `cluster-admin`, unauthenticated endpoint) to v0.2.13 — deployed, verified live, and in daily use from DSH. The chart line has since moved on (current: `helm/` 1.2.0 + `helm-customer/` 1.2.0-customer, see `helm/Chart.yaml`); the invariants below still hold.
 
 ---
 
@@ -141,7 +141,38 @@ For the post-deployment verification checklist against a running instance, see [
 | v0.2.13 | 2.2.0 | Wave-5 additive: `triage(namespace, app)` — a one-call namespace health summary composed ONLY from the server's own governed read paths (namespace policy up front — refusal byte-identical to `list_pods`'; namespaced Python-API reads only, never kubectl / cluster-wide lists; `get_events`' Warning filter, sort and 100-item cap reused). Attention-first output: container waiting reasons (CrashLoopBackOff / OOMKilled / ImagePullBackOff / …), Pending/Failed/Unknown phase, Running-but-`Ready=False`, any restarts, and `Unhealthy` Warning events as failing probes; Succeeded pods stay unflagged. Then pods (name/phase/restarts/age/node), workloads ready-vs-desired, Warning events, PVCs. `app` narrows pods+workloads+attention (label-first `app`/`app.kubernetes.io/name`, then name substring — the `list_pods` label-selector convention); events/PVCs stay namespace-wide. Whole render capped by `K8S_MCP_TRIAGE_MAX_LINES` (default 150, >=1, malformed→default) with a naming marker. One failed non-core read degrades only its section to an honest `Error - …` line; a failed pod read fails the triage exactly like `list_pods`. +40 tests (`test_triage.py`), suite 277. The k8s-mcp↔applygate write-path identity pass-through is deliberately NOT built this wave — README carries the design note, deferred to the Wave-6 shared middleware |
 | v0.2.14 | 2.2.0 | Performance wave: un-named `get_resource` listings resolve in-process (dynamic client, no kubectl spawn) and render compactly — one `namespace/name (Age: …)` line per item, policy-filtered, capped by `K8S_MCP_MAX_LIST_ITEMS` (now default 100, was 500) with the same truncation marker; named gets and `jsonpath=`/`custom-columns=`/`wide`/`name` output keep kubectl's byte-exact output (PyYAML vs Go quoting/escaping differs, and tests + the console parse those), unknown/ambiguous tokens and ANY dynamic-path exception fall back to kubectl unchanged. Under a whitelist the compact listing is policy-FILTERED (like `list_pods` -A) instead of per-namespace rewrite; under blacklist-only it answers filtered where kubectl `-A` refuses. `_expand_allowed` glob expansion cached 30s TTL (staleness ≤30s intentional; API errors bypass the cache and behave as before; exact whitelists never hit the cluster). New env knobs: `K8S_MCP_MAX_EVENTS` (default 100 — `get_events` + `triage` warnings share it, replacing the two hard-coded `[:100]` caps) and `K8S_MCP_MAX_NS_REWRITE` (default 20 — the previously hard-coded cluster-wide rewrite limit); both >=1, malformed→default, re-read per call. BREAKING (approved): `get_pod_logs` `namespace` is now a REQUIRED parameter — the old silent `default` fallback refuses with "namespace is required" instead of reading the wrong pod. Chart: `listing.maxEvents`/`listing.maxNsRewrite` values (default "" = server default, no env rendered — default render byte-identical). +35 tests (`test_perf_wave.py`), suite 317 |
 
-## 14. Files
+## 14. Addendum (2026-10-07 doc wave): shipped after the v0.2.14 perf wave
+
+Feature updates that landed with chart line **1.2.0** (both charts) after the
+table above was written — each additive, none changing the invariants:
+
+- **Gated `/metrics` + ServiceMonitor (Wave-3).** `K8S_MCP_METRICS_ENABLED=true`
+  (chart `metrics.enabled`, default **off** — the default render is
+  byte-identical to the pre-metrics baseline) serves `GET /metrics`:
+  counters only (`k8s_mcp_server_events_total{kind,outcome}` — auth
+  outcomes, kubectl batch outcomes, exec allow/deny decisions, list
+  truncations; nothing cluster-derived), with a dependency-free fallback
+  registry when `prometheus-client` is absent. `metrics.enabled: true` also
+  renders the Prometheus Operator ServiceMonitor (scrape port `mcp`,
+  `metrics.interval` default 30s).
+- **The MCP network zone (fleet decision 2026-09).** Trusted chart only: a
+  default-off ingress NetworkPolicy (`networkPolicy.*`) that locks IN-CLUSTER
+  access to `authorizedClients.namespaces` (deny by absence) while the
+  browser path stays open through the SSO-gated edge gateway
+  (`allowEzafGatewayIngress`, edge pods live-verified `app:
+  istio-ingressgateway`). Full hardened profile:
+  `helm/values-examples/values-hardened-g2.yaml`. The locked customer chart
+  deliberately has no zone.
+- **Memory limit 2Gi (2026-10-05).** The old 512Mi default OOMKilled ×4
+  during heavy `get_resource` listing bursts (full-YAML renders +
+  concurrent kubectl fan-out; steady-state only ~136Mi — the burst is what
+  counts); both charts now default `2Gi`, matching the live G2 deployment.
+- **Hardened-admin VS kill-switch.** `ezua.virtualService.enabled: false`
+  un-renders the browser path while `ezua.enabled` keeps driving every other
+  gate (gate DIRECTLY on the key — Sprig's `default` treats an explicit
+  `false` as empty).
+
+## 15. Files
 
 | File | Purpose |
 | --- | --- |

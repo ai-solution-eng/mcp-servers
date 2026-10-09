@@ -135,7 +135,10 @@ def _load(environ) -> list[dict]:
         # (quietly: this is the configured-but-not-yet-minted state).
         with _lock:
             known = _cache is not None and _cache_path == path and _stat is not None
-            kept = [dict(e) if isinstance(e, dict) else e for e in _cache] if known else []
+            # `_cache or []` — `known` already proved the cache is the loaded
+            # store; the or-[] only satisfies the checker's non-narrowed view
+            # of the module-level Optional inside this comprehension.
+            kept = [dict(e) if isinstance(e, dict) else e for e in (_cache or [])] if known else []
         if known:
             logger.warning(
                 "admin keys file %s vanished after being loaded; keeping the previous contents (fail-closed)", path
@@ -329,14 +332,13 @@ def is_admin(caller) -> bool:
     if getattr(caller, "is_anonymous", False) or caller is None:
         return False
     subject = getattr(caller, "subject", None)
-    if subject:
-        # BOTH subject spellings match: the bare name AND the
-        # 'subject:<name>' prefixed form (the datasets.assignments
-        # canonical spelling — the grant-by-name UI and the docs' examples
-        # write the prefix; live 2026-10-05 the prefixed spelling in
-        # admins never matched a bare Caller.subject, silently failing
-        # every subject-designated admin).
-        if subject in pol.admins or f"subject:{subject}" in pol.admins:
-            return True
+    # BOTH subject spellings match: the bare name AND the
+    # 'subject:<name>' prefixed form (the datasets.assignments
+    # canonical spelling — the grant-by-name UI and the docs' examples
+    # write the prefix; live 2026-10-05 the prefixed spelling in
+    # admins never matched a bare Caller.subject, silently failing
+    # every subject-designated admin).
+    if subject and (subject in pol.admins or f"subject:{subject}" in pol.admins):
+        return True
     fp = getattr(caller, "key_fp", None)
     return bool(fp) and fp in pol.admins

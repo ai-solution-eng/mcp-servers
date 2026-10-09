@@ -36,7 +36,7 @@ from sqlhandler.external import (
     scrub_secrets,
     sql_references_attach,
 )
-from sqlhandler.provider import LakehouseError
+from sqlhandler.provider import DataProvider, LakehouseError
 
 REPO = Path(__file__).resolve().parent.parent
 EXTDIR = REPO / "duckdb-ext" / "v1.5.5" / "linux_amd64"
@@ -73,7 +73,7 @@ requires_ducklake = pytest.mark.skipif(
 class _FakeCon:
     """Records execute() calls; optionally raises on every call from N on."""
 
-    def __init__(self, fail_from=None, error=Exception("boom")):
+    def __init__(self, fail_from: int | None = None, error: Exception = Exception("boom")) -> None:
         self.calls: list[str] = []
         self._fail_from = fail_from
         self._error = error
@@ -85,7 +85,7 @@ class _FakeCon:
         return self
 
 
-class _OneLakeTable:
+class _OneLakeTable(DataProvider):
     """Stub provider exposing one lake table for mixed lake+ducklake joins."""
 
     kind = "stub"
@@ -95,9 +95,7 @@ class _OneLakeTable:
 
         self._path = tmp_path / "lake"
         self._path.mkdir(parents=True, exist_ok=True)
-        ppq.write_table(
-            pa.table({"id": [1, 2, 3], "amt": [10, 20, 30]}), self._path / "data.parquet"
-        )
+        ppq.write_table(pa.table({"id": [1, 2, 3], "amt": [10, 20, 30]}), self._path / "data.parquet")
 
     def list_tables(self):
         from sqlhandler.provider import TableInfo
@@ -206,8 +204,14 @@ def test_parse_mixed_types_ducklake_and_postgres():
     env = {
         "SQLHANDLER_ATTACH": json.dumps(
             [
-                {"name": "ops", "type": "postgres", "host": "pg.internal",
-                 "database": "opsdb", "user": "ro", "password_env": "PW"},
+                {
+                    "name": "ops",
+                    "type": "postgres",
+                    "host": "pg.internal",
+                    "database": "opsdb",
+                    "user": "ro",
+                    "password_env": "PW",
+                },
                 {"name": "dl", "type": "ducklake", "catalog": "sqlite:/data/cat.db"},
             ]
         ),
@@ -232,10 +236,7 @@ def test_build_attach_sql_sqlite_catalog_with_data_path():
     assert con.calls == [
         "SET extension_directory='/data/ext'",
         "LOAD ducklake",
-        (
-            "ATTACH 'ducklake:sqlite:/data/ducklake/catalog.db' AS \"dl\" "
-            "(DATA_PATH '/data/ducklake/files', READ_ONLY)"
-        ),
+        ("ATTACH 'ducklake:sqlite:/data/ducklake/catalog.db' AS \"dl\" (DATA_PATH '/data/ducklake/files', READ_ONLY)"),
     ]
 
 
@@ -409,9 +410,7 @@ def test_engine_mixed_lake_and_ducklake_join(ducklake_attached):
     engine = ducklake_attached["engine"]
     os.environ["SQLHANDLER_DUCKDB_FILE_ACCESS"] = "1"
     try:
-        table = engine.query_duckdb(
-            "SELECT count(*) AS n FROM dl.ops.agent_test a JOIN lake_tbl l ON l.id = a.k"
-        )
+        table = engine.query_duckdb("SELECT count(*) AS n FROM dl.ops.agent_test a JOIN lake_tbl l ON l.id = a.k")
     finally:
         os.environ.pop("SQLHANDLER_DUCKDB_FILE_ACCESS", None)
     assert table.column("n").to_pylist() == [2]
@@ -526,7 +525,9 @@ def test_ducklake_data_files_not_readable_through_duckdb_fs(ducklake_attached):
     does not re-open the fs to callers)."""
     import duckdb
 
-    files = [os.path.join(dp, f) for dp, _, fn in os.walk(ducklake_attached["data"]) for f in fn if f.endswith(".parquet")]
+    files = [
+        os.path.join(dp, f) for dp, _, fn in os.walk(ducklake_attached["data"]) for f in fn if f.endswith(".parquet")
+    ]
     assert files, "fixture did not materialize parquet data files"
     env = _ducklake_spec_env(f"sqlite:{ducklake_attached['cat']}")
     env["SQLHANDLER_DUCKDB_EXTENSION_DIR"] = str(EXTDIR)

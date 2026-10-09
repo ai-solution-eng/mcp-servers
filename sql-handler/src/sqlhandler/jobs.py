@@ -669,6 +669,13 @@ class McpJobManager:
 
         def _watch() -> None:
             try:
+                # The watcher is only spawned when the store exists (the
+                # submit path gates on `self._shared is not None`); alias it
+                # once so the loop reads the same non-None object — the store
+                # reference never swaps to None mid-flight.
+                shared = self._shared
+                if shared is None:  # pragma: no cover - spawn-side invariant
+                    return
                 # Re-check the shared cancel flag while the job runs: a
                 # cancel that landed on another replica must interrupt the
                 # query HERE (the DuckDB interrupt handle is process-local,
@@ -676,10 +683,10 @@ class McpJobManager:
                 # as the poll cadence; with the store absent/unreadable
                 # `cancel_flagged` is False and this is a plain blocking wait.
                 while True:
-                    state = record.job.wait(self._shared.CANCEL_POLL_SECONDS)
+                    state = record.job.wait(shared.CANCEL_POLL_SECONDS)
                     if state != "running":
                         break
-                    if self._shared.cancel_flagged(record.job_id):
+                    if shared.cancel_flagged(record.job_id):
                         record.job.cancel()
                         # stay in the loop: the interrupt may take a moment
                         # to unroll the query; the next non-running state
@@ -1041,7 +1048,7 @@ class McpJobManager:
         """Registry snapshot for introspection (counts, cap, sharing)."""
         with self._lock:
             running = sum(1 for r in self._records.values() if r.job.state == "running")
-            payload = {
+            payload: dict[str, int | str] = {
                 "tracked": len(self._records),
                 "running": running,
                 "max_jobs": self._max_jobs,

@@ -1,5 +1,23 @@
 # DEPLOYMENT — k8s-mcp on PCAI
 
+> **What changed (2026-10-07 doc wave):**
+> - **NEW "Deployment profiles: Internal G2 vs Hosted trial" section** — the
+>   fleet's canonical MCP-server G2-vs-Hosted framing, grounded in the shipped
+>   examples: trusted-chart G2
+>   ([helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml)),
+>   hardened-G2 network-zone profile
+>   ([values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml)),
+>   and the locked customer chart's hosted-trial profile
+>   ([helm-customer/values-examples/values.hosted-trial.yaml](../helm-customer/values-examples/values.hosted-trial.yaml)).
+> - Currency fixes at chart **1.2.0** (both charts): default image tag
+>   `v1.2.0` (was v1.1.0) and the memory limit **2Gi** (512Mi OOMKilled ×4
+>   under heavy `get_resource` listing bursts, 2026-10-05; steady-state
+>   ~136Mi — the burst is what counts).
+> - Values rows the guide lacked: `networkPolicy.*` (the MCP network zone,
+>   default-off), `ezua.virtualService.enabled` (hardened-admin VS
+>   kill-switch), and top-level `extraAllowedHosts` (in-cluster svc-DNS Host
+>   allowlist).
+
 A read-only Kubernetes ops MCP server (MCP 2.0 / protocol `2026-07-28`) with API-key auth, optional namespace governance, an opt-in hardened exec tool, and a built-in HPE ops console at `/ui/`. Deployment on PCAI (HPE Private Cloud AI / Ezmeral Unified Analytics) is values-driven: import the packaged chart into the PCAI catalog once, create the deployment from it, and set every knob in the chart's **Helm Values** editor (or via the PCAI API). PCAI resolves `${DOMAIN_NAME}` in the `ezua` values before rendering.
 
 ## Two charts, one image
@@ -15,7 +33,7 @@ A read-only Kubernetes ops MCP server (MCP 2.0 / protocol `2026-07-28`) with API
 
 Why the split: with one chart, the customer owns any `lockdown` flag itself, so values-based guards were advisory. With two charts the locked posture is structural — there is nothing to flip. (A values-controlled `lockdown` flag existed in chart v0.2.0/0.2.1 and was removed in v0.2.2 in favor of the two-chart split.)
 
-Container hardening (non-root 10001, read-only rootfs, dropped capabilities, RuntimeDefault seccomp, `/tmp` emptyDir) is fixed in **both** charts — not values-overridable. Release tooling (`./automation.sh <version>` / `./bump_version.sh <version>`) bumps **both** charts, their `image.tag`, and packages them.
+Container hardening (non-root 10001, read-only rootfs, dropped capabilities, RuntimeDefault seccomp, `/tmp` emptyDir) is fixed in **both** charts — not values-overridable. The image build ends with a permission neutralizer (`RUN chmod -R a+rX /app`) — files that land mode-0600 on the ops box are COPYed mode-preserving and would otherwise brick the non-root pod at boot (the v0.2.3/v0.2.4 console crash class). Release tooling (`./automation.sh <version>` / `./bump_version.sh <version>`) bumps **both** charts, their `image.tag`, and packages them.
 
 ## Deploying on PCAI (the values way)
 
@@ -58,10 +76,10 @@ ezua:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `deployment.*` | `k8s-mcp`, 1 replica | Naming and scale; the server is stateless. |
-| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/k8s-mcp` / `v1.1.0` | Keep `tag` in lockstep with the chart's `appVersion`. |
+| `image.repository` / `tag` | `ghcr.io/ai-solution-eng/k8s-mcp` / `v1.2.0` | Keep `tag` in lockstep with the chart's `appVersion`. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package stays private. |
 | `service.port` | 9090 | MCP (`/mcp`) + console (`/ui/`). |
-| `resources` | 100m/128Mi → 500m/512Mi | Small; raise the limit if large `--all-namespaces` YAML dumps are common (they buffer in memory before the 50k truncation). |
+| `resources` | 100m/128Mi → 500m/**2Gi** | Small steady-state (~136Mi), but heavy `get_resource` listing bursts (full-YAML renders + concurrent kubectl fan-out) OOMKilled ×4 at the old 512Mi default — raised to 2Gi on 2026-10-05 to match the live G2 deployment (~15× steady-state). Raise further only with evidence. |
 | `serviceAccount.*` | create, name = deployment name | The RBAC subject. |
 | `console.enabled` | `true` | HPE ops console at `/ui/` (`K8S_MCP_CONSOLE_ENABLED=false` underneath). |
 | `rbac.create` / `rbac.scope` | `true` / `cluster` | `cluster` = read-only ClusterRole; `namespace` = Role clamped to the release namespace (auto-RBAC off in that mode). |
@@ -79,11 +97,60 @@ ezua:
 | `listing.maxNsRewrite` | `""` | `K8S_MCP_MAX_NS_REWRITE` (server default 20) — per-namespace rewrite limit for whitelisted `-A` queries. `""` = server default. |
 | `metrics.enabled` / `metrics.interval` | `false` / `30s` | Opt-in observability: `K8S_MCP_METRICS_ENABLED=true` serves `GET /metrics` (counters only) and renders the Prometheus Operator ServiceMonitor (scrape port `mcp`, path `/metrics`). Default off — the default chart render is byte-identical to the pre-metrics baseline. |
 | `podAnnotations` / `nodeSelector` / `tolerations` / `affinity` | istio sidecar injection off | Scheduling knobs. |
+| `extraAllowedHosts` | `[]` | Extra `Host` header values the MCP SDK's DNS-rebinding protection accepts for **in-cluster callers** addressing the server by service DNS (e.g. Open WebUI → `http://<name>-service.<ns>.svc.cluster.local:9090/mcp`); entries verbatim or `host:*`. The pinned public FQDN (`ezua.virtualService.endpoint`) and loopback are always allowed; empty = behavior unchanged. Never bypasses the API-key gate. |
 | `ezua.authorizationPolicy.*` | `enabled: false` | Gateway-level auth gate (oauth2-proxy / SSO bearer). Off by default — the rotating-token pain for machine MCP callers is an accepted lab trade; the template is real, so flipping it on enforces tokens for this host **on top of** the API key. |
+| `ezua.virtualService.enabled` | `true` | **Hardened-admin kill-switch for the browser path**: `false` un-renders the VirtualService (no gateway host at all) while `ezua.enabled` keeps driving every other gate. Gate DIRECTLY on this key — never `default` on it (Sprig treats an explicit `false` as empty). Closing a console is an explicit per-chart, per-site decision, never a default. |
+| `networkPolicy.*` | `enabled: false` | **The MCP network zone** (fleet decision 2026-09): a default-off ingress allowlist — once on, anything not matched is DENIED (deny by absence; egress stays unrestricted). `authorizedClients.namespaces` lists in-cluster caller namespaces by `kubernetes.io/metadata.name` (the LLM gateway's relay namespace first; `monitoring` whenever metrics are on — an unlisted scrape ns dies **silently**); `allowEzafGatewayIngress: true` keeps the browser path open by fleet doctrine (edge pods are live-verified `app: istio-ingressgateway`, NOT `app=ezaf-gateway`); `probeCidrs`/`probeExceptCidrs` cover node-originated kubelet probes (never `0.0.0.0/0` with an empty carve-out — the render fails). Trusted chart only — the locked customer chart has no zone. Hardened profile: [helm/values-examples/values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml). |
 
 ### ezua / Istio wiring
 
 When `ezua.enabled: true` the chart renders the VirtualService on `ezua.virtualService.istioGateway` (default `istio-system/ezaf-gateway`): `/mcp` gets a long timeout (660s — multi-tool agent turns and log tails run for minutes); `/` (the console at `/ui/`, health pokes) rides the fallback route. The Kyverno pre-install policy stamps the `hpe-ezua/*` vendor labels PCAI expects. Unlike the search MCP charts, **this chart does render an AuthorizationPolicy** — gated by `ezua.authorizationPolicy.enabled` (default off), adding an oauth2-proxy gate in `istio-system` for the host.
+
+## Deployment profiles: Internal G2 vs Hosted trial
+
+The workflow sentence: pick the matching shipped example file, paste it into
+the **Helm Values** editor, adjust the `# SITE:` lines, apply. Sanitized,
+secret-free examples ship with the charts; real per-site values live in
+`helm/local/` and `helm-customer/local/` (never committed, never packaged).
+The G2-vs-trial choice is really the **two-chart choice** — which trust level
+the audience gets:
+
+| Concern | Internal G2 (trusted chart, `helm/`) | Hosted trial (locked chart, `helm-customer/`) |
+| --- | --- | --- |
+| Shipped example | [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml) (+ [values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml) for the network-zone posture) | [helm-customer/values-examples/values.hosted-trial.yaml](../helm-customer/values-examples/values.hosted-trial.yaml) |
+| Endpoint / `${DOMAIN_NAME}` | The SE-G2 site files carry the **literal domain** (`k8s-mcp-2-0-server.your-cluster.example`) for plain `helm -f` readability; PCAI would envsubst a pasted placeholder either way. The endpoint doubles as `MCP_HOSTNAME` and must be unique per release. | **`${DOMAIN_NAME}` placeholders stay verbatim** (`k8s-mcp-customer.${DOMAIN_NAME}`) — PCAI resolves them before rendering on current builds; on a build that does not, substitute the literal domain (an unresolved placeholder registers a gateway host that matches nothing). |
+| SSO / AuthorizationPolicy | `ezua.authorizationPolicy.enabled: false` (the accepted lab trade — the built-in API key is the gate). The template is real: flipping it on enforces oauth2-proxy/PCAI tokens for this host **on top of** the API key. | Same key, same default-off posture, same template — flipping it on is the trial's user-identity story on top of the API key (a shared key authenticates the *key*, never a user). |
+| Secrets strategy | Out-of-band Secret **`k8s-mcp-2-0-apikey`** (the G2 example keeps its own Secret convention, key `api-key`) — created before the first apply; the chart never creates or inlines the key. | Out-of-band Secret per the customer's key process (`apiKey.existingSecret` names it; `""` = `<deployment.name>-apikey`). Same invariant: never created or inlined by the chart. |
+| RBAC & exec posture | Values-configurable: `rbac.scope: cluster` + `extraResourceGroups: [serving.kserve.io, genai.hpe.com]`; the G2 lab runs exec ON cluster-wide with the per-pod label gate off (`exec.enabled: true`, `namespaces: "*"`, `requireLabel: false`) — a deliberate lab posture, never a default. | **Baked**: read-only ClusterRole via a chart constant (clamp = edit the constant + repackage — a platform action); exec RBAC is **never minted** — exec stays impossible until an operator runs the NOTES.txt runbook by hand. |
+| Namespace policy | App-layer policy live: the G2 lab uses a blocked-only allowlist (`kube-system,kube-public,k8s-mcp-ops`). | The keys **do not exist** in the locked values — no app-layer policy; the RBAC clamp above is the only boundary. |
+| Network zone (`networkPolicy.*`) | Available, default off; the hardened-G2 example turns it on (in-cluster callers locked to the gateway-relay + agentic-frontend namespaces + `monitoring`, node `/32` probes; browser path stays open). | **Not in the locked chart** — the zone is a trusted-operator knob. |
+| Metrics | On (`metrics.enabled: true` + ServiceMonitor). | On (same key; the locked chart still exposes benign wiring). |
+
+### Proxied corporate G2 site (SITE: your-cluster.example)
+
+- Trusted chart, lab posture made EXPLICIT: blocked-only namespace policy,
+  exec cluster-wide with `requireLabel: false`, CRD reads for the installed
+  operators, metrics + ServiceMonitor on.
+- Fleet posture note: unlike applygate/logsearch (which point at the shared
+  `mcp-fleet-apikeys` Secret), the k8s-mcp G2 example keeps its own
+  `k8s-mcp-2-0-apikey` Secret — a deliberate site convention.
+- Optional hardening: overlay
+  [values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml)
+  to turn the network zone on — enable only AFTER confirming the LLM
+  gateway's relay namespace (`pcai-llm`) is in the allow list; every
+  unlisted in-cluster caller times out.
+
+### Hosted trial (customer-hosted PCAI)
+
+- **The locked customer chart is what ships** (`k8s-mcp-customer-<ver>-customer.tgz`):
+  the security keys are absent from its values and its templates never read
+  them — pasting `exec: {enabled: true}` in the frontend is inert.
+- Keep `${DOMAIN_NAME}` placeholders as-pasted; set the customer's endpoint
+  (unique per release — it doubles as `MCP_HOSTNAME`).
+- API-key Secret provisioned out of band per the customer's key process;
+  the Deployment fails loud (`CreateContainerConfigError`) until it exists.
+- Exec is impossible by construction (no Role minted); any future enablement
+  is the deliberate manual runbook printed by the chart's NOTES.txt.
 
 ## Upgrading
 

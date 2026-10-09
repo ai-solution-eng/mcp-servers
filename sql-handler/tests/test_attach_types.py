@@ -50,7 +50,7 @@ from sqlhandler.provider import LakehouseError
 class _FakeCon:
     """Records execute() calls; optionally raises on the Nth call."""
 
-    def __init__(self, fail_on=None, error=Exception("boom")):
+    def __init__(self, fail_on: int | None = None, error: Exception = Exception("boom")) -> None:
         self.calls: list[str] = []
         self._fail_on = fail_on
         self._error = error
@@ -138,9 +138,7 @@ def test_parse_mongodb_requires_database_scoping():
 
 
 def test_parse_mongodb_rejects_control_chars_in_database():
-    env = _env(
-        {"name": "mdb", "type": "mongodb", "host": "h", "database": "op\x00s", "password_env": ""}
-    )
+    env = _env({"name": "mdb", "type": "mongodb", "host": "h", "database": "op\x00s", "password_env": ""})
     with pytest.raises(ValueError, match="NUL/control"):
         parse_attach_config(env)
 
@@ -347,7 +345,7 @@ def test_build_attach_sql_bigquery_without_token_has_no_access_token_key():
     (spec,) = parse_attach_config(_env({"name": "bq", "type": "bigquery", "database": "proj"}))
     sql = build_attach_sql(spec, None)
     assert "access_token" not in sql
-    assert sql == 'ATTACH \'project=proj\' AS "bq" (TYPE bigquery, READ_ONLY)'
+    assert sql == "ATTACH 'project=proj' AS \"bq\" (TYPE bigquery, READ_ONLY)"
     # ADC is the default auth: no token resolved -> NO secret statement at all
     assert build_pre_attach_sql(spec, None) is None
 
@@ -414,11 +412,8 @@ def test_apply_external_bigquery_loads_and_attaches():
     # token rides the scoped secret, never the ATTACH DSN.
     assert con.calls == [
         "LOAD bigquery",
-        (
-            'CREATE OR REPLACE SECRET "bq" (TYPE bigquery, SCOPE \'bq://proj\', '
-            "ACCESS_TOKEN 'tok1')"
-        ),
-        'ATTACH \'project=proj dataset=ds\' AS "bq" (TYPE bigquery, READ_ONLY)',
+        ("CREATE OR REPLACE SECRET \"bq\" (TYPE bigquery, SCOPE 'bq://proj', ACCESS_TOKEN 'tok1')"),
+        "ATTACH 'project=proj dataset=ds' AS \"bq\" (TYPE bigquery, READ_ONLY)",
     ]
 
 
@@ -431,7 +426,7 @@ def test_apply_external_bigquery_without_token_emits_no_secret_statement():
     apply_external(con, [spec], env)
     assert con.calls == [
         "LOAD bigquery",
-        'ATTACH \'project=proj dataset=ds\' AS "bq" (TYPE bigquery, READ_ONLY)',
+        "ATTACH 'project=proj dataset=ds' AS \"bq\" (TYPE bigquery, READ_ONLY)",
     ]
 
 
@@ -457,10 +452,13 @@ def test_apply_external_bigquery_secret_error_is_scrubbed():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("db_type,database,host", [
-    ("mongodb", "d", "h"),
-    ("bigquery", "proj", ""),
-])
+@pytest.mark.parametrize(
+    "db_type,database,host",
+    [
+        ("mongodb", "d", "h"),
+        ("bigquery", "proj", ""),
+    ],
+)
 def test_literal_password_key_rejected_for_new_types(db_type, database, host):
     entry = {"name": "x", "type": db_type, "database": database, "password": "oops"}
     if host:
@@ -469,10 +467,13 @@ def test_literal_password_key_rejected_for_new_types(db_type, database, host):
         parse_attach_config(_env(entry))
 
 
-@pytest.mark.parametrize("db_type,database,host", [
-    ("mongodb", "d", "h"),
-    ("bigquery", "proj", ""),
-])
+@pytest.mark.parametrize(
+    "db_type,database,host",
+    [
+        ("mongodb", "d", "h"),
+        ("bigquery", "proj", ""),
+    ],
+)
 def test_literal_password_in_params_rejected_for_new_types(db_type, database, host):
     entry = {
         "name": "x",
@@ -488,9 +489,7 @@ def test_literal_password_in_params_rejected_for_new_types(db_type, database, ho
 
 
 def test_missing_password_env_var_rejected_for_new_types():
-    env = _env(
-        {"name": "mdb", "type": "mongodb", "host": "h", "database": "d", "password_env": "NOT_SET"}
-    )
+    env = _env({"name": "mdb", "type": "mongodb", "host": "h", "database": "d", "password_env": "NOT_SET"})
     with pytest.raises(ValueError, match="NOT_SET"):
         parse_attach_config(env)
 
@@ -526,8 +525,7 @@ def test_not_baked_extension_fails_with_friendly_scrubbed_error():
     )
     (spec,) = parse_attach_config(env)
     duckdb_io_error = Exception(
-        'IO Error: Extension "mongo.duckdb_extension" not found. '
-        'Install it first using "INSTALL mongo" password=pw1.'
+        'IO Error: Extension "mongo.duckdb_extension" not found. Install it first using "INSTALL mongo" password=pw1.'
     )
     boom = _FakeCon(fail_on=1, error=duckdb_io_error)  # the LOAD call fails
     with pytest.raises(ExternalAttachError) as ei:

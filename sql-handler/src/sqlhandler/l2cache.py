@@ -135,7 +135,9 @@ class L2ResultCache:
         self.hits = 0
         self.writes = 0
         self._sweeper: threading.Thread | None = None
-        self._write_queue: queue.Queue[tuple[str, object]] | None = None
+        # (key, table, referenced-table ids); ids None = the historical
+        # no-tables call shape (see enqueue_write / _write_loop).
+        self._write_queue: queue.Queue[tuple[str, object, list[str] | None]] | None = None
         self._write_worker: threading.Thread | None = None
         self._write_dropped = 0  # backpressure drops (an ordinary miss each)
 
@@ -363,14 +365,18 @@ class L2ResultCache:
         if self._write_worker is not None and self._write_worker.is_alive():
             return
         self._write_queue = queue.Queue(maxsize=DEFAULT_ASYNC_QUEUE_DEPTH)
-        self._write_worker = threading.Thread(
-            target=self._write_loop, daemon=True, name="sqlhandler-l2-writeout"
-        )
+        self._write_worker = threading.Thread(target=self._write_loop, daemon=True, name="sqlhandler-l2-writeout")
         self._write_worker.start()
 
     def _write_loop(self) -> None:
+        # The worker outlives the attribute's Optional lifetime: the queue is
+        # created before this thread starts and never swapped back to None
+        # (only the sweeper's shutdown clears workers, not queues) — the
+        # assert states that invariant for the checker.
+        write_queue = self._write_queue
+        assert write_queue is not None
         while True:
-            key, table, tables = self._write_queue.get()
+            key, table, tables = write_queue.get()
             try:
                 if tables is None:
                     self.store(key, table)  # historical call shape (no tables known)
@@ -379,7 +385,7 @@ class L2ResultCache:
             except Exception:  # store() never raises, but never trust a loop to die
                 logger.debug("L2 async write-out failed for key %s…", key[:16], exc_info=True)
             finally:
-                self._write_queue.task_done()
+                write_queue.task_done()
 
     def flush_async_stores(self, timeout: float = 30.0) -> bool:
         """Block until every queued write-out is published (tests/shutdown).
@@ -429,9 +435,7 @@ class L2ResultCache:
         tmp_path: str | None = None
         try:
             Path(self._dir).mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-            )
+            fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
             os.close(fd)
             pq.write_table(table, tmp_path, compression="zstd")
             os.replace(tmp_path, path)
@@ -445,9 +449,7 @@ class L2ResultCache:
             if tables:
                 # Dedup + sorted for stable sidecars; only truthy entries.
                 meta["tables"] = sorted({str(t) for t in tables if t})
-            fd, tmp_meta = tempfile.mkstemp(
-                dir=str(path.parent), prefix=path.name + ".", suffix=".meta.tmp"
-            )
+            fd, tmp_meta = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".meta.tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(_fast_json_dumps(meta))
             os.replace(tmp_meta, str(self._sidecar(key)))

@@ -10,7 +10,7 @@ import pytest
 
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 TABLES = [
     TableInfo(name="work_order", schema="workorder", format="parquet"),
@@ -88,7 +88,7 @@ def test_engine_search_matches_name_and_catalog(tmp_path, monkeypatch):
     d.mkdir(parents=True)
     pq.write_table(pa.table({"id": [1], "amount": [10.0], "kind": ["a"]}), d / "p.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self, **kw):
@@ -313,7 +313,7 @@ def test_engine_params_named_and_positional(tmp_path):
     d.mkdir(parents=True)
     pq.write_table(pa.table({"id": [1, 2, 3], "kind": ["a", "b", "a"]}), d / "p.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self, **kw):
@@ -330,9 +330,7 @@ def test_engine_params_named_and_positional(tmp_path):
     eng = SqlEngine(P())
     r1 = eng.query_duckdb("SELECT count(*) AS n FROM work_order WHERE kind = $k", params={"k": "a"})
     assert r1.to_pydict() == {"n": [2]}
-    r2 = eng.query_duckdb(
-        "SELECT count(*) AS n FROM work_order WHERE id > ? AND kind = ?", params=[1, "a"]
-    )
+    r2 = eng.query_duckdb("SELECT count(*) AS n FROM work_order WHERE id > ? AND kind = ?", params=[1, "a"])
     assert r2.to_pydict() == {"n": [1]}  # id 3 only (id 2 is kind b)
     # invalid params are refused with a clear error
     with pytest.raises(ValueError):
@@ -361,7 +359,7 @@ def test_async_job_arrow_result_roundtrip(tmp_path, monkeypatch):
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(_arrow_ipc_table(), d / "part.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):

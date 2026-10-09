@@ -5,6 +5,8 @@ normalizing the MinIO endpoint URL - are pure string logic, so they get real
 unit tests here. Listing is tested against a fake filesystem; no network.
 """
 
+from typing import Any
+
 import pyarrow.fs as pafs
 import pytest
 
@@ -13,8 +15,8 @@ from sqlhandler.provider import LakehouseError, TableInfo
 from sqlhandler.s3 import S3Provider
 
 
-def _provider(**over):
-    base = {"access_key": "minioadmin", "secret_key": "minioadmin", "bucket": "lakehouse"}
+def _provider(**over: Any) -> S3Provider:
+    base: dict[str, Any] = {"access_key": "minioadmin", "secret_key": "minioadmin", "bucket": "lakehouse"}
     base.update(over)
     return S3Provider(S3Config(**base))
 
@@ -46,32 +48,24 @@ def test_endpoint_override_none_when_empty():
 
 def test_derive_flat_single_file():
     info = _provider()._derive("orders.parquet")
-    assert info == TableInfo(
-        name="orders", schema="default", format="parquet", location="orders.parquet"
-    )
+    assert info == TableInfo(name="orders", schema="default", format="parquet", location="orders.parquet")
     assert info.path == "orders"
 
 
 def test_derive_folder_table():
     info = _provider()._derive("customers/part-0.parquet")
-    assert info == TableInfo(
-        name="customers", schema="default", format="parquet", location="customers"
-    )
+    assert info == TableInfo(name="customers", schema="default", format="parquet", location="customers")
 
 
 def test_derive_schema_folder_table():
     info = _provider()._derive("sales/customers/part-0.parquet")
-    assert info == TableInfo(
-        name="customers", schema="sales", format="parquet", location="sales/customers"
-    )
+    assert info == TableInfo(name="customers", schema="sales", format="parquet", location="sales/customers")
     assert info.path == "sales/customers"
 
 
 def test_derive_skips_hive_partition():
     info = _provider()._derive("hr/employees/year=2024/part.parquet")
-    assert info == TableInfo(
-        name="employees", schema="hr", format="parquet", location="hr/employees"
-    )
+    assert info == TableInfo(name="employees", schema="hr", format="parquet", location="hr/employees")
 
 
 def test_derive_ignores_non_parquet_and_hidden():
@@ -108,13 +102,20 @@ def test_table_uri_schema_folder():
 class _FakeFS:
     """pyarrow S3 filesystem stand-in returning canned FileInfos."""
 
-    def __init__(self, entries):
+    def __init__(self, entries: list) -> None:
         self.entries = entries
-        self.selector = None
+        self.selector: _FakeSelector | None = None
 
     def get_file_info(self, selector):
         self.selector = selector
         return self.entries
+
+
+class _FakeSelector:
+    """The FileSelector shape the listing test asserts on."""
+
+    base_dir: str = ""
+    recursive: bool = True
 
 
 def test_list_tables_discovers_all_layouts(monkeypatch):
@@ -124,9 +125,7 @@ def test_list_tables_discovers_all_layouts(monkeypatch):
             pafs.FileInfo("lakehouse/datasets/orders.parquet", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets/sales/customers/a.parquet", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets/sales/customers/b.parquet", pafs.FileType.File),
-            pafs.FileInfo(
-                "lakehouse/datasets/hr/employees/year=2024/part.parquet", pafs.FileType.File
-            ),
+            pafs.FileInfo("lakehouse/datasets/hr/employees/year=2024/part.parquet", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets/readme.txt", pafs.FileType.File),
             pafs.FileInfo("lakehouse/datasets", pafs.FileType.Directory),
         ]
@@ -134,7 +133,7 @@ def test_list_tables_discovers_all_layouts(monkeypatch):
     monkeypatch.setattr(p, "_s3fs", lambda: fake)
     tables = p.list_tables()
     assert [t.path for t in tables] == ["hr/employees", "orders", "sales/customers"]
-    assert fake.selector.recursive
+    assert fake.selector is not None and fake.selector.recursive
 
 
 def test_list_tables_error_raises(monkeypatch):

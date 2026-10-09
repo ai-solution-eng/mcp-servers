@@ -59,6 +59,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .mcp_fleet_common.audit import CALLER_CONTEXT, key_fingerprint
@@ -445,10 +446,10 @@ def _static_keys() -> list[str]:
 
 #: Injected by server.py at import time (``identity.set_static_keys_source(
 #: _McpApiKeyMiddleware._keys)``) — avoids importing server from identity.
-_static_keys_fn: callable | None = None
+_static_keys_fn: Callable[[], list[str]] | None = None
 
 
-def set_static_keys_source(fn) -> None:
+def set_static_keys_source(fn: Callable[[], list[str]]) -> None:
     """Register the static-key source (the key middleware's ``_keys()``).
 
     Called once from server.py import; the callable itself re-reads the env

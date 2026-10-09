@@ -1,5 +1,17 @@
 # Deployment — logsearch-mcp
 
+> **What changed (2026-10-07 doc wave):**
+> - The **MCP network zone** (`networkPolicy.*`, fleet decision 2026-09 —
+>   default-off ingress allowlist) is now in the Optional-values table and the
+>   G2 target profile, with the hardened-G2 example
+>   ([helm/values-examples/values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml)).
+> - Currency pass against `helm/values.yaml` + `helm/values-examples/*` at
+>   chart **0.4.0**: the D8 default-deny posture per target (G2 lab
+>   `emptyAllowsAll: true` vs hosted-trial explicit allowlist), the
+>   `rbac.clusterWide` split, the fleet `mcp-fleet-apikeys` wiring, and the
+>   image build's permission neutralizer (`chmod -R a+rX /app`) are all
+>   verified current.
+
 Deployment is a values problem: import the packaged chart into PCAI once,
 then everything below is edited in the chart's values (PCAI **Helm Values**
 editor, or the PCAI API) and re-applied. Operators running plain Helm do the
@@ -44,7 +56,7 @@ ezua:
 | `apiKey.existingSecret` / `existingSecretKey` | `logsearch-mcp-apikey` / `api-keys` | **Mandatory wiring, never created by the chart**: `/mcp` requires an API key (pod logs routinely contain sensitive strings), so the Secret must exist in the target namespace before `helm install` or the pod sits in `CreateContainerConfigError`. Comma-separated keys (`api-keys=new,old`) are the zero-downtime rotation mechanism (env re-read per request); the fleet-universal `MCP_API_KEYS` env is honored too. |
 | `webui.enabled` | `true` | The HPE-branded log-search console at `/` + `/api/*` — a human front-end over the SAME seams/policy/caps. `false` = MCP-only surface (`/health`, `/healthz`, `/mcp`). |
 | `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request. |
-| `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. |
+| `image.repository` / `tag` / `pullPolicy` | chart-managed | Kept in lockstep with `Chart.yaml` by release tooling — leave at the chart default; pinning a stale tag in a site file is how "old server" pods happen. The image build ends with a permission neutralizer (`RUN chmod -R a+rX /app`) so files that land mode-0600 on the ops box cannot brick the non-root (10001) pod at boot. |
 | `imagePullSecrets` | `[]` | Only if the GHCR package is private (public packages pull anonymously). |
 | `resources` | `100m`/`256Mi` requests, `512Mi` memory limit | Modest; log tails are streamed, not stored. |
 | `securityContext` | non-root uid 10001 | Keep. |
@@ -52,6 +64,7 @@ ezua:
 | `rbac.clusterWide` | `false` | Opt-in: renders the SAME two read-only rules (`pods` get/list + `pods/log` get — nothing else, ever) as a ClusterRole + ClusterRoleBinding, so the SA reads pods/logs cluster-wide. Lab/trusted clusters only; pair with a deliberate namespace policy — RBAC bounds what the SA can read, the policy bounds what agents may ask for. Cluster-wide includes `kube-system`; use `logsearch.blockedNamespaces` ("kube-*") to keep system logs out of agents' reach. Switching an existing release from false→true removes the old namespaced Role/RoleBinding on upgrade. |
 | `proxy.http`/`https`/`noProxy` | `{}` (empty dict) | Per-key proxy wiring (fleet convention): each key is wired only when non-empty, and `proxy: {}` (or omitting the block) means fully off. Fleet-consistency block — the only peer is the in-cluster API, covered by the NO_PROXY cluster-local entries; no `caCert` wiring exists because there is no outbound TLS to trust. (The former `hpe_proxies` boolean flag is removed — see "Migrating from hpe_proxies" in the README.) |
 | `extraAllowedHosts` | `[]` | **EXTRA DNS-rebinding allowlist entries** (fleet pattern: K8S-MCP): Host header values IN-CLUSTER callers use when addressing the server by svc DNS, joined into `MCP_EXTRA_ALLOWED_HOSTS`. Entries match verbatim or as `host:*` for any port. With `ezua` enabled the pinned public FQDN (`ezua.virtualService.endpoint`) is rendered as `MCP_HOSTNAME` automatically; without `ezua` (or in local dev, with neither env set) the SDK's implicit loopback-only protection applies untouched. When transport security is active the chart AUTO-prepends the release's own service DNS (`<deployment.name>-service.<ns>.svc.cluster.local:*` — the gateway relay's Host header), so this key lists only EXTRA hosts; the default render is unchanged (neither env). |
+| `networkPolicy.enabled` (+ `authorizedClients.namespaces`, `allowEzafGatewayIngress`, `probeCidrs`) | `false` | **The MCP network zone** (fleet decision 2026-09): a default-off ingress allowlist — once on, anything not matched is DENIED (deny by absence; egress stays unrestricted). In-cluster caller namespaces by `kubernetes.io/metadata.name` (the LLM gateway's relay namespace first; `monitoring` belongs there whenever the ServiceMonitor is on — an unlisted scrape ns dies **silently**). The browser path stays OPEN by fleet doctrine (`allowEzafGatewayIngress: true` — external traffic rides the SSO-gated edge gateway exactly as pre-zone; edge pods are live-verified `app: istio-ingressgateway`). Full hardened profile: [helm/values-examples/values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml). |
 
 ## Underlying detail: values → environment variables
 
@@ -155,6 +168,12 @@ Behavior that differs by target, and the paste-ready values for each
   the agent-side counterweight for system namespaces.
 - Fleet API key (Secret `mcp-fleet-apikeys`, key `api-keys`), metrics +
   ServiceMonitor on.
+- **Network zone optional.** The plain G2 file leaves `networkPolicy.enabled:
+  false`; the hardened variant
+  ([values-hardened-g2.yaml](../helm/values-examples/values-hardened-g2.yaml))
+  turns the ingress allowlist on for the admin-surface posture (in-cluster
+  callers locked to the gateway-relay + agentic-frontend namespaces +
+  `monitoring`; browser path stays open).
 - Sanitized example:
   [helm/values-examples/values.g2.yaml](../helm/values-examples/values.g2.yaml).
 
@@ -173,7 +192,8 @@ Behavior that differs by target, and the paste-ready values for each
   logs are sensitive — the key gate and the namespace policy are the two
   controls that matter.
 - `proxy: {}` (fully off — the old `hpe_proxies` flag is removed); metrics
-  off keeps the render minimal.
+  off keeps the render minimal, and the network zone stays off (the gateway
+  relay's netpol governs in-cluster access on a trial).
 - Sanitized example:
   [helm/values-examples/values.hosted-trial.yaml](../helm/values-examples/values.hosted-trial.yaml).
 

@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from sqlhandler.engine import LakehouseError, QueryJob, SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 from sqlhandler.webui import (
     QueryJobManager,
     api_async_query,
@@ -25,7 +25,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -49,9 +49,7 @@ def _patch_register(monkeypatch, sleep=None):
     def register(self, con, sql, version=None, **kw):
         if sleep is not None:
             time.sleep(sleep)
-        con.register(
-            "work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]})
-        )
+        con.register("work_order", pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}))
 
     monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", register)
 

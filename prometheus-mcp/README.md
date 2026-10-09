@@ -182,7 +182,7 @@ Defaults fit the fleet baseline; overridable per deployment.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `deployment.appName` | `prometheus-mcp` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is, and names the PVC). Leave at the default; mismatched selectors break the Service/VS wiring. |
-| `image.tag` | `v0.5.2` | Kept in lockstep with the pushed image tags; the release tooling bumps it. Pin a site override only deliberately — a stale tag is how "old MCP" pods happen. |
+| `image.tag` | `v0.7.0` | Kept in lockstep with the pushed image tags / Chart.yaml `appVersion`; the release tooling bumps it. Pin a site override only deliberately — a stale tag is how "old MCP" pods happen. |
 | `resources.requests.cpu` | `100m` | CPU request (limits: memory `512Mi`; requests.memory `128Mi`, no CPU limit). |
 
 ## Connect an MCP client

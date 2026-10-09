@@ -83,7 +83,7 @@ def test_ui_shell_carries_access_panel(app):
     marker = "// ---- Access control"
     end_marker = "// ---- SV editor component"
     assert marker in html and end_marker in html
-    access_js = html[html.index(marker):html.index(end_marker)]
+    access_js = html[html.index(marker) : html.index(end_marker)]
     # Call syntax only (the block's comments mention the storage names by
     # way of promising NOT to use them).
     assert not re.search(r"(local|session)Storage\s*\.", access_js)

@@ -1,6 +1,5 @@
 """Unit tests for SQLhandler config + backend selection (no network)."""
 
-
 import pytest
 
 from sqlhandler.config import (
@@ -25,8 +24,13 @@ def test_config_from_env(monkeypatch):
     # override, and the assertion fails on suite ORDER, not content
     # (seen 2026-09-30: 'abfss://8168...f1f233/Tables' != 'abfss://w@...').
     monkeypatch.setenv("SQLHANDLER_ENV_FILE", "/nonexistent/.env")
-    for var in ("FABRIC_TENANT_ID", "FABRIC_CLIENT_ID", "FABRIC_CLIENT_SECRET",
-                "FABRIC_WORKSPACE_ID", "FABRIC_LAKEHOUSE_ID"):
+    for var in (
+        "FABRIC_TENANT_ID",
+        "FABRIC_CLIENT_ID",
+        "FABRIC_CLIENT_SECRET",
+        "FABRIC_WORKSPACE_ID",
+        "FABRIC_LAKEHOUSE_ID",
+    ):
         monkeypatch.delenv(var, raising=False)
     env = {
         "FABRIC_TENANT_ID": "t",
@@ -198,9 +202,7 @@ def test_iceberg_config_from_env():
 
 
 def test_iceberg_sql_catalog():
-    cfg = load_iceberg_config(
-        {"ICEBERG_CATALOG_TYPE": "sql", "ICEBERG_CATALOG_URI": "sqlite:///tmp/x.db"}
-    )
+    cfg = load_iceberg_config({"ICEBERG_CATALOG_TYPE": "sql", "ICEBERG_CATALOG_URI": "sqlite:///tmp/x.db"})
     assert cfg.catalog_type == "sql"
     assert cfg.is_configured
 

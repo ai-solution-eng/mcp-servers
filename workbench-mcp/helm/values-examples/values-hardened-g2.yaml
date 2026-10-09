@@ -1,67 +1,49 @@
 # workbench-mcp — HARDENED-G2 example: the MCP network zone ON.
 # Admin-surface MCP: the zone locks IN-CLUSTER access to the allowlisted
 # namespaces; the browser/console path stays OPEN through the SSO-gated edge
-# gateway (fleet doctrine 2026-09 — the browser is behind admin sign-ins).
+# gateway (the browser is behind admin sign-ins).
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# OVERLAY: merge onto the base/g2 values document — nothing here is standalone
+# (keys absent here inherit the base document/chart defaults).
+# Pointer: documentation/DEPLOYMENT.md + helm/values.yaml (networkPolicy block).
 #
 # ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
 # with the zone on, every unlisted caller times out (deny by absence).
 #
-# Zone list (G2 live facts, inventory §6): least-privilege — the namespaces
-# the LIVE gateway netpol already names as authorized MCP callers, plus
-# monitoring for the ServiceMonitor scrape. Widen deliberately via the
-# operator recipe in the RUNBOOK, one ns at a time.
+# Zone list: least-privilege — the namespaces the gateway netpol names as
+# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
 networkPolicy:
   enabled: true
   sameNamespace: true
   authorizedClients:
     namespaces:
       - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
-      - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
-      - owebui0-11-0        # OWUI instance on the live gateway allowlist
+      - dsh-web-helm        # DSH web (gateway allowlist)
+      - owebui0-11-0        # OWUI instance on the gateway allowlist
       - opencode-web-helm   # OpenCode web
-      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
-                            # ns `prometheus`) — the monitoring ns holds otel/UA,
-                            # NOT the scraper; omit and up=0 within one interval
-      - monitoring          # Prometheus scraping /metrics (ServiceMonitor) —
-                            # omit and metrics scraping dies SILENTLY
-                            # (check Prometheus targets after enabling)
-  # Browser path stays OPEN (fleet doctrine 2026-09): the zone restricts
-  # IN-CLUSTER callers only; external traffic rides the SSO-gated edge gateway
-  # exactly as pre-zone (the browser is behind admin sign-ins).
-  allowEzafGatewayIngress: true
+      - prometheus          # the ACTUAL Prometheus scraper — the monitoring ns
+                            # holds otel/UA, NOT the scraper; omit and up=0
+      - monitoring          # ServiceMonitor scrape ns — omit and it dies SILENTLY
+  allowEzafGatewayIngress: true   # browser path stays OPEN — IN-CLUSTER callers only
   ingressGatewayNamespace: istio-system
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
-  # Kubelet probes originate at the NODE: allow node IPs only (inventory §4:
-  # node IPs 172.28.1.61-63 masters, .161-.162 workers), with the pod CIDR
-  # carved out so pod traffic stays governed by the zone rules above.
+  # Kubelet probes originate at the NODE (.61-.63 masters, .161-.162 workers).
   probeCidrs:
     - 172.28.1.61/32
     - 172.28.1.62/32
     - 172.28.1.63/32
     - 172.28.1.161/32
     - 172.28.1.162/32
-  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
-  # be a STRICT SUBSET of the cidr — pod IPs (10.224.x) are not inside a node
-  # /32 (172.28.1.x), so there is nothing to carve out. Only a BROAD probe
-  # allow (e.g. 0.0.0.0/0) pairs with a carve-out.
-  probeExceptCidrs: []
+  probeExceptCidrs: []   # only a BROAD probe allow (0.0.0.0/0) pairs with a carve-out
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []
 
-# The VirtualService STAYS rendered (fleet doctrine 2026-09): external/browser
-# traffic keeps flowing through the SSO-gated edge gateway exactly as pre-zone.
+# The VirtualService stays rendered — external/browser traffic rides the
+# SSO-gated edge gateway exactly as without the zone.
 
-# -- Sandbox executor pool (sandbox-exec v1) ------------------------------------------------------
-# Overlay add-on: paste this block (and the workbench.sandboxExec keys from
-# values.yaml) onto a FULL values doc to add the executor pool to a zoned
-# deploy. Pool OFF here — with the zone ON, keep the surface minimal and
-# opt in deliberately. Same hardening as everywhere: no network, no GPU,
-# no SA token, non-root, no tolerations.
-# executors:
-#   enabled: false
-#   appName: workbench-exec
-#   containerName: python
-#   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-#   replicas: 2
+# Add-on: to run the sandbox executor pool on a zoned deploy, paste the
+# executors block + workbench.sandboxExec keys from values.g2.yaml onto this doc.

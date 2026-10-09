@@ -545,9 +545,9 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `SQLHANDLER_EXPORT_MAX_ROWS` | Row cap for CSV/Parquet exports (default 100000; 0 = hard 1M ceiling) |
 | `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off; each line carries `pod` when running in k8s, so a fleet-wide trail can be attributed per replica). Chart value: `query.auditLog` (the chart also mounts a pod-local writable dir for the path; durable audit = point it at your own PVC-backed mount) |
 | `SQLHANDLER_API_TOKEN` | Require this bearer token on `/api/*` (unset = no token check) |
-| `SQLHANDLER_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | OPTIONAL `/mcp` API-key gate: comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). Unset → `/mcp` runs open exactly as before (loud startup warning; gateway remains the outer layer). Rotation: append the new key, move clients, drop the old — env re-read per request, no restart. Chart wiring: `security.apiKey.existingSecret` (empty default = not wired). | unset → `/mcp` open |
+| `SQLHANDLER_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | OPTIONAL `/mcp` API-key gate: comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). Unset → `/mcp` runs open exactly as before (loud startup warning; gateway remains the outer layer). Rotation: append the new key, move clients, drop the old. The env is re-read per request, but in Kubernetes the value comes from a Secret's `secretKeyRef`, which is frozen at container start — chart-wired rotation is a ROLLOUT (the chart's `checksum/secret` annotation automates it on the next apply; DEPLOYMENT.md §4.7.1). Chart wiring: `security.apiKey.existingSecret` (empty default = not wired). |
 | `SQLHANDLER_ADMIN_KEYS_FILE` | File path of the frontend **admin-keys store** (default unset = store disabled — Secret keys only). The file is the full JSON keys document (`{"keys": [...]}`); minted keys' fingerprints + assignments are written there atomically (temp + rename) and hot-reloaded on mtime, so the web UI's Access-control panel works with no restart. Chart wiring: `security.adminKeys.existingSecret` (empty default = not wired) — the chart MOUNTS the Secret's key as a file and renders this var as the mounted path (deliberately file-based, not env, precisely so mtime hot-reload works; an env var from a Secret is frozen at container start). The store COMPLEMENTS the `SQLHANDLER_API_KEYS` Secret keys — the middleware matches the union; Secret-sourced keys are reported `source: "secret"` and are read-only (revoke via kubectl). |
-| `SQLHANDLER_POLICY_ADMINS` (policy document `"admins": [...]`) | Not an env var — a field IN the policy document: the list of designated **admins** (subjects and/or `key:sha256:<12hex>` fingerprints), hot-reloaded with the file. Admins can call the `/api/admin/*` routes (and their MCP twins) to mint keys, edit grants and save the policy from the web UI's Access-control panel — everyone else gets `403 admin access required`. Bootstrap is the one-time hand-edit of the policy ConfigMap: add your admin key's fingerprint under `"admins":`, then never touch kubectl again (README: Administering from the frontend). | unset → no admins |
+| `SQLHANDLER_POLICY_ADMINS` (policy document `"admins": [...]`) | Not an env var — a field IN the policy document: the list of designated **admins** (subjects and/or `key:sha256:<12hex>` fingerprints), hot-reloaded with the file. Admins can call the `/api/admin/*` routes (and their MCP twins) to mint keys, edit grants and save the policy from the web UI's Access-control panel — everyone else gets `403 admin access required`. Bootstrap is the one-time hand-edit of the policy ConfigMap: add your admin key's fingerprint under `"admins":`, then never touch kubectl again (README: Administering from the frontend). |
 | `S3_FORMAT` | `auto` (detect Delta by `_delta_log`), `parquet`, or `delta` |
 
 ## Dataset access control (ACL)
@@ -686,7 +686,7 @@ the page's memory only, never stored), and everything is a button:
 | `GET /api/admin/grants` | the tab itself — admins list, assignments, blocked, keys table | `admin_grants` |
 | `POST /api/admin/keys` | **Mint a key** (label + assignment globs) — the raw key is shown **once** in a copyable field; it is not recoverable (only its `sha256:<12hex>` fingerprint is stored) | `admin_mint_key` |
 | `DELETE /api/admin/keys/{fp}` | **Revoke** per file-source key (confirm dialog; the key's assignment goes with it). Secret-sourced keys are read-only in the panel — their lifecycle is the Secret's (`kubectl`) | `admin_revoke_key` |
-| `PUT /api/admin/policy` | the **policy editor** — the `datasets` document as JSON, pre-filled from the live file; a refused document returns the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
+| `PUT /api/admin/policy` | the **policy editor** — the WHOLE authored policy document (the `datasets` doc AND the top-level `admins` list; the groups form too) as YAML, pre-filled from the live file; JSON is accepted on save as well; a refused document returns the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
 
 Who may call these: a **designated admin** only — `401 {"error": "identity
 required: …"}` for anonymous callers when `SQLHANDLER_REQUIRE_IDENTITY` is on,
@@ -736,6 +736,21 @@ gateway, oauth2-proxy auth, vendor-service discovery labels) exactly like the Mu
 > deployment by setting the chart's **`values.yaml`** in the PCAI *Helm Values*
 > editor (or via the PCAI API). Every `--set` below maps 1:1 to a key in
 > `values.yaml`.
+
+> **Paste-ready profiles:** [`helm/values-examples/`](helm/values-examples/)
+> ships two full values documents — **`values.g2.yaml`** (Internal G2:
+> scale-out + HPA, the `mcp-fleet-apikeys` key gate, the JWT SSO rung,
+> policy-as-code, the semantic-view showcase) and **`values.hosted-trial.yaml`**
+> (customer trial: gateway oauth2-proxy ON, out-of-band Secrets, everything
+> else at chart defaults) — plus **`values-hardened-g2.yaml`**, a fragment that
+> merges onto the G2 file to enable the W6 ingress NetworkPolicy + network
+> zone. Pick the matching file, paste it into the *Helm Values* editor, adjust
+> the `# SITE:` lines, apply. The two postures compared key-by-key —
+> endpoint/`${DOMAIN_NAME}` handling, AuthorizationPolicy/SSO posture,
+> credentials, network zone — in
+> [documentation/DEPLOYMENT.md §4a](documentation/DEPLOYMENT.md) ("Deployment
+> profiles: Internal G2 vs Hosted trial"); the SSO rungs and their ordered
+> enablement are DEPLOYMENT.md §4.10.
 
 ### Endpoint
 
@@ -1007,7 +1022,7 @@ In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is 
 - **Saved-query writes are credential-gated** (the semantic-catalog poisoning lesson, applied to the saved-query store): a saved query is a template other agents run, so `query_save`/`query_delete` — and their REST twins — require a valid credential whenever one is configured (`SQLHANDLER_API_TOKEN`, or `MCP_API_KEYS`/`SQLHANDLER_API_KEYS`; checked per request on REST and per call on the MCP path). With no credential configured the deployment is in the known single-user-local mode: writes work and a loud startup line says so. Saved SQL is validated at save time (parsed; SELECT-only while the read-only mode is on) and the guard is re-applied at run time, so a hand-edited store file cannot smuggle DDL past the read-only mode. Parameters are always **bind** parameters — values never enter the SQL text.
 - **Table names are traversal-guarded**: `schema/name` values containing `..` or absolute paths are rejected, and the NFS backend verifies every table path stays inside `NFS_ROOT` (symlinks included).
 - **Network posture** (helm chart, `security.hardened: true` default): non-root read-only container, no ServiceAccount token, and an optional pod-level AuthorizationPolicy. The ingress NetworkPolicy is **off by default** so in-cluster callers work with zero friction; the ClusterIP Service exposes nothing outside the cluster. Enable it for production / real-data deployments
-  (`security.networkPolicy.enabled: true`) and allowlist direct callers via `allowedNamespaces`. External access is authenticated at the gateway by the oauth2-proxy AuthorizationPolicy — keep `ezua.authorizationPolicy.enabled: true`.
+  (`security.networkPolicy.enabled: true`) and allowlist direct callers via `allowedNamespaces`. External access is authenticated at the gateway by the oauth2-proxy AuthorizationPolicy — keep `ezua.authorizationPolicy.enabled: true` (the hosted-trial standard; on internal G2 the shipped example runs the keys + JWT-rung posture with it off, and the live SSO pilot flips it on together with `security.identity.trustBrowserHeaders: true` — the two AuthorizationPolicies and the full rung ladder are DEPLOYMENT.md §4.10).
 - **Credentials**: create Kubernetes Secrets out-of-band (never in values files); see `helm/local/README.md` for create/read/rotate commands. `SQLHANDLER_SOURCES` with embedded keys is for development only.
 - **In-cluster callers** need nothing while the NetworkPolicy is off (default). Once it is enabled, direct calls from another namespace require that namespace in `security.networkPolicy.allowedNamespaces` — no client-side change.
 

@@ -292,7 +292,7 @@ def _urlopen(req, timeout: float):
         except Exception:
             ssl_ctx = None
     if _is_private_target(target):
-        handlers = [urllib.request.ProxyHandler({})]
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
         if ssl_ctx is not None:
             handlers.append(urllib.request.HTTPSHandler(context=ssl_ctx))
         opener = urllib.request.build_opener(*handlers)

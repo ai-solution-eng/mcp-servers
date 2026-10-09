@@ -121,11 +121,11 @@ class _Captured(Exception):
 
 
 @pytest.fixture()
-def capture_load_catalog(monkeypatch):
+def capture_load_catalog(monkeypatch: pytest.MonkeyPatch):
     """Patch load_catalog where _catalog imports it from; capture the kwargs."""
     calls: dict = {}
 
-    def fake_load_catalog(name, **kwargs):
+    def fake_load_catalog(name: str, **kwargs: object):
         calls["name"] = name
         calls.update(kwargs)
         raise _Captured("captured")

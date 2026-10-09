@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import random
 from decimal import Decimal
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -123,12 +124,8 @@ def test_date32_date64_pandas_identical():
 
 
 def test_tz_aware_timestamp_pandas_identical():
-    _assert_pandas_identical(
-        pa.table({"a": pa.array([1704067200, None, 1719792000], pa.timestamp("s", tz="UTC"))})
-    )
-    _assert_pandas_identical(
-        pa.table({"a": pa.array([1704067200123456789, None], pa.timestamp("ns", tz="+05:30"))})
-    )
+    _assert_pandas_identical(pa.table({"a": pa.array([1704067200, None, 1719792000], pa.timestamp("s", tz="UTC"))}))
+    _assert_pandas_identical(pa.table({"a": pa.array([1704067200123456789, None], pa.timestamp("ns", tz="+05:30"))}))
 
 
 def test_time32_time64_pandas_identical():
@@ -171,8 +168,7 @@ def test_wide_table_pandas_identical():
 
 def test_chunked_column_pandas_identical():
     chunked = pa.concat_tables(
-        [pa.table({"a": pa.array(range(10), pa.int64())}),
-         pa.table({"a": pa.array(range(10, 20), pa.int64())})]
+        [pa.table({"a": pa.array(range(10), pa.int64())}), pa.table({"a": pa.array(range(10, 20), pa.int64())})]
     )
     _assert_pandas_identical(chunked)
 
@@ -199,9 +195,9 @@ def test_naive_timestamp_renders_iso_not_scinotation():
     assert got is not None
     assert "2024-01-01" in got
     assert "1.70407e+18" not in got
-    assert "NaT" in arrow_to_markdown_fast(
-        pa.table({"a": pa.array([1704067200, None], pa.timestamp("s"))})
-    )
+    got_ts = arrow_to_markdown_fast(pa.table({"a": pa.array([1704067200, None], pa.timestamp("s"))}))
+    assert got_ts is not None
+    assert "NaT" in got_ts
 
 
 # ---------------------------------------------------------------------------
@@ -244,15 +240,17 @@ def test_fuzz_pandas_identical_supported_types():
     checked = 0
     for _ in range(200):
         ncol, nrow = random.randint(1, 4), random.randint(0, 12)
-        data = {}
+        # Column values of every kind share this dict; the per-branch
+        # literals are heterogeneous (int/None, float/None, str/None), so
+        # the value type is widened to object rather than annotated per kind.
+        data: dict[str, object] = {}
         for c in range(ncol):
             kind = random.choice(["int", "float", "str", "bool", "date", "tstz", "null"])
             if kind == "int":
-                data[f"c{c}"] = [random.choice([None, random.randint(-10**5, 10**5)]) for _ in range(nrow)]
+                data[f"c{c}"] = [random.choice([None, random.randint(-(10**5), 10**5)]) for _ in range(nrow)]
             elif kind == "float":
                 data[f"c{c}"] = [
-                    random.choice([None, float("nan"), random.uniform(-1e6, 1e6), 1e-7, 1e16])
-                    for _ in range(nrow)
+                    random.choice([None, float("nan"), random.uniform(-1e6, 1e6), 1e-7, 1e16]) for _ in range(nrow)
                 ]
             elif kind == "str":
                 data[f"c{c}"] = [random.choice([None, "a", "1.5", "42", "x|y", "ü"]) for _ in range(nrow)]
@@ -370,12 +368,12 @@ def test_fastrender_never_imports_pandas_directly():
 # ---------------------------------------------------------------------------
 
 
-def _pandas_profile(rows):
+def _pandas_profile(rows: list[dict[str, Any]]):
     return pd.DataFrame(rows).to_markdown(index=False)
 
 
 def test_profile_numeric_and_str_columns_pandas_identical():
-    rows = [
+    rows: list[dict[str, Any]] = [
         {"name": "id", "type": "BIGINT", "min": 1, "avg": 12.5, "q25": 5, "non_null": 100},
         {"name": "who", "type": "VARCHAR", "min": "alice", "avg": None, "q25": None, "non_null": 87},
     ]
@@ -387,7 +385,7 @@ def test_profile_numeric_and_str_columns_pandas_identical():
 def test_profile_object_column_transforms_numeric_strings_like_pandas():
     # '10000000000.0' in a float-typed object column renders '1e+10' — the
     # tabulate float transform, faithfully reproduced.
-    rows = [{"min": "10000000000.0"}, {"min": 1.5}, {"min": None}]
+    rows: list[dict[str, Any]] = [{"min": "10000000000.0"}, {"min": 1.5}, {"min": None}]
     got = profile_to_markdown(rows)
     assert got is not None
     assert "1e+10" in got
@@ -395,7 +393,7 @@ def test_profile_object_column_transforms_numeric_strings_like_pandas():
 
 
 def test_profile_object_column_verbatim_when_not_all_numeric():
-    rows = [{"min": 1000}, {"min": "alice"}, {"min": 0.5}]
+    rows: list[dict[str, Any]] = [{"min": 1000}, {"min": "alice"}, {"min": 0.5}]
     got = profile_to_markdown(rows)
     assert got is not None
     assert "1000" in got and "alice" in got
@@ -415,7 +413,7 @@ def test_profile_all_null_beside_numeric_falls_back():
     # The all-None + numeric promotion is row-shape-sensitive in pandas
     # (dict-constructor NaN-filling interacts with cross-column promote) —
     # outside the proven contract → pandas fallback.
-    rows = [{"a": None}, {"a": None}, {"b": 1}]
+    rows: list[dict[str, Any]] = [{"a": None}, {"a": None}, {"b": 1}]
     assert profile_to_markdown(rows) is None
 
 

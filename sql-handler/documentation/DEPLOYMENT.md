@@ -1,5 +1,23 @@
 # Deploying SQLhandler on PCAI
 
+> **What changed (2026-10-07 doc wave):**
+> - New **§4a — Deployment profiles: Internal G2 vs Hosted trial**: the two shipped
+>   example values documents (`helm/values-examples/values.g2.yaml`,
+>   `values.hosted-trial.yaml`, plus the `values-hardened-g2.yaml` fragment)
+>   compared key-by-key — endpoint/`${DOMAIN_NAME}` handling,
+>   AuthorizationPolicy/SSO posture, credentials/Secrets strategy, network zone,
+>   scale and cache posture.
+> - New **§4.10 — SSO migration, values-first**: the identity ladder as one table
+>   (minted keys → gateway relay → SSO bearer JWT → D22 browser SSO →
+>   oauth2-proxy browser headers), each rung's chart values and its gate, the
+>   ordered-enablement sequence, and the G2-vs-hosted SSO posture difference
+>   (including which AuthorizationPolicy is which).
+> - W7 chart note (§1): the probes now render via the fleet-shared `pcai-fleet-lib`
+>   library chart (dependency repointed to `pcai-helm-lib/`); render byte-identical,
+>   packaged chart unaffected.
+> - Corrections against source: the JWT-rung activation condition (§4.7) and the
+>   packaged image tag (§3 → `v3.7.0`).
+
 Full deployment guide for **PCAI (HPE Private Cloud AI / HPE Ezmeral Unified
 Analytics)**. Field reference for every key: [`../helm/values.yaml`](../helm/values.yaml) ·
 paste-ready examples: [`../helm/values-examples/`](../helm/values-examples/) ·
@@ -25,6 +43,16 @@ PCAI is a Kubernetes wrapper: **users never run `helm install` or
 There is one chart; the "variant" is the **data-source backend** you select
 (`backend:` + its credential block). Everything else — service, Istio, probes,
 security profile — is shared.
+
+Chart-structure note (W7, 2026-10): the liveness/readiness/startup probes
+render through the shared fleet library chart **`pcai-fleet-lib`** — a
+`dependencies:` entry pointing at the fleet-shared `pcai-helm-lib/` checkout
+(vendored unpacked under `helm/charts/` + pinned by `Chart.lock`). The
+packaged `.tar.gz` carries the vendored copy, so a PCAI import needs nothing
+extra; rendering from a repo checkout (`helm template helm/`) needs the
+sibling `pcai-helm-lib/` clone or the vendored `helm/charts/` copy. The
+render is byte-identical to the pre-W7 chart (B6 control) — no deployment
+guidance changes.
 
 To change anything later, **edit the same values document and re-apply** — that
 is the upgrade (see §9).
@@ -78,7 +106,7 @@ the gateway AuthorizationPolicy); a full-values paste that accidentally
 empties them fails loud at render time. `nfs.mount.pvcName` is read by the
 Deployment's volume section, so the failure surfaces when `nfs.mount.enabled`
 is set without a claim. The image tag is packaged with the chart
-(`image.tag: v2.4.0` for the 2.4.0 chart) — set it only to track a newer
+(`image.tag: v3.7.0` for the 3.7.0 chart) — set it only to track a newer
 released image.
 
 ```yaml
@@ -103,6 +131,42 @@ ezua:
 When using `backend: onelake` you **must set it explicitly** — the chart
 default is `s3` and the per-backend credential wiring (and Secret creation) is
 gated on the backend.
+
+## 4a. Deployment profiles: Internal G2 vs Hosted trial
+
+Everything in §3–§9 is identical for both site classes — the profile decides
+which shipped example you start from, plus a handful of keys.
+[`helm/values-examples/`](../helm/values-examples/) ships two sanitized,
+paste-ready values documents — **`values.g2.yaml`** (the Internal G2 posture,
+including the W7 `mcp-fleet-apikeys` key wiring and the semantic-view
+showcase: four virtual tables over the benchmark data) and
+**`values.hosted-trial.yaml`** (the customer-trial posture) — plus
+**`values-hardened-g2.yaml`**, a FRAGMENT that merges onto `values.g2.yaml`
+(paste it after — later keys win) to switch on the W6 ingress NetworkPolicy
+and the fleet network zone. The workflow is §1's: pick the matching file,
+paste it into the *Helm Values* editor, adjust the `# SITE:` lines, apply.
+(`helm/local/` holds the richer REAL site files — a live `values.g2.yaml` with
+the full SSO pilot wiring, `values.toromont.yaml` (OneLake),
+`values.omnilife.yaml`, `values.onelake.yaml` — useful as reference for what a
+filled-in document looks like; they are gitignored and hardlink-excluded, so
+never copy them into git or a package.)
+
+| | **Internal G2** (`values-examples/values.g2.yaml`) | **Hosted trial** (`values-examples/values.hosted-trial.yaml`) |
+|---|---|---|
+| `ezua.virtualService.endpoint` | `sqlhandler.${DOMAIN_NAME}` — the PCAI values editor substitutes the placeholder before rendering; keep it as-is. A raw CLI `helm upgrade -f values.g2.yaml` passes the literal through and the Istio validation webhook DENIES the VirtualService (release `failed` while earlier objects applied) — sed-resolve it first, or deploy through PCAI (the supported path; the local G2 file notes raw CLI deploys are not the supported path) | Same `sqlhandler.${DOMAIN_NAME}` placeholder — customer-managed PCAI substitutes it identically (`ezua.domainName` is informational; no template reads it) |
+| `ezua.authorizationPolicy.enabled` | `false` in the shipped example — the keys + JWT-rung posture (the LIVE G2 SSO pilot flips it `true` to chain browser SSO through the gateway; see §4.10) | `true` (chart default; `# SITE:` marked) — external callers authenticate at the PCAI gateway via `oauth2-proxy`; only switch off for closed in-cluster trials |
+| Scale posture | Scale-OUT: `replicaCount: 4`, HPA 4–8 CPU@80% (the request-as-threshold CAUTION in-file), PDB `minAvailable: 2`, topology spread, preStop drain, shared L2 result cache | `replicaCount: 1`, HPA off with `# SITE:` notes on enabling it (raise `resources.requests.cpu` first — §4.1) |
+| Credentials / Secrets | In-cluster MinIO (`backend: s3`); the example bootstraps the Secret FROM values (`s3.credentialsSecret.create: true` with `<S3_ACCESS_KEY>` placeholders — throwaway-lab pattern only) | `create: false` (`# SITE:` marked) — create `s3-credentials` / `fabric-credentials` out-of-band per §2; `<UPPER_SNAKE>` placeholders never reach a Secret render |
+| `/mcp` key gate | `security.apiKey.existingSecret: mcp-fleet-apikeys` (pre-created in the namespace; the W7 wiring) + `security.identity.requireIdentity: true` — anonymous `/mcp` + `/api/*` get 401 | `security.apiKey.existingSecret: ""` — `# SITE:` choice; open behind the gateway (loud startup warning) until a Secret is wired |
+| SSO rungs active | JWT rung ON (`security.oidc.*`: issuer `https://keycloak.${DOMAIN_NAME}/realms/UA`, `audience: ua`, `jwksUrl` pinned to the IN-CLUSTER headless Keycloak service — plain HTTP, no platform-CA gap; realm `UA` live-verified 2026-10-05). Browser rung OFF in the example (`trustBrowserHeaders: false`) — the live pilot adds D22 + the header rung (§4.10) | None pre-wired: SSO is the gateway's oauth2-proxy (the AuthorizationPolicy row above); the app-side rungs are opt-in per §4.10 with the same ordered sequence |
+| Policy-as-code | `security.policy.enabled: true` + the `sqlhandler-policy` ConfigMap (the file carries the bootstrap `datasets` doc + `admins` list, and the ⚠️ glob-semantics warning: policy globs match the PROVIDER path — `workorder/*`, not `bucket/*`; an explicit EMPTY `blocked` list is a PolicyError) | Off (chart default) |
+| NetworkPolicy | Off in the base example; `values-hardened-g2.yaml` adds the W6 policy + network zone (`pcai-llm`, `dsh-web-helm`, `owebui0-11-0`, `opencode-web-helm`, and `monitoring` — omitting `monitoring` kills Prometheus scraping SILENTLY) | Off (chart default — right posture for short-lived trials; ClusterIP exposes nothing outside the cluster) |
+| Kyverno ClusterPolicy | `ezua.kyverno.enabled: true` (G2/EzAF runs Kyverno) | `true` — disable only on clusters without the `kyverno.io` CRD (the post-install hook would fail the whole release; the same labels are also set directly by the chart helpers) |
+| Caches | PVC-backed on the RWX catalog store: `cache.cacheDir`, `cache.virtualCacheDir`, `cache.l2.dir` (L2 ON — all 4 replicas share one warm cache), `cache.blockCache.dir` (ON, 1 MiB blocks — the NFS-warm block-size trade-off is noted in-file) | Chart defaults (`/tmp` emptyDir); L2 `SHOWCASE-ready but OFF` with the in-file two-step enable note (store PVC first, then `enabled: true` + `dir:`) |
+
+Pick the file, paste, adjust the `# SITE:` lines, apply — that is the whole
+profile decision. The SSO deltas between the profiles are §4.10; the
+credential Secrets both profiles need are §2.
 
 ## 4. Optional values
 
@@ -326,7 +390,7 @@ audits):
 |---|---|---|
 | `security.identity.trustBrowserHeaders` | `false` | TRUST GATE for the oauth2-proxy browser rung (`X-Auth-Request-User` / `X-Forwarded-Groups`). False = those headers are ignored. True ASSERTS the workload AuthorizationPolicy pins ingress to the gateway — only then can a browser header be trusted (headers are forgeable on any pod reachable without that pin) |
 | `security.identity.requireIdentity` | `false` | Identity-required gate: when `true` (renders `SQLHANDLER_REQUIRE_IDENTITY=1`), `/mcp` and `/api/*` REFUSE anonymous callers with 401 — an authenticated identity is required. `/health` `/ready` `/metrics` stay open (probes cannot carry secrets) and the webui shell stays open (data is gated at `/api/*`). Keyless-but-attributed relay calls keep working — the attribution header only rides a key-valid request |
-| `security.oidc.issuer` / `.audience` / `.jwksUrl` | "" / "" / "" | Resource-server JWT verification (SSO bearer rung): users present their SSO bearer token and SQLhandler verifies it via the issuer's JWKS — **NO client secret, NO redirect URIs** (unlike the browser-SSO oauth2-proxy pattern, which the gateway owns; this is the plain resource-server posture). All three set = the JWT rung is active; any empty = off. In-cluster example: `jwksUrl: http://keycloak.<realm-ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs` |
+| `security.oidc.issuer` / `.audience` / `.jwksUrl` | "" / "" / "" | Resource-server JWT verification (SSO bearer rung): users present their SSO bearer token and SQLhandler verifies it via the issuer's JWKS — **NO client secret, NO redirect URIs** (unlike the browser-SSO oauth2-proxy pattern, which the gateway owns; this is the plain resource-server posture). Active = the `enabled` flag AND an `issuer` (fail-closed: enabled-without-issuer warns loudly at startup and every JWT 401s); `audience` defaults to `ua` and `jwksUrl` to `<issuer>/protocol/openid-connect/certs` when empty (`oidc.enabled` + tuning knobs are in the rungs table, §4.10). In-cluster example: `jwksUrl: http://keycloak.<realm-ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs` |
 | `security.policy.enabled` | `false` | Policy-as-code: per-caller row filters + column masks + hidden tables from an operator-authored file (hot-reloaded). Enabling requires you to wire `security.policy.existingConfigMap` as a volume+mount yourself (the chart renders `SQLHANDLER_POLICY_FILE` = `<mountPath>/<existingConfigMapKey>` only — the ConfigMap mount is not chart-rendered). The policy file gains the optional `datasets` ACL form (below) — mutually exclusive with hand-written `groups` |
 
 ### 4.7.1 Dataset ACLs — mint + grants (the admin workflow)
@@ -407,6 +471,9 @@ enabled — the existing `security.identity.trustBrowserHeaders` pin).
 
 #### Browser SSO (D22 — the MM-RAG parity, `scripts/configure-oidc-sql.sh`)
 
+(Cross-reference: the rungs table, the ordered-enablement sequence and the
+G2-vs-hosted SSO posture are consolidated in §4.10.)
+
 Where the edge proxy does not forward the access token, the browser-header
 rung can only resolve the IdP's `sub` UUID — the UI chip would read
 `Signed in as 1d2fee26-… (browser)`. The D22 flow makes the app an OIDC
@@ -452,7 +519,7 @@ work from there with zero kubectl:
 | `GET /api/admin/grants` | the tab itself — admins, assignments, blocked, keys table | `admin_grants` |
 | `POST /api/admin/keys` | **Mint** (label + assignment globs) — the raw key is shown **once** in a copyable field with a "store it now — it is not recoverable" warning; only the fingerprint is stored | `admin_mint_key` |
 | `DELETE /api/admin/keys/{fp}` | **Revoke** (confirm dialog; assignment removed with the key). Secret-source keys are read-only in the panel — revoke those via kubectl (the Secret's lifecycle) | `admin_revoke_key` |
-| `PUT /api/admin/policy` | **Policy editor** — the `datasets` document, pre-filled from the live file; a refused document renders the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
+| `PUT /api/admin/policy` | **Policy editor** — the WHOLE authored policy document (the `datasets` doc AND the top-level `admins` list; the groups form too) as YAML, pre-filled from the live file; JSON is accepted on save as well; a refused document renders the 400's reason and the previous policy keeps enforcing | `admin_put_policy` |
 
 Authorization: a policy-designated **admin** only (`"admins"` list in the
 policy document — orthogonal to the grants lists: admins administer, grants
@@ -508,6 +575,81 @@ timeouts: `/mcp` and `/api/*` use the long one (agent loops, streaming, long
 aggregations), everything else the short one. `ezua.virtualService.endpoint`
 and `.istioGateway` are required (§3).
 
+### 4.10 SSO migration: the identity ladder, values-first
+
+Every request resolves ONE caller through a fixed ladder — the rungs below,
+explicit credentials always outranking proxied identity (the full app-side
+semantics: README "Dataset access control (ACL)", FEATURES.md §3b/§3c). This
+section is the deployment story: the chart values that switch each rung on,
+and the gate that makes it safe to do so.
+
+| # | Rung | Chart values | Gate / when it is safe |
+|---|---|---|---|
+| 1 | Minted API keys (`X-API-Key` / `Bearer` on `/mcp`) | `security.apiKey.existingSecret` (+ `.existingSecretKey`, default `api-keys`) | The Secret is pre-created out-of-band — the chart NEVER creates or inlines keys. Unset = `/mcp` runs open (loud startup warning). The secretKeyRef env is frozen at container start: rotation = append → move clients → drop + a rollout (the `checksum/secret` annotation automates it on the next apply, §2; §4.7.1) |
+| 2 | Gateway relay attribution (`X-MCP-Caller-Subject` — the MCP-bundle topology where the gateway holds the key) | none — always compiled in | Rides a KEY-VALID request only (attribution-never-authorization). Harden with `security.identity.relayHmac.*`: an HMAC-SHA256 proof over `<ts>\n<subject>\n<class>` (±300 s skew) so a key holder can no longer claim another subject; empty = the pre-HMAC behavior |
+| 3 | SSO bearer JWT (resource-server rung) | `security.oidc.enabled` + `issuer` (+ `audience` — default `ua`, `jwksUrl` — default `<issuer>/protocol/openid-connect/certs`, `identityClaim` — default `preferred_username`, and the `jwksRefreshSeconds` / `fetchTimeoutSeconds` / `clockSkewSeconds` tuning) | ACTIVE = the enabled flag AND an issuer (§4.7 row; fail-closed otherwise). RS256 only; `iss`/`exp`/`azp-aud` verified per request. NO client secret, NO redirect URIs. G2: pin `jwksUrl` to the IN-CLUSTER Keycloak HEADLESS service (`http://keycloak-headless.keycloak.svc.cluster.local:8080/realms/UA/...` — plain HTTP, so the platform-CA TLS gap cannot break the fetch; the non-headless `keycloak` Service has no endpoints — selector mismatch) |
+| 4 | D22 browser SSO — the app as OIDC client (`/oauth/login` → realm → `/oauth/oidc/callback` → HttpOnly `pcai-sso` cookie) | `security.oidc.sso.*` — rendered ONLY when `sso.enabled: true` (default render byte-identical; inert = the `/oauth/*` routes 404 and no cookie is ever accepted) | One-time setup per environment: `scripts/configure-oidc-sql.sh` — idempotent; registers `https://<endpoint>/oauth/oidc/callback` in the UA realm's `ua` client (appended to the EXISTING redirect URIs, field-scoped PUT so concurrent client edits survive, VERIFIED after the write), prints the ready-to-paste values block + the client secret ONCE. Secret paths: the PCAI values-editor envsubst `${OIDC_CLIENT_SECRET}` or your own Secret via `clientExistingSecret`. An EXTERNAL `providerUrl` needs `platformCa.enabled: true` (mounts the `ezaf-root-ca` ConfigMap, sets `REMOTE_CA_BUNDLE`) — the full walkthrough is §4.7.1 |
+| 5 | oauth2-proxy browser headers (`X-Auth-Request-User` / `X-Forwarded-Groups`) | `security.identity.trustBrowserHeaders: true` | TRUST GATE: `true` ASSERTS that the edge AuthorizationPolicy pins ingress to the gateway — the headers are forgeable on any pod reachable without that pin. On G2 pair it with `ezua.authorizationPolicy.enabled: true` (the gateway-level CUSTOM policy, provider `oauth2-proxy`) as ONE change; rollback = both flags false + re-apply |
+
+The gate that closes the front door: `security.identity.requireIdentity: true`
+renders `SQLHANDLER_REQUIRE_IDENTITY=1` — `/mcp` and `/api/*` REFUSE anonymous
+callers with 401 (probes `/health` `/ready` `/metrics` stay open — kubelet
+probes cannot carry a secret; the `/ui` shell stays open, data is gated at
+`/api/*`). Self-service key minting for signed-in users (`POST
+/api/admin/keys/self`, the `/ui` "Mint my key" button) needs the WRITABLE
+admin-keys store — `security.adminKeys.existingClaim` on the RWX catalog PVC
+(the Secret mode is read-only and cannot accept the API's writes) — plus
+`security.selfMintMaxKeys` (default 1; 0 disables).
+
+**Ordered enablement (the G2 SSO pilot sequence — done out of order, the
+ladder either exposes spoofable identity or 401s everyone):**
+
+1. **Keys** — wire `security.apiKey.existingSecret` first: it is the ladder's
+   key-valid floor, relay attribution only rides a key-valid request, and
+   `requireIdentity` with no credential source configured fails closed on
+   every caller (by design).
+2. **Policy** — author the policy ConfigMap (the `datasets` doc + the
+   `admins` list) and flip `security.policy.enabled: true` (the chart mounts
+   it; grants hot-reload on mtime, §4.7.1). Grants must exist before the gate
+   closes.
+3. **Gate** — `security.identity.requireIdentity: true` (kill-switch: false +
+   re-apply).
+4. **JWT rung** — `security.oidc.enabled` / `issuer` / `audience` /
+   `jwksUrl`. The issuer is CLAIM-COMPARED, never fetched, for this rung.
+5. **Browser chain + header rung — ATOMIC** — `ezua.authorizationPolicy.enabled:
+   true` AND `security.identity.trustBrowserHeaders: true` in the same
+   change: trusting the headers without the pin is forged-identity exposure;
+   the pin without the trust flag is a harmless no-op. Never "relieve" the
+   pin by unmeshing the pod instead.
+6. **D22 browser SSO** — run the configure script, paste the
+   `security.oidc.sso` block, re-apply, then verify the pod env
+   `SQLHANDLER_OIDC_SSO_CLIENT_SECRET` shows a real string (the literal
+   `${OIDC_CLIENT_SECRET}` means substitution did not happen — switch to
+   `clientExistingSecret`). WHY this rung exists here: on this platform the
+   edge proxy does NOT forward the access token
+   (`X-Auth-Request-Access-Token` absent live), so rung 5 can only carry the
+   IdP `sub` UUID — D22 is what binds the VERIFIED `preferred_username` that
+   policy grants and self-minted keys bind to.
+7. **Self-mint** (optional) — the writable admin-keys store +
+   `security.selfMintMaxKeys`. A mint never creates privileges: it copies the
+   subject's EXISTING policy assignment (no grant row → no mint, 403).
+
+**G2 vs hosted-trial SSO posture.** On internal G2 the ezaf-gateway fronts
+browser SSO for the platform, and the sqlhandler chart's own gateway-level
+block — `ezua.authorizationPolicy.*`, a CUSTOM AuthorizationPolicy rendered on
+the `istio: ingressgateway` selector, host-scoped to the VirtualService
+endpoint, delegating to the `oauth2-proxy` extension provider — is the
+per-host switch for that chain: OFF in the shipped example (keys + JWT rung
+only), ON in the live G2 SSO pilot paired with `trustBrowserHeaders` (step 5;
+the `oauth2-proxy` extension provider exists in `istio-system` on G2 — RAG
+depends on it). Do NOT confuse it with `security.authorizationPolicy.*` — a
+DIFFERENT, pod-level east-west ALLOW policy (default off; an ALLOW policy with
+no rules denies everything, so the render fails unless `principals`/
+`namespaces` are set). On a hosted trial, customer SSO terminates at the PCAI
+gateway via the chart-rendered `ezua.authorizationPolicy` (default ON, §4a) —
+the app-side rungs are the same opt-in values as G2, enabled per customer in
+the same order.
+
 ## 5. Data-source setup
 
 All backends share the same SQL engine, caches, MCP tools, and a backend-aware
@@ -517,8 +659,9 @@ readiness probe; only the `DataProvider` behind them differs.
 
 Every Parquet file or folder of Parquet files under `bucket` (+ optional
 `prefix`) becomes a table; Hive-partition folders fold into the table. Folders
-carrying a Delta `_delta_log` are auto-detected as Delta tables
-(`s3.format: auto` → `S3_FORMAT`), so one bucket can mix formats with time
+carrying a Delta `_delta_log` are auto-detected as Delta tables (`S3_FORMAT`
+env, default `auto` — per-source override via a `format:` entry in a
+`sources:` entry), so one bucket can mix formats with time
 travel where a Delta log exists.
 
 ```yaml
@@ -790,7 +933,10 @@ When `ezua.enabled: true` (default), the chart renders:
   loops / streaming, short timeout for the rest.
 - **Istio AuthorizationPolicy** (when `ezua.authorizationPolicy.enabled`) —
   `action: CUSTOM`, provider `oauth2-proxy`, applied at the `ezaf-gateway`
-  ingressgateway so external callers authenticate at the PCAI gateway.
+  ingressgateway so external callers authenticate at the PCAI gateway. This is
+  the browser-SSO chain switch on G2 (§4.10) — distinct from the pod-level
+  east-west `security.authorizationPolicy` (a different, default-off key —
+  see §4.10's posture note).
 - **Kyverno ClusterPolicy** (when `ezua.kyverno.enabled`) — post-install hook
   tagging the workload `hpe-ezua/type: vendor-service` + `hpe-ezua/app:
   sqlhandler` for PCAI discovery/monitoring. Disable on clusters without the
@@ -853,6 +999,7 @@ in-cluster callers need no header. Humans get the same data at
 |---|---|
 | Every values key, with comments | [`../helm/values.yaml`](../helm/values.yaml) |
 | Key-by-key doc coverage (this guide) | §4.1–§4.9 above |
+| Deployment profiles: Internal G2 vs Hosted trial | §4a above |
 | Paste-ready site examples | [`../helm/values-examples/`](../helm/values-examples/) |
 | Secret convention (local, not packaged) | `helm/local/README.md` |
 | Semantic catalog spec | [`../docs/semantic-catalog.md`](../docs/semantic-catalog.md) |

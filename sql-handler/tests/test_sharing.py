@@ -314,7 +314,7 @@ def test_table_uri_from_schema_label_fallback(tmp_path):
 class _FakeClient:
     """SharingClient stand-in with canned responses (no HTTP)."""
 
-    def __init__(self, tables=None, error=None):
+    def __init__(self, tables: list[dict] | None = None, error: str | None = None) -> None:
         self._tables = (
             tables
             if tables is not None
@@ -325,7 +325,7 @@ class _FakeClient:
         self._error = error
         self.query_calls: list[tuple] = []
 
-    def list_shares(self):
+    def list_shares(self) -> list[dict]:
         if self._error:
             raise LakehouseError(self._error)
         return [{"name": "sales"}]
@@ -362,7 +362,7 @@ def test_list_tables_share_failure_is_scoped_to_that_share(monkeypatch):
     def boom(share):
         raise LakehouseError("HTTP 500 boom")
 
-    fake.list_schemas = boom
+    fake.__dict__["list_schemas"] = boom
     monkeypatch.setattr(prov, "_client", fake)
     assert prov.list_tables() == []  # the broken share is skipped, not fatal
 
@@ -392,11 +392,11 @@ def test_open_dataset_over_fake_server(tmp_path):
 def test_open_dataset_empty_table(tmp_path):
     prov = SharingProvider(SharingConfig(endpoint="https://x/ds", bearer_token="t"))
     fake = _FakeClient()
-    fake.query_table = lambda *a, **k: {
+    fake.__dict__["query_table"] = lambda *a, **k: {
         "schema": _arrow_schema_from_delta({"schemaString": json.dumps(DELTA_SCHEMA)}),
         "files": [],
     }
-    prov._client = fake
+    prov.__dict__["_client"] = fake
     info = TableInfo(name="orders", schema="sales_gold", format="delta", location="sales/gold/orders")
     dset = prov.open_dataset(info)
     assert dset.to_table().num_rows == 0
@@ -408,16 +408,16 @@ def test_open_dataset_empty_table(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_version_as_of_passes_through_to_query():
+def test_version_as_of_passes_through_to_query() -> None:
     prov = SharingProvider(SharingConfig(endpoint="https://x/ds", bearer_token="t"))
     captured: list[tuple] = []
 
     class _Recording(_FakeClient):
-        def query_table(self, share, schema, table, version_as_of=None):
+        def query_table(self, share: str, schema: str, table: str, version_as_of: int | None = None):
             captured.append((share, schema, table, version_as_of))
             return {"schema": pa.schema([]), "files": []}
 
-    prov._client = _Recording()
+    prov.__dict__["_client"] = _Recording()
     info = TableInfo(name="orders", schema="sales_gold", format="delta", location="sales/gold/orders")
     prov.open_dataset(info, version=7)
     assert captured[-1][3] == 7
@@ -425,11 +425,11 @@ def test_version_as_of_passes_through_to_query():
 
 def test_invalid_version_rejected_with_standard_shape():
     prov = SharingProvider(SharingConfig(endpoint="https://x/ds", bearer_token="t"))
-    prov._client = _FakeClient()
+    prov.__dict__["_client"] = _FakeClient()
     info = TableInfo(name="orders", schema="sales_gold", format="delta", location="sales/gold/orders")
     for bad in (-1, "7", True, 1.5):
         with pytest.raises(LakehouseError, match="non-negative integer"):
-            prov.open_dataset(info, version=bad)
+            prov.open_dataset(info, version=bad)  # type: ignore[arg-type]  # bad shapes are the point
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +470,8 @@ def test_exception_containing_token_is_scrubbed_by_provider_paths(tmp_path):
     # The provider's catch-all wrapper scrubs arbitrary exception text.
     prov = SharingProvider(SharingConfig(endpoint="https://x/ds", bearer_token=TOKEN))
     leaky = _FakeClient()
-    leaky.query_table = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"head refused for {TOKEN}"))
-    prov._client = leaky
+    leaky.__dict__["query_table"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"head refused for {TOKEN}"))
+    prov.__dict__["_client"] = leaky
     info = TableInfo(name="orders", schema="sales_gold", format="delta", location="sales/gold/orders")
     with pytest.raises(LakehouseError) as excinfo:
         prov.open_dataset(info)
@@ -539,8 +539,9 @@ def test_check_connection_ok_and_down(tmp_path):
         server.server_close()  # free the port (shutdown alone leaves the socket listening)
     # after close the port refuses -> readiness reports an error string (fast: refused, not hung)
     dead = SharingProvider(_config(port))
-    assert isinstance(dead.check_connection(), str)
-    assert "refused" in dead.check_connection().lower() or "failed" in dead.check_connection().lower()
+    err = dead.check_connection()
+    assert isinstance(err, str)
+    assert "refused" in err.lower() or "failed" in err.lower()
 
 
 def test_engine_run_sql_over_sharing_table(tmp_path):

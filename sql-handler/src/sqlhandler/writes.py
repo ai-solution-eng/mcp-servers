@@ -183,8 +183,7 @@ def scratch_roots(environ: dict[str, str] | None = None) -> list[tuple[str, str]
                 prefix = tail.strip()
         if not prefix:
             raise ValueError(
-                f"Invalid {WRITE_SCRATCH_ROOTS_ENV} entry {entry!r}: empty prefix "
-                f"(expected [name=]<path-or-uri>)."
+                f"Invalid {WRITE_SCRATCH_ROOTS_ENV} entry {entry!r}: empty prefix (expected [name=]<path-or-uri>)."
             )
         position += 1
         if not name:
@@ -527,9 +526,7 @@ def _classify_one(stmt_type: str, statement: str) -> StatementClass:
     # would otherwise classify as a read here).
     head = statement.lstrip(" \t\r\n(\"'")
     if head.upper().startswith("PRAGMA") or _PRAGMA_FUNCTION_RE.search(statement):
-        return StatementClass(
-            CLASS_WRITE_OTHER, statement, "PRAGMA", reason="PRAGMA statements are not allowed"
-        )
+        return StatementClass(CLASS_WRITE_OTHER, statement, "PRAGMA", reason="PRAGMA statements are not allowed")
     if stmt_type == "SELECT":
         return StatementClass(CLASS_READ, statement, stmt_type)
     if stmt_type == "EXPLAIN":
@@ -539,9 +536,7 @@ def _classify_one(stmt_type: str, statement: str) -> StatementClass:
         try:
             inner_spans = extract_statement_spans(inner)
         except ValueError:
-            return StatementClass(
-                CLASS_WRITE_OTHER, statement, stmt_type, reason="EXPLAIN of an unparseable statement"
-            )
+            return StatementClass(CLASS_WRITE_OTHER, statement, stmt_type, reason="EXPLAIN of an unparseable statement")
         for inner_type, inner_span in inner_spans:
             if inner_type != "SELECT":
                 return StatementClass(
@@ -778,8 +773,7 @@ class WriteLease:
             os.makedirs(os.path.dirname(self.lease_path) or ".", exist_ok=True)
         except OSError as exc:
             raise WriteError(
-                f"Write refused: scratch directory {os.path.dirname(self.lease_path)!r} "
-                f"is not writable ({exc}).",
+                f"Write refused: scratch directory {os.path.dirname(self.lease_path)!r} is not writable ({exc}).",
                 code="E_WRITE_TARGET",
             ) from exc
         try:

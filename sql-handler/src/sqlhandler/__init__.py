@@ -20,6 +20,25 @@ or keep the old single-class import (``OneLakeHandler``) from
 ``sqlhandler.lakehouse``.
 """
 
+# Submodule re-exports: ``from sqlhandler import server`` (and the rest of
+# the app layer below) is the fleet-wide test/service convention — declared
+# here so the attribute exists for type checkers too. server.py re-exports
+# __version__ from this package (single-sourced version string), so it MUST
+# come after __version__ is defined: the heavy HTTP stack is imported lazily
+# at the bottom, after the class/dataclass re-exports above and __version__.
+from . import (
+    admin_keys,
+    errors,
+    identity,
+    jobs,
+    l2cache,
+    mcp_resources,
+    observability,
+    oidc_identity,
+    policy,
+    resources,
+    saved,
+)
 from .config import (
     CacheConfig,
     FabricConfig,
@@ -42,6 +61,17 @@ from .onelake import OneLakeProvider
 from .provider import DataProvider, LakehouseError, TableInfo, make_provider
 from .s3 import S3Provider
 
+__version__ = "3.7.0"
+
+# server.py + webui.py import __version__ back from this package — keep them
+# below it (a submodule importing the partially-initialized parent would
+# otherwise raise ImportError on a cold import).
+from . import (
+    server,
+    webui,
+    writes,
+)
+
 __all__ = [
     "CacheConfig",
     "DataProvider",
@@ -57,6 +87,11 @@ __all__ = [
     "S3Provider",
     "SqlEngine",
     "TableInfo",
+    "admin_keys",
+    "errors",
+    "identity",
+    "jobs",
+    "l2cache",
     "load_backend_config",
     "load_cache_config",
     "load_config",
@@ -65,6 +100,13 @@ __all__ = [
     "load_iceberg_config",
     "load_s3_config",
     "make_provider",
+    "mcp_resources",
+    "observability",
+    "oidc_identity",
+    "policy",
+    "resources",
+    "saved",
+    "server",
+    "webui",
+    "writes",
 ]
-
-__version__ = "3.6.0"

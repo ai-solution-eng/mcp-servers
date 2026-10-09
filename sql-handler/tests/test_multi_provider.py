@@ -5,16 +5,17 @@ cross-source SQL (including bare-name collision gating in the engine).
 """
 
 import json
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.dataset as pad
 import pyarrow.parquet as pq
 
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import MultiProvider, TableInfo
+from sqlhandler.provider import DataProvider, MultiProvider, TableInfo
 
 
-class DirProvider:
+class DirProvider(DataProvider):
     """Tiny provider: every .parquet in a directory is a table (stem = name)."""
 
     kind = "dir"
@@ -74,7 +75,7 @@ def test_multiprovider_routes_open_and_uri_to_owner(tmp_path):
     crm = next(t for t in tables if t.source == "crm")
     assert str(d1) in mp.table_uri(sales)
     assert str(d2) in mp.table_uri(crm)
-    assert mp.open_dataset(sales).to_table().to_pydict()["id"] == [1]
+    assert cast("pad.Dataset", mp.open_dataset(sales)).to_table().to_pydict()["id"] == [1]
 
 
 # --------------------------------------------------------------------------- config
@@ -97,7 +98,9 @@ def test_load_source_providers_parses_json():
     from sqlhandler.config import load_source_providers
 
     mp = load_source_providers({"SQLHANDLER_SOURCES": raw})
-    assert mp is not None
+    from sqlhandler.provider import MultiProvider
+
+    assert isinstance(mp, MultiProvider)
     assert mp.source_count == 2
     assert mp.sources == ["sales", "inventory"]
 

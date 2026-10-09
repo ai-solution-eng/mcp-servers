@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import LakehouseError, TableInfo
+from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
 
 TABLES = [
     TableInfo(name="sales", schema="shop", format="parquet"),
@@ -28,19 +28,19 @@ TABLES = [
 BIG_SALES_DEF = "SELECT id, amount FROM sales WHERE amount > 15 ORDER BY id"
 
 
-class FakeProvider:
+class FakeProvider(DataProvider):
     """A DataProvider backed by a local temp directory of Parquet files."""
 
     kind = "fake"
 
-    def __init__(self, root):
+    def __init__(self, root) -> None:
         self.root = root
         self.versions: dict[str, int] = {}  # path -> snapshot token (mutable in tests)
 
-    def list_tables(self):
+    def list_tables(self) -> list[TableInfo]:
         return TABLES
 
-    def table_uri(self, info):
+    def table_uri(self, info: TableInfo) -> str:
         return f"fake://{info.path}"
 
     def open_dataset(self, info, version=None):
@@ -143,9 +143,7 @@ def test_virtual_definition_pulls_in_base_tables(engine):
 
 
 def test_virtual_joins_physical_in_one_query(engine):
-    out = engine.query_duckdb(
-        "SELECT s.id FROM shop_sales p JOIN vw_big_sales s USING (id) ORDER BY s.id"
-    )
+    out = engine.query_duckdb("SELECT s.id FROM shop_sales p JOIN vw_big_sales s USING (id) ORDER BY s.id")
     assert out.column("id").to_pylist() == [2, 3]
 
 
@@ -309,9 +307,7 @@ def test_snowflake_array_construct_compact_runs_verbatim(tmp_path, monkeypatch):
 def test_compact_rewrite_is_string_literal_safe(tmp_path, monkeypatch):
     doc = _catalog_doc(
         name="vw_literal",
-        definition=(
-            "SELECT id FROM sales WHERE 'call array_construct_compact(x, y)' <> '' ORDER BY id LIMIT 1"
-        ),
+        definition=("SELECT id FROM sales WHERE 'call array_construct_compact(x, y)' <> '' ORDER BY id LIMIT 1"),
     )
     eng, _ = _make_engine(tmp_path, monkeypatch, doc=doc)
     out = eng.query_duckdb("SELECT id FROM vw_literal")

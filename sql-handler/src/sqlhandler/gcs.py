@@ -111,9 +111,7 @@ def gcs_delta_storage_options(config: GcsConfig) -> dict:
                 raise ValueError("must be a JSON object")  # noqa: TRY004
             opts.update(extra)
         except Exception as exc:
-            raise LakehouseError(
-                f"SQLHANDLER_GCS_STORAGE_OPTIONS is not valid JSON options: {exc}"
-            ) from exc
+            raise LakehouseError(f"SQLHANDLER_GCS_STORAGE_OPTIONS is not valid JSON options: {exc}") from exc
     return opts
 
 
@@ -300,9 +298,7 @@ class GcsProvider(DataProvider):
         try:
             if version is None:
                 return DeltaTableCls(uri, storage_options=gcs_delta_storage_options(self.config))
-            return DeltaTableCls(
-                uri, version=version, storage_options=gcs_delta_storage_options(self.config)
-            )
+            return DeltaTableCls(uri, version=version, storage_options=gcs_delta_storage_options(self.config))
         except Exception as exc:
             raise LakehouseError(f"Could not open GCS Delta table {info.path!r}: {exc}") from exc
 

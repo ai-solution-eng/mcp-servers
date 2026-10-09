@@ -145,9 +145,7 @@ def test_inspector_call_describe_table_returns_columns(client):
 
 
 def test_inspector_call_run_sql_roundtrip(client):
-    is_err, text = call_tool(
-        client, "run_sql", {"sql": "SELECT COUNT(*) AS n FROM orders", "output_format": "json"}
-    )
+    is_err, text = call_tool(client, "run_sql", {"sql": "SELECT COUNT(*) AS n FROM orders", "output_format": "json"})
     assert is_err is False
     assert json.loads(text.rstrip().rsplit("\n", 1)[-1] if text.lstrip().startswith("{") is False else text)
     assert "3" in text
@@ -186,7 +184,10 @@ def test_inspector_call_missing_required_arg_is_param_invalid(client):
 def test_inspector_call_bridge_validation_http_4xx(client):
     # malformed body / wrong shapes are the BRIDGE's errors — HTTP 4xx.
     assert client.post("/api/inspector/call", content=b"{not json").status_code == 400
-    assert client.post("/api/inspector/call", content=b"[1,2]", headers={"Content-Type": "application/json"}).status_code == 400
+    assert (
+        client.post("/api/inspector/call", content=b"[1,2]", headers={"Content-Type": "application/json"}).status_code
+        == 400
+    )
     assert client.post("/api/inspector/call", json={"arguments": {}}).status_code == 400  # no name
     assert client.post("/api/inspector/call", json={"name": "   "}).status_code == 400
     assert client.post("/api/inspector/call", json={"name": "run_sql", "arguments": "oops"}).status_code == 400
@@ -245,9 +246,7 @@ def test_inspector_routes_behind_api_token(tmp_path, monkeypatch):
     TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
     from sqlhandler.server import _ApiTokenMiddleware
 
-    pq.write_table(
-        pa.table({"id": [1, 2]}), str(tmp_path / "orders.parquet")
-    )
+    pq.write_table(pa.table({"id": [1, 2]}), str(tmp_path / "orders.parquet"))
     eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=3600)
     monkeypatch.setattr(server_module, "_handler", lambda: eng)
     app = server_module.mcp.streamable_http_app(

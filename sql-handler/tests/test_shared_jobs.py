@@ -19,7 +19,7 @@ import pytest
 from sqlhandler import jobs as jobs_module
 from sqlhandler.engine import SqlEngine
 from sqlhandler.jobs import JobError, McpJobManager
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
 def _make_engine(tmp_path):
@@ -30,7 +30,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -93,14 +93,20 @@ def test_submit_writes_tombstone_then_finish_publishes_outcome(tmp_path):
     assert mgr.shared_store is not None
     job_id = mgr.submit(eng, "SELECT * FROM work_order")["job_id"]
 
-    tomb = json.loads((mgr.shared_store.root / f"{job_id}.json").read_text())
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    tomb = json.loads((_store.root / f"{job_id}.json").read_text())
     assert tomb["state"] == "running"
 
     _wait_done(mgr, job_id)
-    done = json.loads((mgr.shared_store.root / f"{job_id}.json").read_text())
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    done = json.loads((_store.root / f"{job_id}.json").read_text())
     assert done["state"] == "done"
     assert done["has_result_file"] is True
-    assert (mgr.shared_store.root / f"{job_id}.parquet").exists()
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    assert (_store.root / f"{job_id}.parquet").exists()
     assert done["n_rows"] == 5
 
 
@@ -159,7 +165,9 @@ def test_foreign_replica_can_poll_and_fetch(tmp_path):
     with pytest.raises(JobError, match="already fetched"):
         owner.take_result(job_id)
     # the parquet sidecar is gone with the hand-over
-    assert not (owner.shared_store.root / f"{job_id}.parquet").exists()
+    _store = owner.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    assert not (_store.root / f"{job_id}.parquet").exists()
 
 
 def test_running_tombstone_foreign_poll_not_404(tmp_path, monkeypatch):
@@ -206,6 +214,7 @@ def test_fetch_claim_is_atomic_and_stale_claims_are_stolen(tmp_path):
 
     foreign = McpJobManager()
     store = foreign.shared_store
+    assert store is not None  # SQLHANDLER_JOBS_DIR is set
     assert store.claim_fetch(job_id) is True
     # a second claim while held is refused...
     assert store.claim_fetch(job_id) is False
@@ -227,7 +236,9 @@ def test_ttl_and_cap_bound_the_shared_dir(tmp_path, monkeypatch):
         job_id = mgr.submit(eng, "SELECT count(*) AS n FROM work_order")["job_id"]
         _wait_done(mgr, job_id)
         mgr.take_result(job_id)
-    records = list(mgr.shared_store.root.glob("*.json"))
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    records = list(_store.root.glob("*.json"))
     assert len(records) <= 2
 
 
@@ -235,12 +246,16 @@ def test_zombie_tombstone_aged_out(tmp_path):
     eng = _make_engine(tmp_path)
     mgr = McpJobManager()
     job_id = mgr.submit(eng, "SELECT * FROM work_order")["job_id"]
-    tomb = mgr.shared_store.root / f"{job_id}.json"
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    tomb = _store.root / f"{job_id}.json"
     data = json.loads(tomb.read_text())
     # pretend the owner pod died long ago (timeout + grace in the past)
     data["submitted_at_wall"] = time.time() - 100000
     tomb.write_text(json.dumps(data))
-    mgr.shared_store._cleanup()
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    _store._cleanup()
     assert not tomb.exists()
 
 
@@ -297,7 +312,9 @@ def test_stats_reports_shared_store(tmp_path):
     assert "shared_store" in mgr.stats()
     job_id = mgr.submit(eng, "SELECT * FROM work_order")["job_id"]
     _wait_done(mgr, job_id)
-    assert mgr.stats()["shared_store"] == str(mgr.shared_store.root)
+    _store = mgr.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    assert mgr.stats()["shared_store"] == str(_store.root)
 
 
 # --------------------------------------------------- ownership across replicas
@@ -314,10 +331,14 @@ def test_shared_record_carries_owner_and_foreign_replica_enforces(tmp_path):
     job_id = owner.submit(eng, "SELECT * FROM work_order WHERE kind = 'a'", owner="subject:alice")["job_id"]
 
     # the tombstone records the owner scope for the cluster
-    tomb = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    _store = owner.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    tomb = json.loads((_store.root / f"{job_id}.json").read_text())
     assert tomb["owner"] == "subject:alice"
     _wait_done(owner, job_id, owner="subject:alice")
-    done = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    _store = owner.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    done = json.loads((_store.root / f"{job_id}.json").read_text())
     assert done["owner"] == "subject:alice"
 
     foreign = McpJobManager()
@@ -347,7 +368,9 @@ def test_foreign_cancel_of_running_owned_job_refused(tmp_path, monkeypatch):
     with pytest.raises(JobError, match="Unknown job id"):
         foreign.cancel(job_id, owner="subject:mallory")
     # the shared tombstone is untouched — still "running", not cancelled
-    tomb = json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    _store = owner.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    tomb = json.loads((_store.root / f"{job_id}.json").read_text())
     assert tomb["state"] == "running"
     owner.cancel(job_id, owner="subject:alice")
 
@@ -358,7 +381,9 @@ def test_shared_unowned_job_stays_shared(tmp_path):
     eng = _make_engine(tmp_path)
     owner = McpJobManager()
     job_id = owner.submit(eng, "SELECT * FROM work_order")["job_id"]  # no owner
-    assert "owner" not in json.loads((owner.shared_store.root / f"{job_id}.json").read_text())
+    _store = owner.shared_store
+    assert _store is not None  # SQLHANDLER_JOBS_DIR is set
+    assert "owner" not in json.loads((_store.root / f"{job_id}.json").read_text())
     _wait_done(owner, job_id)
     foreign = McpJobManager()
     assert foreign.status(job_id, owner="subject:anyone")["state"] == "done"
@@ -421,6 +446,7 @@ def test_cancel_flag_lifecycle(tmp_path):
     eng = _make_engine(tmp_path)  # noqa: F841 - keeps the fixture shape uniform
     owner = McpJobManager()
     store = owner.shared_store
+    assert store is not None  # SQLHANDLER_JOBS_DIR is set
     store.flag_cancel("job-x")
     assert store.cancel_flagged("job-x") is True
     store._drop("job-x")

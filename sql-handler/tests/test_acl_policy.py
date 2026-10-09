@@ -48,11 +48,13 @@ from sqlhandler.policy import (
     POLICY_ENABLED_ENV,
     POLICY_FILE_ENV,
     PolicyError,
+    _parse_text,
     canonical_hash,
+    dump_doc,
     load_policy,
     reset_policy_store,
 )
-from sqlhandler.provider import LakehouseError, TableInfo
+from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
 
 TABLES = [
     TableInfo(name="work_order", schema="workorder", format="parquet"),
@@ -60,7 +62,7 @@ TABLES = [
 ]
 
 
-class PolicyProvider:
+class PolicyProvider(DataProvider):
     """FakeProvider with two ACL-able tables (the leak suite's provider + payroll)."""
 
     kind = "fake"
@@ -577,7 +579,6 @@ def test_effective_hash_differs_across_assignments(tmp_path, datasets_env):
     """Different assignment sets ⇒ different per-caller hashes; the same set
     (reloaded) ⇒ the same hash (identically-restricted callers share cache
     entries — the canonical_hash contract)."""
-    eng = _make_engine(tmp_path)
     pol = load_policy(str(datasets_env))
     h_alice = pol.effective_hash("alice", None)
     h_carol = pol.effective_hash(None, "sha256:cccccccccccc")
@@ -702,9 +703,7 @@ def test_handwritten_groups_suite_shape_still_enforces(tmp_path, policy_env, mon
     spec = json.loads(pf.read_text())
     spec["groups"] = {
         "analysts": {
-            "tables": {
-                "workorder/work_order": {"row_filter": "kind != 'secret'", "column_masks": {"ssn": "redact"}}
-            }
+            "tables": {"workorder/work_order": {"row_filter": "kind != 'secret'", "column_masks": {"ssn": "redact"}}}
         }
     }
     spec["default_group"] = "analysts"
@@ -727,3 +726,81 @@ def test_no_policy_at_all_untouched(tmp_path, no_policy):
     out = eng.query_duckdb(SQL_WO, caller=ALICE)
     assert out.num_rows == 3
     assert out.column("ssn").to_pylist() == ["ssn-000", "ssn-001", "ssn-002"]
+
+
+# ---------------------------------------------------------------------------
+# the authored mirror + dump_doc (the grants view's editable policy_text)
+# ---------------------------------------------------------------------------
+
+
+def test_load_policy_authored_mirror_datasets_form(tmp_path):
+    """Policy.authored is the WHOLE parsed document (datasets doc AND the
+    top-level admins list) — the mirror the admin UI's editor prefills
+    from; hash-neutral, so it must not disturb the compiled fields."""
+    import yaml
+
+    doc = {
+        "datasets": {"global": ["workorder/*"], "assignments": {"alice": ["payroll/*"]}},
+        "admins": ["alice"],
+    }
+    pf = _write_policy(tmp_path, doc)
+    pol = load_policy(str(pf))
+    assert pol.authored == doc
+    assert pol.admins == ("alice",)
+    assert pol.datasets == doc["datasets"]
+    assert pol.default_group == "_acl_global"
+    assert yaml.safe_load(dump_doc(pol.authored)) == doc
+
+
+def test_load_policy_authored_mirror_groups_form(tmp_path):
+    """The hand-written groups form mirrors too (the historic prefill was
+    datasets-only, which emptied the editor and invited wiping the file)."""
+    doc = {
+        "groups": {"g": {"tables": {"t/*": {"column_masks": {"c": "redact"}}}}},
+        "default_group": "g",
+        "admins": ["sha256:aaaaaaaaaaaa"],
+    }
+    pf = _write_policy(tmp_path, doc)
+    pol = load_policy(str(pf))
+    assert pol.authored == doc
+    assert pol.datasets is None
+    assert pol.admins == ("sha256:aaaaaaaaaaaa",)
+
+
+def test_dump_doc_yaml_then_parse_roundtrip():
+    """dump_doc is the inverse of _parse_text: YAML default, JSON opt-in,
+    operator key order kept, non-ASCII intact, and whatever dump_doc emits
+    parses back to the same document."""
+    import yaml
+
+    doc = {
+        "datasets": {"global": ["workorder/*", "résumé-*"], "assignments": {"zoe": ["reports/*"]}},
+        "admins": ["zoe", "sha256:0123456789ab"],
+    }
+    text = dump_doc(doc)
+    assert text.endswith("\n")
+    assert list(yaml.safe_load(text)) == list(doc), "operator key order kept"
+    assert "résumé-*" in text, "allow_unicode — no ?? escapes"
+    assert _parse_text(text, "t") == doc
+    js = dump_doc(doc, fmt="json")
+    assert json.loads(js) == doc
+    with pytest.raises(ValueError):
+        dump_doc(doc, fmt="xml")
+
+
+def test_dump_doc_json_fallback_without_pyyaml(monkeypatch):
+    """No pyyaml → JSON text that _parse_text still accepts (the editor
+    must always show text the server can parse back)."""
+
+    doc = {"datasets": {"global": ["a/*"]}}
+    real_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+    def _no_yaml(name, *a, **kw):
+        if name == "yaml":
+            raise ImportError("no yaml for you")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr("builtins.__import__", _no_yaml)
+    text = dump_doc(doc)
+    assert json.loads(text) == doc
+    assert _parse_text(text, "t") == doc

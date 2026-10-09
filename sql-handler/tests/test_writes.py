@@ -240,9 +240,10 @@ def test_subject_slug_collisions_refused():
     must never share a scratch namespace — case-folding, punctuation and
     prefix differences all diverge via the RAW-subject digest."""
     subjects = ["Alice.", "alice", "ALICE", "Alice Smith", "alice-smith", "alice.smith"]
-    slugs = {}
+    slugs: dict[str, str] = {}
     for s in subjects:
         slug = writes.subject_slug(Caller(cls="user", subject=s, via="relay"))
+        assert slug is not None, s  # an attributed user caller is always slug-eligible
         assert slug not in slugs.values(), f"COLLISION: {s!r} vs {slugs}"
         slugs[s] = slug
     # case/punctuation-only differences: identical normalized segment,
@@ -268,6 +269,7 @@ def test_subject_slug_stable_and_charclass():
         c = Caller(cls="user", subject=subject, via="relay")
         assert writes.subject_slug(c) == writes.subject_slug(c)
         slug = writes.subject_slug(c)
+        assert slug is not None, subject  # an attributed user caller is always slug-eligible
         assert re.fullmatch(r"[a-z0-9._-]+", slug), slug  # _SLUG_RE's class
         assert slug == slug.strip("-.")
 
@@ -381,9 +383,7 @@ def test_delta_ctas_roundtrip(monkeypatch, tmp_path):
     """CTAS into subject scratch; read back through the engine (the written
     table lists as an ordinary Delta table and queries normally)."""
     eng, alice, scratch_root = _delta_engine(tmp_path, monkeypatch)
-    summary = eng.execute_write(
-        "CREATE TABLE daily AS SELECT id, amount FROM work_order WHERE id > 1", caller=alice
-    )
+    summary = eng.execute_write("CREATE TABLE daily AS SELECT id, amount FROM work_order WHERE id > 1", caller=alice)
     row = summary.to_pydict()
     assert row["target"][0] == f"{scratch_root}/{ALICE_SLUG}/daily"
     assert row["backend"][0] == "delta"
@@ -410,9 +410,7 @@ def test_delta_ctas_rerun_replaces(monkeypatch, tmp_path):
 def test_delta_insert_appends(monkeypatch, tmp_path):
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     eng.execute_write("CREATE TABLE t AS SELECT id FROM work_order", caller=alice)
-    eng.execute_write(
-        "INSERT INTO t SELECT CAST(id + 10 AS BIGINT) AS id FROM work_order", caller=alice
-    )
+    eng.execute_write("INSERT INTO t SELECT CAST(id + 10 AS BIGINT) AS id FROM work_order", caller=alice)
     res = eng.query_duckdb(f"SELECT count(*) AS n, max(id) AS mx FROM {ALICE_SLUG}_t")
     assert res.to_pydict() == {"n": [6], "mx": [13]}
 
@@ -512,9 +510,7 @@ def test_write_target_collision_with_source_refused(monkeypatch, tmp_path):
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     # point the scratch ROOT at the provider root; the subject's OWN scratch
     # namespace then overlaps the provider root's directory listing
-    monkeypatch.setenv(
-        "SQLHANDLER_WRITE_SCRATCH_ROOTS", f"main={tmp_path}"
-    )
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", f"main={tmp_path}")
     alice_slug = writes.subject_slug(alice)
     # a source table at <root>/<slug>/work_order — inside alice's namespace
     src = tmp_path / alice_slug / "work_order"
@@ -522,15 +518,11 @@ def test_write_target_collision_with_source_refused(monkeypatch, tmp_path):
     write_deltalake(str(src), pa.table({"id": pa.array([9], type=pa.int64())}), mode="overwrite")
     eng._write_tier_source_paths = None  # re-snapshot (fixture wrote a source)
     with pytest.raises(LakehouseError, match="resolves onto a configured source"):
-        eng.execute_write(
-            "CREATE TABLE work_order AS SELECT id FROM workorder_work_order", caller=alice
-        )
+        eng.execute_write("CREATE TABLE work_order AS SELECT id FROM workorder_work_order", caller=alice)
     # a DIFFERENT name under the same namespace is not a source location and
     # writes fine (the refusal is location-exact, not name-based); the SELECT
     # reads the fixture's source table (3 rows)
-    eng.execute_write(
-        "CREATE TABLE work_order2 AS SELECT id FROM workorder_work_order", caller=alice
-    )
+    eng.execute_write("CREATE TABLE work_order2 AS SELECT id FROM workorder_work_order", caller=alice)
     assert eng.query_duckdb(f"SELECT count(*) AS n FROM {ALICE_SLUG}_work_order2").to_pydict() == {"n": [3]}
     del write_deltalake
 
@@ -543,9 +535,7 @@ def test_write_source_query_policy_masked(monkeypatch, tmp_path):
     policy_file.write_text(
         json.dumps(
             {
-                "groups": {
-                    "analysts": {"tables": {"workorder/*": {"column_masks": {"amount": "redact"}}}}
-                },
+                "groups": {"analysts": {"tables": {"workorder/*": {"column_masks": {"amount": "redact"}}}}},
                 "subjects": {"alice": ["analysts"]},
             }
         )
@@ -596,9 +586,7 @@ def test_pyiceberg_write_smoke(monkeypatch, tmp_path):
     pq.write_table(pa.table({"id": pa.array([1, 2], type=pa.int64())}), src / "part.parquet")
     scratch_root = tmp_path / "wh"
     monkeypatch.setenv("SQLHANDLER_WRITES_ENABLED", "1")
-    monkeypatch.setenv(
-        "SQLHANDLER_WRITE_SCRATCH_ROOTS", f"iceberg://ice={scratch_root}"
-    )
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", f"iceberg://ice={scratch_root}")
     monkeypatch.setenv("SQLHANDLER_WRITE_ICEBERG_WAREHOUSE", f"file://{scratch_root}/warehouse")
     monkeypatch.setenv("NFS_ROOT", str(tmp_path))
     eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
@@ -608,9 +596,7 @@ def test_pyiceberg_write_smoke(monkeypatch, tmp_path):
     assert row["backend"][0] == "iceberg"
     assert row["rows_written"][0] == 2
     # a second write appends via the same catalog
-    summary2 = eng.execute_write(
-        "INSERT INTO ict SELECT CAST(id + 5 AS BIGINT) AS id FROM work_order", caller=alice
-    )
+    summary2 = eng.execute_write("INSERT INTO ict SELECT CAST(id + 5 AS BIGINT) AS id FROM work_order", caller=alice)
     assert summary2.to_pydict()["rows_written"][0] == 2
 
 
@@ -632,6 +618,7 @@ def test_audit_write_lines_and_metrics(monkeypatch, tmp_path):
     # query lines are untouched (additive family)
     assert all(l["event"] == "query" for l in lines if l["event"] != "write")
     reset_policy_store()
+
 
 def test_metrics_write_series_additive(monkeypatch, tmp_path):
     """The write counters increment (process-global registry — assert on

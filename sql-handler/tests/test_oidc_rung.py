@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sqlhandler import identity as _identity
 from sqlhandler import oidc_identity as oidc
+from sqlhandler.provider import DataProvider
 from sqlhandler.server import _build_http_app
 
 # ===========================================================================
@@ -77,8 +78,14 @@ def _generate_rsa(key_id: str = KID) -> dict:
     return {
         "key": key,
         "kid": key_id,
-        "jwk": {"kty": "RSA", "kid": key_id, "use": "sig", "alg": "RS256",
-                "n": _b64uint(nums.n), "e": _b64uint(nums.e)},
+        "jwk": {
+            "kty": "RSA",
+            "kid": key_id,
+            "use": "sig",
+            "alg": "RS256",
+            "n": _b64uint(nums.n),
+            "e": _b64uint(nums.e),
+        },
         "sign": lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()),
     }
 
@@ -136,13 +143,13 @@ def _claims(
 class _JwksServer:
     """A minimal local JWKS endpoint: 127.0.0.1, ephemeral port, daemon thread."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         holder = self
         self._doc: dict = {"keys": []}
         self._status = 200
 
         class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
+            def do_GET(self) -> None:
                 body = json.dumps(holder._doc).encode("utf-8")
                 self.send_response(holder._status)
                 self.send_header("Content-Type", "application/json")
@@ -515,9 +522,7 @@ def test_fetch_runs_outside_lock_and_marker_released(jwks_server, monkeypatch):
 
     monkeypatch.setattr(oidc, "_fetch_jwks", slow)
     result: dict = {}
-    worker = threading.Thread(
-        target=lambda: result.setdefault("keys", oidc._jwks_keys(jwks_server.url)), daemon=True
-    )
+    worker = threading.Thread(target=lambda: result.setdefault("keys", oidc._jwks_keys(jwks_server.url)), daemon=True)
     worker.start()
     try:
         assert entered.wait(5), "the fetch never started"
@@ -681,7 +686,11 @@ def _tools_call(client, name, args=None, headers=None):
     body = client.post(
         "/mcp",
         json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": args or {}}},
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **(headers or {})},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **(headers or {}),
+        },
     ).json()
     result = body.get("result", {})
     return result.get("isError", False), result["content"][0]["text"]
@@ -744,9 +753,9 @@ def test_whoami_lists_hidden_tables_as_not_visible(app, jwks_server, monkeypatch
     pq.write_table(pa.table({"id": [1], "amount": [10.0]}), d / "part.parquet")
 
     from sqlhandler.engine import SqlEngine
-    from sqlhandler.provider import TableInfo
+    from sqlhandler.provider import DataProvider, TableInfo
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -797,7 +806,7 @@ def test_whoami_lists_hidden_tables_as_not_visible(app, jwks_server, monkeypatch
     ]
 
 
-class _FakeProvider:
+class _FakeProvider(DataProvider):
     """One fake table (the test_dispatch_arg_contract pattern)."""
 
     kind = "fake"

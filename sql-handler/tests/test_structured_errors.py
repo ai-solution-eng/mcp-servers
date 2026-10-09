@@ -15,7 +15,7 @@ import pytest
 
 from sqlhandler import errors, server
 from sqlhandler.engine import LakehouseError, SqlEngine, _with_hints
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
 def _make_engine(tmp_path):
@@ -26,7 +26,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -60,24 +60,30 @@ def _tail(text: str) -> dict:
 
 
 def test_table_not_found_message_classified():
-    code, hints = errors.classify("Table 'work_odr' not found in data source")
+    _r = errors.classify("Table 'work_odr' not found in data source")
+    assert _r is not None
+    code, hints = _r
     assert code == errors.E_TABLE_NOT_FOUND
     assert hints and all(isinstance(h, str) for h in hints)
 
 
 def test_duckdb_table_error_classified():
-    code, _ = errors.classify("Catalog Error: Table with name work_odr does not exist!")
+    _r = errors.classify("Catalog Error: Table with name work_odr does not exist!")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_TABLE_NOT_FOUND
 
 
 def test_column_not_found_messages_classified():
     # _validate_column's message ...
-    code, _ = errors.classify(
-        "Column 'amont' does not exist on table 'work_order'. Available columns: id"
-    )
+    _r = errors.classify("Column 'amont' does not exist on table 'work_order'. Available columns: id")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_COLUMN_NOT_FOUND
     # ... and DuckDB's Binder phrasing.
-    code, _ = errors.classify('Binder Error: Column "amont" does not exist')
+    _r = errors.classify('Binder Error: Column "amont" does not exist')
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_COLUMN_NOT_FOUND
 
 
@@ -86,31 +92,37 @@ def test_readonly_refusal_classified():
         "Read-only MCP (SQLHANDLER_MCP_READONLY): INSERT statements are not allowed. "
         "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
     )
-    code, _ = errors.classify(msg)
+    _r = errors.classify(msg)
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_READONLY
 
 
 def test_timeout_and_gate_messages_classified():
-    code, _ = errors.classify(
-        "Query timed out after 600s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled."
-    )
+    _r = errors.classify("Query timed out after 600s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_TIMEOUT
-    code, _ = errors.classify(
-        "Too many concurrent queries (limit 8), and the queue wait of 30.0s expired. Retry later."
-    )
+    _r = errors.classify("Too many concurrent queries (limit 8), and the queue wait of 30.0s expired. Retry later.")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_CONCURRENCY_GATE
-    code, _ = errors.classify(
+    _r = errors.classify(
         "Too many active query jobs (8 of 8, SQLHANDLER_MAX_JOBS); cancel or fetch results and retry later."
     )
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_CONCURRENCY_GATE
 
 
 def test_param_errors_classified():
-    code, _ = errors.classify("Query params: named parameters need string keys.")
+    _r = errors.classify("Query params: named parameters need string keys.")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_PARAM_INVALID
-    code, _ = errors.classify(
-        "Query params must be scalars (str/int/float/bool/datetime/Decimal/None); got dict."
-    )
+    _r = errors.classify("Query params must be scalars (str/int/float/bool/datetime/Decimal/None); got dict.")
+    assert _r is not None
+    code, _ = _r
     assert code == errors.E_PARAM_INVALID
 
 
@@ -135,9 +147,7 @@ def test_enrich_appends_exactly_one_json_line():
 def test_enrich_passthrough_for_unknown_and_disabled(monkeypatch):
     assert errors.enrich("plain message") == "plain message"
     monkeypatch.setenv("SQLHANDLER_STRUCTURED_ERRORS", "0")
-    assert (
-        errors.enrich("Table 'x' not found in data source") == "Table 'x' not found in data source"
-    )
+    assert errors.enrich("Table 'x' not found in data source") == "Table 'x' not found in data source"
 
 
 def test_structured_disabled_values(monkeypatch):
@@ -150,7 +160,9 @@ def test_structured_disabled_values(monkeypatch):
 
 
 def test_hint_substitutes_the_bad_name():
-    _, hints = errors.classify("Table 'work_odr' not found in data source")
+    _h = errors.classify("Table 'work_odr' not found in data source")
+    assert _h is not None
+    _, hints = _h
     assert any("work_odr" in h for h in hints)
 
 
@@ -208,9 +220,7 @@ def test_scan_table_typo_tail(wired):
 
 def test_column_stats_column_typo_tail(wired):
     text = server.column_stats("work_order", "amont")
-    assert text.startswith(
-        "Error computing column stats: Column 'amont' does not exist on table 'work_order'"
-    )
+    assert text.startswith("Error computing column stats: Column 'amont' does not exist on table 'work_order'")
     assert _tail(text)["code"] == errors.E_COLUMN_NOT_FOUND
 
 

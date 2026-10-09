@@ -19,7 +19,7 @@ import pytest
 from sqlhandler import saved as saved_module
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 from sqlhandler.saved import (
     NotAuthorized,
     SavedQueryStore,
@@ -47,7 +47,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -76,9 +76,7 @@ class FakeRequest:
 
 def test_save_list_get_delete_roundtrip():
     store = SavedQueryStore()
-    entry = store.save(
-        "kind-a", "SELECT * FROM work_order WHERE kind = $k", {"k": "a"}, "kind A orders"
-    )
+    entry = store.save("kind-a", "SELECT * FROM work_order WHERE kind = $k", {"k": "a"}, "kind A orders")
     assert entry["name"] == "kind-a"
     assert entry["sql"] == "SELECT * FROM work_order WHERE kind = $k"
     assert entry["params"] == {"k": "a"}
@@ -184,18 +182,14 @@ def test_run_uses_bind_params_injection_is_inert(tmp_path, monkeypatch):
 
     # the injection attempt: stored SQL must keep its placeholder
     assert "$k" in store.get("by-kind")["sql"]
-    payload = json.loads(
-        server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json")
-    )
+    payload = json.loads(server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json"))
     assert payload["rows"] == [], "injection must not leak other rows (bind, not interpolate)"
 
     # positional-? variant too
     store.save("positional", "SELECT id FROM work_order WHERE kind = ?", ["b"])
     payload = json.loads(server.query_saved("positional", output_format="json"))
     assert payload["rows"] == [[2], [4]]
-    payload = json.loads(
-        server.query_saved("positional", params=["x' OR '1'='1"], output_format="json")
-    )
+    payload = json.loads(server.query_saved("positional", params=["x' OR '1'='1"], output_format="json"))
     assert payload["rows"] == []
 
 
@@ -367,16 +361,11 @@ def test_rest_saved_queries_auth_matrix(tmp_path, monkeypatch):
     # middleware and (for any caller that reaches it) the saved-write gate.
     # Either refusing is the contract; the gate's own message is asserted in
     # the unit tests + the MCP-keys-only REST test below.
-    assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1"}).status_code == 401
-    )
+    assert client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1"}).status_code == 401
     assert client.delete("/api/saved-queries/whatever").status_code == 401
     auth = {"X-API-Token": "tok-1"}
     assert (
-        client.post(
-            "/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth
-        ).status_code
-        == 200
+        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth).status_code == 200
     )
     assert client.delete("/api/saved-queries/q", headers=auth).status_code == 200
     # reads follow the /api posture (token middleware), not the write gate
@@ -409,10 +398,7 @@ def test_rest_saved_queries_with_mcp_keys_only(tmp_path, monkeypatch):
     assert "MCP_API_KEYS" in r.json()["error"]
     ok = {"X-API-Key": "key-9"}
     assert (
-        client.post(
-            "/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok
-        ).status_code
-        == 200
+        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok).status_code == 200
     )
     # reads stay open (same posture as /mcp without its own gate here)
     assert client.get("/api/saved-queries").status_code == 200
@@ -436,19 +422,11 @@ def test_rest_saved_validation_and_run_errors(tmp_path, monkeypatch):
     register_ui(app, lambda: eng)
     client = TestClient(app)
 
-    assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "DROP TABLE x"}).status_code
-        == 400
-    )
-    assert (
-        client.post("/api/saved-queries", json={"name": "a/b", "sql": "SELECT 1"}).status_code
-        == 400
-    )
+    assert client.post("/api/saved-queries", json={"name": "q", "sql": "DROP TABLE x"}).status_code == 400
+    assert client.post("/api/saved-queries", json={"name": "a/b", "sql": "SELECT 1"}).status_code == 400
     assert client.post("/api/saved-queries", json={"sql": "SELECT 1"}).status_code == 400
     assert client.post("/api/saved-queries/nope/run", json={}).status_code == 404
-    bad = client.post(
-        "/api/saved-queries", json={"name": "q", "sql": "SELECT $x", "params": {"x": [1]}}
-    )
+    bad = client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT $x", "params": {"x": [1]}})
     assert bad.status_code == 400
 
 
@@ -513,7 +491,6 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
         assert json.loads(text)["saved"] is True
 
 
-
 # ------------------------------------------------------ cross-replica merge
 
 # The 2026-09 HA-review fix: on a shared volume the store was
@@ -559,3 +536,32 @@ def test_concurrent_save_and_delete_merge(tmp_path, monkeypatch):
     names = {e["name"] for e in store.list()}
     assert "new" in names  # the save is never lost
     assert not ({"old"} & names) or "new" in names  # delete of a racing name is not an error
+
+
+# ------------------------------------- presented_credential (D19 ordering) —
+
+
+def test_presented_credential_prefers_explicit_key():
+    """Both headers present: the explicit X-API-Key claim wins over the
+    ambient Bearer — same explicit-over-ambient resolution as the /mcp key
+    gate and the /api admin surface, so ownership attribution agrees with
+    the identity the gate authenticated. (FakeRequest is a plain dict, so
+    header keys are spelled lowercase like the reader expects — real
+    Starlette headers are case-insensitive.)"""
+    both = FakeRequest({"authorization": "Bearer ambient-key", "x-api-key": "tenant-key"})
+    assert saved_module.presented_credential(both) == "tenant-key"
+
+
+def test_presented_credential_bearer_only_unchanged():
+    only_bearer = FakeRequest({"authorization": "Bearer ambient-key"})
+    assert saved_module.presented_credential(only_bearer) == "ambient-key"
+
+
+def test_presented_credential_token_header():
+    token_only = FakeRequest({"x-api-token": "tok-key"})
+    assert saved_module.presented_credential(token_only) == "tok-key"
+
+
+def test_presented_credential_none():
+    assert saved_module.presented_credential(None) == ""
+    assert saved_module.presented_credential(FakeRequest()) == ""

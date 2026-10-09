@@ -46,12 +46,12 @@ from sqlhandler.policy import (
     reset_policy_store,
     validate_row_filter,
 )
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 TABLES = [TableInfo(name="work_order", schema="workorder", format="parquet")]
 
 
-class PolicyProvider:
+class PolicyProvider(DataProvider):
     """FakeProvider with policy-relevant columns (ssn = the leak canary)."""
 
     kind = "fake"

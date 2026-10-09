@@ -347,9 +347,7 @@ class AdlsProvider(DataProvider):
                     raise ValueError("must be a JSON object")  # noqa: TRY004
                 opts.update(extra)
             except Exception as exc:
-                raise LakehouseError(
-                    f"SQLHANDLER_ADLS_STORAGE_OPTIONS is not valid JSON options: {exc}"
-                ) from exc
+                raise LakehouseError(f"SQLHANDLER_ADLS_STORAGE_OPTIONS is not valid JSON options: {exc}") from exc
         return opts
 
     def _open_delta(self, info: TableInfo, version: int | None = None):
@@ -436,8 +434,7 @@ class AdlsProvider(DataProvider):
                 return dt.to_pyarrow_dataset(filesystem=fs)
             except Exception as exc:
                 raise LakehouseError(
-                    f"Could not open ADLS Delta dataset {info.path!r}: "
-                    f"{_scrub(str(exc), self.config.client_secret)}"
+                    f"Could not open ADLS Delta dataset {info.path!r}: {_scrub(str(exc), self.config.client_secret)}"
                 ) from exc
         if is_raw_format(info.format):
             if version is not None:

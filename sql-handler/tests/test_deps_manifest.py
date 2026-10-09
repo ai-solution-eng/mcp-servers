@@ -86,6 +86,6 @@ def test_lock_is_frozen_to_pyproject_deps():
         floor_match = re.search(r"(>=|==|~=)\s*([0-9][^,;\s]*)", req)
         if floor_match:
             spec = f"{floor_match.group(1)}{floor_match.group(2)}"
-            assert packaging.specifiers.SpecifierSet(spec).contains(
-                pins[key]
-            ), f"lock pins {name}=={pins[key]} which violates pyproject floor {spec}"
+            assert packaging.specifiers.SpecifierSet(spec).contains(pins[key]), (
+                f"lock pins {name}=={pins[key]} which violates pyproject floor {spec}"
+            )

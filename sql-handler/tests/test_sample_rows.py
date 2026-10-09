@@ -15,7 +15,7 @@ import pytest
 
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine, _profile_max_rows
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 
 
 def _make_engine(tmp_path, catalog=None, monkeypatch=None):
@@ -32,7 +32,7 @@ def _make_engine(tmp_path, catalog=None, monkeypatch=None):
         d / "part.parquet",
     )
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -183,22 +183,14 @@ def test_virtual_table_routes_through_sql_path(tmp_path, monkeypatch):
 
 
 def test_virtual_table_column_outside_definition_refused(tmp_path, monkeypatch):
-    catalog = {
-        "tables": {
-            "kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}
-        }
-    }
+    catalog = {"tables": {"kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}}}
     eng = _make_engine(tmp_path, catalog=catalog, monkeypatch=monkeypatch)
     with pytest.raises(Exception, match="does not exist|not found"):
         eng.sample_rows("kind_a_view", columns=["amount"])
 
 
 def test_virtual_table_respects_profile_cap(tmp_path, monkeypatch):
-    catalog = {
-        "tables": {
-            "kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}
-        }
-    }
+    catalog = {"tables": {"kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}}}
     monkeypatch.setenv("SQLHANDLER_PROFILE_MAX_ROWS", "2")
     eng = _make_engine(tmp_path, catalog=catalog, monkeypatch=monkeypatch)
     s = eng.sample_rows("kind_a_view")
@@ -241,11 +233,7 @@ def test_mcp_markdown_rendering_physical(wired):
 
 
 def test_mcp_markdown_virtual_marker(wired, tmp_path, monkeypatch):
-    catalog = {
-        "tables": {
-            "kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}
-        }
-    }
+    catalog = {"tables": {"kind_a_view": {"definition": "SELECT id, kind FROM work_order WHERE kind = 'a'"}}}
     veng = _make_engine(tmp_path, catalog=catalog, monkeypatch=monkeypatch)
     monkeypatch.setattr(server, "_handler", lambda: veng)
     text = server.sample_rows("kind_a_view", limit=1)
