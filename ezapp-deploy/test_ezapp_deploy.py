@@ -1493,6 +1493,22 @@ check("apply rejects both/neither/unknown-id argument combos",
 
 print("12. get_ezappconfig read-back (summary default, elided blobs)")
 
+# MCP_HOSTNAME list parsing (DNS-rebind allowlist)
+set_env(MCP_HOSTNAME=None)
+check("no MCP_HOSTNAME → empty allowlist", server._allowed_hosts() == [])
+set_env(MCP_HOSTNAME="app.example.com")
+check("single FQDN parses", server._allowed_hosts() == ["app.example.com"])
+set_env(MCP_HOSTNAME="app.example.com, ezapp-deploy-service.ezapp-deploy-mcp.svc.cluster.local:9090")
+check("comma-separated list parses with whitespace stripped",
+      server._allowed_hosts() == [
+          "app.example.com",
+          "ezapp-deploy-service.ezapp-deploy-mcp.svc.cluster.local:9090",
+      ], str(server._allowed_hosts()))
+set_env(MCP_HOSTNAME=" , ,app.example.com,, ")
+check("empty entries are dropped",
+      server._allowed_hosts() == ["app.example.com"], str(server._allowed_hosts()))
+set_env(MCP_HOSTNAME=None)
+
 BIG_DOC = {
     "apiVersion": "ezconfig.hpe.ezaf.com/v1alpha1",
     "kind": "EzAppConfig",

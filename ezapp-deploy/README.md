@@ -130,7 +130,7 @@ This is a **write-capable** server (it deploys things). Every mutating path is b
 6. **API-key auth.** Every HTTP request must present `EZAPP_MCP_API_KEY` as `Authorization: Bearer <key>` or `X-API-Key: <key>`; constant-time compare (`hmac.compare_digest`); 401 before the MCP app is reached. Unset = open endpoint + loud startup warning (local development only — never in-cluster).
 7. **Least-privilege RBAC.** A ClusterRole granting only `get/create/update/patch/delete` on `ezappconfigs.<group>` — deliberately **no `list`/`watch`**, so the server is structurally unable to enumerate EzAppConfigs it did not deploy (the UI and tools address CRs by name, ledger-driven only); a namespaced Role granting only `get/patch` on the ONE ledger ConfigMap (`resourceNames`-pinned — no other ConfigMap is readable). A wildcard `apiGroup` is refused at render time.
 8. **Pod hardening.** Non-root (uid/gid 10001), read-only root filesystem, all capabilities dropped, RuntimeDefault seccomp, `/tmp` as emptyDir.
-9. **Host-header pinning.** `MCP_HOSTNAME` (wired from the chart's `ezua.virtualService.endpoint`) enables SDK DNS-rebinding protection allowlisting only the public FQDN.
+9. **Host-header pinning.** `MCP_HOSTNAME` (wired from the chart) is a comma-separated allowlist: the public `ezua.virtualService.endpoint` + the in-cluster service DNS name (with and without port) **by default**, plus operator `ezua.virtualService.extraEndpoints`. The chart fails to render if the endpoint is missing while ezua is enabled.
 
 ## Configuration
 
@@ -151,7 +151,7 @@ This is a **write-capable** server (it deploys things). Every mutating path is b
 | `EZAPP_MCP_UI_ENABLED` | `true` | Read-only web view at `/ui/` (`false` disables shell + data endpoint) |
 | `EZAPP_MCP_CHUNKED_UPLOAD_ENABLED` | `true` | Chunked upload tools (`false` drops the three tools from the server) |
 | `EZAPP_MCP_DELETE_ENABLED` | `true` | `delete_chart` / `delete_ezappconfig` (`false` drops both tools — decommissioning becomes a purely human action) |
-| `MCP_HOSTNAME` | unset | Public FQDN for DNS-rebinding protection |
+| `MCP_HOSTNAME` | unset | Hostname(s) for DNS-rebinding protection — one FQDN or a comma-separated list (external gateway FQDN, internal service DNS name, …); `localhost`/`127.0.0.1` always allowed |
 
 ## Deploy (helm chart — `helm/`)
 

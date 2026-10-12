@@ -104,7 +104,10 @@ EZAPP_MCP_CHUNKED_UPLOAD_ENABLED       chunked upload tools (begin/chunk/
 EZAPP_MCP_DELETE_ENABLED               delete_chart / delete_ezappconfig;
                                        default on, "false" drops both tools
                                        (decommissioning becomes manual)
-MCP_HOSTNAME                           public FQDN for DNS-rebinding protection
+MCP_HOSTNAME                           public hostname(s) for DNS-rebinding
+                                       protection — one FQDN or a comma-
+                                       separated list (external FQDN, internal
+                                       service DNS name, ...)
 """
 
 import asyncio
@@ -2120,6 +2123,18 @@ class _UiRouterApp:
 
 # ─── Entrypoint ──────────────────────────────────────────────────────────
 
+def _allowed_hosts() -> list:
+    """Hostnames accepted in Host/Origin (DNS-rebinding allowlist).
+
+    MCP_HOSTNAME may be a single FQDN or a comma-separated list — e.g. the
+    public gateway FQDN plus an internal service DNS name for in-cluster
+    access. localhost/127.0.0.1 are always allowed (port-forward dev).
+    """
+    raw = os.environ.get("MCP_HOSTNAME", "").strip()
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    return hosts
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -2142,18 +2157,20 @@ if __name__ == "__main__":
         + " (data endpoint /api/managed is API-key gated).",
         flush=True,
     )
-    # Host-header (DNS-rebinding) protection: when MCP_HOSTNAME is set, keep
-    # the SDK's protection ON but allowlist the real public hostname. The
-    # SDK's implicit default (loopback-only) rejects every gateway-fronted
-    # request. Without MCP_HOSTNAME (local dev), the SDK's implicit loopback
+    # Host-header (DNS-rebinding) protection: when MCP_HOSTNAME is set (one
+    # FQDN or a comma-separated list), keep the SDK's protection ON but
+    # allowlist the real hostname(s). The SDK's implicit default
+    # (loopback-only) rejects every gateway-fronted request with 421
+    # "Invalid Host header" AFTER auth — only valid-key requests ever saw
+    # it. Without MCP_HOSTNAME (local dev), the SDK's implicit loopback
     # protection applies untouched.
-    mcp_hostname = os.environ.get("MCP_HOSTNAME", "").strip()
+    hosts = _allowed_hosts()
     transport_security = None
-    if mcp_hostname:
+    if hosts:
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[mcp_hostname, "localhost:*", "127.0.0.1:*"],
-            allowed_origins=[f"https://{mcp_hostname}"],
+            allowed_hosts=[*hosts, "localhost:*", "127.0.0.1:*"],
+            allowed_origins=[f"https://{h}" for h in hosts],
         )
     # MCP 2.0 / protocol 2026-07-28 is stateless: no initialize handshake,
     # no Mcp-Session-Id header. stateless_http=True keeps 2025-era clients

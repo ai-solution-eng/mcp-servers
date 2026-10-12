@@ -51,9 +51,23 @@ spec:
                   name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
                   key: {{ .Values.apiKey.existingSecretKey }}
             {{- if and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
-            # Public FQDN — pins the Host header (DNS-rebinding protection).
+            {{- /* DNS-rebind allowlist: the public endpoint, the in-cluster
+                  service DNS name (with and without port) by default, and
+                  any operator extras. The endpoint is required — a list
+                  without it 421s every gateway-fronted request. */ -}}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local" .Values.deployment.name .Release.Namespace }}
+            {{- $hosts := concat
+                  (list (required "ezua.virtualService.endpoint must be set (it pins MCP_HOSTNAME + the VirtualService host)" .Values.ezua.virtualService.endpoint))
+                  (list $svcHost (printf "%s:%d" $svcHost (int .Values.service.port)))
+                  (default list .Values.ezua.virtualService.extraEndpoints) }}
+            # Public FQDN + in-cluster service DNS name (with and without
+            # port) + any extraEndpoints — comma-separated, pins the Host
+            # header (DNS-rebinding protection). First entry is the
+            # VirtualService host clients use through the gateway.
             - name: MCP_HOSTNAME
-              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+              value: {{ $hosts | uniq | join "," | quote }}
+            {{- else if .Values.ezua.enabled }}
+            {{- fail "ezua.enabled=true requires ezua.virtualService.endpoint (it pins MCP_HOSTNAME + the VirtualService host)" }}
             {{- end }}
             # ChartMuseum (in-cluster ClusterIP) — upload target for curl.
             - name: CHARTMUSEUM_URL

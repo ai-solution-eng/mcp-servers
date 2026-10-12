@@ -163,9 +163,20 @@ ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
   virtualService:
+    # Primary public hostname (VirtualService host + first DNS-rebind pin).
+    # "-mcp" is deliberate: it distinguishes this endpoint from the release
+    # namespace and stays stable across chart renames.
     endpoint: "ezapp-deploy-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
+    # The DNS-rebind allowlist is <endpoint> + the in-cluster service DNS
+    # name (with and without port) BY DEFAULT, plus anything listed here.
+    # Only `endpoint` gets a VirtualService — extra names need their own
+    # routing (another VS, port-forward via localhost, etc.).
+    # Example:
+    #   extraEndpoints:
+    #     - ezapp-deploy.alt-domain.example.net
+    extraEndpoints: []
   # Gateway-level auth gate (oauth2-proxy / SSO bearer). OFF by default — the
   # rotating-token pain for machine MCP callers is an accepted lab trade; the
   # template is real, so flipping it on enforces tokens for this host.
