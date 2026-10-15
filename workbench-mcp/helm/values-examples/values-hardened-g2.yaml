@@ -28,6 +28,7 @@ networkPolicy:
       - monitoring          # ServiceMonitor scrape ns — omit and it dies SILENTLY
   allowEzafGatewayIngress: true   # browser path stays OPEN — IN-CLUSTER callers only
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   # Kubelet probes originate at the NODE (.61-.63 masters, .161-.162 workers).
@@ -38,6 +39,7 @@ networkPolicy:
     - 172.28.1.161/32
     - 172.28.1.162/32
   probeExceptCidrs: []   # only a BROAD probe allow (0.0.0.0/0) pairs with a carve-out
+
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []

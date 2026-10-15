@@ -2,17 +2,19 @@
 # logsearch-mcp — read-only, namespace-scoped Kubernetes pod-log search over
 # MCP (/mcp, through the PCAI Istio gateway when ezua is enabled); the same
 # port serves the HPE log-search console (/ and /api/*) when webui.enabled.
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
+# ============================================================================
 
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — never created/inlined by the chart; the pod
-#      sits in CreateContainerConfigError until it exists (ref: logsearch-mcp-apikey,
-#      key api-keys; pod logs are sensitive — /mcp must never trust network position).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard;
-#      must resolve ${DOMAIN_NAME}; unique per release.
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: logsearch-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — /mcp must never trust network position; pod logs are sensitive.
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
 
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
 #   Namespace policy (THE access control; default-deny): logsearch.allowedNamespaces /
 #     blockedNamespaces, or the emptyAllowsAll lab escape hatch — documentation/DEPLOYMENT.md
 #   RBAC scope: rbac.clusterWide (release-ns default; cluster-wide = lab only) — documentation/DEPLOYMENT.md
@@ -153,6 +155,7 @@ networkPolicy:
   # Node-originated kubelet probes; NEVER 0.0.0.0/0 with an empty probeExceptCidrs.
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     enabled: false   # admin MCPs reach the k8s API / Prometheus / internet legitimately
     extraEgress: []

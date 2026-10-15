@@ -1,16 +1,21 @@
-# prometheus-mcp — values for a proxied corporate PCAI site
-# (your-cluster.example)
+# ============================================================================
+# prometheus-mcp — sanitized proxied-PCAI EXAMPLE values (full copy of
+# helm/values.yaml for your-cluster.example; paste-ready, complete on its own).
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# Sanitized — no credentials; real site values live in helm/local/ (deep WHY: helm/values.yaml).
 
 # ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. prometheusUrl — the in-cluster Prometheus this deployment IS [no render
-#      guard: the default targets the kube-prometheus-stack service, verified on
-#      G2 — set it to your cluster's Prometheus deliberately]
-#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
-#      default true); templates call `required` on it — the render aborts without it
+#   1. prometheusUrl — the in-cluster Prometheus this deployment queries; no render
+#      guard (the default targets the kube-prometheus-stack service).
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart default
+#      true); templates call `required` on it — the render aborts without it.
 
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
 #   GPU/NVLink tab: gpuNvlinkDomains, nvlinkAutodetect.* — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
 #   Gateway auth (oauth2-proxy/SSO): ezua.authorizationPolicy.* — documentation/DEPLOYMENT.md "Gateway exposure"
 #   Saved-query persistence: persistence.* — documentation/DEPLOYMENT.md | values-examples/values.hosted-trial.yaml
@@ -18,11 +23,6 @@
 #   Self-metrics + ServiceMonitor: metrics.* — documentation/DEPLOYMENT.md
 #   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth"
 #   Nodes-tab default filter: nodeFilter — documentation/DEPLOYMENT.md "Optional values"
-
-# FULL VALUES — every key from helm/values.yaml is present, so this file alone
-# is the complete values document. Adjust the fill-in lines, then apply; the
-# deep WHY for each key lives in helm/values.yaml. Sanitized: no credentials
-# (real site values live in helm/local/).
 
 # ============================================================================
 # Deployment / Image

@@ -85,11 +85,11 @@ ezua:
 | `rbac.create` / `rbac.scope` | `true` / `cluster` | `cluster` = read-only ClusterRole; `namespace` = Role clamped to the release namespace (auto-RBAC off in that mode). |
 | `rbac.extraResourceGroups` | `[]` | CRD apiGroups the tools may read (`resources: "*"`, get/list/watch only). Add one entry per installed operator (e.g. `serving.kserve.io`, `genai.hpe.com`). NEVER `["*"]` — refused at render time (it would re-grant secrets read). `networking.istio.io/virtualservices` is always granted. |
 | `namespaces.allowed` / `blocked` | `""` / `""` | `K8S_MCP_ALLOWED_NAMESPACES` / `K8S_MCP_BLOCKED_NAMESPACES` — comma-separated fnmatch globs; blacklist always wins; `""` = all namespaces readable. |
-| `exec.enabled` | `false` | Opt-in hardened exec tool (`exec_in_pod`). Off = the tool is not even registered. |
+| `exec.enabled` | `false` | Opt-in hardened exec tool (`exec_in_pod`; env `K8S_MCP_EXEC_ENABLED`). Off = the tool is not even registered. |
 | `exec.namespaces` | `""` | `K8S_MCP_EXEC_NAMESPACES` — the exec allowlist; `""` = follow the general namespace policy. |
-| `exec.requireLabel` | `true` | Target pod must carry `k8s-mcp.io/exec: "true"`. |
+| `exec.requireLabel` | `true` | Target pod must carry `k8s-mcp.io/exec: "true"` (env `K8S_MCP_EXEC_REQUIRE_LABEL`). |
 | `exec.allowedCommands` | `""` | Extra binaries beyond the built-in read-only allowlist (`K8S_MCP_EXEC_ALLOWED_COMMANDS`). |
-| `exec.autoRbac` | `true` | Cluster scope only: the server binds its own pods/exec RoleBindings at startup (`K8S_MCP_EXEC_AUTO_RBAC`). |
+| `exec.autoRbac` | `true` | Cluster scope only: the server binds its own pods/exec RoleBindings at startup (`K8S_MCP_EXEC_AUTO_RBAC`). Per-release naming: the provisioned role/binding are `<deployment.name>-pods-exec` / `<deployment.name>-exec` (chart-rendered `K8S_MCP_EXEC_TEMPLATE_ROLE` / `K8S_MCP_EXEC_BINDING_NAME`; the `K8S_MCP_SA_NAME` / `K8S_MCP_SA_NAMESPACE` envs override the assumed SA identity for bare-local runs), so multiple chart releases coexist in one cluster without colliding. |
 | `clients.value` / `clients.existingSecret` | `""` | Per-user keys with per-user exec assignments (`K8S_MCP_CLIENTS`, `name:key[:ns-patterns];…`). CONTAINS SECRETS — prefer `existingSecret`. |
 | `listing.maxItems` | `""` | `K8S_MCP_MAX_LIST_ITEMS` (server default 100) — cap on `-A`/cluster-wide list results (Python-API tools and the in-process `get_resource` fast path); a truncation marker naming the env appears when the cap bites. `""` = server default (renders no env; the default chart render is unchanged). |
 | `listing.concurrency` | `""` | `K8S_MCP_LIST_CONCURRENCY` (server default 8) — bounded-semaphore width for the parallel per-namespace `-A` fan-out. `""` = server default. |

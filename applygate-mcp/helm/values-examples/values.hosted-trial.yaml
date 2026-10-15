@@ -1,23 +1,23 @@
-# applygate-mcp — values for a customer HOSTED-TRIAL environment
-#
-# FULL VALUES — every key from helm/values.yaml is present, so this file alone
-# is the complete values document for the PCAI Helm Values editor. Adjust the
-# site-specific lines, then apply. Secret-free: if your PCAI build resolves
-# ${DOMAIN_NAME} in ezua values the placeholders work as pasted; otherwise
-# substitute the literal cluster domain (an unresolved placeholder registers
-# a gateway host that matches nothing).
-
+# ============================================================================
+# applygate-mcp — sanitized HOSTED-TRIAL EXAMPLE values (full copy of
+# helm/values.yaml; paste-ready for the PCAI Helm Values editor).
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-#
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — the chart NEVER creates or inlines it; the pod
-#      sits in CreateContainerConfigError until it exists (default ref:
-#      applygate-mcp-apikey, key api-keys; /mcp 401s without keys).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard
-#      (templates/virtualservice.yaml); must resolve ${DOMAIN_NAME}; unique per release.
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
-#   Write surface (default-deny!): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+# ============================================================================
+
+# Secret-free: if your PCAI build resolves ${DOMAIN_NAME} the placeholders work
+# as pasted; otherwise substitute the literal cluster domain.
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: applygate-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — comma-separated keys all authenticate (/mcp 401s without).
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Write surface (default-deny): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
 #   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
 #   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
 #   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
@@ -83,8 +83,7 @@ namespaces:
 # ============================================================================
 
 kinds:
-  # Chart default — narrow (e.g. ConfigMap,Service,Deployment,Job) if
-  # the trial only demos a subset
+  # Narrow (e.g. ConfigMap,Service,Deployment,Job) if the trial only demos a subset.
   allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
 
 # ============================================================================
@@ -113,8 +112,7 @@ metrics:
 persistence:
   enabled: true
   size: 1Gi
-  accessModes:
-  - ReadWriteOnce
+  accessModes: [ReadWriteOnce]
 
 # ============================================================================
 # Service Exposure
@@ -130,12 +128,8 @@ service:
 # ============================================================================
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    cpu: '1'
-    memory: 512Mi
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 512Mi}
 
 # ============================================================================
 # Security Contexts
@@ -155,8 +149,7 @@ containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
   capabilities:
-    drop:
-    - ALL
+    drop: [ALL]
 
 # ============================================================================
 # Service Account / RBAC
@@ -221,7 +214,7 @@ callerPassthrough:
   trustedCidrs: ''
 
 # ============================================================================
-# MCP Network Zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF)
+# MCP Network Zone (ADDITIVE, DEFAULT OFF)
 # ============================================================================
 
 # Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
@@ -231,12 +224,16 @@ networkPolicy:
   sameNamespace: true
   authorizedClients:
     namespaces: []
+
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway
+
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     enabled: false
     extraEgress: []

@@ -1,28 +1,20 @@
-# sqlhandler — MCP NETWORK ZONE add-on for values.g2.yaml (HARDENED-G2).
+# sqlhandler — hardened MCP-network-zone overlay: paste AFTER values.g2.yaml.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-# ### OVERLAY ### — FRAGMENT: merge ONTO values.g2.yaml (later keys win — paste
-# this file AFTER the base). Turns the W6 ingress NetworkPolicy on and adds the
-# fleet network-zone rules: authorizedClients + the OPTIONAL sqlLocalAccess
-# CIDR list (disabled here by default — SQL local access is opt-in).
-# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
-# with the zone on, every unlisted caller times out (deny by absence).
+# ⚠️ CRITICAL: list the gateway's relay namespace first — with the zone on,
+# every unlisted caller times out (deny by absence).
 security:
   networkPolicy:
     enabled: true
     gatewayNamespace: istio-system
-    allowedNamespaces: []          # W6 keys stay as-is (empty; the zone list below is the allowlist)
+    allowedNamespaces: []          # empty: the zone list below is the allowlist
     additionalIngress: []
-    # MCP network zone — appends in-cluster caller namespaces on
-    # kubernetes.io/metadata.name to the W6 rules above.
+    # Appends in-cluster caller namespaces (kubernetes.io/metadata.name) to the rules above.
     authorizedClients:
-      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
-      - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
-      - owebui0-11-0        # OWUI instance on the live gateway allowlist
+      - pcai-llm            # LLM Gateway relay
+      - dsh-web-helm        # DSH web
+      - owebui0-11-0        # OWUI
       - opencode-web-helm   # OpenCode web
-      - monitoring          # Prometheus scraping /metrics — omit and scraping
-                            # dies SILENTLY (check Prometheus targets after enabling)
-    # SQL local access — OPTIONAL, DEFAULT OFF: uncomment to let an operator
-    # desktop subnet reach the service port directly (bypassing the gateway).
-    # sqlLocalAccess:
-    #   - 10.11.12.0/23   # Andrew's desktop subnet (operator-supplied)
+      - monitoring          # Prometheus scrape ns — omit and /metrics scraping dies SILENTLY
+
+    # OPTIONAL: sqlLocalAccess — CIDRs allowed direct to the service port (bypassing the gateway).

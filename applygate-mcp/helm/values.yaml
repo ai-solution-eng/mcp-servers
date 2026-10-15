@@ -1,15 +1,19 @@
+# ============================================================================
 # applygate-mcp — the governed Kubernetes WRITE-path MCP server (PCAI Helm values)
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-#
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — the chart NEVER creates or inlines it; the pod
-#      sits in CreateContainerConfigError until it exists (default ref:
-#      applygate-mcp-apikey, key api-keys; /mcp 401s without keys).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard
-#      (templates/virtualservice.yaml); must resolve ${DOMAIN_NAME}; unique per release.
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
-#   Write surface (default-deny!): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: applygate-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — comma-separated keys all authenticate (/mcp 401s without).
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Write surface (default-deny): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
 #   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
 #   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
 #   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
@@ -30,12 +34,13 @@ image:
 imagePullSecrets: []
 
 # ============================================================================
-# Transport Security (DNS-rebinding protection; fleet pattern: K8S-MCP)
+# Transport Security (DNS-rebinding protection)
 # ============================================================================
-# mcpHostname: the public FQDN pin — set in lockstep with ezua.virtualService
-# .endpoint, or every gateway-fronted request 421s. extraAllowedHosts: EXTRA
-# in-cluster svc-DNS hosts (verbatim or host:*; own-svc DNS auto-prepended).
+
+# Public FQDN pin — set in lockstep with ezua.virtualService.endpoint, or
+# every gateway-fronted request 421s.
 mcpHostname: ''
+# EXTRA in-cluster svc-DNS hosts (verbatim or host:*; own-svc DNS auto-prepended).
 extraAllowedHosts: []
 
 # Operator-created Secret (never inline a key in values); the Deployment
@@ -84,8 +89,7 @@ metrics:
 persistence:
   enabled: true
   size: 1Gi
-  accessModes:
-  - ReadWriteOnce
+  accessModes: [ReadWriteOnce]
 
 service:
   type: ClusterIP
@@ -93,12 +97,8 @@ service:
   targetPort: 9102
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
-    cpu: '1'
-    memory: 512Mi
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 512Mi}
 
 securityContext:
   runAsNonRoot: true
@@ -114,8 +114,7 @@ containerSecurityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
   capabilities:
-    drop:
-    - ALL
+    drop: [ALL]
 
 serviceAccount:
   create: true
@@ -123,6 +122,7 @@ serviceAccount:
 
 rbac:
   create: true
+
 # Per-key proxy wiring — each key wired only when non-empty; proxy: {} = off
 # (the in-cluster k8s API is covered by the standard NO_PROXY entries).
 proxy: {}
@@ -142,8 +142,9 @@ ezua:
     timeout: 120s
 
 # ============================================================================
-# MCP Network Zone (fleet decision 2026-09 — ADDITIVE, DEFAULT OFF)
+# MCP Network Zone (ADDITIVE, DEFAULT OFF)
 # ============================================================================
+
 # Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
 # egress stays unrestricted (policyTypes: [Ingress] only).
 networkPolicy:
@@ -165,6 +166,7 @@ networkPolicy:
   # with an empty probeExceptCidrs (the template fails the render).
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
     # k8s API / Prometheus / internet legitimately per site).

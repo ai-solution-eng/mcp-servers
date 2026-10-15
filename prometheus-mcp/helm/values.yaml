@@ -1,18 +1,19 @@
 # ============================================================================
-# prometheus-mcp — read-only Prometheus observation over MCP (PromQL
-# queries, series discovery, alerts, rules) for PCAI, exposed at /mcp
-# through the PCAI Istio gateway (MCP clients run outside the cluster).
+# prometheus-mcp — read-only Prometheus observation over MCP (PromQL queries,
+# series discovery, alerts, rules); exposed at /mcp through the PCAI Istio gateway.
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
+# ============================================================================
 
 # ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. prometheusUrl — the in-cluster Prometheus this deployment IS [no render
-#      guard: the default targets the kube-prometheus-stack service, verified on
-#      G2 — set it to your cluster's Prometheus deliberately]
-#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
-#      default true); templates call `required` on it — the render aborts without it
+#   1. prometheusUrl — the in-cluster Prometheus this deployment queries; no render
+#      guard (the default targets the kube-prometheus-stack service).
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart default
+#      true); templates call `required` on it — the render aborts without it.
 
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
 #   GPU/NVLink tab: gpuNvlinkDomains, nvlinkAutodetect.* — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
 #   Gateway auth (oauth2-proxy/SSO): ezua.authorizationPolicy.* — documentation/DEPLOYMENT.md "Gateway exposure"
 #   Saved-query persistence: persistence.* — documentation/DEPLOYMENT.md | values-examples/values.hosted-trial.yaml
@@ -43,8 +44,7 @@ imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
 # Prometheus Target
 # ============================================================================
 
-# The kube-prometheus-stack service (verified on G2); PROM_URL renders from
-# this key.
+# The kube-prometheus-stack service; PROM_URL renders from this key.
 prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
 
 # ============================================================================
@@ -131,6 +131,7 @@ networkPolicy:
   # Node-originated kubelet probes; NEVER 0.0.0.0/0 with an empty probeExceptCidrs.
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     enabled: false   # admin MCPs reach the k8s API / Prometheus / internet legitimately
     extraEgress: []
@@ -146,8 +147,7 @@ persistence:
   mountPath: /data
   size: 1Gi
   storageClass: ""   # "" = cluster default StorageClass
-  accessModes:
-    - ReadWriteOnce
+  accessModes: [ReadWriteOnce]
   savedQueriesFile: saved-queries.json   # pinned INSIDE the mount
   # shared: true declares the store genuinely shared (single replica or RWX);
   # a declaration, NOT concurrency control — fragmented stores should stay loud.

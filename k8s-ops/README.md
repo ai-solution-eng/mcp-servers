@@ -112,7 +112,7 @@ Exec is arbitrary code execution inside a workload container — it can never be
 | --- | --- | --- |
 | 1. Opt-in | Tool not registered unless `exec.enabled: true` (`K8S_MCP_EXEC_ENABLED`) | server |
 | 2. RBAC | `pods/exec` `create` granted only by **namespaced** RoleBindings (never a ClusterRole) | API server — the real boundary |
-| 3. Per-pod opt-in | Target pod must carry label `k8s-mcp.io/exec: "true"` (`exec.requireLabel`) | server |
+| 3. Per-pod opt-in | Target pod must carry label `k8s-mcp.io/exec: "true"` (`exec.requireLabel`, env `K8S_MCP_EXEC_REQUIRE_LABEL`) | server |
 | 4. Argv-typed tool | `command: list[str]`, one command, passed after kubectl's `--` | server + kubectl flag parsing |
 | 5. Binary allowlist | Basename of `command[0]` in a read-only set (`ps`, `ls`, `cat`, `tail`, `head`, `grep`, `df`, `du`, `free`, `ss`, `netstat`, `ip`, `stat`, `id`, …), extendable via `exec.allowedCommands` | server |
 | 6. Hard denies | Shells, interpreters, `su`/`sudo`, `nsenter`/`unshare`; `find -exec` / `ip netns` tokens rejected — never overridable | server |

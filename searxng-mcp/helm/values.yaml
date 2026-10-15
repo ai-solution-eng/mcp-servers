@@ -66,6 +66,7 @@ searxng:
     - startpage images
     - startpage news
     - wikidata
+
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
@@ -96,6 +97,7 @@ browser:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
     tag: v1.6.1
     pullPolicy: IfNotPresent
+
   resources:
     requests: {cpu: 250m, memory: 512Mi}
     limits: {memory: 1Gi}
@@ -145,7 +147,7 @@ apiKey:
 extraAllowedHosts: []
 
 # ============================================================================
-# fetch_content SSRF Policy
+# Fetch Content SSRF Policy
 # ============================================================================
 
 # Escapes/caps for the fetch SSRF guard; empty strings keep the built-in
@@ -191,6 +193,7 @@ ezua:
     endpoint: "searxng-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
+
   authorizationPolicy:
     enabled: true
     namespace: "istio-system"
@@ -209,6 +212,7 @@ networkPolicy:
     namespaces: []   # LLM-gateway relay ns goes here first
   allowEzafGatewayIngress: true   # browser path stays ON (user-facing chart)
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   probeCidrs: []   # node-originated kubelet probes; NEVER 0.0.0.0/0 with empty probeExceptCidrs

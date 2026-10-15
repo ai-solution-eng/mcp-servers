@@ -27,7 +27,7 @@ directory on a persistent volume plus a governed command runner:
 - `write_file` / `read_file` / `list_files` / `delete_file` — path-confined
   file access (traversal and symlink escapes refused by design).
 - `set_env` / `get_env` — per-workspace env vars that `run_command` injects.
-- `run_command` — argv-list execution (no shell) with a binary allowlist /
+- `run_command` — argv-list execution (no shell) with a binary allowlist /   Commands run with cwd = the workspace root and a child env that names the addressed workspace (`WORKBENCH_WORKSPACE=<name>`) plus the operator's proxy/TLS passthrough — never the server's own credentials.
   denylist, timeouts, output caps, and a JSONL audit log.
 - `sandbox_run` (v1, opt-in) — run a python file from the workspace in a
   dedicated no-network, no-credentials, no-GPU executor pod (see "Sandbox

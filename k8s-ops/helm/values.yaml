@@ -1,31 +1,25 @@
-# k8s-mcp — Kubernetes ops MCP server for PCAI (HPE Ezmeral Unified
-# Analytics): read-only cluster inspection, hardened exec (opt-in), namespace
-# governance, and an HPE ops console, exposed at /mcp and /ui/ through the
-# PCAI Istio gateway. TRUSTED-OPERATOR chart — every knob below is values-
-# configurable; customer deliveries use helm-customer/ (security knobs do not
-# exist there).
-#
-# Owner: Andrew Bydlon
-# Email: andrew.bydlon@hpe.com
-# Owner: Francesco Caliva
-# Email: francesco.caliva@hpe.com
-#
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — the chart NEVER creates or inlines it (an envsubst
-#      apply once emptied a live key Secret); CreateContainerConfigError until it
-#      exists (default ref: <deployment.name>-apikey, key api-key).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` in BOTH the
-#      VirtualService and AuthorizationPolicy templates; doubles as MCP_HOSTNAME;
-#      unique per release (two VSes on one host split traffic — observed live).
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
-#   Namespace governance: namespaces.allowed/blocked — documentation/DEPLOYMENT.md Day-2
-#   Hardened exec posture: exec.* (allowlist, requireLabel, autoRbac) — documentation/DEPLOYMENT.md Exec
+# ============================================================================
+# k8s-mcp — Kubernetes ops MCP server for PCAI: read-only cluster inspection,
+# hardened exec (opt-in), namespace governance, ops console at /ui/.
+# Full guide: documentation/DEPLOYMENT.md
+# Owners: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+#   1. apiKey.existingSecret — the API-key Secret, created OUT OF BAND (this chart
+#      never creates or inlines it); CreateContainerConfigError until it exists.
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — render FAILS without it;
+#      doubles as MCP_HOSTNAME and must be unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Namespace governance: namespaces.allowed/blocked — documentation/DEPLOYMENT.md
+#   Hardened exec: exec.* (allowlist, requireLabel, autoRbac) — documentation/DEPLOYMENT.md
 #   Per-user keys + exec assignments: clients.existingSecret — documentation/DEPLOYMENT.md
 #   RBAC scope + CRD reads (never ['*']): rbac.scope/extraResourceGroups — documentation/DEPLOYMENT.md
-#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Network zone (default off): values-examples/values-hardened-g2.yaml (overlay)
 #   Metrics + ServiceMonitor: metrics.enabled — documentation/DEPLOYMENT.md
 #   In-cluster callers: extraAllowedHosts (svc-DNS; 421s otherwise) — documentation/DEPLOYMENT.md
-#   Cluster-wide listing caps: listing.* ('' = server default) — documentation/DEPLOYMENT.md
 
 # ============================================================================
 # Deployment / Image / Service / Resources
@@ -38,9 +32,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  # Lockstep with Chart.yaml appVersion and the pushed image tags — a stale
-  # default is how an "old MCP + new chart" pod happens.
-  tag: v1.2.0
+  tag: v1.2.0   # keep in lockstep with Chart.yaml appVersion
   pullPolicy: IfNotPresent
 
 # Only for a PRIVATE GHCR package (public pulls are anonymous):
@@ -53,14 +45,8 @@ service:
   targetPort: 9090
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    # 512Mi OOMKilled ×4 in heavy get_resource listing bursts (steady-state
-    # ~136Mi — the burst is what counts); 2Gi matches live G2.
-    memory: 2Gi
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 2Gi}
 
 serviceAccount:
   create: true
@@ -68,8 +54,6 @@ serviceAccount:
 
 # ============================================================================
 # MCP Server App Config
-# (the API key is NEVER created or inlined by this chart — out-of-band Secret
-# only; wildcard apiGroups are refused at render)
 # ============================================================================
 
 apiKey:
@@ -85,26 +69,24 @@ console:
 
 # ============================================================================
 # Cluster-wide Listing Guardrails
-# ("" = the server's own default — no env rendered)
 # ============================================================================
 
 listing:
-  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 100): cap on -A/cluster-wide list results, with a truncation marker naming the env
-  concurrency: ""            # K8S_MCP_LIST_CONCURRENCY (server default 8): bounded-semaphore width for the per-namespace -A fan-out
-  maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
-  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
+  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS — cluster-wide list cap (server default 100)
+  concurrency: ""            # K8S_MCP_LIST_CONCURRENCY — -A fan-out width (server default 8)
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS — get_events/triage items (server default 100)
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE — per-namespace rewrite limit (server default 20)
 
 # ============================================================================
 # Metrics
-# (opt-in; default off = byte-identical render)
 # ============================================================================
 
 metrics:
-  enabled: false             # K8S_MCP_METRICS_ENABLED=true: serve GET /metrics (counters only) + the ServiceMonitor below
+  enabled: false             # K8S_MCP_METRICS_ENABLED=true serves GET /metrics + the ServiceMonitor
   interval: 30s              # ServiceMonitor scrape interval
 
 # ============================================================================
-# Cluster Access (read-only RBAC — this chart talks to the K8s API)
+# Cluster Access / Read-Only RBAC
 # ============================================================================
 
 rbac:
@@ -116,8 +98,8 @@ rbac:
 # ============================================================================
 # Namespace Governance
 # ============================================================================
-# App layer; RBAC remains the true boundary.
 
+# App layer; RBAC remains the true boundary.
 namespaces:
   allowed: ""                # K8S_MCP_ALLOWED_NAMESPACES ("" = all namespaces)
   blocked: ""                # K8S_MCP_BLOCKED_NAMESPACES
@@ -125,7 +107,6 @@ namespaces:
 # ============================================================================
 # Hardened Exec
 # ============================================================================
-# Opt-in.
 
 exec:
   enabled: false
@@ -136,7 +117,6 @@ exec:
 
 # ============================================================================
 # Per-user Keys
-# (per-user keys with per-user exec assignments)
 # ============================================================================
 
 clients:
@@ -147,10 +127,9 @@ clients:
 
 # ============================================================================
 # Pod Annotations / Node Placement
-# (container hardening — non-root, read-only rootfs, dropped caps, seccomp —
-# is NOT values-overridable: the audited baseline)
 # ============================================================================
 
+# Container hardening (non-root, read-only rootfs, dropped caps, seccomp) is NOT values-overridable.
 podAnnotations:
   sidecar.istio.io/inject: "false"
 
@@ -160,20 +139,21 @@ affinity: {}
 
 # ============================================================================
 # PCAI Networking
-# (the endpoint doubles as MCP_HOSTNAME — MUST be unique per release on the
-# shared gateway; two VSes on one host split traffic)
 # ============================================================================
 
+# The endpoint doubles as MCP_HOSTNAME and MUST be unique per release on the shared gateway.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
+
   virtualService:
     # Gate DIRECTLY on this key — Sprig's `default` treats explicit false as empty.
     enabled: true
     endpoint: "k8s-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
-  # Gateway auth gate (oauth2-proxy) — on = PCAI tokens enforced for this host.
+
+  # Gateway auth gate (oauth2-proxy) — on = PCAI tokens on top of the API key.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"
@@ -181,28 +161,30 @@ ezua:
 
 # ============================================================================
 # MCP Network Zone
-# (ADDITIVE, DEFAULT OFF: once enabled, anything not matched is DENIED; egress
-# stays unrestricted)
 # ============================================================================
 
+# ADDITIVE, DEFAULT OFF — once enabled, anything not matched is DENIED; egress stays unrestricted.
 networkPolicy:
   enabled: false
   sameNamespace: true
+
   # The LLM gateway's relay ns goes first; `monitoring` belongs here whenever
   # the chart ships a ServiceMonitor (an unlisted scrape ns dies SILENTLY).
   authorizedClients:
     namespaces: []
+
   # Browser path stays OPEN — the zone stops random IN-CLUSTER access only.
-  # Flip to false only as an explicit, per-chart, per-site decision.
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
-  # Edge pods carry app=istio-ingressgateway (`ezaf-gateway` is the Gateway CR NAME).
+
+  # Edge pods carry app=istio-ingressgateway (`ezaf-gateway` is the Gateway CR name).
   ingressGatewayLabels:
     app: istio-ingressgateway
-  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
-  # with an empty probeExceptCidrs (the template fails the render).
+
+  # Kubelet probes originate at the NODE — 0.0.0.0/0 with an empty probeExceptCidrs FAILS the render.
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     # Intentionally unrestricted (admin MCPs reach the k8s API / Prometheus / internet).
     enabled: false

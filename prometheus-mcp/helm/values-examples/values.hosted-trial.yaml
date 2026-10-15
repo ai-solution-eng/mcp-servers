@@ -1,15 +1,22 @@
-# prometheus-mcp — values for a customer HOSTED-TRIAL environment
+# ============================================================================
+# prometheus-mcp — sanitized HOSTED-TRIAL EXAMPLE values (full copy of
+# helm/values.yaml; paste-ready for the PCAI Helm Values editor).
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# Secret-free; PCAI resolves ${DOMAIN_NAME} before rendering — keep the placeholders
+# as-is, substituting the literal domain only for a local `helm template`.
 
 # ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. prometheusUrl — the in-cluster Prometheus this deployment IS [no render
-#      guard: the default targets the kube-prometheus-stack service, verified on
-#      G2 — set it to your cluster's Prometheus deliberately]
-#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
-#      default true); templates call `required` on it — the render aborts without it
+#   1. prometheusUrl — the in-cluster Prometheus this deployment queries; no render
+#      guard (the default targets the kube-prometheus-stack service).
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart default
+#      true); templates call `required` on it — the render aborts without it.
 
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
 #   GPU/NVLink tab: gpuNvlinkDomains, nvlinkAutodetect.* — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
 #   Gateway auth (oauth2-proxy/SSO): ezua.authorizationPolicy.* — documentation/DEPLOYMENT.md "Gateway exposure"
 #   Saved-query persistence: persistence.* — documentation/DEPLOYMENT.md | values-examples/values.hosted-trial.yaml
@@ -17,12 +24,6 @@
 #   Self-metrics + ServiceMonitor: metrics.* — documentation/DEPLOYMENT.md
 #   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth"
 #   Nodes-tab default filter: nodeFilter — documentation/DEPLOYMENT.md "Optional values"
-
-# FULL VALUES — every key from helm/values.yaml is present, so this file alone
-# is the complete values document for the PCAI Helm Values editor. Adjust the
-# fill-in lines, then apply. Secret-free by construction. PCAI resolves
-# ${DOMAIN_NAME} before rendering — keep the placeholders as-is; substitute
-# the literal domain only when render-checking outside PCAI (`helm template`).
 
 # ============================================================================
 # Deployment / Image

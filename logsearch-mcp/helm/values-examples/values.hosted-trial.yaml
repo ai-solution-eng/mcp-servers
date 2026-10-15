@@ -1,23 +1,22 @@
-# logsearch-mcp — values for a customer HOSTED-TRIAL environment
-#
-# FULL VALUES — every key from helm/values.yaml is present, so this file alone
-# is the complete values document for the PCAI Helm Values editor. Adjust the
-# fill-in lines, then apply. Secret-free: if your PCAI build resolves
-# ${DOMAIN_NAME} in ezua values the placeholders work as pasted; otherwise
-# substitute the literal cluster domain (an unresolved placeholder registers
-# a gateway host that matches nothing).
-
+# ============================================================================
+# logsearch-mcp — sanitized HOSTED-TRIAL EXAMPLE values (full copy of
+# helm/values.yaml; paste-ready for the PCAI Helm Values editor).
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
+# ============================================================================
 
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — never created/inlined by the chart; the pod
-#      sits in CreateContainerConfigError until it exists (ref: logsearch-mcp-apikey,
-#      key api-keys; pod logs are sensitive — /mcp must never trust network position).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` render guard;
-#      must resolve ${DOMAIN_NAME}; unique per release.
+# Secret-free: if your PCAI build resolves ${DOMAIN_NAME} the placeholders work
+# as pasted; otherwise substitute the literal cluster domain.
 
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: logsearch-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — /mcp must never trust network position; pod logs are sensitive.
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
 #   Namespace policy (THE access control; default-deny): logsearch.allowedNamespaces /
 #     blockedNamespaces, or the emptyAllowsAll lab escape hatch — documentation/DEPLOYMENT.md
 #   RBAC scope: rbac.clusterWide (release-ns default; cluster-wide = lab only) — documentation/DEPLOYMENT.md
@@ -157,10 +156,13 @@ networkPolicy:
     namespaces: []
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway
+
   probeCidrs: []
   probeExceptCidrs: []
+
   egress:
     enabled: false
     extraEgress: []

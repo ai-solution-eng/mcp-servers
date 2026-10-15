@@ -1,14 +1,11 @@
-# prometheus-mcp — HARDENED-G2 example: the MCP network zone ON, browser
-# console KEPT.
+# prometheus-mcp — HARDENED-G2 overlay: the MCP network zone ON, browser console
+# KEPT (merge onto the base/g2 values document; nothing here is standalone).
+
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
 
-# OVERLAY: merge onto the base/g2 values document — nothing here is standalone.
-# Zone list (G2 live facts): the namespaces the LIVE gateway netpol names as
-# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
-# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
-# with the zone on, every unlisted caller times out (deny by absence).
-
+# Authorized callers from the LIVE gateway netpol (+ the ServiceMonitor scrape ns).
+# Enable only once the LLM gateway's relay namespace is listed — unlisted callers time out.
 networkPolicy:
   enabled: true
   sameNamespace: true
@@ -22,6 +19,7 @@ networkPolicy:
       - monitoring          # ServiceMonitor scrape ns; omit and scraping dies SILENTLY
   allowEzafGatewayIngress: true   # browser path ON for this chart (per-chart choice)
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   # Per-node /32 kubelet-probe allows (masters .61-.63, workers .161-.162).
@@ -34,6 +32,7 @@ networkPolicy:
   # Stays EMPTY: ipBlock.except must be a STRICT SUBSET of the cidr — pod IPs
   # are not inside a node /32, nothing to carve out.
   probeExceptCidrs: []
+
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []

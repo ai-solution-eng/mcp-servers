@@ -1,31 +1,26 @@
-# k8s-mcp-customer — PCAI hosted-trial values (values-examples, secret-free).
-# Target: an HPE-hosted PCAI trial cluster — ${DOMAIN_NAME} is resolved by PCAI
-# before rendering; keep the placeholders verbatim.
-# FULL VALUES — complete copy of helm-customer/values.yaml with the site
-# edits inline. Paste-ready: this file alone is the full values document
-# (PCAI's values editor replaces the chart's bundled values.yaml entirely, so
-# every key must be present here).
-#
-# STRUCTURALLY LOCKED — the locked twin of helm/ (trusted-operator chart): the
-# security knobs (exec, namespace policy, per-user keys, RBAC scope) DO NOT
-# EXIST in these values and templates never read them. The frontend configures
-# only benign wiring: image, naming, service, exposure endpoint, API-key
-# Secret reference, console toggle. Day-2 security changes are a platform
-# action (NOTES.txt prints the exact commands).
-#
-# Owner: Andrew Bydlon
-# Email: andrew.bydlon@hpe.com
-# Owner: Francesco Caliva
-# Email: francesco.caliva@hpe.com
-#
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — never created/inlined by the chart;
-#      CreateContainerConfigError until it exists (ref: <name>-apikey / api-key).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` in the
-#      VirtualService + AuthorizationPolicy templates; doubles as MCP_HOSTNAME.
-# ### OPTIONAL ### — the LOCKED chart tunes only benign wiring; security changes are a
-#   platform action (the chart's NOTES.txt prints every command):
-#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md Deployment profiles
+# ============================================================================
+# k8s-mcp-customer — PCAI hosted-trial values (values-examples, secret-free);
+# target: an HPE-hosted PCAI trial cluster. STRUCTURALLY LOCKED twin of helm/.
+# Full guide: documentation/DEPLOYMENT.md
+# Owners: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# ============================================================================
+
+# STRUCTURALLY LOCKED — the security knobs (exec, namespace policy, per-user keys,
+# RBAC scope, extra groups) DO NOT EXIST here and the templates never read them:
+# pasting them is inert; Day-2 security changes are a platform action (NOTES.txt).
+
+# FULL VALUES — complete copy of helm-customer/values.yaml with the site edits inline.
+# ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the placeholders verbatim.
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+#   1. apiKey.existingSecret — the API-key Secret, created OUT OF BAND (the chart
+#      never creates or inlines it); CreateContainerConfigError until it exists.
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — render FAILS without it;
+#      doubles as MCP_HOSTNAME and must be unique per release.
+
+# ### OPTIONAL ###
+# The LOCKED chart tunes only benign wiring (copy the shape from the pointer):
+#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md
 #   Console shell: console.enabled — documentation/DEPLOYMENT.md
 #   In-cluster callers: extraAllowedHosts (svc-DNS; never bypasses the key gate) — documentation/DEPLOYMENT.md
 #   Listing caps / metrics: listing.* / metrics.enabled — documentation/DEPLOYMENT.md
@@ -41,10 +36,8 @@ deployment:
   replicaCount: 1
 
 image:
-  # Keep in lockstep with Chart.yaml appVersion (same image as the internal
-  # chart — the locking lives in this chart, not the binary).
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v1.2.0
+  tag: v1.2.0   # same image as the internal chart — the locking lives in this chart
   pullPolicy: IfNotPresent
 
 # Only for a PRIVATE GHCR package (public pulls are anonymous):
@@ -57,14 +50,8 @@ service:
   targetPort: 9090
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    # 512Mi OOMKilled ×4 in heavy get_resource listing bursts (steady-state
-    # ~136Mi — the burst is what counts); chart default 2Gi.
-    memory: 2Gi
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 2Gi}
 
 serviceAccount:
   create: true
@@ -73,8 +60,6 @@ serviceAccount:
 # ============================================================================
 # MCP Server App Config (benign keys only)
 # ============================================================================
-# (the API key is NEVER created or inlined by the chart — out-of-band Secret
-# only; this example carries just the SECRET NAME)
 
 apiKey:
   # The pre-created API-key Secret (kubectl create secret generic …).
@@ -88,13 +73,12 @@ console:
 # API-key gate). Kept at the chart default.
 extraAllowedHosts: []
 
-# Cluster-wide listing guardrails: performance guardrails only — NOT security
-# knobs. "" = the server's own default; kept at the chart default.
+# Performance guardrails only — NOT security knobs; "" = the server's own default.
 listing:
   maxItems: ""
   concurrency: ""
-  maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
-  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS — get_events/triage items (server default 100)
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE — per-namespace rewrite limit (server default 20)
 
 # RBAC is BAKED, NOT VALUES-DRIVEN: templates/rbac-readonly.yaml carries a
 # $scope chart constant; clamping a tenant = switch it + repackage (platform action).
@@ -102,8 +86,8 @@ listing:
 # ============================================================================
 # Pod Annotations / Node Placement
 # ============================================================================
-# (container hardening — non-root, read-only rootfs, dropped caps, seccomp —
-# is NOT values-overridable: the audited baseline)
+
+# Container hardening (non-root, read-only rootfs, dropped caps, seccomp) is NOT values-overridable.
 podAnnotations:
   sidecar.istio.io/inject: "false"
 
@@ -114,19 +98,19 @@ affinity: {}
 # ============================================================================
 # PCAI Networking
 # ============================================================================
-# ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the
-# placeholders verbatim on a hosted trial.
+
+# ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the placeholders verbatim.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+
   virtualService:
-    # Unique per release on the shared gateway; doubles as MCP_HOSTNAME
-    # (DNS-rebinding pin).
+    # Unique per release on the shared gateway; doubles as MCP_HOSTNAME.
     endpoint: "k8s-mcp-customer.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
-  # Gateway oauth2 gate OFF by default (the built-in API key is the gate);
-  # flipping it on enforces PCAI tokens for this host, ON TOP of the API key.
+
+  # Gateway auth gate (oauth2-proxy) — on = PCAI tokens on TOP of the API key.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"

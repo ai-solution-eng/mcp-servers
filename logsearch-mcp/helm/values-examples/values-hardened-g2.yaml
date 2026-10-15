@@ -1,12 +1,11 @@
-# logsearch-mcp — HARDENED-G2 example: the MCP network zone ON.
+# logsearch-mcp — HARDENED-G2 overlay: the MCP network zone ON (merge onto the
+# base/G2 values document; nothing here is standalone).
 
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
 
-# OVERLAY: merge onto the base/G2 values document — nothing here is standalone.
-# Zone list (G2 live facts): the namespaces the LIVE gateway netpol names as
-# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
-
+# Zone list: the namespaces the LIVE gateway netpol names as authorized MCP
+# callers, plus monitoring for the ServiceMonitor scrape.
 networkPolicy:
   enabled: true
   sameNamespace: true
@@ -20,6 +19,7 @@ networkPolicy:
       - monitoring          # ServiceMonitor scrape ns; omit and scraping dies SILENTLY
   allowEzafGatewayIngress: true   # browser path stays on the SSO-gated edge gateway
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   # Per-node /32 kubelet-probe allows (masters .61-.63, workers .161-.162).
@@ -32,6 +32,7 @@ networkPolicy:
   # Stays EMPTY: ipBlock.except must be a STRICT SUBSET of the cidr, and pod
   # IPs are not inside a node /32 — nothing to carve out.
   probeExceptCidrs: []
+
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []

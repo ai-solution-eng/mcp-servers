@@ -225,10 +225,12 @@ networkPolicy:
     namespaces: []   # LLM-gateway relay ns goes here first
   allowEzafGatewayIngress: true   # browser/console path stays OPEN (external traffic rides the SSO-gated edge)
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   probeCidrs: []   # node-originated kubelet probes; NEVER 0.0.0.0/0 with empty probeExceptCidrs
   probeExceptCidrs: []
+
   egress:
     enabled: false   # intentionally unrestricted (admin MCPs reach k8s API/Prometheus/internet per site)
     extraEgress: []

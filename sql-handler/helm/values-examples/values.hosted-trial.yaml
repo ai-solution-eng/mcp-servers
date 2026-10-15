@@ -1,24 +1,10 @@
 # ============================================================================
-# SQLhandler — Hosted-trial site values (EXAMPLE — sanitized, no credentials)
-#
-# This file lives in helm/values-examples/, a folder that is hardlink-synced
-# to GitHub: it is intentionally SECRET-FREE. Real per-site values belong in
-# helm/local/ (gitignored + hardlink-excluded — never commit, never package).
-#
-# Site        : customer-managed PCAI (hosted trial). PCAI resolves
-#               ${DOMAIN_NAME} before rendering — leave it as-is.
-# Standard    : ezua.virtualService.endpoint uses ${DOMAIN_NAME}, the gateway
-#               AuthorizationPolicy (oauth2-proxy) stays ENABLED, credentials
-#               use <UPPER_SNAKE> placeholders or an out-of-band Secret.
-# Usage (PCAI): import the packaged chart once, paste this whole document into
-#               the chart's Helm Values editor, adjust the 'FILL IN' lines,
-#               apply. Operators can render it with:
-#                 helm template helm -f helm/values-examples/values.hosted-trial.yaml
-# This is a FULL VALUES document (every chart key listed) — paste-ready.
-# Field reference: helm/values.yaml · Deployment guide: documentation/DEPLOYMENT.md
+# SQLhandler — hosted-trial example values (sanitized, SECRET-FREE, paste-ready).
+# Full guide: documentation/DEPLOYMENT.md.
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-#
+# ============================================================================
+
 # ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
 #   1. ezua.virtualService.endpoint + .istioGateway — render FAILS while
 #      ezua.enabled (default); MCP clients use https://<endpoint>/mcp. Keep the
@@ -28,14 +14,14 @@
 #      wiring is gated on the choice (onelake MUST be explicit; chart default
 #      s3). Without the Secret the backend-aware /ready drains the pods.
 #   3. nfs.mount.pvcName — render FAILS when nfs.mount.enabled: true.
-#
-# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer)
 #   Scale-out & resources: replicaCount/autoscaling (the HPA owns replicas;
 #     requests.cpu doubles as the HPA threshold) — documentation/DEPLOYMENT.md §4.1.
-#   Identity & SSO ladder: security.apiKey (the /mcp key gate — DEFAULT
-#     OPEN without it; set it unless the gateway edge fronts the service), e.g.
-#     mcp-fleet-apikeys), security.identity.*, security.oidc.* (JWT rung) +
-#     security.oidc.sso.* (browser SSO), adminKeys + selfMintMaxKeys — §4.7/§4.10.
+#   Identity & SSO ladder: security.apiKey (the /mcp key gate — DEFAULT OPEN
+#     without it; set it unless the gateway edge fronts the service),
+#     security.identity.*, security.oidc.* (JWT rung) + security.oidc.sso.*
+#     (browser SSO), adminKeys + selfMintMaxKeys — §4.7/§4.10.
 #   Policy-as-code: security.policy.* (datasets ACL) — §4.7.1.
 #   Other data sources: sources: (federated), databases: (read-only attach) — §5.
 #   Semantic catalog + saved queries: semanticCatalog.* (+ .store PVC),
@@ -44,34 +30,26 @@
 #   Network zone: security.networkPolicy.* — values-examples/values-hardened-g2.yaml.
 #   Metrics: metrics.podMonitor.* (+ security.metricsAuth) — §4.3.
 
-# SQLhandler MCP server — PCAI deployment, MCP 2.0 (streamable-http) at
-# <endpoint>/mcp through the PCAI Istio gateway.
-
 # ============================================================================
 # Deployment / Scaling
 # ============================================================================
 
-# Scale OUT, not UP — benchmark rationale in helm/values.yaml (replicaCount).
-replicaCount: 1  # FILL IN: scale out, not up — enable the HPA below (see documentation/BENCHMARKS.md)
+replicaCount: 1  # scale out, not up — enable the HPA below (see documentation/BENCHMARKS.md)
 
-# HPA (autoscaling/v2; needs metrics-server). CAUTION: the CPU target is a %
-# OF REQUEST — see helm/values.yaml. Enable via the FILL IN note below.
+# HPA (autoscaling/v2; needs metrics-server). CAUTION: CPU target is a % OF REQUEST.
 autoscaling:
-  enabled: false  # FILL IN: recommended true for trials with concurrent agents (4-8 replicas, CPU@80%)
+  enabled: false  # recommended true for trials with concurrent agents (4-8 replicas, CPU@80%)
   minReplicas: 2
   maxReplicas: 8
   targetCPUUtilizationPercentage: 80
-  # CAUTION: the CPU target is a % OF THE REQUEST — with 250m requests the
-  # threshold is only 200m/pod; raise resources.requests.cpu before enabling.
   extraMetrics: []
+
   behavior:
-    # Scale-up reacts quickly; scale-down is deliberately slow so a burst of
-    # MCP tool calls doesn't thrash the fleet.
+    # Scale up fast, scale down slowly so a burst of MCP calls doesn't thrash the fleet.
     scaleUpStabilizationSeconds: 30
     scaleDownStabilizationSeconds: 300
 
-# Spread replicas across nodes (ScheduleAnyway keeps scheduling permissive on
-# single-node clusters).
+# Spread replicas across nodes; ScheduleAnyway keeps single-node clusters schedulable.
 topologySpread:
   enabled: false
   maxSkew: 1
@@ -83,13 +61,10 @@ podDisruptionBudget:
   enabled: false
   minAvailable: 1
 
-# Grace period for in-flight MCP tool calls on rollout (gateway allows up
-# to 3600s per call; the pod gets this many seconds to finish draining).
+# Grace period for in-flight MCP tool calls on rollout (the gateway allows 3600s per call).
 terminationGracePeriodSeconds: 90
 
 image:
-  # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
-  # the sibling PCAI apps.
   repository: ghcr.io/ai-solution-eng/sqlhandler
   tag: v3.7.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
@@ -100,23 +75,20 @@ image:
 # Backend Selection
 # ============================================================================
 
-# s3 | minio | onelake | adls | gcs | iceberg | nfs | sharing — onelake MUST
-# be explicit (credential wiring is gated on it).
+# s3 | minio | onelake | adls | gcs | iceberg | nfs | sharing — onelake must be explicit.
 backend: s3
 
-# Federated mode: non-empty `sources` OVERRIDES `backend` — one endpoint,
-# cross-source JOINs; `name` = SQL prefix; credentials land in the ConfigMap.
+# Federated mode: non-empty `sources` OVERRIDES `backend` — one endpoint, cross-source JOINs.
 sources: []
 
 # External databases (STRICTLY read-only attach): postgres | mariadb | mysql |
-# sqlite | sqlserver | ducklake | mongodb | bigquery (type notes: helm/values.yaml).
+# sqlite | sqlserver | ducklake | mongodb | bigquery — see helm/values.yaml.
 databases: []
-# Opt back IN to DuckDB's own fs layer (parquet_scan/COPY/ducklake row reads);
-# default locked down — enable only when an attached source needs it.
+
+# Opt back IN to DuckDB's own fs layer (parquet_scan/COPY/ducklake reads); default locked down.
 duckdbFileAccess: false
 
-# Delta Sharing (read-only): profile (endpoint + bearer token) via
-# existingConfigMap or existingSecret — NEVER in values.
+# Delta Sharing (read-only): profile via existingConfigMap or existingSecret — NEVER in values.
 sharing:
   enabled: false
   existingConfigMap: ""   # profile ConfigMap name; key below must exist
@@ -124,33 +96,30 @@ sharing:
   existingSecret: ""      # alternative to the ConfigMap: endpoint+token keys
   existingSecretEndpointKey: endpoint
   existingSecretBearerTokenKey: bearer-token
+
 # ============================================================================
 # Metrics
 # ============================================================================
 
-# PodMonitor so the prometheus-operator scrapes /metrics; with metricsAuth
-# true the scrape needs a credential (bearerTokenSecret — see helm/values.yaml).
+# Prometheus-operator scrape of /metrics (bearerTokenSecret when metricsAuth is true).
 metrics:
   podMonitor:
     enabled: true
-    # Extra labels on the PodMonitor — set the podMonitorSelector match label
-    # here or the target silently never appears.
+    # Extra labels — must carry the podMonitorSelector match label or the target is never scraped.
     additionalLabels: {}
-    # Bearer token for the scrape when security.metricsAuth is true.
-    # Shape: {name: <secret>, key: <key>} — omit for open scraping.
+    # Bearer token for the scrape when security.metricsAuth is true; {name:, key:}.
     bearerTokenSecret: {}
-# Naming overrides (rarely needed).
+
 nameOverride: ""
+
 fullnameOverride: ""
 
-# SQLhandler needs no RBAC by default; keep this simple unless you add a
-# SecretProvider tier that requires it.
+# SQLhandler needs no Kubernetes RBAC by default.
 serviceAccount:
   create: false
   name: ""
   annotations: {}
 
-# MCP streamable-http endpoint: port 9097 at path /mcp
 service:
   type: ClusterIP
   port: 9097
@@ -160,11 +129,10 @@ mcp:
   transport: streamable-http   # MCP 2.0 transport
   path: /mcp                   # FastMCP default; VirtualService routes on it
   port: 9097                   # container + service port
-  readonly: true               # fleet D2: MCP run_sql is SELECT-only (0 = DDL for trusted callers)
+  readonly: true               # MCP run_sql is SELECT-only (0 = DDL for trusted callers)
   allowedHosts: ""             # optional strict Host allowlist (DNS-rebinding guard, 421 on mismatch)
   allowedOrigins: ""           # extra browser origins; empty = same-origin only
-  # gzip for MCP/JSON-API/UI responses (5-10x); minSize skips tiny bodies;
-  # SSE/streaming excluded.
+  # gzip for MCP/JSON-API/UI responses; SSE/streaming excluded.
   compression:
     enabled: true
     # Bytes: responses smaller than this are served uncompressed.
@@ -174,95 +142,83 @@ mcp:
 # Write Tier
 # ============================================================================
 
-# Scratch writes under subject-scoped namespaces — targets must resolve under
-# <scratch-root>/<subject-slug>/...; single-writer lease conflict is retryable.
+# Scratch writes: targets must resolve under <scratch-root>/<subject-slug>/....
 writes:
   enabled: false
+
   scratch:
-    # Allowlisted scratch roots: comma-separated [name=]<path> mounted dirs
-    # (iceberg:// prefix = pyiceberg root). Empty = fail closed.
+    # Allowlisted scratch roots: comma-separated [name=]<path> dirs (iceberg:// = pyiceberg root).
     roots: ""
-    # Advisory single-writer lease TTL in seconds (a crashed writer's
-    # lease is broken after this long). 300 default.
+    # Advisory single-writer lease TTL (seconds; a crashed writer's lease breaks after this long).
     leaseTtl: "300"
-    # pyiceberg scratch catalog (backend iceberg only): SQL-catalog DB URI
+    # pyiceberg scratch catalog (backend iceberg only): SQL-catalog DB URI.
     icebergCatalogUri: ""
     icebergWarehouse: ""
-    # RWX: with replicas > 1 the scratch root MUST be a ReadWriteMany claim;
-    # single-replica may use a pod-local emptyDir path.
+    # RWX: with replicas > 1 the scratch root MUST be a ReadWriteMany claim.
     pvc:
-      # Dedicated RWX PVC for scratch — enable with writes.enabled, point
-      # scratch.roots at "<mountPath>".
+      # Dedicated RWX PVC for scratch — point scratch.roots at "<mountPath>".
       enabled: false
       size: 10Gi
       storageClass: ""
       accessModes: []        # default [ReadWriteMany], guarded at render
       mountPath: /scratch
       existingClaim: ""      # mount an existing claim instead of creating one
+
 # ============================================================================
 # Raw-Format Landing Zone
 # ============================================================================
 
-# CSV/TSV/JSON/NDJSON/JSONL (+.gz) discover as tables with Parquet's folder
-# conventions — LANDING-ZONE only; promotion = write tier's COPY TO parquet.
+# CSV/TSV/JSON/NDJSON/JSONL (+.gz) land as tables with Parquet folder conventions.
 rawFiles:
   # Master switch (SQLHANDLER_RAW_FORMATS=0 hides every raw table).
   enabled: true
-  # Per-file size cap in MB: a table is skipped WHOLE when any single file
-  # exceeds it (0 = unlimited; for .gz the cap is the COMPRESSED size).
+  # Per-file size cap in MB; a table is skipped WHOLE if any file exceeds it (0 = unlimited).
   maxFileMB: 64
+
 # ============================================================================
 # Query Execution
 # ============================================================================
 
 # Applies to the DuckDB SQL path — MCP run_sql and the web API alike.
 query:
-  # Fleet decision D5: per-query wall-clock timeout (0 = none). The gateway
-  # itself caps calls at 3600s.
+  # Per-query wall-clock timeout (0 = none); the gateway caps calls at 3600s.
   timeoutSeconds: "600"
-  # Default row cap for run_sql / scan_table / query_result (0 = uncapped —
-  # a runaway SELECT * fills the wire and the model context). Per-call limit overrides.
+  # Default row cap for run_sql / scan_table / query_result (0 = uncapped; per-call limit overrides).
   maxRows: "1000"
   # Row cap for profile_table / column_stats sampling (0 = full table)
   profileMaxRows: "1000000"
   # Max concurrent async query jobs (query_submit; HTTP 429 beyond it).
   maxJobs: 8
-  # Query-memory resource depth: how many recent query outcomes the
-  # sqlhandler://query-memory resource keeps (0 disables recording).
+  # How many recent query outcomes the sqlhandler://query-memory resource keeps (0 disables).
   queryMemorySize: 50
-  # Bare `SELECT ... LIMIT n` previews read the first data file's first row
-  # group instead of enumerating every fragment (false = normal query path).
+  # Bare `SELECT ... LIMIT n` previews read one row group instead of every fragment.
   previewFastpath: true
+
 # ============================================================================
 # Resources
 # ============================================================================
 
-# LIMITS key DuckDB's thread count/memory budget; see helm/values.yaml for
-# the HPA request-as-threshold CAUTION and the working-set note.
+# LIMITS key DuckDB's thread count/memory budget; requests.cpu carries the HPA threshold.
 resources:
-  requests:
-    cpu: 500m  # FILL IN: HPA threshold carrier (0.8x = 400m gate, above measured peak)
-    memory: 2Gi  # FILL IN: covers the measured hot-pod working set (1.9-3Gi on G2)
-  limits:
-    cpu: "4"
-    memory: 16Gi
+  requests: {cpu: 500m, memory: 2Gi}
+  limits: {cpu: "4", memory: 16Gi}
 
-# /health and /ready are served by the container (server.py).
+# Probes: /health and /ready are served by the container (server.py).
 livenessProbe:
   enabled: true
   initialDelaySeconds: 15
   periodSeconds: 20
   timeoutSeconds: 5
+
 readinessProbe:
   enabled: true
   initialDelaySeconds: 5
   periodSeconds: 10
-  # /ready performs a real backend check — a short timeout here would flap a
-  # slow-but-healthy backend out of the Service.
+  # /ready does a real backend check — a short timeout flaps a slow backend out of the Service.
   timeoutSeconds: 20
+
 startupProbe:
-  # Gates liveness/readiness until the server is listening (prewarm can
-  # outlive the old 15s initialDelay).
+  # Gates liveness/readiness until the server is listening.
   enabled: true
   periodSeconds: 5
   failureThreshold: 24
@@ -271,45 +227,37 @@ startupProbe:
 # Probes & Workload Hardening
 # ============================================================================
 
-# Defense-in-depth for a network-facing SQL endpoint (each piece is
-# individually toggleable).
+# Defense-in-depth for a network-facing SQL endpoint (each piece is individually toggleable).
 security:
-  # Non-root, seccomp RuntimeDefault, dropped caps, read-only rootfs, no SA
-  # token, plus the optional ingress NetworkPolicy below.
+  # Non-root, seccomp RuntimeDefault, dropped caps, read-only rootfs, no SA token.
   hardened: true
-  # /mcp API-key gate: out-of-band Secret whose key holds a comma-separated
-  # key list (X-API-Key or Bearer); empty = open behind the gateway.
+
+  # /mcp API-key gate: out-of-band Secret whose key holds a comma-separated key list.
   apiKey:
-    existingSecret: ""         # FILL IN: e.g. "mcp-fleet-apikeys" (key: api-keys)
+    existingSecret: ""         # e.g. "mcp-fleet-apikeys" (key: api-keys)
     existingSecretKey: api-keys
-  # 1 gates /metrics behind the API token / an /mcp key. /ready is NEVER
-  # gated — kubelet probes cannot carry a secret (gating strands pods NotReady).
+  # 1 gates /metrics behind the API token / an /mcp key; /ready is NEVER gated.
   metricsAuth: false
-  # Per-caller identity + policy-as-code (implementation review §3/§5):
+
   identity:
     # TRUST GATE for oauth2-proxy browser headers: TRUE only when the edge
     # AuthorizationPolicy pins ingress to the gateway (headers are forgeable).
     trustBrowserHeaders: false
-  # Policy-as-code (per-caller row filters / column masks / hidden tables):
-  # operator-authored file, hot-reloaded; see helm/values.yaml + README.
+  # Policy-as-code (row filters / column masks / hidden tables); hot-reloaded — see helm/values.yaml.
   policy:
     enabled: false
     # ConfigMap carrying the policy document (empty = enforcement inert)
     existingConfigMap: ""
     existingConfigMapKey: policy.json
     mountPath: /etc/sqlhandler/policy
-  # Ingress NetworkPolicy: default-deny + own ns + gateway ns + allowedNamespaces
-  # (egress unrestricted). DEFAULT OFF = in-cluster frictionless.
+  # Ingress NetworkPolicy: default-deny + own ns + gateway ns + allowedNamespaces.
   networkPolicy:
     enabled: false
     gatewayNamespace: istio-system
-    # Extra namespaces allowed to call this service directly
     allowedNamespaces: []
-    # Raw extra NetworkPolicy `from:` peers (CIDRs, podSelectors...),
-    # appended verbatim to the ingress rules.
+    # Raw extra NetworkPolicy `from:` peers (CIDRs, podSelectors...), appended verbatim.
     additionalIngress: []
-  # Pod-level east-west AuthorizationPolicy — off by default (a wrong list
-  # locks the service; needs principals/namespaces when enabled).
+  # Pod-level east-west AuthorizationPolicy — a wrong list locks the service.
   authorizationPolicy:
     enabled: false
     # e.g. ["cluster.local/ns/istio-system/sa/ezaf-gateway-service-account"]
@@ -325,70 +273,62 @@ security:
 # OneLake / Fabric Connection
 # ============================================================================
 
-# Sensitive values in a Kubernetes Secret, non-secret connection details in a
-# ConfigMap — NEVER the SP secret in values.yaml.
+# Sensitive values in a Kubernetes Secret, non-secret details in a ConfigMap — never in values.
 fabric:
-  # Secret name + keys holding the Entra service-principal credential.
   credentialsSecret:
     name: fabric-credentials
     tenantIdKey: tenant-id
     clientIdKey: client-id
     clientSecretKey: client-secret
-    # create: true renders the Secret FROM values (non-production bootstrap
-    # only) — prefer out-of-band; NEVER commit real credentials.
+    # create: true renders the Secret FROM values — non-production bootstrap only.
     create: false
+
     values:
       tenantId: ""
       clientId: ""
       clientSecret: ""
 
-  # Non-secret connection details injected via ConfigMap.
   lakehouseAbfssUrl: ""          # e.g. abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>
   workspaceId: ""                # fallback (if no full URL)
   lakehouseId: ""                # fallback (if no full URL)
   authority: onelake.dfs.fabric.microsoft.com
-  # Extra delta-rs storage options (JSON-merged into the env): object-client
-  # retries, timeouts, connection behavior for the OneLake backend.
+  # Extra delta-rs storage options (JSON-merged into the env).
   storageOptions: {}
 
 # ============================================================================
 # S3 / MinIO Backend
 # ============================================================================
 
-# Used when backend: s3. Non-secret values in the ConfigMap; access/secret
-# keys through a Kubernetes Secret — NEVER in values.yaml.
+# Used when backend: s3; non-secret values in the ConfigMap, keys via a Secret — never in values.
 s3:
-  # Create the Secret out-of-band (preferred) / rotate with kubectl; commands
-  # in helm/values.yaml and helm/local/README.md.
+  # Create the Secret out-of-band (preferred); commands in helm/values.yaml and helm/local/README.md.
   credentialsSecret:
     name: s3-credentials
     accessKeyKey: access-key
     secretKeyKey: secret-key
-    # Keep false for a customer trial: create: true renders the Secret FROM
-    # values (lands in the Helm release secret) — throwaway clusters only.
-    create: false  # FILL IN: keep false for a customer trial — create the Secret out-of-band
+    # create: true renders the Secret FROM values (lands in the Helm release secret).
+    create: false  # keep false for a customer trial — create the Secret out-of-band
                    # (helm/local/README.md); set true ONLY on a throwaway cluster.
+
     values:
-      accessKey: "<S3_ACCESS_KEY>"  # FILL IN (used only when create: true)
-      secretKey: "<S3_SECRET_KEY>"  # FILL IN (used only when create: true)
+      accessKey: "<S3_ACCESS_KEY>"  # used only when create: true
+      secretKey: "<S3_SECRET_KEY>"  # used only when create: true
 
   # MinIO/S3 connection details (non-secret -> ConfigMap).
-  endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # FILL IN: point at the trial's S3/MinIO
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"   # point at the trial's S3/MinIO
   region: us-east-1
-  bucket: "<BUCKET>"                              # FILL IN: required
-  prefix: ""                  # FILL IN: optional sub-tree within the bucket
+  bucket: "<BUCKET>"                              # required
+  prefix: ""                  # optional sub-tree within the bucket
   anonymous: false            # read public buckets without keys
   useSsl: false               # force https when endpointUrl has no scheme
-  # Extra pyarrow S3FileSystem kwargs (JSON-merged into the env): timeouts,
-  # retry limits, connection behavior. e.g. {request_timeout: 120}
+  # Extra pyarrow S3FileSystem kwargs (JSON-merged into the env), e.g. {request_timeout: 120}.
   options: {}
 
 # ============================================================================
 # Iceberg Backend
 # ============================================================================
 
-# Used when backend: iceberg. Catalog discovery + Parquet data files in your
-# object store; catalog token + S3 keys via a Secret, never values.yaml.
+# Used when backend: iceberg; catalog token + S3 keys via a Secret, never values.yaml.
 iceberg:
   catalogType: rest            # rest | sql
   catalogUri: ""              # e.g. http://rest-catalog:8181 or sqlite:///path
@@ -404,20 +344,19 @@ iceberg:
     accessKeyKey: access-key
     secretKeyKey: secret-key
     create: false
+
     values:
       token: ""
       accessKey: ""
       secretKey: ""
-  # S3 storage for the Iceberg data files (optional).
+
   storage:
     endpointUrl: ""
     region: us-east-1
     anonymous: false
 
-# NFS / local filesystem backend (backend: nfs): reads Parquet from a mounted
-# directory (hostPath, PV/PVC, or any volume). No credentials required.
+# NFS backend (backend: nfs): reads Parquet from a mounted directory; no credentials required.
 nfs:
-  # Absolute path of the mounted directory containing Parquet files.
   rootDir: "/data"
   # Optional volume to mount providing the data (only when backend: nfs).
   mount:
@@ -430,8 +369,7 @@ nfs:
 # ADLS Gen2 Backend
 # ============================================================================
 
-# Used when backend: adls. Parquet/Delta via pyarrow AzureFileSystem; the
-# client secret never renders — ADLS_CLIENT_SECRET_ENV carries the env-var NAME.
+# Used when backend: adls; the client secret never renders — ADLS_CLIENT_SECRET_ENV holds the env NAME.
 adls:
   enabled: false
   account: ""             # storage account name (required)
@@ -441,27 +379,23 @@ adls:
   auth: anon              # anon | client-secret
   tenantId: ""            # Entra tenant (client-secret mode)
   clientId: ""            # Entra app/client id (client-secret mode)
-  # Secret (created out-of-band) whose key holds the client secret. NEVER put
-  # the secret value in values — only the Secret NAME and KEY land here.
+  # Secret (created out-of-band) whose key holds the client secret — only the NAME and KEY land here.
   existingSecret: ""
   existingSecretClientSecretKey: client-secret
-  # Sovereign clouds: core.windows.net (default) | core.usgovcloudapi.net |
-  # core.chinacloudapi.cn
+  # Sovereign clouds: core.windows.net (default) | core.usgovcloudapi.net | core.chinacloudapi.cn
   endpointSuffix: ""
 
 # ============================================================================
 # GCS Backend
 # ============================================================================
 
-# Used when backend: gcs. Parquet/Delta via pyarrow GcsFileSystem; the SA key
-# file is MOUNTED (operator-supplied volume) — key CONTENTS never in values.
+# Used when backend: gcs; the SA key file is MOUNTED — key contents never in values.
 gcs:
   enabled: false
   bucket: ""              # bucket name (required)
   prefix: ""              # optional sub-tree within the bucket
   projectId: ""           # only needed for bucket creation; reads work without
-  # Mounted path of the service-account key file (requires the operator's
-  # volume mount; empty = ambient application-default credentials).
+  # Mounted SA key file path (empty = ambient application-default credentials).
   credentialsFile: ""
   anonymous: false        # read a public bucket with no credential
 
@@ -479,39 +413,32 @@ cache:
   prewarmTables: ""
   # First N row groups of each prewarm table read through the block cache (0 = off)
   prewarmRowgroups: 1
-  # Serve list_tables from cache immediately, refresh in the background
-  # (plus once per ttl). false = fully synchronous.
+  # Serve list_tables from cache immediately, refresh in the background.
   listAsyncRefresh: true
-  # DuckDB budget = duckdbMemoryFraction x the POD memory limit; spills to
-  # spillDir instead of OOMKill (which wipes the caches). "0" = DuckDB defaults.
+  # DuckDB budget = duckdbMemoryFraction x the POD memory limit; spills to spillDir instead of OOMKill.
   duckdbMemoryFraction: "0.6"
   # Spill dir — /tmp (the hardened profile's emptyDir survives restarts).
   spillDir: /tmp/sqlhandler-duckdb-spill
-  # Disk-warm metadata cache (survives container restarts; a PVC mount path
-  # also survives rescheduling).
+  # Disk-warm metadata cache (survives container restarts; a PVC path survives rescheduling).
   cacheDir: /tmp/sqlhandler-cache
   # Virtual-table materialized-result reuse seconds (0 disables)
   virtualCacheTtl: 3600
-  # Materialized-result location (default: cacheDir; an RWX PVC shared by all
-  # replicas materializes once per deployment).
+  # Materialized-result location (default: cacheDir; an RWX PVC materializes once per deployment).
   virtualCacheDir: ""
   # Sort materialized virtual results by lowest-cardinality columns (0 = off).
   virtualCacheSort: true
-  # Identical-query result served from memory (keyed by sql/params/limits +
-  # base-snapshot versions). 0 disables.
+  # Identical-query result served from memory (keyed by sql/params/limits + snapshot versions).
   resultCacheTtl: 3600
   # In-memory byte cap for cached query results (LRU-evicted).
   resultCacheMaxBytes: "268435456"
-  # Shared L2 result cache (cross-replica): enable semanticCatalog.store, then
-  # dir: <store mountPath>/l2-cache — MUST be ReadWriteMany (RWO strands others silently).
+  # Shared L2 cache (cross-replica): enable semanticCatalog.store; dir MUST be ReadWriteMany.
   l2:
     enabled: false
     dir: ""
     ttl: "3600"
     minBytes: "262144"
     maxBytes: "2147483648"
-  # Disk block cache (object-store reads): opt-in cache for parquet footers/
-  # column chunks (backends + trade-offs: see helm/values.yaml).
+  # Disk block cache (object-store reads): opt-in cache for parquet footers/column chunks.
   blockCache:
     enabled: false
     # Cache location. Default: <tmp>/sqlhandler-block-cache.
@@ -520,53 +447,42 @@ cache:
     blockSize: "8388608"
     # Total cache size; the cache resets itself when exceeded.
     maxBytes: "4294967296"
-    # 1 also caches LocalFileSystem paths (NFS mounts are network despite
-    # being LocalFileSystem to pyarrow; real-local disk has the page cache).
+    # 1 also caches LocalFileSystem paths (NFS mounts are network to pyarrow).
     includeLocal: false
 
-# Saved-query store: EMPTY = /tmp emptyDir (lost on reschedule). Durable:
-# savedQueriesPath on a mounted volume, or semanticCatalog.store.enabled=true.
+# Saved-query store: EMPTY = /tmp emptyDir (lost on reschedule). Durable: savedQueriesPath.
 savedQueriesPath: ""
+
 # ============================================================================
 # Semantic Catalog
 # ============================================================================
 
-# Table/column descriptions merged into list/describe — paste AS NATIVE YAML
-# under tables: (hot-reloads on mtime; spec: docs/semantic-catalog.md).
+# Paste table/column descriptions as NATIVE YAML under tables: (hot-reloads on mtime).
 semanticCatalog:
-  enabled: false  # FILL IN: paste a catalog as native YAML here, or enable
+  enabled: false  # paste a catalog as native YAML here, or enable
                   # the upload store and seed it from the /ui panel post-deploy
   # Catalog ConfigMap mount (file: <mountPath>/semantic-catalog.json)
   mountPath: /etc/sqlhandler
-  # NATIVE YAML (no stringification): description / aliases / columns /
-  # definition (VIRTUAL table — single read-only SELECT). Validated at render.
+  # NATIVE YAML: description / aliases / columns / definition (VIRTUAL table).
   tables: {}
-  # Alternative: inline JSON STRING — mutually exclusive with tables/yaml
-  # (more than one non-empty fails the render).
+  # Alternative: inline JSON / YAML STRING (verbatim paste); mutually exclusive with tables.
   json: ""
-  # Alternative: inline YAML STRING (verbatim paste). Mutually exclusive with
-  # `tables` and `json`.
   yaml: ""
-  # Alternative: an EXISTING ConfigMap carrying a `semantic-catalog.json` key
-  # (mounted + env wired; no chart-rendered ConfigMap).
+  # Alternative: an EXISTING ConfigMap carrying a `semantic-catalog.json` key.
   existingConfigMap: ""
-  # Upload store: backs UI/API uploads with a PVC (durable + cross-pod);
-  # ReadWriteMany REQUIRED when replicas can exceed 1.
+  # Upload store: backs UI/API uploads with a PVC; ReadWriteMany REQUIRED when replicas > 1.
   store:
     enabled: false
     # Mount an existing PVC; "" = chart creates <release>-catalog.
     existingClaim: ""
-    # Catalog content is KBs of text — 1Gi is ~100x headroom.
     size: 1Gi
     # "" = cluster default StorageClass; it must offer the access mode below.
     storageClass: ""
     # [ReadWriteOnce] ONLY for single-replica deployments (modes immutable).
     accessModes: [ReadWriteMany]
-    # Store mount path; SQLHANDLER_CATALOG_STORE = <mountPath>/semantic-catalog.json
-    # (read-write — the upload API writes here).
+    # Store mount path; SQLHANDLER_CATALOG_STORE = <mountPath>/semantic-catalog.json.
     mountPath: /var/lib/sqlhandler-catalog
 
-# Runtime arguments for the sqlhandler entrypoint.
 containerArgs:
   - --transport
   - streamable-http
@@ -580,6 +496,7 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
+
   hosts:
     - host: sqlhandler.local
       paths:
@@ -592,28 +509,28 @@ ingress:
 # ============================================================================
 
 podAnnotations: {}
+
 nodeSelector: {}
+
 tolerations: []
+
 affinity: {}
 
 # ============================================================================
 # PCAI (HPE Ezmeral Unified Analytics) Integration
 # ============================================================================
 
-# Renders the Istio VirtualService + AuthorizationPolicy + Kyverno
-# vendor-service tagging for PCAI discovery/monitoring.
+# Renders the Istio VirtualService + AuthorizationPolicy + Kyverno vendor-service tagging.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
 
-  # Disable on clusters without the kyverno.io CRD — the post-install hook
-  # would otherwise fail the release.
+  # Disable on clusters without the kyverno.io CRD — the post-install hook fails otherwise.
   kyverno:
     enabled: true
 
   virtualService:
-    # Public endpoint on the PCAI gateway. MCP clients connect to:
-    #   https://<endpoint>/mcp
+    # Public endpoint on the PCAI gateway; MCP clients connect to https://<endpoint>/mcp.
     endpoint: "sqlhandler.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     # Default for normal calls (health etc.); the /mcp route uses longTimeout.
@@ -621,8 +538,7 @@ ezua:
     # MCP streamable-http is long-lived (tool calls, streaming responses).
     longTimeout: 3600s
 
-  # FILL IN: hosted-trial standard keeps this ON — external callers
-  # authenticate at the PCAI gateway; switch off only for closed in-cluster trials.
+  # hosted-trial standard keeps this ON — callers authenticate at the gateway.
   authorizationPolicy:
     enabled: true
     namespace: "istio-system"

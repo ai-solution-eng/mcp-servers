@@ -27,6 +27,7 @@ networkPolicy:
       - monitoring          # ServiceMonitor scrape ns — omit and it dies SILENTLY
   allowEzafGatewayIngress: true   # gateway rule stays ON (SearXNG UI + /mcp via the VS)
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   # Kubelet probes originate at the NODE.

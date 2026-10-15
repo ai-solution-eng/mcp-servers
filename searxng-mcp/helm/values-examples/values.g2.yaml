@@ -57,6 +57,7 @@ searxng:
   # [] = every default engine stays enabled (SearXNG auto-suspends the
   # consistently dead); hard-disable one only if it is consistently dead here.
   disabledEngines: []
+
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: "1", memory: 1Gi}
@@ -87,9 +88,11 @@ browser:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
     tag: v1.6.1
     pullPolicy: IfNotPresent
+
   resources:
     requests: {cpu: 250m, memory: 512Mi}
     limits: {memory: 1Gi}
+
   caCert:
     enabled: true   # Chromium needs the corporate MITM CA (must carry the proxy root too)
     configMap: "ezaf-root-ca"
@@ -104,7 +107,7 @@ env:
     value: "http://localhost:8080"
 
 # ============================================================================
-# fetch_content SSRF Policy
+# Fetch Content SSRF Policy
 # ============================================================================
 
 # Chart defaults ("" = built-in values; loopback/pod-local/metadata targets
@@ -140,6 +143,7 @@ ezua:
     endpoint: "searxng-mcp.<cluster-domain>"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
+
   authorizationPolicy:
     enabled: true
     namespace: "istio-system"

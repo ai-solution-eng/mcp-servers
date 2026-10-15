@@ -1,11 +1,11 @@
-# applygate-mcp — HARDENED-G2 example: the MCP network zone ON.
+# applygate-mcp — HARDENED-G2 overlay: the MCP network zone ON (merge onto the
+# base/G2 values document; browser path open).
 
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-#
-# OVERLAY: merge onto the base/G2 values document — turns the MCP network zone
-# ON (in-cluster callers allowlisted; browser path open). ⚠️ Confirm the LLM
-# gateway's relay namespace is listed first — unlisted callers time out.
+
+# Confirm the LLM gateway's relay namespace is listed first — unlisted callers
+# time out.
 networkPolicy:
   enabled: true
   sameNamespace: true
@@ -17,10 +17,11 @@ networkPolicy:
       - opencode-web-helm   # OpenCode web
       - prometheus         # the ACTUAL scraper (kubeprom stack) — omit and up=0
       - monitoring          # ServiceMonitor scrape — omit and scraping dies SILENTLY
-  # Browser path stays OPEN (fleet doctrine 2026-09): the zone restricts
-  # IN-CLUSTER callers only; external traffic rides the SSO-gated edge gateway.
+  # Browser path stays OPEN: the zone restricts IN-CLUSTER callers only;
+  # external traffic rides the SSO-gated edge gateway.
   allowEzafGatewayIngress: true
   ingressGatewayNamespace: istio-system
+
   ingressGatewayLabels:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   # Kubelet probes originate at the NODE: per-node /32 allows only (G2:
@@ -34,6 +35,7 @@ networkPolicy:
   # Stays EMPTY with per-node /32s: ipBlock.except must be a STRICT SUBSET and
   # pod IPs are not inside a node /32 — only a BROAD probe allow pairs with it.
   probeExceptCidrs: []
+
   egress:
     enabled: false          # admin MCP egress intentionally unrestricted
     extraEgress: []
@@ -46,8 +48,7 @@ networkPolicy:
 # or host:*; own-svc DNS auto-prepended). mcpHostname = the VS host (421 else).
 mcpHostname: applygate-mcp.${DOMAIN_NAME}
 
-extraAllowedHosts:
-  - applygate-mcp.*.svc.cluster.local
+extraAllowedHosts: [applygate-mcp.*.svc.cluster.local]
 
-# The VirtualService STAYS rendered (fleet doctrine 2026-09): external/browser
-# traffic keeps flowing through the SSO-gated edge gateway exactly as pre-zone.
+# The VirtualService STAYS rendered: external/browser traffic keeps flowing
+# through the SSO-gated edge gateway exactly as pre-zone.

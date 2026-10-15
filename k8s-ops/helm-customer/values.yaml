@@ -1,30 +1,23 @@
+# ============================================================================
 # k8s-mcp-customer — customer distribution of the Kubernetes ops MCP server,
-# for PCAI (HPE Ezmeral Unified Analytics).
-#
-# STRUCTURALLY LOCKED — the locked twin of helm/ (the trusted-operator chart).
-# The security knobs — exec, namespace policy, per-user keys, RBAC scope and
-# extra groups — DO NOT EXIST in these values and the templates never read
-# them: pasting `exec: {enabled: true}` in the frontend is inert. Day-2
-# security changes are a platform action from the kube command line (NOTES.txt
-# prints the exact commands); the exec Role is never minted, so exec stays
-# impossible until the operator creates it deliberately.
-#
-# The frontend can configure only benign wiring: image, naming, service,
-# exposure endpoint, API-key Secret reference, console toggle.
-#
-# Owner: Andrew Bydlon
-# Email: andrew.bydlon@hpe.com
-# Owner: Francesco Caliva
-# Email: francesco.caliva@hpe.com
-#
-# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
-#   1. API-key Secret, out of band — never created/inlined by the chart;
-#      CreateContainerConfigError until it exists (ref: <name>-apikey / api-key).
-#   2. ezua.virtualService.endpoint WHEN ezua.enabled — `helm required` in the
-#      VirtualService + AuthorizationPolicy templates; doubles as MCP_HOSTNAME.
-# ### OPTIONAL ### — the LOCKED chart tunes only benign wiring; security changes are a
-#   platform action (the chart's NOTES.txt prints every command):
-#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md Deployment profiles
+# for PCAI (HPE Ezmeral Unified Analytics). STRUCTURALLY LOCKED twin of helm/.
+# Full guide: documentation/DEPLOYMENT.md
+# Owners: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# ============================================================================
+
+# STRUCTURALLY LOCKED — the security knobs (exec, namespace policy, per-user keys,
+# RBAC scope, extra groups) DO NOT EXIST here and the templates never read them:
+# pasting them is inert; Day-2 security changes are a platform action (NOTES.txt).
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+#   1. apiKey.existingSecret — the API-key Secret, created OUT OF BAND (the chart
+#      never creates or inlines it); CreateContainerConfigError until it exists.
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — render FAILS without it;
+#      doubles as MCP_HOSTNAME and must be unique per release.
+
+# ### OPTIONAL ###
+# The LOCKED chart tunes only benign wiring (copy the shape from the pointer):
+#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md
 #   Console shell: console.enabled — documentation/DEPLOYMENT.md
 #   In-cluster callers: extraAllowedHosts (svc-DNS; never bypasses the key gate) — documentation/DEPLOYMENT.md
 #   Listing caps / metrics: listing.* / metrics.enabled — documentation/DEPLOYMENT.md
@@ -41,9 +34,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  # Lockstep with Chart.yaml appVersion (same image as the internal chart —
-  # the locking lives in this chart, not the binary).
-  tag: v1.2.0
+  tag: v1.2.0   # same image as the internal chart — the locking lives in this chart
   pullPolicy: IfNotPresent
 
 # Only for a PRIVATE GHCR package (public pulls are anonymous):
@@ -56,14 +47,8 @@ service:
   targetPort: 9090
 
 resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    # 512Mi OOMKilled ×4 in heavy get_resource listing bursts (steady-state
-    # ~136Mi — the burst is what counts); 2Gi matches live G2.
-    memory: 2Gi
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 2Gi}
 
 serviceAccount:
   create: true
@@ -72,9 +57,8 @@ serviceAccount:
 # ============================================================================
 # MCP Server App Config (benign keys only)
 # ============================================================================
-# The API key is NEVER created by this chart and NEVER inlined in values —
-# reference an out-of-band Secret; the Deployment fails loud until it exists.
 
+# The API key is never created by this chart and never inlined in values.
 apiKey:
   existingSecret: ""         # empty = "<deployment.name>-apikey"
   existingSecretKey: api-key
@@ -89,22 +73,21 @@ console:
 # ============================================================================
 # Cluster-wide Listing Guardrails
 # ============================================================================
-# Performance guardrails only — NOT security knobs. "" = the server's own
-# default (no env rendered; default render unchanged).
 
+# Performance guardrails only — NOT security knobs; "" = the server's own default.
 listing:
-  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS (server default 100): cap on -A/cluster-wide list results, with a truncation marker naming the env
-  concurrency: ""            # K8S_MCP_LIST_CONCURRENCY (server default 8): bounded-semaphore width for the per-namespace -A fan-out
-  maxEvents: ""              # K8S_MCP_MAX_EVENTS (server default 100): cap on get_events / triage Warning-event items
-  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE (server default 20): per-namespace rewrite limit for whitelisted -A queries
+  maxItems: ""               # K8S_MCP_MAX_LIST_ITEMS — cluster-wide list cap (server default 100)
+  concurrency: ""            # K8S_MCP_LIST_CONCURRENCY — -A fan-out width (server default 8)
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS — get_events/triage items (server default 100)
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE — per-namespace rewrite limit (server default 20)
 
 # ============================================================================
 # Metrics
 # ============================================================================
-# Opt-in; default off = byte-identical render.
 
+# Opt-in; default off = byte-identical render.
 metrics:
-  enabled: false             # K8S_MCP_METRICS_ENABLED=true: serve GET /metrics (counters only, no key) + the ServiceMonitor below
+  enabled: false             # K8S_MCP_METRICS_ENABLED=true serves GET /metrics + the ServiceMonitor
   interval: 30s              # ServiceMonitor scrape interval
 
 # RBAC is BAKED, NOT VALUES-DRIVEN: templates/rbac-readonly.yaml carries a
@@ -113,8 +96,8 @@ metrics:
 # ============================================================================
 # Pod Annotations / Node Placement
 # ============================================================================
-# (container hardening — non-root, read-only rootfs, dropped caps, seccomp —
-# is NOT values-overridable: the audited baseline)
+
+# Container hardening (non-root, read-only rootfs, dropped caps, seccomp) is NOT values-overridable.
 podAnnotations:
   sidecar.istio.io/inject: "false"
 
@@ -125,17 +108,19 @@ affinity: {}
 # ============================================================================
 # PCAI Networking
 # ============================================================================
+
 # Deploys the Istio VirtualService through the ezaf-gateway; the endpoint
-# doubles as MCP_HOSTNAME — unique per release on the shared gateway.
+# doubles as MCP_HOSTNAME and must be unique per release.
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
+
   virtualService:
     endpoint: "k8s-mcp-customer.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
-  # Gateway-level auth gate (oauth2-proxy / SSO bearer) — OFF by default;
-  # on = PCAI tokens for this host, on TOP of the API key.
+
+  # Gateway auth gate (oauth2-proxy) — on = PCAI tokens on TOP of the API key.
   authorizationPolicy:
     enabled: false
     namespace: "istio-system"
