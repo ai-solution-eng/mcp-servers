@@ -5,8 +5,6 @@ normalizing the MinIO endpoint URL - are pure string logic, so they get real
 unit tests here. Listing is tested against a fake filesystem; no network.
 """
 
-from typing import Any
-
 import pyarrow.fs as pafs
 import pytest
 
@@ -15,8 +13,8 @@ from sqlhandler.provider import LakehouseError, TableInfo
 from sqlhandler.s3 import S3Provider
 
 
-def _provider(**over: Any) -> S3Provider:
-    base: dict[str, Any] = {"access_key": "minioadmin", "secret_key": "minioadmin", "bucket": "lakehouse"}
+def _provider(**over):
+    base = {"access_key": "minioadmin", "secret_key": "minioadmin", "bucket": "lakehouse"}
     base.update(over)
     return S3Provider(S3Config(**base))
 
@@ -30,7 +28,16 @@ def test_endpoint_override_keeps_scheme():
 
 
 def test_endpoint_override_adds_scheme_when_missing():
+    # use_ssl now defaults to TRUE (audit P3: cleartext S3 creds) — a
+    # scheme-less endpoint dials https unless S3_USE_SSL=false opts out.
     p = _provider(endpoint_url="127.0.0.1:9000")
+    assert p._endpoint_override() == "https://127.0.0.1:9000"
+
+
+def test_endpoint_override_http_when_use_ssl_opt_out():
+    # the documented plain-http MinIO opt-out: S3_USE_SSL=false (or the
+    # config field) restores the old behavior.
+    p = _provider(endpoint_url="127.0.0.1:9000", use_ssl=False)
     assert p._endpoint_override() == "http://127.0.0.1:9000"
 
 
@@ -102,20 +109,13 @@ def test_table_uri_schema_folder():
 class _FakeFS:
     """pyarrow S3 filesystem stand-in returning canned FileInfos."""
 
-    def __init__(self, entries: list) -> None:
+    def __init__(self, entries):
         self.entries = entries
-        self.selector: _FakeSelector | None = None
+        self.selector = None
 
     def get_file_info(self, selector):
         self.selector = selector
         return self.entries
-
-
-class _FakeSelector:
-    """The FileSelector shape the listing test asserts on."""
-
-    base_dir: str = ""
-    recursive: bool = True
 
 
 def test_list_tables_discovers_all_layouts(monkeypatch):
@@ -133,7 +133,7 @@ def test_list_tables_discovers_all_layouts(monkeypatch):
     monkeypatch.setattr(p, "_s3fs", lambda: fake)
     tables = p.list_tables()
     assert [t.path for t in tables] == ["hr/employees", "orders", "sales/customers"]
-    assert fake.selector is not None and fake.selector.recursive
+    assert fake.selector.recursive
 
 
 def test_list_tables_error_raises(monkeypatch):

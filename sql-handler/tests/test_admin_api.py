@@ -253,6 +253,7 @@ def test_grants_policy_text_covers_the_groups_form(app, policy_file):
 
     groups_doc = {
         "groups": {"analysts": {"tables": {"payroll*": {"column_masks": {"amount": "redact"}}}}},
+        "default_group": "analysts",
         "admins": [ADMIN_FP],
     }
     policy_file.write_text(json.dumps(groups_doc, indent=2) + "\n", encoding="utf-8")
@@ -532,7 +533,10 @@ def test_key_mint_groups_form_refused_503(app, keys_file, policy_file):
     """The Lead decision: when the policy uses the GROUPS form (no datasets
     doc), mint REFUSES with 503 "bind via the policy form..." — a datasets
     doc is never silently created (mutual exclusion would refuse the file)."""
-    policy_file.write_text(json.dumps({"groups": {"g": {"tables": {}}}, "admins": [ADMIN_FP]}), encoding="utf-8")
+    policy_file.write_text(
+        json.dumps({"groups": {"g": {"tables": {}}}, "default_group": "g", "admins": [ADMIN_FP]}),
+        encoding="utf-8",
+    )
     _policy.reset_policy_store()
     assert _wait_until(lambda: _policy.policy_store().get().hash != "")
     r = app.post("/api/admin/keys", json={"label": "x"}, headers=_admin_headers())

@@ -22,10 +22,10 @@ These tests document the *reason* for each rejection — if one starts
 failing, re-read the attack before loosening the assertion.
 """
 
+
 import json
 import re
 from contextlib import contextmanager
-from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -36,7 +36,7 @@ from sqlhandler.config import FileConfig, load_source_providers
 from sqlhandler.engine import SqlEngine, _max_rows
 from sqlhandler.external import AttachSpec
 from sqlhandler.file import FileProvider
-from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
+from sqlhandler.provider import LakehouseError
 from sqlhandler.server import _arrow_to_markdown
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ from sqlhandler.server import _arrow_to_markdown
 # ---------------------------------------------------------------------------
 
 
-class _NoTables(DataProvider):
+class _NoTables:
     """Minimal provider stub: no tables, everything else unused."""
 
     kind = "stub"
@@ -187,10 +187,8 @@ def test_s3_provider_rejects_traversal_segments():
 
 
 def test_sources_reject_duplicate_labels():
-    raw = (
-        '[{"name":"sales","bucket":"a","accessKey":"k","secretKey":"s"},'
-        '{"name":"sales","bucket":"b","accessKey":"k","secretKey":"s"}]'
-    )
+    raw = '[{"name":"sales","bucket":"a","accessKey":"k","secretKey":"s"},' \
+          '{"name":"sales","bucket":"b","accessKey":"k","secretKey":"s"}]'
     with pytest.raises(ValueError, match="duplicated"):
         load_source_providers({"SQLHANDLER_SOURCES": raw})
 
@@ -203,14 +201,10 @@ def test_sources_reject_unsafe_labels(bad):
 
 
 def test_sources_accept_safe_labels():
-    raw = (
-        '[{"name":"sales","bucket":"b1","accessKey":"k","secretKey":"s"},'
-        '{"name":"source2","bucket":"b2","accessKey":"k","secretKey":"s"}]'
-    )
+    raw = '[{"name":"sales","bucket":"b1","accessKey":"k","secretKey":"s"},' \
+          '{"name":"source2","bucket":"b2","accessKey":"k","secretKey":"s"}]'
     mp = load_source_providers({"SQLHANDLER_SOURCES": raw})
-    from sqlhandler.provider import MultiProvider
-
-    assert isinstance(mp, MultiProvider) and mp.source_count == 2
+    assert mp is not None and mp.source_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -296,27 +290,15 @@ def test_iceberg_unconfigured_error_message():
 # ---------------------------------------------------------------------------
 
 
-def _run_sql_engine(calls: list[str]) -> SqlEngine:
+def _run_sql_engine(calls: list[str]):
     """Stub engine for server.run_sql: records the SQL it is handed."""
 
-    class _Recording(DataProvider):
-        def __init__(self) -> None:
-            self.kind = "recording"
-
-        def list_tables(self) -> list[TableInfo]:
-            return []
-
-        def table_uri(self, info: TableInfo) -> str:
-            return "recording://"
-
-        def open_dataset(self, info: TableInfo, version: int | None = None) -> object:
-            raise AssertionError("open_dataset should not be called in these tests")
-
-        def query_duckdb(self, sql: str, limit=None, params=None, version_as_of=None, **kw):
+    class _Recording:
+        def query_duckdb(self, sql, limit=None, params=None, version_as_of=None, **kw):
             calls.append(sql)
             return pa.table({"ok": [1]})
 
-    return cast(SqlEngine, _Recording())
+    return _Recording()
 
 
 @pytest.fixture()
@@ -337,48 +319,36 @@ def mcp_readonly_env(monkeypatch):
         "UPDATE t SET a = 1",
     ],
 )
-def test_mcp_run_sql_rejects_ddl_by_default(monkeypatch: pytest.MonkeyPatch, mcp_readonly_env: None, sql: str) -> None:
+def test_mcp_run_sql_rejects_ddl_by_default(monkeypatch, mcp_readonly_env, sql):
     """P0-5: the MCP path used to execute multi-statement DDL unchecked."""
     from sqlhandler import server
 
     calls: list[str] = []
-
-    def _handler_stub() -> SqlEngine:
-        return _run_sql_engine(calls)
-
-    monkeypatch.setattr(server, "_handler", _handler_stub)
+    monkeypatch.setattr(server, "_handler", lambda: _run_sql_engine(calls))
     out = server.run_sql(sql)
     assert "Error running SQL:" in out
     assert "SQLHANDLER_MCP_READONLY" in out  # the error must name the env
     assert calls == []  # the engine was never reached
 
 
-def test_mcp_run_sql_opt_out_restores_ddl(monkeypatch: pytest.MonkeyPatch, mcp_readonly_env: None) -> None:
+def test_mcp_run_sql_opt_out_restores_ddl(monkeypatch, mcp_readonly_env):
     """SQLHANDLER_MCP_READONLY=0 restores today's DDL capability (D2 hatch)."""
     from sqlhandler import server
 
     calls: list[str] = []
-
-    def _handler_stub() -> SqlEngine:
-        return _run_sql_engine(calls)
-
-    monkeypatch.setattr(server, "_handler", _handler_stub)
+    monkeypatch.setattr(server, "_handler", lambda: _run_sql_engine(calls))
     monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
     out = server.run_sql("SELECT 41+1 AS answer")
     assert "Error" not in out
     assert calls == ["SELECT 41+1 AS answer"]
 
 
-def test_mcp_run_sql_selects_unaffected(mcp_readonly_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_run_sql_selects_unaffected(mcp_readonly_env, monkeypatch):
     """Legitimate read-only callers see identical behavior (D2 UX note)."""
     from sqlhandler import server
 
     calls: list[str] = []
-
-    def _handler_stub() -> SqlEngine:
-        return _run_sql_engine(calls)
-
-    monkeypatch.setattr(server, "_handler", _handler_stub)
+    monkeypatch.setattr(server, "_handler", lambda: _run_sql_engine(calls))
     assert "Error" not in server.run_sql("SELECT * FROM work_order_header LIMIT 3")
     assert "Error" not in server.run_sql("WITH x AS (SELECT 1 AS a) SELECT * FROM x")
     assert len(calls) == 2
@@ -417,18 +387,9 @@ def _attach_engine(monkeypatch) -> SqlEngine:
 
     eng = _engine()
     eng.attaches = [_OPS_SPEC]
-    applied: list[list] = []
-
-    def _record_apply(con: object, specs: list) -> None:
-        applied.append(list(specs))
-
-    def _no_register(
-        self, con: object, sql: str, version: int | None = None, materialize: bool = True, **kw: object
-    ) -> None:
-        return None
-
-    monkeypatch.setattr(eng_mod, "apply_external", _record_apply)
-    monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", _no_register)
+    applied: list = []
+    monkeypatch.setattr(eng_mod, "apply_external", lambda con, specs: applied.append(list(specs)))
+    monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", lambda self, con, sql, version=None, materialize=True, **kw: None)
     eng._applied_attaches = applied  # type: ignore[attr-defined]
     return eng
 
@@ -438,7 +399,7 @@ def test_attach_exfil_insert_is_refused(monkeypatch):
     eng = _attach_engine(monkeypatch)
     with pytest.raises(LakehouseError, match="attached external databases"):
         eng.query_duckdb("INSERT INTO sink.public.stolen SELECT * FROM ops.public.work_orders")
-    assert getattr(eng, "_applied_attaches", []) == []  # extensions were never even loaded
+    assert eng._applied_attaches == []  # extensions were never even loaded
 
 
 def test_attach_exfil_via_multistatement_script_is_refused(monkeypatch):
@@ -450,7 +411,7 @@ def test_attach_exfil_via_multistatement_script_is_refused(monkeypatch):
     )
     with pytest.raises(LakehouseError, match="attached external databases"):
         eng.query_duckdb(attack)
-    assert getattr(eng, "_applied_attaches", []) == []
+    assert eng._applied_attaches == []
 
 
 def test_attach_exfil_not_enabled_by_mcp_opt_out(monkeypatch, mcp_readonly_env):
@@ -462,7 +423,7 @@ def test_attach_exfil_not_enabled_by_mcp_opt_out(monkeypatch, mcp_readonly_env):
     eng = _attach_engine(monkeypatch)
     with pytest.raises(LakehouseError, match="attached external databases"):
         eng.query_duckdb("INSERT INTO sink.public.stolen SELECT * FROM ops.public.work_orders")
-    assert getattr(eng, "_applied_attaches", []) == []
+    assert eng._applied_attaches == []
 
 
 def test_attach_read_queries_still_allowed(monkeypatch):
@@ -470,7 +431,7 @@ def test_attach_read_queries_still_allowed(monkeypatch):
     eng = _attach_engine(monkeypatch)
     with pytest.raises(LakehouseError) as excinfo:
         eng.query_duckdb("SELECT count(*) FROM ops.public.work_orders")
-    assert getattr(eng, "_applied_attaches", []) == [[_OPS_SPEC]]  # attach path was taken
+    assert eng._applied_attaches == [[_OPS_SPEC]]  # attach path was taken
     assert "attached external databases" not in str(excinfo.value)  # not the guard
 
 
@@ -480,18 +441,9 @@ def test_plain_lake_connection_never_sees_attaches(monkeypatch):
 
     eng = _engine()
     eng.attaches = [_OPS_SPEC]
-    applied: list[list] = []
-
-    def _record_apply(con: object, specs: list) -> None:
-        applied.append(list(specs))
-
-    def _no_register(
-        self: object, con: object, sql: str, version: int | None = None, materialize: bool = True, **kw: object
-    ) -> None:
-        return None
-
-    monkeypatch.setattr(eng_mod, "apply_external", _record_apply)
-    monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", _no_register)
+    applied: list = []
+    monkeypatch.setattr(eng_mod, "apply_external", lambda con, specs: applied.append(list(specs)))
+    monkeypatch.setattr(eng_mod.SqlEngine, "_register_schema", lambda self, con, sql, version=None, materialize=True, **kw: None)
     # No attached alias referenced -> plain path, no attach, no SELECT-only
     # guard: with the MCP opt-out a caller regains multi-statement DDL on
     # lake data (D2 — the audited capability), but the connection has no ops
@@ -499,7 +451,9 @@ def test_plain_lake_connection_never_sees_attaches(monkeypatch):
     # exfiltrate INTO.
     monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
     script = (
-        "CREATE TEMP TABLE scratch (a int); INSERT INTO scratch VALUES (41), (1); SELECT sum(a) AS total FROM scratch"
+        "CREATE TEMP TABLE scratch (a int); "
+        "INSERT INTO scratch VALUES (41), (1); "
+        "SELECT sum(a) AS total FROM scratch"
     )
     out = eng.query_duckdb(script)  # must not raise
     assert out.column("total")[0].as_py() == 42
@@ -821,12 +775,13 @@ def test_metrics_and_ready_open_by_default(monkeypatch):
 
 
 def test_metrics_auth_gate(monkeypatch):
-    """SQLHANDLER_METRICS_AUTH=1 gates /metrics only; /ready stays open (kubelet probes cannot authenticate)."""
+    """SQLHANDLER_METRICS_AUTH=1 gates /metrics + /ready on the API token."""
     with _client(monkeypatch, SQLHANDLER_METRICS_AUTH="1", SQLHANDLER_API_TOKEN="probe-token") as client:
         assert client.get("/metrics").status_code == 401
+        assert client.get("/ready").status_code == 401
         assert client.get("/metrics", headers={"X-API-Token": "probe-token"}).status_code == 200
-        # /ready + /health stay open for kubelet probes either way.
-        assert client.get("/ready").status_code == 200
+        assert client.get("/ready", headers={"Authorization": "Bearer probe-token"}).status_code == 200
+        # /health stays open for liveness probes either way.
         assert client.get("/health").status_code == 200
 
 
@@ -837,7 +792,7 @@ def test_metrics_auth_accepts_mcp_keys(monkeypatch):
 
 
 def test_metrics_auth_without_credentials_fails_closed(monkeypatch):
-    """Gate on but no secret configured: deny everyone (visible misconfig). /ready stays open."""
+    """Gate on but no secret configured: deny everyone (visible misconfig)."""
     with _client(monkeypatch, SQLHANDLER_METRICS_AUTH="1") as client:
         assert client.get("/metrics").status_code == 401
-        assert client.get("/ready").status_code == 200
+        assert client.get("/ready").status_code == 401

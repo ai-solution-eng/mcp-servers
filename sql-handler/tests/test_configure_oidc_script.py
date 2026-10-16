@@ -37,7 +37,7 @@ SCRIPT = REPO_ROOT / "scripts" / "configure-oidc-sql.sh"
 
 DOMAIN = "pcai-se-ai-application.hst.rdlabs.hpecorp.net"
 EXPECTED_CALLBACK = f"https://sqlhandler.{DOMAIN}/oauth/oidc/callback"
-FAKE_SECRET = "ua-client-secret-FAKE1234567890"
+FAKE_SECRET = "ua-client-secret-FAKE1234567890"  # secret-scan:allow (test fixture, not a real secret)
 
 
 class _FakeKeycloak:

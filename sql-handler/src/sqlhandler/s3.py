@@ -68,6 +68,20 @@ def normalize_s3_format(fmt: str) -> str:
     )
 
 
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    """Replace every secret occurrence in ``text`` with '***' (adls.py pattern).
+
+    Applied at every error-raising edge that could carry a credential
+    fragment. Best-effort by design (URL-encoded shapes slip past a literal
+    replace) - the primary containment is that secrets never ride in a URI
+    this module builds.
+    """
+    for secret in secrets:
+        if secret and secret in text:
+            text = text.replace(secret, "***")
+    return text
 def _endpoint_override(endpoint_url: str, use_ssl: bool) -> str | None:
     """Normalize an S3 endpoint URL so pyarrow can dial a local MinIO."""
     url = (endpoint_url or "").strip()
@@ -104,11 +118,11 @@ def build_s3fs(config: S3Config) -> pafs.S3FileSystem:
                 raise ValueError("must be a JSON object")  # noqa: TRY004
             kwargs.update(extra)
         except Exception as exc:
-            raise LakehouseError(f"SQLHANDLER_S3_OPTIONS is not valid JSON options: {exc}") from exc
+            raise LakehouseError(f"SQLHANDLER_S3_OPTIONS is not valid JSON options: {_scrub(str(exc), config.access_key, config.secret_key, config.session_token)}") from exc
     try:
         return pafs.S3FileSystem(**{k: v for k, v in kwargs.items() if v is not None})
     except Exception as exc:
-        raise LakehouseError(f"Could not create S3 filesystem: {exc}") from exc
+        raise LakehouseError(f"Could not create S3 filesystem: {_scrub(str(exc), config.access_key, config.secret_key, config.session_token)}") from exc
 
 
 class S3Provider(DataProvider):
@@ -224,7 +238,7 @@ class S3Provider(DataProvider):
             selector = pafs.FileSelector(root, recursive=True)
             infos = fs.get_file_info(selector)
         except Exception as exc:
-            raise LakehouseError(f"Could not list S3 path '{root}': {exc}") from exc
+            raise LakehouseError(f"Could not list S3 path '{root}': {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}") from exc
 
         seen: dict[str, TableInfo] = {}
         # Delta detection: a data-file path with a _delta_log segment marks
@@ -367,14 +381,14 @@ class S3Provider(DataProvider):
         try:
             from deltalake import DeltaTable as DeltaTableCls
         except ImportError as exc:  # pragma: no cover - deltalake is a hard dep
-            raise LakehouseError(f"deltalake is required for S3 Delta tables: {exc}") from exc
+            raise LakehouseError(f"deltalake is required for S3 Delta tables: {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}") from exc
         uri = self.table_uri(info)
         try:
             if version is None:
                 return DeltaTableCls(uri, storage_options=self._delta_storage_options())
             return DeltaTableCls(uri, version=version, storage_options=self._delta_storage_options())
         except Exception as exc:
-            raise LakehouseError(f"Could not open S3 Delta table {info.path!r}: {exc}") from exc
+            raise LakehouseError(f"Could not open S3 Delta table {info.path!r}: {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}") from exc
 
     def _delta_version(self, info: TableInfo) -> int | None:
         """Latest Delta version from the table's _delta_log keys (cheap list)."""
@@ -384,12 +398,15 @@ class S3Provider(DataProvider):
             entries = self._s3fs().get_file_info(pafs.FileSelector(log_dir, recursive=False))
         except Exception:
             return None
-        versions = [0]
+        # No numeric log file seen -> None, NOT 0 (audit P2): seeding
+        # versions=[0] made "no _delta_log listing" indistinguishable from
+        # "table at version 0". None tells the engine to fall back to TTL.
+        versions: list[int] = []
         for fi in entries:
             stem = fi.path.split("/")[-1].split(".", 1)[0]
             if stem.isdigit():
                 versions.append(int(stem))
-        return max(versions)
+        return max(versions) if versions else None
 
     def check_version(self, info: TableInfo) -> int | None:
         """Cheap version token: Delta log listing (delta) / None (parquet)."""
@@ -445,7 +462,7 @@ class S3Provider(DataProvider):
                 return build_raw_dataset(info.location or info.path, info.format, list(files), fs)
             except Exception as exc:
                 raise LakehouseError(
-                    f"Could not open S3 raw-format table '{info.path}' ({info.format}): {exc}"
+                    f"Could not open S3 raw-format table '{info.path}' ({info.format}): {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}"
                 ) from exc
         if version is not None:
             raise LakehouseError(
@@ -463,4 +480,4 @@ class S3Provider(DataProvider):
         try:
             return pad.dataset(root, filesystem=fs, format="parquet")
         except Exception as exc:
-            raise LakehouseError(f"Could not open S3 dataset '{info.path}': {exc}") from exc
+            raise LakehouseError(f"Could not open S3 dataset '{info.path}': {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}") from exc

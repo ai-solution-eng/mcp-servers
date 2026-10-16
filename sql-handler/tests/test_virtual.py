@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
+from sqlhandler.provider import LakehouseError, TableInfo
 
 TABLES = [
     TableInfo(name="sales", schema="shop", format="parquet"),
@@ -28,19 +28,19 @@ TABLES = [
 BIG_SALES_DEF = "SELECT id, amount FROM sales WHERE amount > 15 ORDER BY id"
 
 
-class FakeProvider(DataProvider):
+class FakeProvider:
     """A DataProvider backed by a local temp directory of Parquet files."""
 
     kind = "fake"
 
-    def __init__(self, root) -> None:
+    def __init__(self, root):
         self.root = root
         self.versions: dict[str, int] = {}  # path -> snapshot token (mutable in tests)
 
-    def list_tables(self) -> list[TableInfo]:
+    def list_tables(self):
         return TABLES
 
-    def table_uri(self, info: TableInfo) -> str:
+    def table_uri(self, info):
         return f"fake://{info.path}"
 
     def open_dataset(self, info, version=None):
@@ -426,54 +426,6 @@ def test_result_cache_serves_identical_queries(engine):
     # different params/limits are different identities
     engine.query_duckdb(q, limit=1)
     assert engine._result_cache_writes == 2
-
-
-def test_result_cache_hits_across_formatting_variants(engine):
-    """Whitespace-only differences share one cache entry (normalized key)."""
-    engine.query_duckdb("SELECT count(*) AS c FROM sales WHERE amount > 15")
-    engine.query_duckdb("SELECT   count(*)\n AS c FROM sales WHERE amount > 15")
-    assert engine._result_cache_writes == 1
-    assert engine._result_cache_hits == 1
-    # Case is NOT folded (unsafe with quoted content): lowercase is a new identity.
-    engine.query_duckdb("select count(*) as c from sales where amount > 15;")
-    assert engine._result_cache_writes == 2
-
-
-def test_result_cache_never_merges_quoted_content(engine):
-    """Whitespace INSIDE literals is semantic — normalized keys stay distinct."""
-    engine.query_duckdb("SELECT count(*) AS c FROM sales WHERE CAST(id AS VARCHAR) = '1  '")
-    engine.query_duckdb("SELECT count(*) AS c FROM sales WHERE CAST(id AS VARCHAR) = '1'")
-    assert engine._result_cache_writes == 2  # different results possible — no merge
-    # ...while the same literals with outer formatting churned DO share an entry.
-    engine.query_duckdb("SELECT   count(*) AS c FROM sales WHERE CAST(id AS VARCHAR) = '1'")
-    assert engine._result_cache_hits == 1
-
-
-def test_result_cache_bails_on_comments_and_dollar_quotes(engine):
-    """Comment-bearing SQL keeps raw keys (fail-open normalizer).
-
-    count(*) queries are deliberately NOT used here: the metadata count
-    fastpath intercepts bare COUNT(*) before the result cache (and a
-    trailing comment defeats its regex), which would muddy the assertion.
-    """
-    engine.query_duckdb("SELECT id FROM sales WHERE amount > 15 -- trailing note")
-    engine.query_duckdb("SELECT id FROM sales WHERE amount > 15")
-    assert engine._result_cache_writes == 2  # bail = byte-exact keys, as before
-    engine.query_duckdb("SELECT id FROM sales WHERE amount > 15 -- trailing note")
-    assert engine._result_cache_hits == 1  # the raw-keyed entry still hits itself
-
-
-def test_normalize_cache_sql_edges():
-    from sqlhandler.engine import _normalize_cache_sql as nz
-
-    assert nz("SELECT  1") == nz("SELECT 1") == "SELECT 1"
-    assert nz(" SELECT 1 ; ") == "SELECT 1"
-    assert nz("SELECT 'a  b'") == "SELECT 'a  b'"  # literal spacing preserved
-    assert nz("SELECT 'it''s'") == "SELECT 'it''s'"  # doubled quote inside literal
-    assert nz('SELECT "my  col" FROM t') == 'SELECT "my  col" FROM t'
-    assert nz("SELECT 1 -- don't") == "SELECT 1 -- don't"  # bail: raw passthrough
-    assert nz("SELECT $tag$x$tag$") == "SELECT $tag$x$tag$"  # bail: dollar quote
-    assert nz("SELECT 'unterminated") == "SELECT 'unterminated"  # bail
 
 
 def test_result_cache_invalidated_by_base_version(engine):

@@ -13,29 +13,12 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .provider import DataProvider
-
 
 from .provider import LakehouseError
 
 
 def _getenv(name: str, default: str = "") -> str:
-    """Read an environment variable with a stripped fallback.
-
-    Precedence note (test-isolation gotcha, 2026-09-30): os.environ FIRST,
-    ``default`` second — the deployment-correct order (a real env var must
-    win over a .env-derived fallback). But it makes an explicit ``env=``
-    dict a FLOOR, not an override: load_config(env={"K": "v"}) still sees
-    an ambient os.environ value for K. Server-built test suites import the
-    operator's config/.env into os.environ via load_dotenv()
-    (server.py _handler/main), so config tests running AFTER them observe
-    .env values — pin SQLHANDLER_ENV_FILE to a missing path (the
-    test_env_not_polluted_by_dotenv pattern) or monkeypatch.delenv the
-    FABRIC_* vars when constructing configs in tests.
-    """
+    """Read an environment variable with a stripped fallback."""
     return os.environ.get(name, default).strip()
 
 
@@ -59,11 +42,10 @@ def _to_bool(name: str, env: Mapping[str, str], default: bool = False) -> bool:
         return False
     return default
 
-
 # Raw-text landing-zone discovery (csv/tsv/json/ndjson/jsonl + .gz variants)
 # on the s3 and nfs/file backends. A LANDING-ZONE feature by design: raw text
-# has no row groups/statistics, so every scan reads whole files — never the
-# scan path for big data (promote with the write tier's COPY TO parquet).
+# has no row groups/statistics, so every scan reads whole files - never the
+# scan path for big data (promote with the write tier COPY TO parquet).
 RAW_TEXT_SUFFIXES = (
     ".csv",
     ".tsv",
@@ -75,25 +57,25 @@ RAW_GZ_SUFFIXES = tuple(s + ".gz" for s in RAW_TEXT_SUFFIXES)
 
 
 def raw_formats_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """Whether raw-text table discovery is on (``SQLHANDLER_RAW_FORMATS``).
+    """Whether raw-text table discovery is on (SQLHANDLER_RAW_FORMATS).
 
-    Values: ``on`` (default) | ``off`` — the master switch for the
-    landing-zone feature; ``off`` hides every raw-format table so discovery
-    is byte-identical to the Parquet/Delta-only behavior.
+    Values: on (default) | off - the master switch for the landing-zone
+    feature; off hides every raw-format table so discovery is byte-identical
+    to the Parquet/Delta-only behavior.
     """
     return _to_bool("SQLHANDLER_RAW_FORMATS", env or os.environ, True)
 
 
 def raw_max_file_mb(env: Mapping[str, str] | None = None) -> int:
-    """Per-file size cap (MB) for raw-format discovery (``SQLHANDLER_RAW_MAX_FILE_MB``).
+    """Per-file size cap (MB) for raw-format discovery (SQLHANDLER_RAW_MAX_FILE_MB).
 
     A raw-format table is DISCOVERED only if every file that would feed it is
     at or under this size; any single oversized file disqualifies the whole
-    table (a partitioned table with one huge shard is skipped too — partial
-    tables would lie). ``0`` = unlimited. For ``.gz`` files the cap applies to
-    the COMPRESSED size (an uncompressed estimate needs a decompression pass
-    per object at listing time); gzip means the cap is approximate and a
-    decompression bomb can exceed it — the default stays on because the
+    table (a partitioned table with one huge shard is skipped too - partial
+    tables would lie). 0 = unlimited. For .gz files the cap applies to the
+    COMPRESSED size (an uncompressed estimate needs a decompression pass per
+    object at listing time); gzip means the cap is approximate and a
+    decompression bomb can exceed it - the default stays on because the
     landing zone is operator-authored storage, not untrusted upload.
     """
     return max(_to_int("SQLHANDLER_RAW_MAX_FILE_MB", env or os.environ, 64), 0)
@@ -188,7 +170,10 @@ class S3Config:
     bucket: str = ""
     prefix: str = ""
     anonymous: bool = False
-    use_ssl: bool = False
+    # https by default (audit P3): cleartext S3 creds were the silent default.
+    # Opt out ONLY for a plain-http MinIO endpoint with S3_USE_SSL=false (or
+    # an endpoint_url that already carries an explicit http:// scheme).
+    use_ssl: bool = True
     path_style_access: bool = True
     # Table format: "auto" (default) detects Delta tables by their
     # _delta_log and reads everything else as plain Parquet; "parquet"
@@ -217,13 +202,11 @@ def load_s3_config(env: dict | None = None) -> S3Config:
       S3_BUCKET
       S3_PREFIX
       S3_ANONYMOUS   (true/1/on enables anonymous read of a public bucket)
-      S3_USE_SSL     (force https when endpoint_url has no scheme)
+      S3_USE_SSL     (https when endpoint_url has no scheme; default TRUE -
+                      set S3_USE_SSL=false ONLY for a plain-http MinIO)
       S3_PATH_STYLE  (default true; MinIO uses path-style addressing)
       S3_FORMAT      (auto | parquet | delta; auto detects Delta tables by
                       their _delta_log and reads the rest as plain Parquet)
-      plus the SQLHANDLER_RAW_FORMATS / SQLHANDLER_RAW_MAX_FILE_MB knobs
-      (see :func:`raw_formats_enabled` / :func:`raw_max_file_mb`) for
-      raw-text landing-zone discovery on this backend
     """
     e = env if env is not None else os.environ
     return S3Config(
@@ -235,7 +218,7 @@ def load_s3_config(env: dict | None = None) -> S3Config:
         bucket=_getenv("S3_BUCKET", e.get("S3_BUCKET", "")),
         prefix=_getenv("S3_PREFIX", e.get("S3_PREFIX", "")),
         anonymous=_to_bool("S3_ANONYMOUS", e, False),
-        use_ssl=_to_bool("S3_USE_SSL", e, False),
+        use_ssl=_to_bool("S3_USE_SSL", e, True),
         path_style_access=_to_bool("S3_PATH_STYLE", e, True),
         format=_getenv("S3_FORMAT", e.get("S3_FORMAT", "auto")).lower() or "auto",
     )
@@ -356,9 +339,6 @@ def load_file_config(env: dict | None = None) -> FileConfig:
 
     Environment variables:
       NFS_ROOT - absolute path to the mounted root directory (required)
-      plus the SQLHANDLER_RAW_FORMATS / SQLHANDLER_RAW_MAX_FILE_MB knobs
-      (see :func:`raw_formats_enabled` / :func:`raw_max_file_mb`) for
-      raw-text landing-zone discovery on this backend
     """
     e = env if env is not None else os.environ
     return FileConfig(root_dir=_getenv("NFS_ROOT", e.get("NFS_ROOT", "")))
@@ -375,6 +355,9 @@ def load_backend_config(env: dict | None = None) -> tuple[str, object]:
       * ``sharing``            - Delta Sharing server (open protocol, read-only)
       * ``adls``               - Azure Data Lake Storage Gen2 (Parquet/Delta)
       * ``gcs``                - Google Cloud Storage (Parquet/Delta)
+
+    Unknown values raise :class:`LakehouseError` - a typo must never
+    silently fall through to the OneLake backend.
 
     Returns ``(backend_name, config)``; feed the config to
     :func:`sqlhandler.provider.make_provider` to build the provider.
@@ -393,10 +376,16 @@ def load_backend_config(env: dict | None = None) -> tuple[str, object]:
         return "adls", load_adls_config(env)
     if backend == "gcs":
         return "gcs", load_gcs_config(env)
-    return "onelake", load_config(env)
+    if backend == "onelake":
+        return "onelake", load_config(env)
+    raise LakehouseError(
+        f"Unknown SQLHANDLER_BACKEND {backend!r}: use one of "
+        "'onelake' (default), 's3'/'minio'/'parquet', 'nfs'/'file', "
+        "'iceberg', 'sharing', 'adls' or 'gcs'."
+    )
 
 
-def load_source_providers(env: dict | None = None) -> DataProvider | None:
+def load_source_providers(env: dict | None = None) -> object | None:
     """Build a federated :class:`MultiProvider` from ``SQLHANDLER_SOURCES``.
 
     ``SQLHANDLER_SOURCES`` is an optional JSON array of source objects. When
@@ -557,43 +546,6 @@ def load_cache_config(env: dict | None = None) -> CacheConfig:
     )
 
 
-@dataclass(frozen=True)
-class CompressionConfig:
-    """HTTP response-compression knobs for the streamable-HTTP server.
-
-    Agent-facing tool results are markdown/JSON-heavy text, so gzip
-    compresses them 5-10x — a straight win for callers on constrained links
-    (and for the ingress hop). SSE/streaming responses are never compressed:
-    Starlette's GZipMiddleware excludes ``text/event-stream`` by default, and
-    for plain streaming responses it compresses chunk-wise with a Z_SYNC_FLUSH
-    per chunk, so streams stay incremental (nothing buffers whole-body).
-    """
-
-    # "gzip" (default) adds GZipMiddleware to the app stack; "off" removes it.
-    mode: str = "gzip"
-    # Responses smaller than this many bytes are passed through uncompressed
-    # (compressing a probe-sized body costs more than it saves).
-    min_size: int = 1024
-
-
-def load_compression_config(env: dict | None = None) -> CompressionConfig:
-    """Build a :class:`CompressionConfig` from the environment.
-
-    Environment variables (also loadable from ``config/.env``):
-      SQLHANDLER_COMPRESSION          - gzip (default) | off; any other value
-                                        falls back to "gzip" (fail loud in the
-                                        log at startup, never silently off)
-      SQLHANDLER_COMPRESSION_MIN_SIZE - integer bytes below which responses
-                                        are NOT compressed (default 1024;
-                                        garbage falls back to the default)
-    """
-    e = env if env is not None else os.environ
-    mode = _getenv("SQLHANDLER_COMPRESSION", e.get("SQLHANDLER_COMPRESSION", "gzip")).lower()
-    if mode not in ("gzip", "off"):
-        mode = "gzip"
-    return CompressionConfig(mode=mode, min_size=_to_int("SQLHANDLER_COMPRESSION_MIN_SIZE", e, 1024))
-
-
 def load_dotenv(path: str | None = None) -> None:
     """Minimal .env loader (no external dep). Reads ``KEY=VALUE`` lines.
 
@@ -608,7 +560,9 @@ def load_dotenv(path: str | None = None) -> None:
         # the tree — picking up an unrelated sibling project's .env is worse
         # than finding nothing.
         here = os.path.dirname(os.path.abspath(__file__))
-        for candidate in (os.path.join(here, "..", "..", "config", ".env"),):
+        for candidate in (
+            os.path.join(here, "..", "..", "config", ".env"),
+        ):
             if os.path.exists(candidate):
                 path = candidate
                 break
@@ -636,23 +590,23 @@ def load_dotenv(path: str | None = None) -> None:
 class SharingConfig:
     """Connection details for a Delta Sharing server (open protocol).
 
-    Auth mirrors the protocol's standard *profile file* (what
-    ``delta-sharing://...`` URLs and the reference CLI consume):
+    Auth mirrors the protocol standard *profile file* (what
+    delta-sharing://... URLs and the reference CLI consume):
 
         shareCredentialsVersion: 1
         endpoint: https://<sharing-server>/delta-sharing
         bearerToken: <token>
 
-    ``profile_path`` points at that file (YAML or JSON — the reference
+    ``profile_path`` points at that file (YAML or JSON - the reference
     profile is YAML, but JSON is a subset of YAML so both parse identically
     via pyyaml). For env-only deployments without a file, DELTA_SHARING_ENDPOINT
-    + DELTA_SHARING_BEARER_TOKEN override (or replace) the profile fields —
+    + DELTA_SHARING_BEARER_TOKEN override (or replace) the profile fields -
     the env endpoint/token win when both are set, matching how the other
     backends let env vars layer on top of file-based config.
 
     Secrets discipline: the bearer token lives ONLY in this config object
-    and in the sharing client's request headers. It must never reach a tool
-    response, a log line, or an exception message — the provider scrubs it
+    and in the sharing client request headers. It must never reach a tool
+    response, a log line, or an exception message - the provider scrubs it
     from every error it raises (see :mod:`sqlhandler.sharing`).
     """
 
@@ -681,7 +635,7 @@ class SharingConfig:
 def _read_sharing_profile(path: str) -> dict:
     """Parse a Delta Sharing profile file (YAML or JSON) into a dict.
 
-    Both formats load through pyyaml (JSON is a YAML subset — the reference
+    Both formats load through pyyaml (JSON is a YAML subset - the reference
     client does the same). A YAML document that parses to a non-mapping, or
     a file that fails to parse, raises :class:`LakehouseError` naming the
     problem without echoing file contents (the profile carries the token).
@@ -712,7 +666,7 @@ def load_sharing_config(env: dict | None = None) -> SharingConfig:
 
     Precedence: profile file first, then the DELTA_SHARING_ENDPOINT /
     DELTA_SHARING_BEARER_TOKEN env vars layered on top (either may be set
-    alone — e.g. rotate the token via env while the endpoint stays in the
+    alone - e.g. rotate the token via env while the endpoint stays in the
     profile). A configured profile file that is missing/unreadable raises
     ``LakehouseError`` at config-load time (startup), not at first query.
     """
@@ -746,20 +700,20 @@ class AdlsConfig:
 
     ``account`` is the storage account name (the abfs host is built from it:
     ``abfs://<container>@<account>.dfs.<suffix>/<prefix>``), ``container`` is
-    the filesystem (ADLS Gen2's term for a container), and ``prefix`` scopes
+    the filesystem (ADLS Gen2 term for a container), and ``prefix`` scopes
     the search to a sub-tree.
 
-    Credentials mirror the S3 backend's shape: ``auth="anon"`` reads a public
-    container (pyarrow 25 then sends NO Authorization header at all — verified
+    Credentials mirror the S3 backend shape: ``auth="anon"`` reads a public
+    container (pyarrow 25 then sends NO Authorization header at all - verified
     against a capture server), while ``auth="client-secret"`` is the Entra
     service-principal client-credentials flow (tenant + client id + secret).
-    pyarrow 25's ``AzureFileSystem`` implements client-secret NATIVELY (no
+    pyarrow 25 AzureFileSystem implements client-secret NATIVELY (no
     azure-identity Python dependency at read time), so the same three values
-    feed both the pyarrow filesystem and delta-rs's storage options.
+    feed both the pyarrow filesystem and delta-rs storage options.
 
     Secrets discipline: ``client_secret_env`` holds the NAME of the env var
-    carrying the secret — never the secret itself (the onelake.py pattern,
-    and what makes the helm chart render the value via ``secretKeyRef``).
+    carrying the secret - never the secret itself (the onelake.py pattern,
+    and what makes the helm chart render the value via secretKeyRef).
     The secret value lives only inside the resolved config object.
     """
 
@@ -810,7 +764,7 @@ def load_adls_config(env: dict | None = None) -> AdlsConfig:
       ADLS_TENANT_ID          - Entra tenant (client-secret mode)
       ADLS_CLIENT_ID          - Entra app/client id (client-secret mode)
       ADLS_CLIENT_SECRET_ENV  - NAME of the env var holding the client secret
-                                (never the secret itself — the helm chart wires
+                                (never the secret itself - the helm chart wires
                                 that var from a Kubernetes Secret)
       ADLS_ENDPOINT_SUFFIX    - core.windows.net (default) | core.usgovcloudapi.net
                                 | core.chinacloudapi.cn (sovereign clouds)
@@ -832,7 +786,7 @@ def load_adls_config(env: dict | None = None) -> AdlsConfig:
         if not secret:
             raise LakehouseError(
                 f"ADLS_CLIENT_SECRET_ENV names env var {secret_env_name!r} but it is not set "
-                "— the client secret must be present in the environment (via a Kubernetes "
+                "- the client secret must be present in the environment (via a Kubernetes "
                 "Secret secretKeyRef in helm, or export it for local runs)."
             )
     return AdlsConfig(
@@ -859,13 +813,13 @@ class GcsConfig:
 
     ``bucket`` is required and ``prefix`` scopes the search to a sub-tree
     (mirrors S3Config). Credentials: ``credentials_file`` is the path to a
-    service-account JSON key file — pyarrow resolves it the same way
-    ``GOOGLE_APPLICATION_CREDENTIALS`` does (application-default lookup), so
+    service-account JSON key file - pyarrow resolves it the same way
+    GOOGLE_APPLICATION_CREDENTIALS does (application-default lookup), so
     the chart mounts the key file and this config points at the mounted path;
     ``anonymous=True`` reads a public bucket with no credential at all.
 
     Secrets discipline: a key FILE path (mounted read-only), never the key
-    contents in values/env — the same posture as the sharing profile file.
+    contents in values/env - the same posture as the sharing profile file.
     """
 
     bucket: str = ""
@@ -880,7 +834,7 @@ class GcsConfig:
         """Whether we have enough to point at a bucket and authenticate."""
         # With no explicit file, pyarrow falls back to ambient application-
         # default credentials (GOOGLE_APPLICATION_CREDENTIALS, workload
-        # identity, metadata server) — a legitimate configuration.
+        # identity, metadata server) - a legitimate configuration.
         return bool(self.bucket)
 
 
@@ -908,38 +862,37 @@ def load_gcs_config(env: dict | None = None) -> GcsConfig:
 
 
 @dataclass(frozen=True)
-class PerformanceConfig:
-    """Performance-feature switches (preview fast path + data prewarm depth).
+class CompressionConfig:
+    """HTTP response-compression knobs for the streamable-HTTP server.
 
-    Both features degrade to the plain code path when disabled — these are
-    accelerators, never behavior contracts (a bare-LIMIT preview reads the
-    same SQL semantics from fewer bytes; a data prewarm is invisible when
-    the block cache is off).
+    SQLHANDLER_COMPRESSION selects the middleware mode:
+      * "gzip" (default) - Starlette GZipMiddleware on the /api + /ui + /mcp
+        apps (text-heavy tool results compress 5-10x)
+      * "off"            - no compression middleware at all
+    Unknown values fall back to gzip (never silently off).
+
+    ``min_size`` keeps probe-sized bodies uncompressed (a compressed 404 is
+    larger than the body it carries). SSE responses (text/event-stream) are
+    excluded by the middleware itself, so MCP streaming stays incremental.
     """
 
-    # Bare `SELECT cols FROM t LIMIT n` previews take the first-row-group
-    # fast path (SQLHANDLER_PREVIEW_FASTPATH; engine default ON — see
-    # engine._preview_fastpath_enabled for the exact parsing).
-    preview_fastpath: bool = True
-    # First N row groups of each prewarm table read through the disk block
-    # cache at startup (SQLHANDLER_PREWARM_ROWGROUPS; 0 = describe-only).
-    prewarm_rowgroups: int = 1
+    mode: str = "gzip"
+    min_size: int = 1024
 
 
-def load_performance_config(env: dict | None = None) -> PerformanceConfig:
-    """Build a :class:`PerformanceConfig` from the environment.
+def load_compression_config(env: dict | None = None) -> CompressionConfig:
+    """Build a :class:`CompressionConfig` from the environment (or a dict).
 
     Environment variables:
-      SQLHANDLER_PREVIEW_FASTPATH   - on|off (default on; any of
-                                      0/false/no/off switches the
-                                      bare-LIMIT preview fast path off)
-      SQLHANDLER_PREWARM_ROWGROUPS  - first N row groups prewarmed per
-                                      table (default 1; 0 = off)
+      SQLHANDLER_COMPRESSION           - gzip (default) | off
+      SQLHANDLER_COMPRESSION_MIN_SIZE  - minimum response byte size to
+                                         compress (default 1024)
     """
     e = env if env is not None else os.environ
-    raw_preview = _getenv("SQLHANDLER_PREVIEW_FASTPATH", e.get("SQLHANDLER_PREVIEW_FASTPATH", "")).lower()
-    preview = True if not raw_preview else raw_preview not in ("0", "false", "no", "off")
-    return PerformanceConfig(
-        preview_fastpath=preview,
-        prewarm_rowgroups=max(_to_int("SQLHANDLER_PREWARM_ROWGROUPS", e, 1), 0),
-    )
+    raw_mode = _getenv("SQLHANDLER_COMPRESSION", e.get("SQLHANDLER_COMPRESSION", "")).lower()
+    mode = "gzip" if raw_mode != "off" else "off"
+    try:
+        min_size = int(_getenv("SQLHANDLER_COMPRESSION_MIN_SIZE", e.get("SQLHANDLER_COMPRESSION_MIN_SIZE", "1024")))
+    except ValueError:
+        min_size = 1024
+    return CompressionConfig(mode=mode, min_size=max(min_size, 0))

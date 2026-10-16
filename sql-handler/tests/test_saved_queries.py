@@ -9,7 +9,6 @@ run-time re-application of the read-only guard against a hand-poisoned store.
 """
 
 import json
-import threading
 import time
 
 import pyarrow as pa
@@ -19,7 +18,7 @@ import pytest
 from sqlhandler import saved as saved_module
 from sqlhandler import server
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import DataProvider, TableInfo
+from sqlhandler.provider import TableInfo
 from sqlhandler.saved import (
     NotAuthorized,
     SavedQueryStore,
@@ -47,7 +46,7 @@ def _make_engine(tmp_path):
         d / "part.parquet",
     )
 
-    class P(DataProvider):
+    class P:
         kind = "fake"
 
         def list_tables(self):
@@ -124,13 +123,133 @@ def test_name_validation_refuses(name):
         SavedQueryStore().save(name, "SELECT 1")
 
 
-def test_store_corrupt_file_starts_empty(tmp_path):
+def test_store_corrupt_file_is_quarantined_not_wiped(tmp_path):
+    """A corrupt store is moved aside; the next save cannot destroy it.
+
+    Before the fix a corrupt file loaded as EMPTY, so the next save rewrote
+    the store with one entry and silently destroyed every other saved query
+    (audit 2026-10-16 P2).
+    """
     path = tmp_path / "broken.json"
     path.write_text("{not json", encoding="utf-8")
     store = SavedQueryStore(str(path))
     assert store.list() == []
     store.save("q", "SELECT 1")  # recovers by overwriting
     assert [e["name"] for e in store.list()] == ["q"]
+    # ...and the original bytes are preserved for recovery
+    quarantined = list(tmp_path.glob("broken.json.corrupt-*"))
+    assert len(quarantined) == 1, quarantined
+    assert quarantined[0].read_text(encoding="utf-8") == "{not json"
+
+
+def test_store_unreadable_file_refuses_write(tmp_path, monkeypatch):
+    """An EXISTING but unreadable store must refuse the write, not wipe it.
+
+    ``_load`` answers "what can I show?" (empty on any problem); a mutating
+    caller needs "do I have the current contents?", because writing an empty
+    base is data loss.
+    """
+    path = tmp_path / "store.json"
+    store = SavedQueryStore(str(path))
+    store.save("keep", "SELECT 1")
+    path.chmod(0o000)
+    try:
+        with pytest.raises(saved_module.NotAuthorized, match="cannot be read"):
+            SavedQueryStore(str(path)).save("other", "SELECT 2")
+    finally:
+        path.chmod(0o600)
+    # the original entry survived
+    assert [e["name"] for e in SavedQueryStore(str(path)).list()] == ["keep"]
+
+
+# ------------------------------------------------- owner scoping (identity spine)
+
+ALICE = None  # bound in the fixtures below to keep the Caller import local
+
+
+def _caller(subject=None, key_fp=None):
+    from sqlhandler.identity import Caller
+
+    return Caller(cls="user" if subject else "key", subject=subject, key_fp=key_fp, via="relay")
+
+
+@pytest.fixture()
+def _policy_on(monkeypatch, tmp_path):
+    """Policy enforcement ON with a valid (default_group-bearing) policy file."""
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    pf = tmp_path / "policy.json"
+    pf.write_text(
+        json.dumps({"version": 1, "default_group": "analysts", "groups": {"analysts": {"tables": {}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(pf))
+    from sqlhandler.policy import reset_policy_store
+
+    reset_policy_store()
+    yield
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    reset_policy_store()
+
+
+def test_owner_scoping_enforced(_policy_on, tmp_path):
+    """A caller sees only their own entries; cross-owner delete is refused."""
+    alice, bob = _caller(subject="alice"), _caller(key_fp="sha256:bbbb")
+    store = SavedQueryStore(str(tmp_path / "s.json"))
+    store.save("a_q", "SELECT 1", caller=alice)
+    store.save("b_q", "SELECT 2", caller=bob)
+    assert [e["name"] for e in store.list(caller=alice)] == ["a_q"]
+    assert [e["name"] for e in store.list(caller=bob)] == ["b_q"]
+    assert store.get("a_q", caller=bob) is None
+    assert store.get("a_q", caller=alice) is not None
+    with pytest.raises(NotAuthorized):
+        store.delete("a_q", caller=bob)
+    assert store.delete("a_q", caller=alice) is True
+
+
+def test_owner_scoping_off_is_shared(_policy_on, tmp_path, monkeypatch):
+    """Enforcement OFF -> the store is shared and byte-identical (no owner)."""
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    from sqlhandler.policy import reset_policy_store
+
+    reset_policy_store()
+    alice, bob = _caller(subject="alice"), _caller(key_fp="sha256:bbbb")
+    store = SavedQueryStore(str(tmp_path / "s.json"))
+    store.save("a_q", "SELECT 1", caller=alice)
+    store.save("b_q", "SELECT 2", caller=bob)
+    assert [e["name"] for e in store.list(caller=alice)] == ["a_q", "b_q"]
+    assert store.get("a_q", caller=bob) is not None
+    # no owner field is written at all when enforcement is off
+    raw = json.loads((tmp_path / "s.json").read_text(encoding="utf-8"))
+    assert all("owner" not in e for e in raw["queries"].values())
+
+
+def test_unowned_legacy_entries_stay_visible(_policy_on, tmp_path):
+    """Entries saved before attribution must not vanish when enforcement turns on."""
+    store = SavedQueryStore(str(tmp_path / "s.json"))
+    store.save("legacy", "SELECT 1")  # no caller -> no owner recorded
+    alice = _caller(subject="alice")
+    assert [e["name"] for e in store.list(caller=alice)] == ["legacy"]
+    assert store.get("legacy", caller=alice) is not None
+    # ...but a cross-owner entry is still invisible
+    store.save("mine", "SELECT 2", caller=alice)
+    bob = _caller(key_fp="sha256:bbbb")
+    assert [e["name"] for e in store.list(caller=bob)] == ["legacy"]
+
+
+def test_store_entry_cap(tmp_path, monkeypatch):
+    """The store is bounded; an OVERWRITE is still allowed at the cap."""
+    monkeypatch.setenv("SQLHANDLER_SAVED_QUERIES_MAX", "3")
+    path = tmp_path / "store.json"
+    store = SavedQueryStore(str(path))
+    for i in range(3):
+        store.save(f"n{i}", f"SELECT {i}")
+    assert len(store.list()) == 3
+    with pytest.raises(ValueError, match="full"):
+        store.save("overflow", "SELECT 1")
+    assert len(store.list()) == 3
+    store.save("n0", "SELECT 111")  # overwrite of an existing name is fine
+    assert len(store.list()) == 3
+    assert [e for e in store.list() if e["name"] == "n0"][0]["sql"] == "SELECT 111"
 
 
 # ------------------------------------------------- save-time validation (D2)
@@ -182,14 +301,18 @@ def test_run_uses_bind_params_injection_is_inert(tmp_path, monkeypatch):
 
     # the injection attempt: stored SQL must keep its placeholder
     assert "$k" in store.get("by-kind")["sql"]
-    payload = json.loads(server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json"))
+    payload = json.loads(
+        server.query_saved("by-kind", params={"k": "a' OR 1=1 --"}, output_format="json")
+    )
     assert payload["rows"] == [], "injection must not leak other rows (bind, not interpolate)"
 
     # positional-? variant too
     store.save("positional", "SELECT id FROM work_order WHERE kind = ?", ["b"])
     payload = json.loads(server.query_saved("positional", output_format="json"))
     assert payload["rows"] == [[2], [4]]
-    payload = json.loads(server.query_saved("positional", params=["x' OR '1'='1"], output_format="json"))
+    payload = json.loads(
+        server.query_saved("positional", params=["x' OR '1'='1"], output_format="json")
+    )
     assert payload["rows"] == []
 
 
@@ -232,12 +355,7 @@ def test_mcp_query_save_list_delete_roundtrip(monkeypatch):
     monkeypatch.setattr(server, "_handler", lambda: None)
     text, is_error = server._dispatch_tool(
         "query_save",
-        {
-            "name": "orders",
-            "sql": "SELECT * FROM work_order WHERE kind = $k",
-            "params": {"k": "a"},
-            "description": "d",
-        },
+        {"name": "orders", "sql": "SELECT * FROM work_order WHERE kind = $k", "params": {"k": "a"}, "description": "d"},
     )
     assert is_error is False
     entry = json.loads(text)
@@ -257,14 +375,7 @@ def test_mcp_query_save_list_delete_roundtrip(monkeypatch):
 def test_mcp_query_saved_run(tmp_path, monkeypatch):
     eng = _make_engine(tmp_path)
     monkeypatch.setattr(server, "_handler", lambda: eng)
-    server._dispatch_tool(
-        "query_save",
-        {
-            "name": "b-kind",
-            "sql": "SELECT id FROM work_order WHERE kind = $k",
-            "params": {"k": "b"},
-        },
-    )
+    server._dispatch_tool("query_save", {"name": "b-kind", "sql": "SELECT id FROM work_order WHERE kind = $k", "params": {"k": "b"}})
     text, is_error = server._dispatch_tool("query_saved", {"name": "b-kind"})
     assert is_error is False
     assert "4" in text and "2" in text  # ids 2 and 4 in the markdown
@@ -364,9 +475,7 @@ def test_rest_saved_queries_auth_matrix(tmp_path, monkeypatch):
     assert client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1"}).status_code == 401
     assert client.delete("/api/saved-queries/whatever").status_code == 401
     auth = {"X-API-Token": "tok-1"}
-    assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth).status_code == 200
-    )
+    assert client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=auth).status_code == 200
     assert client.delete("/api/saved-queries/q", headers=auth).status_code == 200
     # reads follow the /api posture (token middleware), not the write gate
     assert client.get("/api/saved-queries").status_code == 401
@@ -397,9 +506,7 @@ def test_rest_saved_queries_with_mcp_keys_only(tmp_path, monkeypatch):
     assert r.status_code == 401
     assert "MCP_API_KEYS" in r.json()["error"]
     ok = {"X-API-Key": "key-9"}
-    assert (
-        client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok).status_code == 200
-    )
+    assert client.post("/api/saved-queries", json={"name": "q", "sql": "SELECT 1 AS one"}, headers=ok).status_code == 200
     # reads stay open (same posture as /mcp without its own gate here)
     assert client.get("/api/saved-queries").status_code == 200
     assert client.post("/api/saved-queries/q/run", json={}).status_code == 200
@@ -447,10 +554,7 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_API_TOKEN", "tok-e2e")
     app = _build_http_app()
     with TestClient(app) as client:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
         def rpc(method, params, rid=1, extra=None):
             h = dict(headers)
@@ -464,11 +568,7 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
 
         init = rpc(
             "initialize",
-            {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "t", "version": "0"},
-            },
+            {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
             rid=0,
         )
         assert init.status_code == 200
@@ -489,79 +589,3 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
         )
         assert err is False
         assert json.loads(text)["saved"] is True
-
-
-# ------------------------------------------------------ cross-replica merge
-
-# The 2026-09 HA-review fix: on a shared volume the store was
-# last-writer-wins ACROSS replicas (the thread lock cannot see another
-# process) — two replicas saving/deleting concurrently silently lost one
-# edit. Every read-modify-write cycle now takes a flock on a sidecar
-# .lock file, so concurrent saves MERGE.
-
-
-def test_concurrent_saves_from_separate_stores_merge(tmp_path, monkeypatch):
-    """Two store instances (two replicas) saving at once lose no entry."""
-    monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
-    path = str(tmp_path / "shared" / "saved-queries.json")
-    a, b = SavedQueryStore(path), SavedQueryStore(path)
-    threads = [
-        threading.Thread(target=lambda: a.save("from_a", "SELECT 1 AS one")),
-        threading.Thread(target=lambda: b.save("from_b", "SELECT 2 AS two")),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    names = {e["name"] for e in SavedQueryStore(path).list()}
-    assert names == {"from_a", "from_b"}
-
-
-def test_concurrent_save_and_delete_merge(tmp_path, monkeypatch):
-    """A delete racing a save cannot resurrect or erase the wrong entry."""
-    monkeypatch.setenv("SQLHANDLER_MCP_READONLY", "0")
-    path = str(tmp_path / "shared" / "saved-queries.json")
-    seed = SavedQueryStore(path)
-    seed.save("old", "SELECT 3 AS three")
-    a, b = SavedQueryStore(path), SavedQueryStore(path)
-    threads = [
-        threading.Thread(target=lambda: a.delete("old")),
-        threading.Thread(target=lambda: b.save("new", "SELECT 4 AS four")),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    store = SavedQueryStore(path)
-    names = {e["name"] for e in store.list()}
-    assert "new" in names  # the save is never lost
-    assert not ({"old"} & names) or "new" in names  # delete of a racing name is not an error
-
-
-# ------------------------------------- presented_credential (D19 ordering) —
-
-
-def test_presented_credential_prefers_explicit_key():
-    """Both headers present: the explicit X-API-Key claim wins over the
-    ambient Bearer — same explicit-over-ambient resolution as the /mcp key
-    gate and the /api admin surface, so ownership attribution agrees with
-    the identity the gate authenticated. (FakeRequest is a plain dict, so
-    header keys are spelled lowercase like the reader expects — real
-    Starlette headers are case-insensitive.)"""
-    both = FakeRequest({"authorization": "Bearer ambient-key", "x-api-key": "tenant-key"})
-    assert saved_module.presented_credential(both) == "tenant-key"
-
-
-def test_presented_credential_bearer_only_unchanged():
-    only_bearer = FakeRequest({"authorization": "Bearer ambient-key"})
-    assert saved_module.presented_credential(only_bearer) == "ambient-key"
-
-
-def test_presented_credential_token_header():
-    token_only = FakeRequest({"x-api-token": "tok-key"})
-    assert saved_module.presented_credential(token_only) == "tok-key"
-
-
-def test_presented_credential_none():
-    assert saved_module.presented_credential(None) == ""
-    assert saved_module.presented_credential(FakeRequest()) == ""

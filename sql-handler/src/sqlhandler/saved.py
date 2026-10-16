@@ -45,23 +45,23 @@ import threading
 import time
 from pathlib import Path
 
-try:  # cross-process file locking (POSIX); elsewhere the store stays thread-safe only
+from .engine import _validate_params
+from .sqlguard import assert_mcp_readonly, extract_statement_spans, mcp_readonly_enabled
+
+try:  # cross-process file locking (POSIX); elsewhere the store is thread-safe only
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
-
-from .engine import _validate_params
-from .sqlguard import assert_mcp_readonly, extract_statement_spans, mcp_readonly_enabled
 
 logger = logging.getLogger("sqlhandler.saved")
 
 _SAVED_PATH_ENV = "SQLHANDLER_SAVED_QUERIES_PATH"
 _STORE_VERSION = 1
 
-# Cross-replica serialization: every read-modify-write cycle of the store
-# holds this flock (see _process_lock). The timeout keeps a wedged lock
-# file from turning query_save into an outage — availability over strict
-# serialization for a human-rate store.
+#: Cross-replica serialization: every read-modify-write cycle holds this flock
+#: (see :func:`_process_lock`). The timeout keeps a wedged lock file from
+#: turning query_save into an outage -- availability over strict serialization
+#: for a human-rate store.
 _LOCK_TIMEOUT_SECONDS = 10.0
 
 
@@ -69,20 +69,28 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 def _process_lock(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS):
     """Serialize one read-modify-write cycle ACROSS replicas (advisory flock).
 
-    The store file may live on an RWX PVC shared by every replica of a
-    scaled-out deployment; the class's thread lock cannot see another
-    process, so two replicas saving/deleting concurrently were
-    last-writer-wins and one edit was silently lost. An flock on a sidecar
-    lock file (same directory as the store) closes that without changing
-    the file format. Degrades: no fcntl → thread-only; lock busy past the
-    timeout → proceed unlocked with a warning (never an outage).
+    The store may live on an RWX PVC shared by every replica of a scaled-out
+    deployment; the class's thread lock cannot see another process, so two
+    replicas saving/deleting concurrently were last-writer-wins and one edit
+    was silently lost. An flock on a sidecar lock file (same directory as the
+    store) closes that without changing the file format. Degrades: no fcntl ->
+    thread-only; lock busy past the timeout -> proceed unlocked with a warning
+    (never an outage).
     """
     if fcntl is None:  # pragma: no cover - non-POSIX
         yield
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield  # an unwritable dir is the store's problem, not the lock's
+        return
     lock_path = path.with_name(path.name + ".lock")
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield
+        return
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -107,13 +115,28 @@ def _process_lock(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS):
             pass
         os.close(fd)
 
-
 # A saved query is a JSON-file entry, not a filesystem path: forbid path
 # separators, control characters and surrounding whitespace, cap the length.
 # ("/" is forbidden too so every name stays a single REST path segment.)
 _NAME_RE = re.compile(r"[^/\\\x00-\x1f]{1,128}")
 _SQL_MAX_CHARS = 100_000
 _DESCRIPTION_MAX_CHARS = 2_000
+
+#: Hard bound on stored entries. The store is a single JSON file rewritten in
+#: full on every save, so an unbounded map is a memory + disk-growth channel
+#: (audit 2026-10-16 P2). Overridable for tests/operators.
+_MAX_ENTRIES_ENV = "SQLHANDLER_SAVED_QUERIES_MAX"
+_MAX_ENTRIES_DEFAULT = 500
+
+
+def max_entries() -> int:
+    """Entry cap (SQLHANDLER_SAVED_QUERIES_MAX, default 500, min 1)."""
+    raw = os.environ.get(_MAX_ENTRIES_ENV, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MAX_ENTRIES_DEFAULT
+    return value if value > 0 else _MAX_ENTRIES_DEFAULT
 
 
 def saved_queries_path() -> str:
@@ -132,13 +155,41 @@ def saved_queries_path() -> str:
     return str(Path(base) / "sqlhandler-saved-queries.json")
 
 
+def _owner_for(caller) -> str | None:
+    """The owner scope to record/filter on, or None when scoping is off.
+
+    Owner scoping is active only when policy ENFORCEMENT is on AND a caller
+    was supplied -- enforcement off keeps the shared store byte-identical (no
+    ``owner`` field, every caller sees everything), which is what the
+    pre-attribution tests pin.
+
+    The scope comes from :func:`policy.owner_key`: subject when attributed,
+    else the key fingerprint, else ``anonymous``. NEVER the raw key.
+    """
+    if caller is None:
+        return None
+    from . import policy as policy_mod
+
+    if not policy_mod.policy_enabled():
+        return None
+    return policy_mod.owner_key(caller)
+
+
+def _owner_of(entry: object) -> str | None:
+    """The recorded owner of a stored entry (None for legacy/unowned)."""
+    return entry.get("owner") if isinstance(entry, dict) else None
+
+
 def validate_query_name(name: object) -> str:
     """Validate + normalize a saved-query name (clear client errors)."""
     if not isinstance(name, str):
         raise ValueError("Saved-query name must be a string.")  # noqa: TRY004
     cleaned = name.strip()
     if not cleaned or not _NAME_RE.fullmatch(cleaned):
-        raise ValueError("Saved-query name must be 1-128 characters with no path separators or control characters.")
+        raise ValueError(
+            "Saved-query name must be 1-128 characters with no path separators "
+            "or control characters."
+        )
     return cleaned
 
 
@@ -180,12 +231,7 @@ def presented_credential(request) -> str:
     """The caller's credential from an ASGI/Starlette request ('' when none).
 
     Same header conventions as the /mcp and /api middlewares: ``Authorization:
-    Bearer <key>``, ``X-API-Key`` or ``X-API-Token`` — resolved
-    explicit-over-ambient (D19): an explicit X-API-Key/X-API-Token claim
-    outranks a co-forwarded Authorization Bearer. The /mcp key gate and the
-    /api admin surface already resolve the explicit claim first; ownership
-    attribution must agree, or a request authenticated as one key would
-    record its saved-query ownership under the ambient relay credential.
+    Bearer <key>``, ``X-API-Key`` or ``X-API-Token``.
     """
     if request is None:
         return ""
@@ -193,13 +239,10 @@ def presented_credential(request) -> str:
         headers = request.headers
     except Exception:
         return ""
-    explicit = (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
-    if explicit:
-        return explicit
     auth = headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return ""
+    return (headers.get("x-api-key") or headers.get("x-api-token") or "").strip()
 
 
 def credential_ok(provided: str) -> bool:
@@ -207,7 +250,9 @@ def credential_ok(provided: str) -> bool:
     creds = _configured_credentials()
     if not creds or not provided:
         return False
-    return any(hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in creds)
+    return any(
+        hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in creds
+    )
 
 
 class NotAuthorized(Exception):
@@ -255,13 +300,7 @@ def assert_write_allowed(request) -> None:
 
 
 class SavedQueryStore:
-    """Name → {sql, params, description} JSON store (atomic, thread-safe).
-
-    Cross-replica safe when the path is on a shared volume: every
-    read-modify-write cycle takes a process-level flock on a sidecar
-    lock file, so concurrent saves/deletes from different replicas
-    MERGE instead of last-writer-wins.
-    """
+    """Name → {sql, params, description} JSON store (atomic, thread-safe)."""
 
     def __init__(self, path: str | None = None):
         self._path = path or saved_queries_path()
@@ -272,20 +311,90 @@ class SavedQueryStore:
         return self._path
 
     # ---- io
+    def _empty(self) -> dict:
+        return {"version": _STORE_VERSION, "queries": {}}
+
+    def _quarantine(self, reason: str) -> str | None:
+        """Move an unusable store aside instead of letting it be overwritten.
+
+        A corrupt store used to load as EMPTY, so the very next ``save()``
+        rewrote the file with one entry and DESTROYED every other saved query
+        (audit 2026-10-16 P2). The bytes are preserved under
+        ``<path>.corrupt-<epoch>`` so an operator can recover them by hand.
+        Best-effort: a failed rename is logged, never raised (a read must not
+        start failing because the quarantine could not be written).
+        """
+        stamp = int(time.time())
+        dest = f"{self._path}.corrupt-{stamp}"
+        try:
+            os.replace(self._path, dest)
+        except OSError:
+            logger.warning(
+                "saved-query store %s is unusable (%s) and could not be quarantined; "
+                "leaving it in place (writes will refuse until it is fixed)",
+                self._path,
+                reason,
+                exc_info=True,
+            )
+            return None
+        logger.error(
+            "saved-query store %s was unusable (%s); moved to %s — recover entries "
+            "from that file, or delete it to start empty",
+            self._path,
+            reason,
+            dest,
+        )
+        return dest
+
     def _load(self) -> dict:
-        """Read the store; a missing/corrupt file is an EMPTY store (never an error)."""
+        """Read the store.
+
+        A missing file is an empty store. A file that exists but cannot be
+        parsed is QUARANTINED (``<path>.corrupt-<epoch>``) and reported as
+        empty, so the next write cannot silently destroy recoverable data.
+        """
         try:
             with open(self._path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return {"version": _STORE_VERSION, "queries": {}}
-        except (OSError, json.JSONDecodeError):
-            logger.warning("saved-query store %s unreadable; starting from an empty store", self._path)
-            return {"version": _STORE_VERSION, "queries": {}}
+            return self._empty()
+        except json.JSONDecodeError as exc:
+            self._quarantine(f"invalid JSON: {exc}")
+            return self._empty()
+        except OSError as exc:
+            # Unreadable (permissions, transient IO): do NOT quarantine (the
+            # bytes may be perfectly fine) and do NOT treat it as empty for
+            # WRITE purposes -- see _load_for_write.
+            logger.warning("saved-query store %s could not be read (%s)", self._path, exc)
+            return self._empty()
         if not isinstance(data, dict) or not isinstance(data.get("queries"), dict):
-            logger.warning("saved-query store %s has an unexpected shape; ignoring it", self._path)
-            return {"version": _STORE_VERSION, "queries": {}}
+            self._quarantine("unexpected JSON shape")
+            return self._empty()
         return data
+
+    def _load_for_write(self) -> dict:
+        """``_load`` for a MUTATING caller: refuse when the store exists but
+        cannot be read, instead of replacing it with an empty one.
+
+        ``_load`` answers "what can I show?" (empty on any problem). A write
+        needs the stronger question "do I have the CURRENT contents?", because
+        writing an empty base is data loss. An absent file is still fine (first
+        save); an unreadable one is refused loudly.
+        """
+        if os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    json.load(fh)
+            except FileNotFoundError:
+                pass  # raced a quarantine: an empty base is correct now
+            except (json.JSONDecodeError, OSError) as exc:
+                raise NotAuthorized(
+                    f"The saved-query store {self._path} exists but cannot be read "
+                    f"({exc}). Refusing to overwrite it — fix or remove the file "
+                    "(a corrupt store is quarantined to <path>.corrupt-<epoch> on "
+                    "the next read)."
+                ) from exc
+        return self._load()
 
     def _write(self, data: dict) -> None:
         """Atomic replace: a crashed write can never corrupt the store."""
@@ -333,12 +442,12 @@ class SavedQueryStore:
         guard ``query_saved`` re-applies at run time, so a poisoned store
         still cannot make another agent execute DDL.
 
-        Identity spine: when policy enforcement is on AND a caller is known,
+        Identity spine: when policy enforcement is ON and a caller is known,
         the entry records its ``owner`` (subject slug or key fingerprint —
         never the raw key); reads/lists are then owner-scoped (another
         caller's SQL text can name tables a policy hides) and a cross-owner
-        delete/run is refused like an unknown name. Enforcement off keeps
-        the shared store byte-identical (no owner field).
+        delete is refused like an unknown name. Enforcement off keeps the
+        shared store byte-identical (no owner field).
         """
         clean = validate_query_name(name)
         if not isinstance(sql, str) or not sql.strip():
@@ -356,12 +465,23 @@ class SavedQueryStore:
             if len(description) > _DESCRIPTION_MAX_CHARS:
                 raise ValueError(f"description too long (cap {_DESCRIPTION_MAX_CHARS} chars).")
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        from . import policy as policy_mod
-
-        owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
+        owner = _owner_for(caller)
+        # The process lock serializes the read-modify-write ACROSS replicas; the
+        # thread lock covers same-process threads. Order is thread-then-process
+        # everywhere so the two can never deadlock against each other.
         with self._lock, _process_lock(Path(self._path)):
-            data = self._load()
+            data = self._load_for_write()
             queries = data["queries"]
+            if clean not in queries and len(queries) >= max_entries():
+                # Bounded store: an unbounded name->SQL map is a memory and
+                # disk-growth channel for any caller allowed to save (audit
+                # 2026-10-16 P2). Refuse clearly; an OVERWRITE of an existing
+                # name is always allowed, so the cap never blocks an edit.
+                raise ValueError(
+                    f"Saved-query store is full ({len(queries)} of {max_entries()} entries, "
+                    "SQLHANDLER_SAVED_QUERIES_MAX). Delete a query you no longer need "
+                    "(query_delete) or overwrite an existing name, then retry."
+                )
             created = now
             if clean in queries and isinstance(queries[clean], dict):
                 created = queries[clean].get("created_at") or now
@@ -374,60 +494,71 @@ class SavedQueryStore:
             }
             if owner is not None:
                 entry["owner"] = owner
-            entry = {
-                k: v for k, v in entry.items() if v is not None or k in ("sql", "params", "created_at", "updated_at")
-            }
+            entry = {k: v for k, v in entry.items() if v is not None or k in ("sql", "params", "created_at", "updated_at")}
             queries[clean] = entry
             self._write(data)
         return self._entry_summary(clean, entry)
 
     def list(self, caller=None) -> list[dict]:
-        """Every visible saved query (owner-scoped under enforcement).
+        """Every VISIBLE saved query (owner-scoped under enforcement).
 
-        Enforcement ON + a caller → only that caller's own entries (a saved
-        SQL template names tables — running or even READING another caller's
-        can reveal policy-hidden names). Enforcement off / no caller →
-        everything, byte-identical to the shared store.
+        Enforcement ON + a caller -> only that caller's own entries: a saved
+        SQL template NAMES tables, so even reading another caller's reveals
+        policy-hidden names. Enforcement off / no caller -> everything,
+        byte-identical to the shared store.
         """
-        from . import policy as policy_mod
-
-        owner = policy_mod.owner_key(caller) if (caller is not None and policy_mod.policy_enabled()) else None
+        owner = _owner_for(caller)
         with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             items = sorted(data["queries"].items())
         if owner is None:
             return [self._entry_summary(n, e) for n, e in items]
-        return [self._entry_summary(n, e) for n, e in items if isinstance(e, dict) and e.get("owner") == owner]
+        # An entry with NO recorded owner predates attribution (or was written
+        # with enforcement off): it stays visible to everyone, so flipping
+        # enforcement on cannot make existing saved queries vanish.
+        return [
+            self._entry_summary(n, e)
+            for n, e in items
+            if not isinstance(e, dict) or _owner_of(e) in (None, owner)
+        ]
 
     def get(self, name: object, caller=None) -> dict | None:
+        """One entry, or None when it does not exist OR is another owner's.
+
+        A cross-owner entry resolves as UNKNOWN (not as a permission error),
+        so the store cannot be used to probe which names another caller has
+        saved.
+        """
         clean = validate_query_name(name)
+        owner = _owner_for(caller)
         with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             entry = data["queries"].get(clean)
         if entry is None:
             return None
-        from . import policy as policy_mod
-
-        if caller is not None and policy_mod.policy_enabled():
-            owner = policy_mod.owner_key(caller)
-            if isinstance(entry, dict) and entry.get("owner") is not None and entry.get("owner") != owner:
-                # Another caller's private query: invisible, not readable.
-                return None
+        recorded = _owner_of(entry)
+        if owner is not None and recorded is not None and recorded != owner:
+            return None  # invisible: never reveal another caller's SQL text
         return self._entry_summary(clean, entry)
 
     def delete(self, name: object, caller=None) -> bool:
-        clean = validate_query_name(name)
-        from . import policy as policy_mod
+        """Delete one entry; a cross-owner delete is REFUSED (not silent).
 
+        Deleting someone else's saved query is a destructive action on their
+        data, so it raises :class:`NotAuthorized` rather than reporting a
+        false "not found" -- the caller is authenticated and authorized for
+        the surface, just not for that entry.
+        """
+        clean = validate_query_name(name)
+        owner = _owner_for(caller)
         with self._lock, _process_lock(Path(self._path)):
             data = self._load()
             if clean not in data["queries"]:
                 return False
-            if caller is not None and policy_mod.policy_enabled():
-                entry = data["queries"][clean]
-                owner = policy_mod.owner_key(caller)
-                if isinstance(entry, dict) and entry.get("owner") is not None and entry.get("owner") != owner:
-                    raise NotAuthorized("saved query belongs to another caller")
+            entry = data["queries"][clean]
+            recorded = _owner_of(entry)
+            if owner is not None and recorded is not None and recorded != owner:
+                raise NotAuthorized("saved query belongs to another caller")
             del data["queries"][clean]
             self._write(data)
         return True
@@ -471,7 +602,12 @@ def reset_saved_query_store() -> None:
 
 
 def api_saved_save(body: dict, request=None, *, caller=None) -> dict:
-    """POST /api/saved-queries + MCP query_save."""
+    """POST /api/saved-queries + MCP query_save.
+
+    ``caller`` is keyword-only on purpose: it is the attributed identity used
+    for owner scoping, and it must never be confused with ``request`` (which
+    only carries the presented credential).
+    """
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
     assert_write_allowed(request)

@@ -108,6 +108,7 @@ exactly that shape.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import logging
@@ -167,6 +168,37 @@ def _redact(token: str, text: str) -> str:
     return scrubbed
 
 
+
+
+# Global registry of folded share/schema labels (P2 collision fix): the
+# FIRST share/schema pair to claim a fold wins, later colliders get a
+# hash-qualified suffix. Cleared nothing — the mapping is deterministic
+# per (share, schema) pair per process, which is what TableInfo.schema
+# round-trips need.
+_FOLD_REGISTRY: dict[str, tuple[str, str]] = {}
+
+
+def _fold_share_schema(share: str, schema: str) -> str:
+    """The TableInfo.schema label for a (share, schema) pair.
+
+    The naive fold is ``f"{share}_{schema}"`` — identifier-safe but AMBIGUOUS:
+    share "a_b" + schema "c" and share "a" + schema "b_c" both fold to
+    "a_b_c" (audit P2). The first pair to claim a fold keeps the clean label;
+    a later colliding pair gets a stable 6-hex-char hash suffix so its label
+    is unique AND deterministic across processes. ``TableInfo.location``
+    ("share/schema/table") stays the authoritative address; the label only
+    has to be unique and reversible-by-location.
+    """
+    naive = f"{share}_{schema}" if schema else share
+    claim = (share, schema)
+    owner = _FOLD_REGISTRY.get(naive)
+    if owner is None:
+        _FOLD_REGISTRY[naive] = claim
+        return naive
+    if owner == claim:
+        return naive
+    digest = hashlib.sha256(f"{share}/{schema}".encode()).hexdigest()[:6]
+    return f"{naive}_{digest}"
 class SharingClient:
     """A minimal, dependency-free Delta Sharing protocol client.
 
@@ -390,6 +422,8 @@ class SharingClient:
         """
         schema_json: dict | None = None
         files: list[dict] = []
+        seen_valid_action = False  # P1-11: malformed lines are tolerated only BEFORE the first valid action
+        malformed_after_start = 0
         for line_no, raw in enumerate(resp):
             if line_no >= _MAX_QUERY_LINES:
                 raise LakehouseError("Delta Sharing query response exceeded the action-stream cap")
@@ -399,7 +433,22 @@ class SharingClient:
             try:
                 wrapper = json.loads(line)
             except json.JSONDecodeError:
-                continue  # keep-alive padding / trailing junk: skip, don't fail
+                if not seen_valid_action:
+                    continue  # pre-stream padding (keep-alive, banner junk): skip, don't fail
+                # Junk AFTER real actions means the stream is truncated or
+                # corrupted — silently skipping it would return silently-
+                # incomplete query results (audit P1-11). Count and fail below.
+                malformed_after_start += 1
+                continue
+            if not isinstance(wrapper, dict):
+                if not seen_valid_action:
+                    continue
+                malformed_after_start += 1
+                continue
+            if wrapper.get(_METADATA_ACTION):
+                seen_valid_action = True
+            elif wrapper.get(_ADD_ACTION):
+                seen_valid_action = True
             if wrapper.get(_METADATA_ACTION):
                 schema_json = wrapper[_METADATA_ACTION]
             elif wrapper.get(_ADD_ACTION):
@@ -413,6 +462,11 @@ class SharingClient:
                             "id": add.get("id") or "",
                         }
                     )
+        if malformed_after_start:
+            raise LakehouseError(
+                f"Delta Sharing query response had {malformed_after_start} malformed line(s) after the first action "
+                "(truncated or corrupted stream) — refusing to return silently incomplete results"
+            )
         if schema_json is None:
             raise LakehouseError("Delta Sharing query response carried no metaData action (server protocol violation)")
         return {"schema": _arrow_schema_from_delta(schema_json), "files": files}
@@ -686,8 +740,31 @@ class _HTTPRandomAccessFile:
         if resp.status not in (200, 206):
             body = resp.read(512)
             raise OSError(f"GET {self._safe_url()} failed: HTTP {resp.status} {body!r}")
+        if resp.status == 200 and offset > 0:
+            # A 200 to a Range request means the server ignored the header and
+            # restarted the body at byte 0 — reading it as if it began at
+            # `offset` silently misaligns every subsequent parquet read.
+            # Re-issue once with no Range (the plain full-body GET a 200
+            # actually describes); a second 200 is then correct at offset 0,
+            # and any offset>0 need is still unservable on this host.
+            if offset > 0:
+                self._close_resp()
+                conn = self._connection()
+                conn.request("GET", path, headers={"Accept": "*/*"})
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    body = resp.read(512)
+                    raise OSError(f"GET {self._safe_url()} failed: HTTP {resp.status} {body!r}")
+                # Full body from 0 but the caller wanted offset>0 and the host
+                # does not honor Range at all: reject loudly rather than serve
+                # misaligned bytes.
+                resp.close()
+                raise OSError(
+                    f"GET {self._safe_url()} ignored Range (HTTP 200 to bytes={offset}-); "
+                    "the host does not support random access and offset>0 cannot be served"
+                )
         self._resp = resp
-        self._resp_start = offset
+        self._resp_start = offset if resp.status == 206 else 0
 
     def _close_resp(self) -> None:
         if self._resp is not None:
@@ -716,7 +793,12 @@ class _HTTPRandomAccessFile:
         elif whence == 1:
             self._pos += offset
         elif whence == 2:
-            self._pos = self._stat_size() + offset
+            size = self._stat_size()
+            if size < 0:
+                # No Content-Length from HEAD: seeking from EOF would compute
+                # a bogus negative offset and misalign the next read. Refuse.
+                raise OSError(f"seek whence=2 unsupported: {self._safe_url()} has no known size")
+            self._pos = size + offset
         else:
             raise ValueError(f"invalid whence: {whence!r}")
         return self._pos
@@ -847,9 +929,14 @@ class SharingProvider(DataProvider):
                     tname = t.get("name") if isinstance(t, dict) else None
                     if not tname:
                         continue
-                    # TableInfo.schema keeps every protocol level visible
-                    # ("<share>_<schema>"; a flat share folds to "<share>").
-                    schema_label = f"{share_name}_{schema_name}" if schema_name else share_name
+                    # TableInfo.schema keeps every protocol level visible.
+                    # "<share>_<schema>" is ambiguous on fold (share "a_b" +
+                    # schema "c" and share "a" + schema "b_c" both fold to
+                    # "a_b_c" — audit P2): disambiguate with a short hash of
+                    # the (share, schema) pair ONLY when the naive fold is
+                    # actually colliding, so the common case keeps the clean
+                    # label and location remains the authoritative address.
+                    schema_label = _fold_share_schema(share_name, schema_name)
                     location = f"{share_name}/{schema_name}/{tname}"
                     infos.append(TableInfo(name=tname, schema=schema_label, format="delta", location=location))
         return sorted(infos, key=lambda ti: ti.path)
@@ -880,6 +967,10 @@ class SharingProvider(DataProvider):
             share, schema, table = parts[0], parts[1], "/".join(parts[2:]) or parts[2]
             return share, schema, table
         # Fallback: schema label "<share>_<schema>" (or a bare share name).
+        # location ALWAYS wins when present (audit P2: the label fold is
+        # lossy -- and with the hash-qualified collision labels, splitting a
+        # label on the FIRST underscore can mis-split). The label fallback
+        # below only runs for hand-built TableInfos with NO location.
         label = info.schema or "default"
         if "_" in label and label not in ("default",):
             share, _, schema = label.partition("_")

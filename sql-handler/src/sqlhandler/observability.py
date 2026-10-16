@@ -9,24 +9,15 @@ Metrics (rendered at GET /metrics):
   sqlhandler_queries_total{outcome}        counter (ok | error | timeout | cancelled)
   sqlhandler_query_duration_seconds        histogram (per-query wall time)
   sqlhandler_query_rows_total              counter (rows returned, ok queries)
-  sqlhandler_cache_hits_total{cache}       counter (describe | profile | dataset | l2)
+  sqlhandler_cache_hits_total{cache}       counter (describe | profile | dataset)
   sqlhandler_cache_misses_total{cache}     counter
   sqlhandler_tables                        gauge  (current table count)
   sqlhandler_process_rss_bytes             gauge
   sqlhandler_container_memory_limit_bytes  gauge (0 when unlimited)
-  sqlhandler_readiness_state               gauge  (1 ready, 0.5 degraded, 0 not ready)
-
-Additive families (later waves — absent until first observed, so existing
-series and dashboards render byte-identically):
-
-  sqlhandler_caller_queries_total{caller_class}   identity spine
-  sqlhandler_writes_total{backend}                write tier (delta | iceberg)
-  sqlhandler_writes_total_outcome{outcome}        write tier (ok | error | conflict)
 
 Audit log (SQLHANDLER_AUDIT_LOG=path): one JSON line per query outcome —
 {"ts", "event": "query", "sql", "state", "duration_ms", "n_rows", "error"} —
-so every SQL executed against the lake is reviewable (SIEM-friendly). The
-write tier adds ``event: "write"`` lines with target/backend/rows/caller.
+so every SQL executed against the lake is reviewable (SIEM-friendly).
 """
 
 from __future__ import annotations
@@ -98,28 +89,42 @@ class _Histogram:
 
 class Metrics:
     """Registry of the server's counters/histograms/gauges + text rendering."""
-
     #: The bounded caller-class vocabulary (identity spine). Labels are these
-    #: four values ONLY — never a subject slug or key fingerprint (the
+    #: four values ONLY - never a subject slug or key fingerprint (the
     #: cardinality rule); anything else collapses to ``anonymous``.
     CALLER_CLASSES = ("user", "browser", "key", "anonymous")
 
+    #: The bounded write-backend vocabulary (write tier). Everything else
+    #: collapses to ``other`` (the cardinality rule again).
+    WRITE_BACKENDS = ("delta", "iceberg")
+
     def __init__(self):
-        self.queries = _Counter("sqlhandler_queries_total", "Queries executed, by outcome.", "outcome")
+        self.queries = _Counter(
+            "sqlhandler_queries_total", "Queries executed, by outcome.", "outcome"
+        )
         self.duration = _Histogram(
             "sqlhandler_query_duration_seconds", "Query wall time in seconds.", _DURATION_BUCKETS
         )
         self.rows = _Counter("sqlhandler_query_rows_total", "Rows returned by ok queries.", "table")
+
         # ADDITIVE (identity spine): per-caller-class queries. The series
-        # above render byte-identically — this family only ADDS.
+        # above render byte-identically - this family only ADDS.
         self.caller_queries = _Counter(
             "sqlhandler_caller_queries_total", "Queries executed, by caller class.", "caller_class"
         )
-        # ADDITIVE (write tier, review §4): writes by backend + outcome.
-        # Backend label: delta | iceberg (DuckLake is a later wave) —
-        # bounded vocabulary, like caller_class.
+        # ADDITIVE (write tier, review 4): writes by backend + outcome.
         self.writes = _Counter("sqlhandler_writes_total", "Scratch writes executed, by backend and outcome.", "backend")
         self.write_outcomes = _Counter("sqlhandler_writes_total_outcome", "Scratch write outcomes.", "outcome")
+
+        # Storage listing integrity (audit P2): incremented when a backend
+        # listing hits its continuation/page bound. Any nonzero value means
+        # some directory was too large to enumerate within the bound —
+        # discovery results from that path were refused, not silently cut.
+        self.onelake_listing_truncated = _Counter(
+            "sqlhandler_onelake_listing_truncated_total",
+            "OneLake DFS listings refused after hitting the page bound.",
+            "path",
+        )
 
     def record_query(self, outcome: str, duration_s: float, n_rows: int | None, table: str = "") -> None:
         """One query outcome (called from the engine's record path)."""
@@ -131,6 +136,7 @@ class Metrics:
         except Exception:
             logger.debug("metrics record failed", exc_info=True)
 
+
     def record_caller_query(self, caller_class: str | None) -> None:
         """One caller-class attribution (best-effort, bounded labels)."""
         try:
@@ -138,10 +144,6 @@ class Metrics:
             self.caller_queries.inc(cls)
         except Exception:
             logger.debug("caller metric record failed", exc_info=True)
-
-    #: The bounded write-backend vocabulary (write tier). Everything else
-    #: collapses to ``other`` (the cardinality rule again).
-    WRITE_BACKENDS = ("delta", "iceberg")
 
     def record_write(self, backend: str, outcome: str) -> None:
         """One write outcome: ``sqlhandler_writes_total{backend,outcome}``.
@@ -162,7 +164,7 @@ class Metrics:
         """Prometheus text exposition (engine gauges included when given)."""
         lines: list[str] = []
 
-        def emit(name: str, help_text: str, typ: str, series: list[tuple[str, float]]) -> None:
+        def emit(name: str, help_text: str, typ: str, series: list[tuple[str, str]]) -> None:
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} {typ}")
             for labels, value in series:
@@ -175,14 +177,25 @@ class Metrics:
             "counter",
             [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(q.items())],
         )
+        # The duration histogram's family headers render ONCE, above the
+        # per-outcome series (the per-outcome loop only emits _bucket/_sum/
+        # _count samples). Without a declared family, Prometheus types every
+        # duration series "untyped" and any scrape-validating consumer
+        # flags the exposition — same class of defect as the P1-5 duplicate
+        # headers in the cache-gauge loop.
+        if q:
+            lines.append(f"# HELP {self.duration.name} {self.duration.help}")
+            lines.append(f"# TYPE {self.duration.name} histogram")
         for outcome in sorted(q):
             counts, total_sum, total_n = self.duration.snapshot(outcome)
             cumulative = 0
             for i, bucket in enumerate(self.duration.buckets):
                 cumulative = counts[i]  # counts are cumulative by construction
-                lines.append(f'{self.duration.name}_bucket{{outcome="{outcome}",le="{bucket}"}} {cumulative}')
+                lines.append(
+                    f'{self.duration.name}_bucket{{outcome="{outcome}",le="{bucket}"}} {cumulative}'
+                )
             lines.append(f'{self.duration.name}_bucket{{outcome="{outcome}",le="+Inf"}} {total_n}')
-            emit_count = f'{self.duration.name}_sum{{outcome="{outcome}"}} {round(total_sum, 6)}'
+            emit_count = f"{self.duration.name}_sum{{outcome=\"{outcome}\"}} {round(total_sum, 6)}"
             lines.append(emit_count)
             lines.append(f'{self.duration.name}_count{{outcome="{outcome}"}} {total_n}')
         r = self.rows.snapshot()
@@ -195,9 +208,9 @@ class Metrics:
             )
         # ADDITIVE (identity spine): the caller-class series renders after the
         # historical families so every pre-existing line keeps its byte
-        # position. Emitted even when empty? NO — only when a class has been
-        # observed, matching how `rows` above stays absent until data exists
-        # (dashboards that select the series handle absence).
+        # position. Emitted only when a class has been observed, matching how
+        # `rows` above stays absent until data exists (dashboards that select
+        # the series handle absence).
         cq = self.caller_queries.snapshot()
         if cq:
             emit(
@@ -207,8 +220,8 @@ class Metrics:
                 [(f'{{caller_class="{lbl}"}}', val) for lbl, val in sorted(cq.items())],
             )
         # ADDITIVE (write tier): {backend} and {outcome} views of the write
-        # counter — rendered only once a write has been observed, exactly
-        # like the caller-class family above (dashboards handle absence).
+        # counter - rendered only once a write has been observed (dashboards
+        # handle absence).
         w = self.writes.snapshot()
         if w:
             emit(
@@ -226,7 +239,7 @@ class Metrics:
                 [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(wo.items())],
             )
         # Readiness rollup (HA review 2026-09): rendered ALWAYS, engine or
-        # not — it is most informative exactly when the backend is down.
+        # not - it is most informative exactly when the backend is down.
         emit(
             "sqlhandler_readiness_state",
             "Readiness: 1 ready, 0.5 degraded (backend failing < grace), 0 not ready",
@@ -236,16 +249,23 @@ class Metrics:
         if engine is not None:
             try:
                 stats = engine.cache_stats()
+                # P1-5 (audit): the # HELP/# TYPE headers are per-FAMILY, not
+                # per-series - emitting them inside the loop produced three
+                # duplicate header pairs, which Prometheus rejects as an
+                # invalid exposition (the whole scrape failed, silently
+                # killing monitoring). Hoisted above the loop: exactly one
+                # header pair per family, then the series lines.
+                lines.append("# HELP sqlhandler_cache_hits_total Cache hits by cache type.")
+                lines.append("# TYPE sqlhandler_cache_hits_total counter")
+                lines.append("# HELP sqlhandler_cache_misses_total Cache misses by cache type.")
+                lines.append("# TYPE sqlhandler_cache_misses_total counter")
+                # The "l2" series is additive: describe/profile/dataset lines
+                # render byte-identically to before the shared L2 result cache
+                # existed (dashboards/alerts don't move).
                 for cache in ("describe", "profile", "dataset", "l2"):
-                    # The "l2" series is additive: describe/profile/dataset
-                    # lines render byte-identically to before the shared L2
-                    # result cache existed (dashboards/alerts don't move).
                     hits = stats.get(f"{cache}_hits", 0)
                     misses = stats.get(f"{cache}_misses", 0)
-                    lines.append("# HELP sqlhandler_cache_hits_total Cache hits by cache type.")
-                    lines.append("# TYPE sqlhandler_cache_hits_total counter")
                     lines.append(f'sqlhandler_cache_hits_total{{cache="{cache}"}} {hits}')
-                    lines.append("# TYPE sqlhandler_cache_misses_total counter")
                     lines.append(f'sqlhandler_cache_misses_total{{cache="{cache}"}} {misses}')
                 tables = engine.list_tables()
                 lines.append("# HELP sqlhandler_tables Tables currently exposed.")
@@ -267,10 +287,15 @@ class Metrics:
 metrics = Metrics()  # process-wide registry
 
 
+# ---------------------------------------------------------------------------
+# readiness drift rollup (shared by /ready, /metrics and the drift gate)
+# ---------------------------------------------------------------------------
+
+
 def _ready_degraded_grace() -> float:
     """Seconds a failing backend check reports as DEGRADED before NOT READY.
 
-    `SQLHANDLER_READY_DEGRADED_GRACE` (default 60s). 0 disables the
+    ``SQLHANDLER_READY_DEGRADED_GRACE`` (default 60s). 0 disables the
     degraded band entirely (the historical binary behavior). The grace
     exists so a single flaky check (one blip on the storage endpoint)
     stops draining every replica of a scaled-out deployment at once, while
@@ -286,9 +311,9 @@ def _ready_degraded_grace() -> float:
 class ReadinessDrift:
     """Backend-check rollup shared by /ready, /metrics and the drift gate.
 
-    `note_backend(ok)` is called after every readiness probe (HTTP mode);
-    `rollup()` maps the state onto the readiness gauge's three values.
-    Per-process BY DESIGN — this is the per-pod signal an HPA or a
+    ``note_backend(ok)`` is called after every readiness probe (HTTP mode);
+    ``rollup()`` maps the state onto the readiness gauge's three values.
+    Per-process BY DESIGN - this is the per-pod signal an HPA or a
     dashboard needs; a shared/global view would defeat the purpose.
     """
 
@@ -341,8 +366,8 @@ def audit_log_path() -> str:
 def _audit_pod() -> str | None:
     """Serving replica identity for audit lines (never fails).
 
-    `SQLHANDLER_POD_NAME` (the chart wires the downward API) then
-    `HOSTNAME` (set by k8s even without the downward API). The field is
+    ``SQLHANDLER_POD_NAME`` (the chart wires the downward API) then
+    ``HOSTNAME`` (set by k8s even without the downward API). The field is
     omitted entirely outside k8s, so local/stdio trails stay byte-identical.
     """
     return os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or None
@@ -359,7 +384,7 @@ def audit_query(
     """Append one query outcome to the audit JSONL (best-effort, never raises).
 
     ``caller`` (the identity spine, additive): when one is bound, the record
-    gains ``"caller": {"class", "subject", "key_fp"}`` — the class label, the
+    gains ``"caller": {"class", "subject", "key_fp"}`` - the class label, the
     attributed subject (or None) and the MATCHED KEY's fingerprint (never the
     key). Omitted entirely when no caller is bound, so existing trails and
     readers keep their exact shape (additive-field tolerance is the fleet
@@ -403,8 +428,8 @@ def audit_write(
 ) -> None:
     """Append one WRITE outcome to the audit JSONL (write tier, additive).
 
-    ``event:"write"`` lines carry what the review specified — target, rows,
-    backend — plus the same caller field shape as :func:`audit_query`
+    ``event:"write"`` lines carry what the review specified - target, rows,
+    backend - plus the same caller field shape as :func:`audit_query`
     (class/subject/key_fp; never the raw key). Query lines are untouched;
     readers that filter on ``event == "query"`` see byte-identical trails.
     """
@@ -447,4 +472,8 @@ def token_matches(provided: str, expected: str) -> bool:
     provided = (provided or "").strip()
     if provided.lower().startswith("bearer "):
         provided = provided[7:].strip()
-    return hmac.compare_digest(provided, expected)
+    # P3 (audit): compare BYTES, not str. compare_digest on str raises
+    # TypeError for non-ASCII (a header value outside ASCII - e.g. a
+    # Latin-1 body smuggled into X-API-Token) which surfaced as a 500;
+    # a non-comparable credential simply does not match -> 401.
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))

@@ -84,6 +84,80 @@ def block_cache_enabled() -> bool:
     return _cfg()["enabled"]
 
 
+#: Process-global byte accounting per cache dir. The counter MUST live on
+#: the process, not the handler: `maybe_block_cache` builds a fresh handler on
+#: every provider call, so a per-handler counter made the cap multiply by the
+#: number of live handlers (audit 2026-10-16 P2).
+_TOTALS_LOCK = threading.Lock()
+_TOTALS: dict[str, int] = {}
+
+
+def cache_bytes(cache_dir: str | None = None) -> int:
+    """Bytes currently accounted to ``cache_dir`` (all dirs when None)."""
+    with _TOTALS_LOCK:
+        if cache_dir is None:
+            return sum(_TOTALS.values())
+        return _TOTALS.get(cache_dir, 0)
+
+
+def _dir_size(path: Path) -> int:
+    """Recursive size of one cache-entry directory (best effort)."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.stat(os.path.join(root, name)).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
+def _evict_oldest(cache_dir: str, max_bytes: int) -> int:
+    """Evict whole cache-ENTRY directories, oldest first, until under cap.
+
+    Each entry is a ``<key>-<size>`` directory holding that file's blocks,
+    so dropping a whole entry is atomic from a reader's point of view
+    (``_fetch_block`` already tolerates a vanished block and refetches).
+    Deliberately NOT an ``rmtree`` of the shared root: that evicted every
+    other table's warm blocks and could delete a directory a concurrent
+    reader was mid-read on.
+
+    Returns the number of bytes freed (best effort, for the accounting).
+    """
+    root = Path(cache_dir)
+    try:
+        entries = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return 0
+    sized: list[tuple[float, Path, int]] = []
+    for entry in entries:
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        sized.append((mtime, entry, _dir_size(entry)))
+    sized.sort(key=lambda t: t[0])  # oldest first
+    freed = 0
+    with _TOTALS_LOCK:
+        total = _TOTALS.get(cache_dir, 0)
+    for _mtime, entry, size in sized:
+        if max_bytes > 0 and total - freed <= max_bytes:
+            break
+        try:
+            import shutil
+
+            shutil.rmtree(entry, ignore_errors=True)
+        except Exception:
+            logger.debug("block-cache eviction failed for %s", entry, exc_info=True)
+            continue
+        freed += size
+        logger.info("block cache evicted %s (%d bytes) under %s", entry.name, size, cache_dir)
+    return freed
+
+
 class _BlockCacheHandler(pafs.FileSystemHandler):
     """A read-only ``FileSystemHandler`` adding a disk block cache."""
 
@@ -100,26 +174,34 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
 
     # -- identity -----------------------------------------------------------
 
+    def _sizes_fingerprint(self) -> str:
+        """A stable digest of the caller-supplied known sizes.
+
+        The sizes seed cache keying (they stand in for a stat), so two
+        handlers over the same base/scope/dir with DIFFERENT size maps can
+        serve each other's blocks: the snapshot-scoped delta paths pass the
+        snapshot's file sizes, and a stale map would key blocks by the wrong
+        size. Folding the digest into identity keeps pyarrow's dataset cache
+        from conflating them (audit 2026-10-16 P2).
+        """
+        if not self._sizes:
+            return ""
+        items = "\x00".join(f"{k}={v}" for k, v in sorted(self._sizes.items()))
+        return hashlib.sha256(items.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
     def __eq__(self, other) -> bool:  # pyarrow caches datasets by fs identity
         return (
             isinstance(other, _BlockCacheHandler)
             and self._base == other._base
             and self._cfg["dir"] == other._cfg["dir"]
             and self._scope == other._scope
+            and self._sizes_fingerprint() == other._sizes_fingerprint()
         )
 
     def __hash__(self) -> int:  # keep the wrapper usable as a dict key
-        # NEVER str(self._base): pyarrow's reprs embed the inner filesystem
-        # wrapper's OBJECT ADDRESS (``...LocalFileSystem object at 0x...``),
-        # and a SubTreeFileSystem does not keep that wrapper alive — after a
-        # GC re-materializes it, the same handler's str() prints a different
-        # address, so a str-based hash changes under a LIVE object (violating
-        # the eq/hash contract: dataset-cache identity lookups randomly miss,
-        # defeating the cache — caught live as a flaky test assertion).
-        # type_name + (for subtree fs) base_path is the stable value identity
-        # that __eq__'s ``self._base == other._base`` compares equal on.
-        base_path = getattr(self._base, "base_path", "")
-        return hash((type(self).__name__, self._base.type_name, base_path, self._cfg["dir"], self._scope))
+        return hash(
+            (type(self).__name__, str(self._base), self._cfg["dir"], self._scope, self._sizes_fingerprint())
+        )
 
     # -- the two hot paths ----------------------------------------------------
 
@@ -166,23 +248,33 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
             return self._base.open_input_stream(path)
 
     def _account(self, n: int) -> None:
-        """Track bytes entering the cache; nuke-and-restart past the cap.
+        """Account ``n`` freshly-fetched bytes against the GLOBAL cap.
 
-        Blocks are disposable, so eviction is a whole-directory reset —
-        simple, bounded, and correct (the next reader refills what it needs).
+        Two audit findings are fixed here (2026-10-16):
+
+        * **per-handler -> process-global accounting.** ``_bytes_written``
+          used to live on the handler, and every provider call builds a NEW
+          handler (``maybe_block_cache`` wraps per open), so the effective
+          bound was ``max_bytes x handlers`` -- a 4 GiB cap became tens of
+          GiB. The counter now lives on the PROCESS, keyed by cache dir.
+        * **rmtree -> per-entry eviction.** ``shutil.rmtree(cache_dir)``
+          wiped the WHOLE shared directory, evicting every other table's warm
+          blocks and deleting blocks a concurrent reader was mid-read on.
+          Eviction now removes the oldest ``<key>-<size>`` directories one at
+          a time until the total fits.
         """
+        if n <= 0:
+            return
+        cache_dir = self._cfg["dir"]
+        max_bytes = self._cfg["max_bytes"]
         with self._lock:
-            self._bytes_written += n
-            if self._cfg["max_bytes"] > 0 and self._bytes_written > self._cfg["max_bytes"]:
-                cache_dir = self._cfg["dir"]
-                logger.info("block cache exceeded %d bytes; resetting %s", self._cfg["max_bytes"], cache_dir)
-                try:
-                    import shutil
-
-                    shutil.rmtree(cache_dir, ignore_errors=True)
-                except Exception:
-                    logger.warning("block cache reset failed; continuing uncached", exc_info=True)
-                self._bytes_written = 0
+            with _TOTALS_LOCK:
+                total = _TOTALS.get(cache_dir, 0) + n
+                _TOTALS[cache_dir] = total
+            if max_bytes > 0 and total > max_bytes:
+                freed = _evict_oldest(cache_dir, max_bytes)
+                with _TOTALS_LOCK:
+                    _TOTALS[cache_dir] = max(_TOTALS.get(cache_dir, 0) - freed, 0)
 
     # -- metadata -------------------------------------------------------------
 
@@ -194,15 +286,7 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
         return [self._base.get_file_info(str(paths))]
 
     def get_file_info_selector(self, selector: pafs.FileSelector):
-        # pyarrow >= 21 folded the selector-aware listing into
-        # ``get_file_info(paths_or_selector)`` and REMOVED the dedicated
-        # ``get_file_info_selector`` — calling it raises AttributeError
-        # inside the C++ discovery callback and every cached dataset open
-        # fails (misreported downstream as "table does not exist"). Both
-        # shapes return a list of FileInfo; support either generation.
-        if hasattr(self._base, "get_file_info_selector"):
-            return self._base.get_file_info_selector(selector)
-        return self._base.get_file_info(selector)
+        return self._base.get_file_info_selector(selector)
 
     def normalize_path(self, path: str) -> str:
         return self._base.normalize_path(str(path))
@@ -319,12 +403,7 @@ class _CachedStream:
                 f.write(data)
             os.replace(tmp, bp)
         except Exception:
-            logger.debug(
-                "block %s/%d not cached (disk issue?); serving from stream",
-                self._path,
-                i,
-                exc_info=True,
-            )
+            logger.debug("block %s/%d not cached (disk issue?); serving from stream", self._path, i, exc_info=True)
         return data
 
     # -- the file-like contract pyarrow needs ---------------------------------
@@ -425,9 +504,5 @@ def maybe_block_cache(
         logger.debug("block cache enabled for %s", purpose or type(fs).__name__)
         return wrapped
     except Exception:
-        logger.warning(
-            "could not enable block cache for %s; using the plain filesystem",
-            purpose,
-            exc_info=True,
-        )
+        logger.warning("could not enable block cache for %s; using the plain filesystem", purpose, exc_info=True)
         return fs

@@ -113,9 +113,9 @@ def test_bare_limit_preview_takes_fastpath_not_the_job_path(tmp_path, monkeypatc
     eng, _ = _make_engine(tmp_path)
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         called["fastpath"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
 
@@ -138,8 +138,8 @@ def test_where_limit_does_not_take_fastpath(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path)
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
-        result = orig_fp(self, sql, version)
+    def counting_fp(self, sql, version, caller=None):
+        result = orig_fp(self, sql, version, caller=caller)
         if result is not None:
             served["n"] += 1
         return result
@@ -158,8 +158,8 @@ def test_order_by_limit_does_not_take_fastpath(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path)
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
-        result = orig_fp(self, sql, version)
+    def counting_fp(self, sql, version, caller=None):
+        result = orig_fp(self, sql, version, caller=caller)
         if result is not None:
             served["n"] += 1
         return result
@@ -321,8 +321,8 @@ def test_fastpath_respects_time_travel_refusal(tmp_path, monkeypatch):
     eng, _ = _make_engine(tmp_path)
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
-        result = orig_fp(self, sql, version)
+    def counting_fp(self, sql, version, caller=None):
+        result = orig_fp(self, sql, version, caller=caller)
         if result is not None:
             served["n"] += 1
         return result
@@ -504,9 +504,9 @@ def test_query_tab_and_inspector_share_one_entry(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
 
@@ -527,9 +527,9 @@ def test_smaller_want_after_transport_limit_100(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
     got = eng.query_duckdb("SELECT * FROM work_order LIMIT 100", limit=50)
@@ -571,9 +571,9 @@ def test_reuse_only_within_the_same_shape(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
 
@@ -604,9 +604,9 @@ def test_bigger_limit_after_smaller_still_executes(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
 
@@ -644,9 +644,9 @@ def test_repeated_small_requests_are_canonical_hits(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
 
@@ -696,11 +696,174 @@ def test_supersede_l2_only_store_still_reusable(tmp_path, monkeypatch):
     calls = {"fp": 0}
     orig_fp = SqlEngine._preview_fastpath
 
-    def counting_fp(self, sql, version):
+    def counting_fp(self, sql, version, caller=None):
         calls["fp"] += 1
-        return orig_fp(self, sql, version)
+        return orig_fp(self, sql, version, caller=caller)
 
     monkeypatch.setattr(SqlEngine, "_preview_fastpath", counting_fp)
     small = eng2.query_duckdb("SELECT * FROM work_order LIMIT 5")
     assert small.num_rows == 5
     assert calls["fp"] == 0, "L2 superset must serve the smaller request cross-replica"
+
+
+# ---------------------------------------------------------------------------
+# POLICY x FASTPATH crossover (wave-1 review P1): the leak regression suite
+# ---------------------------------------------------------------------------
+#
+# The preview and count(*) fast paths read the RAW dataset — they never pass
+# through _register_schema, which is where masking views and row filters are
+# installed. Before this guard, a caller whose rule masked a column got RAW
+# values from `SELECT ssn FROM t LIMIT 5` while the same query with a WHERE
+# clause correctly returned '***'; and a caller whose rule HID the table got
+# real rows from both fast paths even though list_tables omitted it.
+#
+# The matrix below is deliberately a 2x2 crossover (masked column / hidden
+# table x preview fastpath / count fastpath): a guard that only covered one
+# axis or one path would still leave three cells leaking. The unrestricted
+# control cells matter as much as the restricted ones — a fix that simply
+# disabled the fast paths would pass the leak assertions and silently destroy
+# the feature, so the last two tests pin that the shortcuts still FIRE.
+
+
+def _policy_engine(tmp_path, monkeypatch, spec):
+    """An engine over work_order with a policy file written from `spec`."""
+    import json
+
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    pf = tmp_path / "policy.json"
+    pf.write_text(json.dumps(spec))
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(pf))
+    from sqlhandler.policy import reset_policy_store
+
+    reset_policy_store()
+    return _make_engine(tmp_path)[0]
+
+
+def _caller(subject):
+    from sqlhandler.identity import Caller
+
+    return Caller(cls="user", subject=subject, key_fp=None, via="subject")
+
+
+_MASK_SPEC = {
+    "version": 1,
+    "default_group": "locked",
+    "groups": {"locked": {"tables": {"workorder/work_order": {"column_masks": {"kind": "redact"}}}}},
+    "subjects": {"alice": ["locked"]},
+}
+_HIDE_SPEC = {
+    "version": 1,
+    "default_group": "hider",
+    "groups": {"hider": {"hidden_tables": ["workorder/*"]}},
+    "subjects": {"bob": ["hider"]},
+}
+
+
+def test_masked_column_never_leaks_through_preview_fastpath(tmp_path, monkeypatch):
+    """Cell 1: masked column x preview fastpath -> the mask applies."""
+    eng = _policy_engine(tmp_path, monkeypatch, _MASK_SPEC)
+    alice = _caller("alice")
+    masked = eng.query_duckdb("SELECT id, kind FROM work_order WHERE id > 5", caller=alice)
+    preview = eng.query_duckdb("SELECT id, kind FROM work_order LIMIT 5", caller=alice)
+    assert set(preview.column("kind").to_pylist()) == {"***"}, "preview fastpath leaked a masked column"
+    assert set(masked.column("kind").to_pylist()) == {"***"}, "the WHERE path must mask too"
+    assert preview.num_rows == 5
+
+
+def test_hidden_table_never_leaks_through_preview_fastpath(tmp_path, monkeypatch):
+    """Cell 2: hidden table x preview fastpath -> empty relation, no rows."""
+    eng = _policy_engine(tmp_path, monkeypatch, _HIDE_SPEC)
+    bob = _caller("bob")
+    assert eng.list_tables(caller=bob) == [], "a hidden table must not be listed"
+    preview = eng.query_duckdb("SELECT id, kind FROM work_order LIMIT 5", caller=bob)
+    assert preview.num_rows == 0, "preview fastpath served a HIDDEN table"
+
+
+def test_masked_column_never_leaks_through_count_fastpath(tmp_path, monkeypatch):
+    """Cell 3: masked column x count(*) fastpath -> the guard refuses, and the
+    normal path's answer is the one served (row count is policy-independent
+    for a pure column mask, so this asserts the PATH, not just the number)."""
+    eng = _policy_engine(tmp_path, monkeypatch, _MASK_SPEC)
+    alice = _caller("alice")
+    info = eng._resolve("work_order")
+    assert eng._metadata_count_fastpath("SELECT count(*) FROM work_order", None, caller=alice) is None
+    assert eng._fastpath_rule_blocked(info, alice) is True
+    out = eng.query_duckdb("SELECT count(*) FROM work_order", caller=alice)
+    assert out.column(0).to_pylist() == [150]
+
+
+def test_hidden_table_never_leaks_through_count_fastpath(tmp_path, monkeypatch):
+    """Cell 4: hidden table x count(*) fastpath -> 0, never the raw count."""
+    eng = _policy_engine(tmp_path, monkeypatch, _HIDE_SPEC)
+    bob = _caller("bob")
+    info = eng._resolve("work_order")
+    assert eng._metadata_count_fastpath("SELECT count(*) FROM work_order", None, caller=bob) is None
+    assert eng._fastpath_rule_blocked(info, bob) is True
+    out = eng.query_duckdb("SELECT count(*) FROM work_order", caller=bob)
+    assert out.column(0).to_pylist() == [0], "count(*) fastpath leaked a hidden table's row count"
+
+
+def test_row_filtered_caller_never_leaks_through_fastpaths(tmp_path, monkeypatch):
+    """The third rule axis: a row_filter must also block BOTH fast paths —
+    otherwise COUNT(*) reports the unfiltered total for a filtered caller."""
+    eng = _policy_engine(
+        tmp_path,
+        monkeypatch,
+        {
+            "version": 1,
+            "default_group": "filtered",
+            "groups": {"filtered": {"tables": {"workorder/work_order": {"row_filter": "kind = 'a'"}}}},
+            "subjects": {"dave": ["filtered"]},
+        },
+    )
+    dave = _caller("dave")
+    info = eng._resolve("work_order")
+    assert eng._fastpath_rule_blocked(info, dave) is True
+    assert eng._metadata_count_fastpath("SELECT count(*) FROM work_order", None, caller=dave) is None
+    assert eng._is_bare_preview("SELECT id FROM work_order LIMIT 5", caller=dave) is None
+    # 75 of the 150 rows have kind == 'a'.
+    assert eng.query_duckdb("SELECT count(*) FROM work_order", caller=dave).column(0).to_pylist() == [75]
+
+
+def test_unrestricted_caller_keeps_both_fastpaths(tmp_path, monkeypatch):
+    """CONTROL: a caller with an EMPTY rule still gets both shortcuts.
+
+    Without this, a fix that disabled the fast paths entirely would pass every
+    leak test above while silently removing the feature."""
+    eng = _policy_engine(
+        tmp_path,
+        monkeypatch,
+        {"version": 1, "default_group": "open", "groups": {"open": {}}, "subjects": {"carol": ["open"]}},
+    )
+    carol = _caller("carol")
+    info = eng._resolve("work_order")
+    assert eng._fastpath_rule_blocked(info, carol) is False
+    assert eng._is_bare_preview("SELECT id FROM work_order LIMIT 5", caller=carol) == ("work_order", 5)
+    assert eng._metadata_count_fastpath("SELECT count(*) FROM work_order", None, caller=carol) is not None
+    raw = eng.query_duckdb("SELECT id, kind FROM work_order LIMIT 5", caller=carol)
+    assert set(raw.column("kind").to_pylist()) == {"a", "b"}, "unrestricted caller must see raw data"
+
+
+def test_enforcement_off_is_byte_identical(tmp_path, monkeypatch):
+    """With enforcement OFF the guard is inert: the fast paths behave exactly
+    as before (the golden no-policy path must not regress)."""
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+    monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
+    from sqlhandler.policy import reset_policy_store
+
+    reset_policy_store()
+    eng, _ = _make_engine(tmp_path)
+    info = eng._resolve("work_order")
+    assert eng._fastpath_rule_blocked(info, None) is False
+    assert eng._is_bare_preview("SELECT id FROM work_order LIMIT 5") == ("work_order", 5)
+    assert eng.query_duckdb("SELECT id, kind FROM work_order LIMIT 5").num_rows == 5
+
+
+def test_no_caller_context_keeps_fastpaths(tmp_path, monkeypatch):
+    """Engine internals / pre-middleware (no Caller bound) keep the shortcuts:
+    _effective_rule documents None as the trusted internal path, not a policy
+    subject — so the guard must not fire on it."""
+    eng = _policy_engine(tmp_path, monkeypatch, _MASK_SPEC)
+    info = eng._resolve("work_order")
+    assert eng._fastpath_rule_blocked(info, None) is False
+    assert eng.query_duckdb("SELECT id, kind FROM work_order LIMIT 5").num_rows == 5

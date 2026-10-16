@@ -289,12 +289,15 @@ class FileProvider(DataProvider):
             names = os.listdir(delta_log)
         except (OSError, LakehouseError):
             return None
-        versions = [0]
+        # No numeric log file seen -> None, NOT 0 (audit P2): seeding
+        # versions=[0] made "no _delta_log listing" indistinguishable from
+        # "table at version 0". None tells the engine to fall back to TTL.
+        versions: list[int] = []
         for name in names:
             stem = name.split(".", 1)[0]
             if stem.isdigit():
                 versions.append(int(stem))
-        return max(versions)
+        return max(versions) if versions else None
 
     def check_connection(self) -> str | None:
         """Verify the mounted directory is present and readable."""

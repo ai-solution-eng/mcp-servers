@@ -1,10 +1,11 @@
 # SQLhandler MCP server — direct SQL access to columnar data (MCP server).
-# Base image pinned BY DIGEST (tag python3.12-bookworm-slim, digest captured
-# 2026-10-02). To move the base: resolve the tag's digest and update BOTH
-# lines — `docker buildx imagetools inspect ghcr.io/astral-sh/uv:python3.12-bookworm-slim`
-# or the registry API. A digest pin is the only thing that stops a rebuild
-# from silently shipping a different Python/uv.
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
+# TODO(digest-pin): pin this base BY DIGEST for production builds — the tag
+# moves. Resolve with: docker buildx imagetools inspect
+# ghcr.io/astral-sh/uv:python3.14-trixie-slim — then replace the FROM line.
+# (Kept on python3.14-trixie during the 2026-10-16 port: the dev venv and
+# the whole test suite run 3.14; the sibling's 3.12 digest was not adopted
+# to avoid a runtime change inside an audit-remediation release.)
+FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

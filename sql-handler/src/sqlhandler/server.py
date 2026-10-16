@@ -21,20 +21,13 @@ standard tools; we deliberately avoid that class here.
 
 Tools exposed:
   * list_tables        - enumerate the tables in the configured source
-  * whoami             - the caller's own identity + their own per-table ACL view
   * search_tables      - keyword search over names/columns/catalog descriptions
   * describe_table     - inspect columns/types of a table
   * profile_table      - column-level statistics (min/max, null %, distinct,
                          quantiles) so agents write correct filters first try
   * run_sql            - execute SQL via DuckDB (aggregations etc.); output
-                         as markdown, JSON, CSV or Arrow IPC
+                         as markdown, JSON or CSV
   * scan_table         - pull rows via pyarrow with column projection + limit
-
-Admin tools (admin-designation gated — policy ``admins:`` list):
-  * admin_grants       - the whole grants view (keys, assignments, blocked, admins)
-  * admin_policy_set   - replace the policy document (validated first)
-  * admin_key_mint     - mint one API key (raw key returned ONCE)
-  * admin_key_revoke   - revoke one key by fingerprint
 """
 
 from __future__ import annotations
@@ -74,7 +67,6 @@ from . import jobs as _jobs
 from . import oidc_identity as _oidc_identity
 from . import policy as _policy
 from . import saved as _saved
-from . import writes as _writes
 from .config import (
     load_backend_config,
     load_cache_config,
@@ -85,17 +77,12 @@ from .config import (
 from .engine import SqlEngine, _max_rows
 from .jobs import JobError
 from .provider import make_provider
-from .rawfiles import is_raw_format
 from .sqlguard import assert_mcp_readonly, mcp_readonly_enabled
-from .webui import _BodyLimitMiddleware, _SecurityHeadersMiddleware, register_ui
+from . import writes as _writes
+from . import webui
+from .webui import register_ui
 
 logger = logging.getLogger("sqlhandler")
-
-# The OIDC rung's static-key source: a Bearer value matching a configured
-# static key is the KEY rung's credential and is NEVER parsed as a JWT.
-# The callable is registered at the middleware-definition site below (after
-# _McpApiKeyMiddleware exists) and re-reads the env per call, so key
-# rotation needs no restart.
 
 # --------------------------------------------------------------------------
 # MCP server (standard MCP, interoperable initialize handshake)
@@ -107,10 +94,23 @@ async def _handle_list_tools(ctx, params) -> ListToolsResult:
     return ListToolsResult(tools=_TOOLS)
 
 
+def mcp_tool_specs() -> list[dict]:
+    """The registered tools as plain dicts: [{name, description, inputSchema}].
+
+    The WEB UI's Inspector tab (webui.py ``/api/inspector/*``) serves this so
+    the browser sees the exact tool surface an MCP client's tools/list sees -
+    one source of truth (_TOOLS), no second table to drift. Re-derived per
+    call (a Tool is a pydantic model; a couple dozen items is cheap) so test
+    monkeypatching is reflected too. Tools only - resources/prompts stay out
+    of scope, the same boundary an MCP client's tools/list draws.
+    """
+    return [{"name": t.name, "description": t.description or "", "inputSchema": t.input_schema} for t in _TOOLS]
+
+
 def _required_args(name: str) -> tuple[str, ...]:
     """The required argument names a tool's ADVERTISED input schema declares.
 
-    tools/list (``_TOOLS``) is the single source of truth — every MCP client
+    tools/list (``_TOOLS``) is the single source of truth - every MCP client
     builds its calls from that schema, so validating the dispatch against the
     same declaration keeps the advertised contract and the enforced contract
     byte-identical by construction (no second table to drift).
@@ -128,16 +128,8 @@ def _param_invalid(name: str, args: dict) -> tuple[str, list[str]] | None:
     ``args.get(key, "")``-style defaults, so a call that mis-keys a required
     argument (e.g. ``run_sql {"query": ...}`` from a stale client manifest)
     used to arrive as an empty string and surface as a MASKED downstream
-    error — run_sql reported the sqlguard message "Empty SQL statement.",
-    which reads like a server bug, not a client-side contract violation.
-
-    The check runs BEFORE the dispatch body, only when a required key is
-    missing entirely, and names the expected shape (with a did-you-mean for
-    mis-keyed calls) — the structured-errors contract. Never fires for
-    explicitly empty strings (the tools' own internal checks keep governing
-    those) and never fires for tools with no required args. The code is
-    pinned at the call site via :func:`errors.structured` — the generic
-    message classifier cannot know this is a parameter error.
+    error. The check runs BEFORE the dispatch body, only when a required key
+    is missing entirely, and names the expected shape.
     """
     required = _required_args(name)
     missing = [key for key in required if key not in args]
@@ -153,11 +145,11 @@ def _param_invalid(name: str, args: dict) -> tuple[str, list[str]] | None:
     hints = [
         f"Call {name} with "
         + json.dumps({k: "<value>" for k in required})
-        + " — the tools/list schema is the contract."
+        + " - the tools/list schema is the contract."
     ]
     if sent:
         hints.append(
-            f"Sent key(s) [{received}] — did you mean to name it/them {expected}? "
+            f"Sent key(s) [{received}] - did you mean to name it/them {expected}? "
             "Rename the argument(s) to match the advertised schema."
         )
     return message, hints
@@ -172,120 +164,44 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
 
     ``request`` is the transport's HTTP request when the tool call arrived
     over streamable-http (None over stdio) — the saved-query write tools use
-    it to verify the caller's credential per call (mutation gate), and the
-    identity spine reads the resolved Caller off its scope state
-    (``caller_from_request_state``) for audit + policy enforcement.
+    it to verify the caller's credential per call (mutation gate).
     """
-    caller = _identity.caller_from_request_state(request)
-    # Advertised-contract gate (E_PARAM_INVALID): a missing required
-    # argument is the caller's bug — refuse it with the shape named instead
-    # of letting the args.get(key, "") defaults coerce it into a masked
-    # downstream error (the "Empty SQL statement." masking this guards
-    # against). An explicitly-sent empty string is NOT missing — the tool's
-    # own validation keeps governing that case.
     invalid = _param_invalid(name, args)
     if invalid:
         message, hints = invalid
         return message + _errors.structured(_errors.E_PARAM_INVALID, hints), True
+    caller = _identity.caller_from_request_state(request)
     try:
-        if name == "list_tables":
-            return list_tables(caller=caller), False
-        elif name == "whoami":
-            return whoami(caller=caller), False
-        elif name == "describe_table":
-            return describe_table(str(args.get("table", "")), caller=caller), False
-        elif name == "profile_table":
-            cols = args.get("columns")
-            col_list = [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
-            return profile_table(str(args.get("table", "")), col_list, caller=caller), False
-        elif name == "search_tables":
-            return search_tables(str(args.get("query", "")), caller=caller), False
-        elif name == "run_sql":
-            params = args.get("params")
-            if params is not None and not isinstance(params, (dict, list)):
-                return "Error running SQL: params must be an object or an array.", True
-            return run_sql(
-                str(args.get("sql", "")),
-                args.get("limit"),
-                args.get("output_format") or "markdown",
-                params,
-                args.get("version_as_of"),
-                caller=caller,
-            ), False
-        elif name == "scan_table":
-            # An explicit limit of 0 is honored (empty result); only a
-            # missing limit defaults to 100. A negative limit resolves to
-            # the SQLHANDLER_MAX_ROWS cap inside scan_table (decision D4).
-            raw_limit = args.get("limit")
-            limit = int(raw_limit) if raw_limit is not None else 100
-            return scan_table(
-                str(args.get("table", "")),
-                args.get("columns"),
-                limit,
-                args.get("output_format") or "markdown",
-                args.get("version_as_of"),
-                caller=caller,
-            ), False
-        elif name == "column_stats":
-            raw_top = args.get("top_n")
-            top_n = int(raw_top) if raw_top is not None else 5
-            return column_stats(str(args.get("table", "")), str(args.get("column", "")), top_n, caller=caller), False
-        elif name == "sample_rows":
-            # An explicit limit of 0 is honored (empty sample); the default
-            # is a small honest head. Negative limits resolve to the
-            # SQLHANDLER_MAX_ROWS cap inside the engine (D4 semantics, same
-            # as scan_table).
-            raw_limit = args.get("limit")
-            limit = int(raw_limit) if raw_limit is not None else 20
-            return sample_rows(str(args.get("table", "")), limit, args.get("columns"), caller=caller), False
-        elif name == "query_submit":
-            params = args.get("params")
-            if params is not None and not isinstance(params, (dict, list)):
-                return "Error submitting query job: params must be an object or an array.", True
-            return query_submit(
-                str(args.get("sql", "")),
-                args.get("limit"),
-                params,
-                args.get("version_as_of"),
-                caller=caller,
-            ), False
-        elif name == "query_status":
-            return query_status(str(args.get("job_id", "")), caller=caller), False
-        elif name == "query_result":
-            return (
-                query_result(str(args.get("job_id", "")), args.get("output_format") or "markdown", caller=caller),
-                False,
-            )
-        elif name == "query_cancel":
-            return query_cancel(str(args.get("job_id", "")), caller=caller), False
-        elif name == "query_save":
-            return query_save(
-                args.get("name"),
-                str(args.get("sql", "")),
-                args.get("params"),
-                args.get("description"),
-                request,
-                caller=caller,
-            ), False
-        elif name == "query_list":
-            return query_list(caller=caller), False
-        elif name == "query_delete":
-            return query_delete(args.get("name"), request, caller=caller), False
-        elif name == "query_saved":
-            params = args.get("params")
-            if params is not None and not isinstance(params, (dict, list)):
-                return "Error running saved query: params must be an object or an array.", True
-            return query_saved(
-                str(args.get("name", "")),
-                params,
-                args.get("limit"),
-                args.get("output_format") or "markdown",
-                args.get("version_as_of"),
-                caller=caller,
-            ), False
+        if name == "admin_grants":
+            return admin_grants(caller=caller), False
+        elif name == "admin_policy_set":
+            doc = args.get("policy")
+            if not isinstance(doc, str):
+                return (
+                    "Error setting policy: 'policy' must be the FULL policy document as a JSON string"
+                    + _errors.structured(
+                        _errors.E_PARAM_INVALID,
+                        ['Call admin_policy_set with {"policy": "{...}"} - the whole document, JSON-encoded.'],
+                    ),
+                    True,
+                )
+            return admin_policy_set(doc, caller=caller), False
+        elif name == "admin_key_mint":
+            label = args.get("label")
+            if label is not None and not isinstance(label, str):
+                return _errors.enrich("Error minting key: label must be a string."), True
+            assign = args.get("assign")
+            if assign is not None and not isinstance(assign, list):
+                return _errors.enrich("Error minting key: assign must be a list of glob strings."), True
+            return admin_key_mint(label, assign, caller=caller), False
+        elif name == "admin_key_revoke":
+            return admin_key_revoke(str(args.get("fp", "")), caller=caller), False
+        elif name == "ask_data":
+            execute = args.get("execute")
+            if execute is not None and not isinstance(execute, bool):
+                return _errors.enrich("Error planning question: execute must be a boolean."), True
+            return ask_data(str(args.get("question", "")), execute=bool(execute)), False
         elif name == "explain_query":
-            # E_PARAM_INVALID for malformed args (structured errors exist and
-            # the review requires citing it where args are malformed).
             params = args.get("params")
             if params is not None and not isinstance(params, (dict, list)):
                 return _errors.enrich(
@@ -301,40 +217,99 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                 bool(include_plan),
                 caller=caller,
             ), False
-        elif name == "ask_data":
-            execute = args.get("execute")
-            if execute is not None and not isinstance(execute, bool):
-                return _errors.enrich("Error planning question: execute must be a boolean."), True
-            return ask_data(str(args.get("question", "")), execute=bool(execute)), False
-        elif name == "admin_grants":
-            return admin_grants(caller=caller), False
-        elif name == "admin_policy_set":
-            doc = args.get("policy")
-            if not isinstance(doc, str):
-                return (
-                    "Error setting policy: 'policy' must be the FULL policy document as a JSON string"
-                    + _errors.structured(
-                        _errors.E_PARAM_INVALID,
-                        ['Call admin_policy_set with {"policy": "{...}"} — the whole document, JSON-encoded.'],
-                    ),
-                    True,
-                )
-            return admin_policy_set(doc, caller=caller), False
-        elif name == "admin_key_mint":
-            label = args.get("label")
-            if label is not None and not isinstance(label, str):
-                return _errors.enrich("Error minting key: label must be a string."), True
-            assign = args.get("assign")
-            if assign is not None and not isinstance(assign, list):
-                return _errors.enrich("Error minting key: assign must be a list of glob strings."), True
-            return admin_key_mint(label, assign, caller=caller), False
-        elif name == "admin_key_revoke":
-            return admin_key_revoke(str(args.get("fp", "")), caller=caller), False
+        elif name == "sample_rows":
+            raw_limit = args.get("limit")
+            limit = int(raw_limit) if raw_limit is not None else 20
+            return sample_rows(str(args.get("table", "")), limit, args.get("columns"), caller=caller), False
+        elif name == "whoami":
+            return whoami(caller=caller), False
+        elif name == "list_tables":
+            return list_tables(), False
+        elif name == "describe_table":
+            return describe_table(str(args.get("table", ""))), False
+        elif name == "profile_table":
+            cols = args.get("columns")
+            col_list = [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
+            return profile_table(str(args.get("table", "")), col_list), False
+        elif name == "search_tables":
+            return search_tables(str(args.get("query", ""))), False
+        elif name == "run_sql":
+            params = args.get("params")
+            if params is not None and not isinstance(params, (dict, list)):
+                return "Error running SQL: params must be an object or an array.", True
+            return run_sql(
+                str(args.get("sql", "")),
+                args.get("limit"),
+                args.get("output_format") or "markdown",
+                params,
+                args.get("version_as_of"),
+            ), False
+        elif name == "scan_table":
+            # An explicit limit of 0 is honored (empty result); only a
+            # missing limit defaults to 100. A negative limit resolves to
+            # the SQLHANDLER_MAX_ROWS cap inside scan_table (decision D4).
+            raw_limit = args.get("limit")
+            limit = int(raw_limit) if raw_limit is not None else 100
+            return scan_table(
+                str(args.get("table", "")),
+                args.get("columns"),
+                limit,
+                args.get("output_format") or "markdown",
+                args.get("version_as_of"),
+            ), False
+        elif name == "column_stats":
+            raw_top = args.get("top_n")
+            top_n = int(raw_top) if raw_top is not None else 5
+            return column_stats(str(args.get("table", "")), str(args.get("column", "")), top_n), False
+        elif name == "query_submit":
+            params = args.get("params")
+            if params is not None and not isinstance(params, (dict, list)):
+                return "Error submitting query job: params must be an object or an array.", True
+            return query_submit(
+                str(args.get("sql", "")),
+                args.get("limit"),
+                params,
+                args.get("version_as_of"),
+                caller=caller,
+            ), False
+        elif name == "query_status":
+            return query_status(str(args.get("job_id", "")), caller=caller), False
+        elif name == "query_result":
+            return query_result(
+                str(args.get("job_id", "")),
+                args.get("output_format") or "markdown",
+                caller=caller,
+            ), False
+        elif name == "query_cancel":
+            return query_cancel(str(args.get("job_id", "")), caller=caller), False
+        elif name == "query_save":
+            return query_save(
+                args.get("name"),
+                str(args.get("sql", "")),
+                args.get("params"),
+                args.get("description"),
+                request,
+            ), False
+        elif name == "query_list":
+            return query_list(), False
+        elif name == "query_delete":
+            return query_delete(args.get("name"), request), False
+        elif name == "query_saved":
+            params = args.get("params")
+            if params is not None and not isinstance(params, (dict, list)):
+                return "Error running saved query: params must be an object or an array.", True
+            return query_saved(
+                str(args.get("name", "")),
+                params,
+                args.get("limit"),
+                args.get("output_format") or "markdown",
+                args.get("version_as_of"),
+            ), False
         return f"Unknown tool: {name}", True
     except Exception as exc:
         # The dispatch-level catch: the human message stays primary, the
         # structured code/fix_hints tail is appended when enabled (best-effort
-        # — enrichment failures degrade to the plain message).
+        # - enrichment failures degrade to the plain message).
         return _errors.enrich(str(exc)), True
 
 
@@ -354,27 +329,75 @@ async def _handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResul
 
 _TOOLS = [
     Tool(
-        name="list_tables",
+        name="whoami",
         description=(
-            "List every table in the data source — START HERE before any query, "
-            "plus a live inventory of any attached (read-only) external databases. "
-            "Returns lake table names with one-line catalog descriptions when "
-            "present. When this list is long or you have keywords but no table "
-            "name, use search_tables instead; follow with describe_table on a "
-            "candidate."
+            "The caller's own identity + their own per-table ACL view. Returns the "
+            "resolved Caller (audit-safe shape: class/subject/key_fp — never a raw "
+            "key), which ladder rung resolved it (via), whether the identity-required "
+            "gate is on, and ONE entry per table showing visible/row_filter/"
+            "masked_columns/hidden for THIS caller. Use it to answer 'who am I here "
+            "and why is a table hidden/masked' — never to see another user's view."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
     Tool(
-        name="whoami",
+        name="admin_grants",
         description=(
-            "Report the caller's OWN resolved identity (class/subject — never a raw "
-            "key), which ladder rung resolved it (relay | jwt | browser | key | "
-            "anonymous | stdio), whether the identity-required gate is on, and the "
-            "caller's OWN policy view per table (visible / row_filter / "
-            "masked_columns / hidden — hidden tables listed with visible:false). "
-            "Use it to confirm authentication and see exactly which tables and "
-            "columns your credentials expose before writing queries."
+            "The whole grants view (admin-gated): the designated admins, the raw datasets "
+            "document, policy_text (the WHOLE authored policy as YAML), the assignments map, "
+            "the blocked globs, the group names, the policy hash, and every key (minted: full "
+            "entry; Secret keys: fingerprint-only, source 'secret', not removable). "
+            "Check whoami first - an authenticated key that is not designated gets this refusal."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="admin_policy_set",
+        description=(
+            "Replace the policy document (admin-gated). Pass the FULL document as a JSON or "
+            "YAML string. Validated first: an invalid document is refused with the loader's "
+            "message and the previous policy stays enforcing; a valid one is written "
+            "atomically and hot-reloads. Returns the new policy hash."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"policy": {"type": "string", "description": "The FULL policy document, JSON or YAML."}},
+            "required": ["policy"],
+        },
+    ),
+    Tool(
+        name="admin_key_mint",
+        description=(
+            "Mint one API key (admin-gated). The raw key is returned ONCE in this response - "
+            "store it now; the server keeps only the fingerprint. 'assign' is the optional list "
+            "of dataset globs bound into the policy's datasets.assignments (omitted = ['*'])."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Human-readable label for the key."},
+                "assign": {"type": "array", "items": {"type": "string"}, "description": "Dataset globs to grant."},
+            },
+        },
+    ),
+    Tool(
+        name="admin_key_revoke",
+        description=(
+            "Revoke one minted key by fingerprint (admin-gated). Removes the store entry AND its "
+            "policy assignment. Secret-managed fingerprints are refused (409) - rotate those via "
+            "kubectl; an unknown fingerprint is a 404-shaped error."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"fp": {"type": "string", "description": "The key fingerprint (sha256:<12hex>)."}},
+            "required": ["fp"],
+        },
+    ),
+    Tool(
+        name="list_tables",
+        description=(
+            "List the tables available in the configured data source, plus a live "
+            "inventory of any attached (read-only) external databases."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
@@ -424,27 +447,15 @@ _TOOLS = [
     Tool(
         name="search_tables",
         description=(
-            "Find tables by keyword — the fast entry point when the table list "
-            "is long or you don't know which table holds what. Matches against "
-            "table and column names, human-written semantic-catalog "
-            "descriptions and aliases (business terms like 'work orders'), and "
-            "column documentation — so business-language queries like 'customer "
-            "churn' or 'order amounts' surface the right table even when no "
-            "name matches literally. Ranked best-first: exact/substring hits "
-            "outrank fuzzy near-miss matches for typos. Returns each match "
-            "with its description and matched columns; follow with "
-            "describe_table on the best hit."
+            "Find tables by keyword: matches table names, columns and catalog "
+            "descriptions, ranked best-first (exact/substring terms, then fuzzy "
+            "near-miss names for typos). Use when the table list is long or you "
+            "don't know which table holds what."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Keywords — business terms work ('work order amount', "
-                        "'customer churn'); matches names, aliases, and column docs."
-                    ),
-                },
+                "query": {"type": "string", "description": "Keywords to look for (e.g. 'work order amount')."},
             },
             "required": ["query"],
         },
@@ -452,19 +463,13 @@ _TOOLS = [
     Tool(
         name="run_sql",
         description=(
-            "Execute one SQL SELECT against the lake tables and return rows — "
-            "the workhorse for 'run this query / count / aggregate / join / top-N'. "
-            "Read-only: non-SELECT statements (INSERT, CREATE, DROP, ATTACH, COPY, "
-            "PRAGMA, multi-statement scripts) are refused. Reference tables by "
-            "their listed name (e.g. work_order_header, or schema/name); attached "
-            "external databases (see list_tables) are addressed as "
-            "<db-alias>.<schema>.<table> and joinable with lake tables in one "
-            "query. Workflow: list_tables / search_tables -> describe_table / "
-            "profile_table -> this. Estimate an expensive query first with "
-            "explain_query; a query that may outlive the tool-call timeout belongs "
-            "in query_submit. To chart the result, pass the SAME sql to a charting "
-            "tool (e.g. the seaborn MCP plot tool's `sql` argument) — this server "
-            "returns data, not charts."
+            "Execute a read-only SQL query against the source tables and return results. "
+            "Tables are referenced by folder name (e.g. work_order_header, or schema/name); "
+            "attached external databases (read-only) are referenced as "
+            "<db-alias>.<schema>.<table> and can be joined with lake tables in the same "
+            "query. Aggregations, filters, and joins are pushed into the scan. "
+            "SELECT-only: DDL/DML (INSERT, CREATE, ATTACH, COPY, ...) are rejected "
+            "unless the operator set SQLHANDLER_MCP_READONLY=0."
         ),
         input_schema={
             "type": "object",
@@ -485,12 +490,10 @@ _TOOLS = [
                 },
                 "output_format": {
                     "type": "string",
-                    "enum": ["markdown", "json", "csv", "arrow"],
+                    "enum": ["markdown", "json", "csv"],
                     "description": (
                         "Result rendering: markdown (default, human/LLM friendly), "
-                        "json ({columns, rows} — compact, machine-parseable), csv, "
-                        "or arrow (base64 Arrow IPC stream — exact dtypes, "
-                        "base64-decodes into pa.ipc.open_stream)."
+                        "json ({columns, rows} — compact, machine-parseable) or csv."
                     ),
                 },
                 "params": {
@@ -503,8 +506,9 @@ _TOOLS = [
                 "version_as_of": {
                     "type": "integer",
                     "description": (
-                        "Time travel: read the table as of a Delta snapshot version "
-                        "(nfs/onelake) or Iceberg snapshot id."
+                        "Optional historical snapshot for time travel: a Delta snapshot "
+                        "version (nfs/onelake backends) or Iceberg snapshot id. Applies "
+                        "to every versionable table the query touches."
                     ),
                 },
             },
@@ -514,13 +518,9 @@ _TOOLS = [
     Tool(
         name="scan_table",
         description=(
-            "Fetch raw rows/columns from one table WITHOUT writing SQL (pyarrow "
-            "scan) — for 'just give me the rows/columns of <table>', or to hand "
-            "exact-dtype Arrow data to a programmatic caller. Prefer run_sql "
-            "whenever filters/aggregations/joins can be pushed into the query "
-            "(they prune the scan). Unlike sample_rows (which adds per-column "
-            "fill/null rates for filter planning), this is the plain row/column "
-            "fetch."
+            "Fetch rows/columns from a table via pyarrow (columnar). Prefer run_sql "
+            "when filters or aggregations can be pushed into the scan; use this to "
+            "sample raw columns or feed a programmatic caller without writing SQL."
         ),
         input_schema={
             "type": "object",
@@ -543,7 +543,7 @@ _TOOLS = [
                 },
                 "output_format": {
                     "type": "string",
-                    "enum": ["markdown", "json", "csv", "arrow"],
+                    "enum": ["markdown", "json", "csv"],
                     "description": "Result rendering (default markdown).",
                 },
                 "version_as_of": {
@@ -621,173 +621,6 @@ _TOOLS = [
         },
     ),
     Tool(
-        name="query_submit",
-        description=(
-            "Start a read-only SQL query as a background job; returns its job_id "
-            "immediately. Use INSTEAD of run_sql when the query may outlive the "
-            "tool-call timeout (big scans, heavy joins). Same read-only guard as "
-            "run_sql, enforced at submit time (DDL refused). Then: poll "
-            "query_status, fetch the finished result ONCE with query_result (a "
-            "second fetch is refused — resubmit instead), and query_cancel to "
-            "stop a running job. Same row caps and audit as run_sql; the "
-            "registry holds at most SQLHANDLER_MAX_JOBS (default 8) jobs and is "
-            "cleared on restart. Multi-replica deployments need the operator's "
-            "SQLHANDLER_JOBS_DIR shared store for cross-replica fetch; under "
-            "policy enforcement jobs are owner-scoped."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "sql": {
-                    "type": "string",
-                    "description": "The SQL SELECT to run (read-only guard applies at submit).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional max rows (SQLHANDLER_MAX_ROWS caps it either way).",
-                },
-                "params": {
-                    "description": (
-                        "Optional bind parameters: an object for named $placeholders or an array for positional ?."
-                    ),
-                },
-                "version_as_of": {
-                    "type": "integer",
-                    "description": "Optional historical snapshot (Delta version / Iceberg snapshot id).",
-                },
-            },
-            "required": ["sql"],
-        },
-    ),
-    Tool(
-        name="query_status",
-        description=(
-            "Poll an async query job (from query_submit): state "
-            "(running/done/error/cancelled), elapsed_ms, error, and — when done "
-            "and not yet fetched — the column names and row count. No row data; "
-            "fetch rows with query_result. With the operator's SQLHANDLER_JOBS_DIR "
-            "shared store any replica can poll any job; under policy enforcement "
-            "jobs are owner-scoped (another caller's job id reads as unknown)."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {"job_id": {"type": "string", "description": "The job id from query_submit."}},
-            "required": ["job_id"],
-        },
-    ),
-    Tool(
-        name="query_result",
-        description=(
-            "Fetch a finished async query job's result ONCE (markdown default, "
-            "json, csv, arrow) — a second fetch of the same job is refused "
-            "(resubmit instead), so capture the output the first time. On "
-            "multi-replica deployments (SQLHANDLER_JOBS_DIR shared store) the "
-            "once-only contract holds cluster-wide; under policy enforcement "
-            "another caller's job is refused as unknown before any rows are "
-            "handed over."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "The job id from query_submit."},
-                "output_format": {
-                    "type": "string",
-                    "enum": ["markdown", "json", "csv", "arrow"],
-                    "description": "Result rendering (default markdown).",
-                },
-            },
-            "required": ["job_id"],
-        },
-    ),
-    Tool(
-        name="query_cancel",
-        description=(
-            "Cancel a running async query job (DuckDB interrupt). Owner-scoped "
-            "under policy enforcement: another caller's job reads as unknown."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {"job_id": {"type": "string", "description": "The job id from query_submit."}},
-            "required": ["job_id"],
-        },
-    ),
-    Tool(
-        name="query_save",
-        description=(
-            "Save a parameterized SQL query under a name for reuse with "
-            "query_saved: query_save(name, sql, params, description). The SQL is "
-            "validated at save time (parsed; SELECT-only while the read-only mode "
-            "is on) and params are stored as BIND parameters ($name / ? "
-            "placeholders — never string-interpolated). Saves are auth-gated when "
-            "the deployment has API keys configured; single-user-local mode "
-            "allows them."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short name to address the query by (1-128 chars).",
-                },
-                "sql": {
-                    "type": "string",
-                    "description": 'The SQL template, with $name / ? placeholders for parameters (e.g. "SELECT * FROM t WHERE kind = $kind").',
-                },
-                "params": {
-                    "description": "Optional default bind parameters (object for $names or array for ?).",
-                },
-                "description": {"type": "string", "description": "Optional human note (what/why)."},
-            },
-            "required": ["name", "sql"],
-        },
-    ),
-    Tool(
-        name="query_list",
-        description="List saved parameterized queries (name, SQL, default params, description).",
-        input_schema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="query_delete",
-        description=("Delete a saved query by name. WRITES ARE AUTH-GATED (same posture as query_save)."),
-        input_schema={
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "The saved-query name to delete."}},
-            "required": ["name"],
-        },
-    ),
-    Tool(
-        name="query_saved",
-        description=(
-            "Run a saved parameterized query by name. Call-time params override "
-            "stored ones (dict merge) and travel as BIND parameters — the stored "
-            "SQL is never string-interpolated. The read-only guard is re-applied "
-            "at run time. output_format/limit/version_as_of work like run_sql."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "The saved-query name."},
-                "params": {
-                    "description": "Optional bind params overriding the stored defaults (object for $names / array for ?).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional max rows (SQLHANDLER_MAX_ROWS caps it).",
-                },
-                "output_format": {
-                    "type": "string",
-                    "enum": ["markdown", "json", "csv", "arrow"],
-                    "description": "Result rendering (default markdown).",
-                },
-                "version_as_of": {
-                    "type": "integer",
-                    "description": "Optional historical snapshot (Delta version / Iceberg snapshot id).",
-                },
-            },
-            "required": ["name"],
-        },
-    ),
-    Tool(
         name="explain_query",
         description=(
             "Estimate one read-only query's cost WITHOUT running it — use when a "
@@ -827,7 +660,8 @@ _TOOLS = [
             "required": ["sql"],
         },
     ),
-    Tool(
+
+Tool(
         name="ask_data",
         description=(
             "Turn a plain-language data question into a SQL plan — never executes. "
@@ -868,115 +702,161 @@ _TOOLS = [
     # each one is ADMIN-GATED AT THE TOOL LEVEL (require_admin's is_admin
     # check in-process — MCP has no HTTP routes for middleware to guard);
     # a non-admin caller gets the SAME 403-shaped structured error.
+
     Tool(
-        name="admin_grants",
+        name="query_submit",
         description=(
-            "ADMIN (policy-designated admins only). The whole grants view: "
-            "designated admins, the raw datasets document (or null), "
-            "policy_text (the WHOLE authored policy document as YAML — the "
-            "editable truth the UI editor prefills from), the assignments "
-            "map (identity -> globs), the blocked globs, group names, the "
-            "policy hash, and every API key (minted keys with "
-            "label/created_at/created_by/source:file; bootstrap Secret keys "
-            "fp-only with source:secret — not removable here). Never returns "
-            "a raw key."
+            "Start an async query job and return its job_id immediately — for "
+            "queries that may outlive a tool-call timeout. The read-only guard "
+            "applies at SUBMIT time (DDL is refused, same as run_sql); the job "
+            "runs on the same engine path with the same SQLHANDLER_QUERY_TIMEOUT "
+            "(600s default, watchdog-enforced) and SQLHANDLER_MAX_ROWS cap. "
+            "Poll query_status, then fetch ONCE with query_result. The registry "
+            "is in-memory (a restart clears it) and bounded by SQLHANDLER_MAX_JOBS "
+            "(default 8; beyond the cap the submit is refused)."
         ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "The SQL SELECT to run (read-only guard applies at submit).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional max rows (SQLHANDLER_MAX_ROWS caps it either way).",
+                },
+                "params": {
+                    "description": (
+                        "Optional bind parameters: an object for named $placeholders "
+                        "or an array for positional ?."
+                    ),
+                },
+                "version_as_of": {
+                    "type": "integer",
+                    "description": "Optional historical snapshot (Delta version / Iceberg snapshot id).",
+                },
+            },
+            "required": ["sql"],
+        },
+    ),
+    Tool(
+        name="query_status",
+        description=(
+            "Poll an async query job: state (running/done/error/cancelled), "
+            "elapsed_ms, error, and — when done and not yet fetched — the column "
+            "names and row count. No row data; fetch rows with query_result."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "string", "description": "The job id from query_submit."}},
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="query_result",
+        description=(
+            "Fetch a finished async query job's result ONCE (markdown default, "
+            "json, csv), then the spooled result is freed from memory — a second "
+            "fetch of the same job is refused (resubmit instead)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "The job id from query_submit."},
+                "output_format": {
+                    "type": "string",
+                    "enum": ["markdown", "json", "csv"],
+                    "description": "Result rendering (default markdown).",
+                },
+            },
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="query_cancel",
+        description="Cancel a running async query job (DuckDB interrupt).",
+        input_schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "string", "description": "The job id from query_submit."}},
+            "required": ["job_id"],
+        },
+    ),
+    Tool(
+        name="query_save",
+        description=(
+            "Save a parameterized query under a name for reuse: "
+            "query_save(name, sql, params, description). The SQL is validated at "
+            "save time (parsed; SELECT-only while the read-only mode is on) and "
+            "params are stored as BIND parameters ($name / ? placeholders — never "
+            "string-interpolated). WRITES ARE AUTH-GATED: when SQLHANDLER_API_TOKEN "
+            "or MCP_API_KEYS/SQLHANDLER_API_KEYS is configured, an unauthenticated "
+            "save is refused; with no credential configured (single-user-local "
+            "mode) saves are allowed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Short name to address the query by (1-128 chars)."},
+                "sql": {
+                    "type": "string",
+                    "description": 'The SQL template, with $name / ? placeholders for parameters (e.g. "SELECT * FROM t WHERE kind = $kind").',
+                },
+                "params": {
+                    "description": "Optional default bind parameters (object for $names or array for ?).",
+                },
+                "description": {"type": "string", "description": "Optional human note (what/why)."},
+            },
+            "required": ["name", "sql"],
+        },
+    ),
+    Tool(
+        name="query_list",
+        description="List saved parameterized queries (name, SQL, default params, description).",
         input_schema={"type": "object", "properties": {}},
     ),
     Tool(
-        name="admin_policy_set",
+        name="query_delete",
         description=(
-            "ADMIN (policy-designated admins only). Replace the policy "
-            "document: pass the FULL document as a JSON or YAML string "
-            "(datasets form AND/OR groups form + optional admins list — the "
-            "same shapes the policy file accepts; admin_grants' policy_text "
-            "round-trips as-is). Validated FIRST (an invalid document is "
-            "refused with the loader's message and the previous policy "
-            "keeps enforcing), then written atomically; the mtime "
-            "hot-reload picks it up. Returns the new policy hash."
+            "Delete a saved query by name. WRITES ARE AUTH-GATED (same posture as "
+            "query_save)."
         ),
         input_schema={
             "type": "object",
-            "properties": {
-                "policy": {
-                    "type": "string",
-                    "description": (
-                        "The FULL policy document as a JSON or YAML string, "
-                        'e.g. \'{"datasets": {"global": ["workorder/*"], '
-                        '"assignments": {...}}, "admins": ["sha256:..."]}\' '
-                        "or the same document in YAML (as admin_grants' "
-                        "policy_text serves it)."
-                    ),
-                },
-            },
-            "required": ["policy"],
+            "properties": {"name": {"type": "string", "description": "The saved-query name to delete."}},
+            "required": ["name"],
         },
     ),
     Tool(
-        name="admin_key_mint",
+        name="query_saved",
         description=(
-            "ADMIN (policy-designated admins only). Mint one API key: "
-            "generates the secret, stores ONLY its fingerprint + sha256 "
-            "(never the raw), binds the assignment into the policy's "
-            "datasets.assignments (datasets form required — the groups form "
-            "binds by hand), and returns the raw key ONCE — copy it now, it "
-            "is not recoverable. The minted key authenticates on /mcp "
-            "immediately (the key middleware matches the store live)."
+            "Run a saved parameterized query by name. Call-time params override "
+            "stored ones (dict merge) and travel as BIND parameters — the stored "
+            "SQL is never string-interpolated. The read-only guard is re-applied "
+            "at run time. output_format/limit/version_as_of work like run_sql."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "label": {
-                    "type": "string",
-                    "description": "Free-text label for the key's owner/purpose (audit + UI display).",
+                "name": {"type": "string", "description": "The saved-query name."},
+                "params": {
+                    "description": "Optional bind params overriding the stored defaults (object for $names / array for ?).",
                 },
-                "assign": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        'Optional dataset globs to grant, e.g. ["workorder/*"]. '
-                        'Omitted = ["*"] (full access) recorded in the policy.'
-                    ),
+                "limit": {"type": "integer", "description": "Optional max rows (SQLHANDLER_MAX_ROWS caps it)."},
+                "output_format": {
+                    "type": "string",
+                    "enum": ["markdown", "json", "csv"],
+                    "description": "Result rendering (default markdown).",
+                },
+                "version_as_of": {
+                    "type": "integer",
+                    "description": "Optional historical snapshot (Delta version / Iceberg snapshot id).",
                 },
             },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="admin_key_revoke",
-        description=(
-            "ADMIN (policy-designated admins only). Revoke one minted key "
-            "by fingerprint (the sha256:<12hex> admin_grants lists): drops "
-            "the store entry AND its policy assignment. Secret-managed keys "
-            "are refused (409 — revoke via kubectl, the Secret's lifecycle); "
-            "an unknown fingerprint is a 404-shaped error."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "fp": {
-                    "type": "string",
-                    "description": "The key fingerprint to revoke, 'sha256:' + 12 hex (from admin_grants).",
-                },
-            },
-            "required": ["fp"],
+            "required": ["name"],
         },
     ),
 ]
-
-
-def mcp_tool_specs() -> list[dict]:
-    """The registered tools as plain dicts: [{name, description, inputSchema}].
-
-    The WEB UI's Inspector tab (webui.py ``/api/inspector/*``) serves this so
-    the browser sees the exact tool surface an MCP client's tools/list sees —
-    one source of truth (_TOOLS), no second table to drift. Re-derived per
-    call (a Tool is a pydantic model; 23 items is cheap) so test monkeypatching
-    is reflected too. Tools only — resources/prompts stay out of scope, the
-    same boundary an MCP client's tools/list draws.
-    """
-    return [{"name": t.name, "description": t.description or "", "inputSchema": t.input_schema} for t in _TOOLS]
-
 
 mcp = Server(
     "sqlhandler",
@@ -988,25 +868,17 @@ mcp = Server(
     version=__version__,
     description=("Direct, fast SQL access to columnar data (OneLake/Delta, S3/MinIO/Parquet, Iceberg) as MCP tools."),
     instructions=(
-        "Read-only SQL analytics over columnar lake tables (Delta/Parquet/Iceberg) "
-        "plus attached read-only external databases. Every non-SELECT statement is "
-        "refused. "
-        "Workflow: 1) list_tables (or search_tables for keyword/fuzzy lookup) to "
-        "find real table names — never guess. "
-        "2) describe_table for columns/types; profile_table / column_stats / "
-        "sample_rows for value ranges, null rates, top values — check these BEFORE "
-        "writing WHERE clauses. "
-        "3) run_sql for the query. Estimate expensive queries first with "
-        "explain_query (bytes-to-scan, warm/cold cache, optional EXPLAIN). A query "
-        "that may outlive the tool-call timeout: query_submit, poll query_status, "
-        "fetch ONCE with query_result, query_cancel to stop. "
-        "4) Plain-language questions: ask_data drafts SQL + a follow-up; nothing "
-        "executes — run the draft yourself with an explicit run_sql. "
-        "Charts: this server returns data, not charts — pass the same SQL to a "
-        "charting tool (the seaborn MCP plot tool takes a `sql` argument). "
-        "Time travel: version_as_of (Delta snapshot version / Iceberg snapshot id) "
-        "reads history. Results render as markdown | json | csv | arrow; rows are "
-        "capped by limit / SQLHANDLER_MAX_ROWS (default 1000)."
+        "Direct, fast access to columnar data (OneLake/Delta or S3/MinIO/Parquet) "
+        "as an EzPresto replacement. Use list_tables to discover tables, describe_table "
+        "for schema, profile_table for column statistics (value ranges, null %, distinct "
+        "counts — helps write correct filters first try), column_stats for one column's "
+        "top values and quantiles, and run_sql / scan_table to "
+        "query. Prefers predicate filters and column projections to avoid full scans. "
+        "When external databases are attached (see the list_tables output), their tables "
+        "are addressed as <db-alias>.<schema>.<table>, join-able with lake tables in one "
+        "query, and strictly read-only. For queries that may run long, query_submit "
+        "starts an async job (poll query_status, fetch once with query_result, "
+        "query_cancel to stop); query_save/query_saved reuse parameterized queries."
     ),
     on_list_tools=_handle_list_tools,
     on_call_tool=_handle_call_tool,
@@ -1018,7 +890,6 @@ mcp = Server(
     on_list_prompts=mcp_resources.handle_list_prompts,
     on_get_prompt=mcp_resources.handle_get_prompt,
 )
-
 
 def _env_list(name: str) -> list[str]:
     """Parse a comma-separated env list into a clean list (empty when unset)."""
@@ -1037,76 +908,6 @@ def _truthy(name: str, default: str = "0") -> bool:
 # The equivalent protection runs in _McpTransportGuard below, which applies
 # the same checks with deployment-configurable lists.
 _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-
-
-def _ready_response(status_code: int, error: str) -> JSONResponse:
-    """Build the /ready body for a failing backend check (drift-aware).
-
-    The HTTP status follows the check's age: a first failure still returns
-    200 {status: degraded} so the kubelet does NOT drain the pod for a
-    blip; once SQLHANDLER_READY_DEGRADED_GRACE of continuous failure has
-    elapsed it becomes 503 (the historical outcome). Callers that want the
-    raw verdict read "backend_ok" / "degraded".
-    """
-    rollup = observability.drift.rollup()
-    if rollup >= 1.0:  # unreachable here (only called on failure) but safe
-        return JSONResponse({"status": "ready"})
-    failed_s = round(observability.drift.failed_seconds(), 1)
-    if rollup > 0.0:
-        return JSONResponse(
-            {
-                "status": "degraded",
-                "backend_ok": False,
-                "degraded": True,
-                "failing_for_s": failed_s,
-                "error": error,
-            }
-        )
-    return JSONResponse(
-        {"status": "not ready", "backend_ok": False, "failing_for_s": failed_s, "error": error},
-        status_code=status_code,
-    )
-
-
-class _DriftGateMiddleware:
-    """ASGI middleware: shed NEW SQL work while the backend check is failing.
-
-    Active only when SQLHANDLER_READY_DRIFT_GATE=1. Gate classes: the /api
-    run/scan endpoints (calls that would otherwise queue a doomed scan into
-    the concurrency gate); /mcp is EXEMPT (agents must still be able to
-    interrogate the failure); /health, /ready, /metrics and UI pages pass
-    through. Off by default — enabling it is a per-site decision (it trades
-    "always answer something" for "fail fast on doomed work").
-    """
-
-    _GATED_PREFIXES = ("/api/query", "/api/scan", "/api/sample", "/api/profile")
-
-    def __init__(self, app):
-        self.app = app
-        self.enabled = os.environ.get("SQLHANDLER_READY_DRIFT_GATE", "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-
-    async def __call__(self, scope, receive, send):
-        gated = scope["type"] == "http" and scope.get("path", "").startswith(self._GATED_PREFIXES)
-        if not (self.enabled and gated):
-            await self.app(scope, receive, send)
-            return
-        if observability.drift.backend_failed():
-            resp = JSONResponse(
-                {
-                    "error": "Backend degraded: the data source check is failing "
-                    "(SQLHANDLER_READY_DRIFT_GATE refuses new scans while the "
-                    "readiness probe is in its degraded band). Retry shortly."
-                },
-                status_code=503,
-            )
-            await resp(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
 
 
 class _McpTransportGuard:
@@ -1180,22 +981,17 @@ class _McpTransportGuard:
 
 
 class _ProbesAuthMiddleware:
-    """Optional auth gate on ``/metrics`` only (default OFF).
+    """Optional auth gate on ``/metrics`` and ``/ready`` (default OFF).
 
     ``SQLHANDLER_METRICS_AUTH=1`` requires a valid credential from the same
     sources the other gates use — ``SQLHANDLER_API_TOKEN`` (the /api token)
     or the /mcp API keys (``MCP_API_KEYS`` / ``SQLHANDLER_API_KEYS``) — via
     ``Authorization: Bearer``, ``X-API-Key`` or ``X-API-Token``, compared
-    constant-time. Default OFF keeps today's behavior (/metrics
+    constant-time. Default OFF keeps today's behavior (both endpoints
     unauthenticated). When enabled with NO credential source configured the
     gate fails CLOSED (401 for everyone) with a loud startup warning —
-    a metrics gate without a secret would be theater.
-
-    /ready is NEVER gated: kubelet readiness probes cannot carry a secret
-    (probe headers are literal, not secretRef), so a gated /ready strands
-    every pod NotReady forever — seen live as pods 0/1 with probe 401s.
-    Readiness is a cluster-internal signal; liveness stays on /health
-    (always open).
+    a metrics gate without a secret would be theater. Liveness probes
+    should keep using /health (always open).
     """
 
     def __init__(self, app):
@@ -1208,7 +1004,7 @@ class _ProbesAuthMiddleware:
         return [t for t in expected if t]
 
     async def __call__(self, scope, receive, send):
-        gated = scope["type"] == "http" and scope.get("path", "") == "/metrics"
+        gated = scope["type"] == "http" and scope.get("path", "") in ("/metrics", "/ready")
         if gated and _truthy("SQLHANDLER_METRICS_AUTH"):
             provided = ""
             for k, v in scope.get("headers", []):
@@ -1223,11 +1019,12 @@ class _ProbesAuthMiddleware:
                     break
             expected = self._expected()
             ok = bool(provided) and any(
-                hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in expected
+                hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8"))
+                for candidate in expected
             )
             if not ok:
                 resp = JSONResponse(
-                    {"error": "unauthorized: /metrics is gated (SQLHANDLER_METRICS_AUTH)"},
+                    {"error": "unauthorized: /metrics and /ready are gated (SQLHANDLER_METRICS_AUTH)"},
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
@@ -1287,8 +1084,7 @@ def _handler() -> SqlEngine:
     """Return the process-wide SqlEngine, building it on first use.
 
     The data source is selected by SQLHANDLER_BACKEND (onelake by default,
-    or s3/minio, iceberg, nfs/file, sharing) and its config is built from
-    the environment. On first use
+    or s3/minio) and its config is built from the environment. On first use
     the engine is created and, when pre-warm tables are configured, a daemon
     thread warms the describe cache in the background so the first agent
     describe is already a cache hit.
@@ -1352,29 +1148,17 @@ def _prewarm(handler: SqlEngine, tables: tuple[str, ...]) -> None:
 # --------------------------------------------------------------------------
 
 
-def list_tables(*, caller=None) -> str:
-    """List every table in the data source — START HERE before any query.
-
-    Returns lake table names with one-line catalog descriptions when present,
-    plus any attached read-only external databases with their fully-qualified
-    <db-alias>.<schema>.<table> names. When this list is long or you have
-    keywords but no table name, use search_tables instead; follow with
-    describe_table on a candidate.
-
-    ``caller`` (identity spine): policy-hidden tables are omitted for a
-    caller whose groups hide them (byte-identical list when enforcement is
-    off / no caller).
-    """
+def list_tables() -> str:
+    """List the tables available in the configured data source."""
     try:
         handler = _handler()
-        tables = handler.list_tables(caller=caller)
+        tables = handler.list_tables()
         lines: list[str]
         if not tables:
             lines = ["No tables found in the configured data source."]
         else:
             lines = ["Tables:"]
             n_virtual = 0
-            n_raw = 0
             for t in tables:
                 # Catalog descriptions annotate the list when present (compact:
                 # name first, description after an em dash), so agents can pick
@@ -1383,20 +1167,12 @@ def list_tables(*, caller=None) -> str:
                 if t.format == "virtual":
                     n_virtual += 1
                     lines.append(f"  - {t.name} (VIRTUAL)" + (f" — {desc}" if desc else ""))
-                elif is_raw_format(t.format):
-                    n_raw += 1
-                    lines.append(f"  - {t.name} (RAW {t.format})" + (f" — {desc}" if desc else ""))
                 else:
                     lines.append(f"  - {t.name}" + (f" — {desc}" if desc else ""))
             if n_virtual:
                 lines.append(
                     f"  ({n_virtual} VIRTUAL table{'s' if n_virtual != 1 else ''} — computed on the fly "
                     "from their semantic-catalog definitions; query them like any other table)"
-                )
-            if n_raw:
-                lines.append(
-                    f"  ({n_raw} RAW table{'s' if n_raw != 1 else ''} — landing-zone csv/tsv/json files, "
-                    "no row-group pruning or statistics; promote to Parquet for large data)"
                 )
         # Attached external databases (read-only): listed with fully-qualified
         # names so agents can address them in run_sql / describe_table
@@ -1425,23 +1201,14 @@ def list_tables(*, caller=None) -> str:
         return f"Error listing tables: {exc}"
 
 
-def describe_table(table: str, *, caller=None) -> str:
-    """Return column names, types, and the canonical URI for a table.
-
-    ``caller`` (identity spine): masked columns are omitted and hidden
-    tables raise (policy-consistent schema visibility).
-    """
+def describe_table(table: str) -> str:
+    """Return column names, types, and the canonical URI for a table."""
     try:
         handler = _handler()
-        info = handler.describe_table(table, caller=caller)
+        info = handler.describe_table(table)
         lines = [f"Table: {info['table']}", f"URI: {info['uri']}"]
         if info.get("virtual"):
             lines.append("Kind: VIRTUAL — computed on the fly from its semantic-catalog definition")
-        elif is_raw_format(info.get("format", "")):
-            lines.append(
-                f"Kind: RAW ({info['format']}) — landing-zone raw text, scanned whole "
-                "(no row groups/statistics); promote to Parquet for large data"
-            )
         if info.get("description"):
             lines.append(f"Description: {info['description']}")
         if info.get("aliases"):
@@ -1457,15 +1224,11 @@ def describe_table(table: str, *, caller=None) -> str:
         return f"Error describing table: {exc}"
 
 
-def profile_table(table: str, columns: list[str] | None = None, *, caller=None) -> str:
-    """Return per-column statistics for a table as a markdown table.
-
-    ``caller`` (identity spine): profiles run over the masking view — the
-    stats describe what this caller can actually read.
-    """
+def profile_table(table: str, columns: list[str] | None = None) -> str:
+    """Return per-column statistics for a table as a markdown table."""
     try:
         handler = _handler()
-        p = handler.profile_table(table, columns=columns, caller=caller)
+        p = handler.profile_table(table, columns=columns)
         header = [f"Table: {p['table']}"]
         if p.get("n_rows") is not None:
             header.append(
@@ -1476,36 +1239,19 @@ def profile_table(table: str, columns: list[str] | None = None, *, caller=None) 
                     else ""
                 )
             )
-        # fastrender.profile_to_markdown: the same pandas-dtype-faithful
-        # rendering without the DataFrame materialization (fuzz-verified
-        # byte-identical incl. the object-dtype/fobj transform rules); falls
-        # back to pandas for any shape outside its proven contract.
-        from .fastrender import profile_to_markdown
+        import pandas as pd
 
-        body = profile_to_markdown(p["columns"])
-        if body is None:
-            import pandas as pd
-
-            body = pd.DataFrame(p["columns"]).to_markdown(index=False)
-        return "\n".join(header) + "\n\n" + body
+        df = pd.DataFrame(p["columns"])
+        return "\n".join(header) + "\n\n" + df.to_markdown(index=False)
     except Exception as exc:
-        return f"Error profiling table: {_errors.enrich(str(exc))}"
+        return f"Error profiling table: {exc}"
 
 
-def search_tables(query: str, *, caller=None) -> str:
-    """Find tables by keyword — the fast entry point when the table list is
-    long or you don't know which table holds what.
-
-    Matches against table and column names, human-written semantic-catalog
-    descriptions and aliases (business terms like 'work orders'), and column
-    documentation — so business-language queries like 'customer churn' or
-    'order amounts' surface the right table even when no name matches
-    literally. Ranked best-first: exact/substring hits outrank fuzzy
-    near-miss matches for typos. Never triggers a per-table schema fetch.
-    """
+def search_tables(query: str) -> str:
+    """Keyword search over table names/columns/catalog descriptions."""
     try:
         handler = _handler()
-        results = handler.search_tables(query, caller=caller)
+        results = handler.search_tables(query)
         if not results:
             return f"No tables match {query!r}. Try broader keywords, or run list_tables."
         lines = [f"Found {len(results)} table(s) matching {query!r}:"]
@@ -1521,115 +1267,6 @@ def search_tables(query: str, *, caller=None) -> str:
         return f"Error searching tables: {exc}"
 
 
-def whoami(*, caller=None) -> str:
-    """The caller's own identity + their OWN ACL view, per table.
-
-    Returns the resolved Caller (audit-safe shape: class/subject/key_fp —
-    never a raw key), which ladder rung resolved it, whether the
-    identity-required gate is currently on, and ONE entry per provider
-    table computed through the engine's ``_effective_rule(info, caller)``:
-    visible / row_filter / masked_columns / hidden. The table list is the
-    UNFILTERED provider list (engine.list_tables would already omit hidden
-    tables; here the point is to SHOW the caller their own view of
-    everything) — hidden tables appear with ``visible: false``. Honest for
-    anonymous callers too: their default-group view, or everything when no
-    policy is configured. A caller NEVER sees another user's view: the
-    rules are computed for THIS caller only.
-    """
-    try:
-        effective_caller = caller if caller is not None else _identity.ANONYMOUS
-        handler = _handler()
-        physical = handler._provider_tables()
-        tables = list(physical) + list(handler._virtual_infos(physical))
-        datasets: list[dict] = []
-        for info in tables:
-            try:
-                rule = handler._effective_rule(info, effective_caller)
-            except Exception:
-                # Fail-closed honesty: an unresolvable rule must never
-                # render the table as open — mark it hidden + not visible.
-                datasets.append(
-                    {
-                        "table": info.qualified_name,
-                        "visible": False,
-                        "row_filter": None,
-                        "masked_columns": [],
-                        "hidden": True,
-                    }
-                )
-                continue
-            datasets.append(
-                {
-                    "table": info.qualified_name,
-                    "visible": not rule.hidden,
-                    "row_filter": rule.row_filter,
-                    "masked_columns": sorted(rule.column_masks.keys()),
-                    "hidden": bool(rule.hidden),
-                }
-            )
-        payload = {
-            "caller": effective_caller.as_audit_dict(),
-            "via": effective_caller.via,
-            "require_identity": _IdentityRequiredMiddleware._required(),
-            "datasets": datasets,
-        }
-        return json.dumps(payload, indent=2, default=str)
-    except Exception as exc:
-        return f"Error computing whoami: {_errors.enrich(str(exc))}"
-
-
-def _whoami_rest_payload(request) -> dict:
-    """The REST /api/whoami body — the same contract the MCP whoami tool
-    returns, as JSON for the web UI's header identity widget (D-UI, 2026-10).
-
-    Resolution mirrors the ADMIN surface (``_admin_resolve_caller``), not
-    the bare ladder: an X-API-Key / Bearer presented on the request is
-    authenticated HERE (the /api routes have no key middleware), and a
-    key-shaped value that matches NOTHING stays anonymous — a wrong key is
-    never redeemed as the browser user behind it (the same contract
-    ``require_admin`` pins). A genuinely keyless request resolves through
-    the full ladder (SSO bearer JWT rung → oauth2-proxy browser rung).
-
-    The payload previews the identity — it is NOT a grant: it answers
-    "who would this request resolve as" so the UI can render the header
-    chip (``Signed in as …``) and tell an SSO visitor why self-mint will
-    or will not accept them (``via``). Audit-safe by construction: the
-    caller renders through ``as_audit_dict`` (class/subject/fp — never a
-    raw key) and the response never says whether the caller is an ADMIN
-    (an admin designation must not be probeable from an unauthenticated
-    page; the Access-control panel's own calls already 401/403 loudly).
-    """
-    presented = _admin_presented_keys(request)
-    caller = _admin_resolve_caller(request, presented)
-    if caller is None:
-        caller = _identity.ANONYMOUS
-    # The D22 sign-in hint: when anonymous AND the SSO flow is served, the
-    # header chip offers "Sign in with SSO" instead of only the key modal.
-    # A config read only — no identity leak (the flow is public knowledge).
-    from . import oidc_sso
-
-    return {
-        "caller": caller.as_audit_dict(),
-        "via": caller.via,
-        "authenticated": not caller.is_anonymous,
-        "require_identity": _IdentityRequiredMiddleware._required(),
-        "sso_login_available": oidc_sso.sso_enabled(),
-    }
-
-
-def _validate_output_format(output_format: str) -> str:
-    """Normalize one output_format name; ValueError names the valid set.
-
-    Flows through each tool's catch-all, so a bad name surfaces as the
-    same "Error <verb> ... {"error": {...}}" shape any other bad input
-    produces (E_PARAM_INVALID — see errors.py).
-    """
-    fmt = str(output_format or "markdown").strip().lower()
-    if fmt not in ("markdown", "json", "csv", "arrow"):
-        raise ValueError(f"Unsupported output_format {fmt!r}; use 'markdown', 'json', 'csv' or 'arrow'.")
-    return fmt
-
-
 def run_sql(
     sql: str,
     limit: int | None = None,
@@ -1639,14 +1276,7 @@ def run_sql(
     *,
     caller=None,
 ) -> str:
-    """Execute one SQL SELECT against the lake tables and return rows.
-
-    The workhorse for "run this query / count / aggregate / join / top-N".
-    Workflow: list_tables / search_tables -> describe_table / profile_table ->
-    this. Estimate an expensive query first with explain_query; a query that
-    may outlive the tool-call timeout belongs in query_submit. To chart the
-    result, pass the SAME sql to a charting tool (e.g. the seaborn MCP plot
-    tool's ``sql`` argument) — this server returns data, not charts.
+    """Execute a SQL query against the source tables and return results.
 
     Read-only by default (fleet decision D2): the same DuckDB-parser guard
     the web API uses rejects every non-SELECT statement (multi-statement
@@ -1656,35 +1286,20 @@ def run_sql(
     needs no restart. Queries that touch an attached external catalog stay
     SELECT-only regardless (engine-level, see sqlhandler/engine.py).
 
-    Write tier (additive, review §4 — GLOBAL FLAG, DEFAULT FALSE): when
-    ``SQLHANDLER_WRITES_ENABLED`` is set, a single classified
-    scratch-write statement (CREATE TABLE AS / INSERT INTO / COPY INTO
-    targeting ``<scratch-root>/<subject-slug>/...``) is admitted here —
-    BEFORE the read guard (which would refuse it by shape) — and the write
-    SUMMARY (target, backend, rows written) returns in place of rows.
-    ``SQLHANDLER_MCP_READONLY`` keeps governing multi-statement/DDL
-    exactly as before — the new flag gates only the new capability, so the
-    default posture is unchanged twice over. Writes are never cached and
-    never served from cache (classification precedes the cache check).
-
     Args:
-        sql: The SQL SELECT to run against the source tables (or, with the
-            write tier enabled, one classified scratch-write statement).
+        sql: The SQL SELECT to run against the source tables.
         limit: Optional max rows to return; SQLHANDLER_MAX_ROWS (default 1000)
             caps the result either way.
-        output_format: markdown (default) | json | csv | arrow.
+        output_format: markdown (default) | json | csv.
         params: optional bind parameters (named dict or positional list).
-        version_as_of: Optional historical snapshot for time travel: a Delta
-            snapshot version (nfs/onelake) or Iceberg snapshot id, applied to
-            every versionable table the query touches.
     """
     try:
         fmt = _validate_output_format(output_format)
         # Write tier FIRST (classification before the read guard): when the
         # global flag is ON, a single classified scratch-write statement is
         # ADMITTED here (the read guard would refuse it by shape) and the
-        # write summary returns in place of rows. Everything else —
-        # multi-statement scripts, DDL, PRAGMA — still hits the D2 guard
+        # write summary returns in place of rows. Everything else -
+        # multi-statement scripts, DDL, PRAGMA - still hits the D2 guard
         # below exactly as today (the new flag gates only the new
         # capability). Flag off (default): this branch is inert and the
         # guard below sees the statement first, byte-identically.
@@ -1699,7 +1314,9 @@ def run_sql(
             # with the env named in the message.
             sql = assert_mcp_readonly(sql)
         handler = _handler()
-        arrow = handler.query_duckdb(sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller)
+        arrow = handler.query_duckdb(
+            sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller
+        )
         return _arrow_to_output(arrow, max_rows=limit, fmt=fmt)
     except Exception as exc:
         return f"Error running SQL: {_errors.enrich(str(exc))}"
@@ -1718,8 +1335,6 @@ def _write_summary_output(arrow, fmt: str = "markdown") -> str:
         return _arrow_to_output(arrow, max_rows=1, fmt="json")
     if fmt == "csv":
         return _arrow_to_output(arrow, max_rows=1, fmt="csv")
-    if fmt == "arrow":
-        return _arrow_to_output(arrow, max_rows=1, fmt="arrow")
     row = {k: arrow.column(k)[0].as_py() for k in arrow.column_names} if arrow.num_rows else {}
     lines = [
         "Write complete.",
@@ -1740,17 +1355,12 @@ def scan_table(
     limit: int = 100,
     output_format: str = "markdown",
     version_as_of: int | None = None,
-    *,
-    caller=None,
 ) -> str:
-    """Fetch raw rows/columns from one table WITHOUT writing SQL (pyarrow scan).
+    """Fetch rows/columns from a table via pyarrow (columnar).
 
-    For "just give me the rows/columns of <table>" — no filters, no SQL.
-    Prefer run_sql whenever filters/aggregations/joins can be pushed into the
-    query (they prune the scan); use this for a bounded columnar slice to
-    inspect, or to hand exact-dtype Arrow data to another tool. Unlike
-    sample_rows (which adds per-column fill/null rates for filter planning),
-    this is the plain row/column fetch.
+    Prefer run_sql when filters or aggregations can be pushed into the scan;
+    use this to sample raw columns or feed a programmatic caller without
+    writing SQL.
 
     Args:
         table: Table name (schema/name when the source uses schemas).
@@ -1763,24 +1373,20 @@ def scan_table(
             ``.head(-1)``, which drops the LAST row). An explicit positive
             limit is honored exactly; ``SQLHANDLER_MAX_ROWS=0`` (cap
             disabled) resolves the negative/missing case to unlimited.
-        output_format: markdown (default) | json | csv | arrow.
-        version_as_of: Optional historical snapshot for time travel: a Delta
-            snapshot version (nfs/onelake) or Iceberg snapshot id.
+        output_format: markdown (default) | json | csv.
     """
     try:
         fmt = _validate_output_format(output_format)
         handler = _handler()
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
         resolved_limit = _resolve_scan_limit(limit)
-        arrow = handler.scan_arrow(
-            table, columns=col_list, limit=resolved_limit, version_as_of=version_as_of, caller=caller
-        )
+        arrow = handler.scan_arrow(table, columns=col_list, limit=resolved_limit, version_as_of=version_as_of)
         return _arrow_to_output(arrow, max_rows=resolved_limit, fmt=fmt)
     except Exception as exc:
         return f"Error scanning table: {_errors.enrich(str(exc))}"
 
 
-def column_stats(table: str, column: str, top_n: int = 5, *, caller=None) -> str:
+def column_stats(table: str, column: str, top_n: int = 5) -> str:
     """Statistics for ONE column over a bounded sample (additive).
 
     distinct count, null count/pct, min/max, q25/q50/q75 and the top-N
@@ -1788,7 +1394,7 @@ def column_stats(table: str, column: str, top_n: int = 5, *, caller=None) -> str
     cap profile_table uses (never a full-table scan beyond the profile cap).
     """
     try:
-        s = _handler().column_stats(table, column, top_n, caller=caller)
+        s = _handler().column_stats(table, column, top_n)
         return _column_stats_markdown(s)
     except Exception as exc:
         return f"Error computing column stats: {_errors.enrich(str(exc))}"
@@ -1828,6 +1434,124 @@ def _column_stats_markdown(s: dict) -> str:
         for r in top:
             lines.append(f"| {_md_cell(r.get('value'))} | {_md_cell(r.get('count'))} |")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# whoami (MCP tool + REST twin) - the caller's own identity + ACL preview
+# ---------------------------------------------------------------------------
+
+
+def whoami(*, caller=None) -> str:
+    """The caller's own identity + their OWN ACL view, per table.
+
+    Returns the resolved Caller (audit-safe shape: class/subject/key_fp -
+    never a raw key), which ladder rung resolved it, whether the
+    identity-required gate is currently on, and ONE entry per provider
+    table computed through the engine's ``_effective_rule(info, caller)``:
+    visible / row_filter / masked_columns / hidden. The table list is the
+    UNFILTERED provider list (engine.list_tables would already omit hidden
+    tables; here the point is to SHOW the caller their own view of
+    everything) - hidden tables appear with ``visible: false``. Honest for
+    anonymous callers too: their default-group view, or everything when no
+    policy is configured. A caller NEVER sees another user's view: the
+    rules are computed for THIS caller only.
+
+    Note: ``_effective_rule`` lands with the engine-side Stage-2 policy
+    integration (another agent's zone); until then the per-table view
+    degrades to "everything visible" via the fail-open fallback below
+    (never a 500 - whoami is a preview, not an enforcement surface).
+    """
+    try:
+        effective_caller = caller if caller is not None else _identity.ANONYMOUS
+        handler = _handler()
+        physical = handler._provider_tables()
+        tables = list(physical) + list(handler._virtual_infos(physical))
+        datasets: list[dict] = []
+        has_rule = hasattr(handler, "_effective_rule")
+        for info in tables:
+            if not has_rule:
+                datasets.append(
+                    {
+                        "table": info.qualified_name,
+                        "visible": True,
+                        "row_filter": None,
+                        "masked_columns": [],
+                        "hidden": False,
+                    }
+                )
+                continue
+            try:
+                rule = handler._effective_rule(info, effective_caller)
+            except Exception:
+                # Fail-closed honesty: an unresolvable rule must never
+                # render the table as open - mark it hidden + not visible.
+                datasets.append(
+                    {
+                        "table": info.qualified_name,
+                        "visible": False,
+                        "row_filter": None,
+                        "masked_columns": [],
+                        "hidden": True,
+                    }
+                )
+                continue
+            datasets.append(
+                {
+                    "table": info.qualified_name,
+                    "visible": not rule.hidden,
+                    "row_filter": rule.row_filter,
+                    "masked_columns": sorted(rule.column_masks.keys()),
+                    "hidden": bool(rule.hidden),
+                }
+            )
+        payload = {
+            "caller": effective_caller.as_audit_dict(),
+            "via": effective_caller.via,
+            "require_identity": _IdentityRequiredMiddleware._required(),
+            "datasets": datasets,
+        }
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return f"Error computing whoami: {_errors.enrich(str(exc))}"
+
+
+def _whoami_rest_payload(request) -> dict:
+    """The REST /api/whoami body - the same contract the MCP whoami tool
+    returns, as JSON for the web UI's header identity widget (D-UI, 2026-10).
+
+    Resolution mirrors the ADMIN surface (``_admin_resolve_caller``), not
+    the bare ladder: an X-API-Key / Bearer presented on the request is
+    authenticated HERE (the /api routes have no key middleware), and a
+    key-shaped value that matches NOTHING stays anonymous - a wrong key is
+    never redeemed as the browser user behind it (the same contract
+    ``require_admin`` pins). A genuinely keyless request resolves through
+    the full ladder (SSO bearer JWT rung -> oauth2-proxy browser rung).
+
+    The payload previews the identity - it is NOT a grant: it answers
+    "who would this request resolve as" so the UI can render the header
+    chip (``Signed in as ...``) and tell an SSO visitor why self-mint will
+    or will not accept them (``via``). Audit-safe by construction: the
+    caller renders through ``as_audit_dict`` (class/subject/fp - never a
+    raw key) and the response never says whether the caller is an ADMIN
+    (an admin designation must not be probeable from an unauthenticated
+    page; the Access-control panel's own calls already 401/403 loudly).
+    """
+    presented = _admin_presented_keys(request)
+    caller = _admin_resolve_caller(request, presented)
+    if caller is None:
+        caller = _identity.ANONYMOUS
+    # The D22 sign-in hint: when anonymous AND the SSO flow is served, the
+    # header chip offers "Sign in with SSO" instead of only the key modal.
+    # A config read only - no identity leak (the flow is public knowledge).
+    from . import oidc_sso
+
+    return {
+        "caller": caller.as_audit_dict(),
+        "via": caller.via,
+        "authenticated": not caller.is_anonymous,
+        "require_identity": _IdentityRequiredMiddleware._required(),
+        "sso_login_available": oidc_sso.sso_enabled(),
+    }
 
 
 def _sample_rows_markdown(s: dict) -> str:
@@ -1871,355 +1595,6 @@ def _sample_rows_markdown(s: dict) -> str:
     else:
         lines += ["", "(no rows in the sample — the table is empty, or the limit is 0)"]
     return "\n".join(lines)
-
-
-def sample_rows(table: str, limit: int = 20, columns: str | None = None, *, caller=None) -> str:
-    """Preview a table's actual rows plus per-column fill rates, in one call.
-
-    The "what does this data look like" step before writing SQL. Use
-    describe_table for types, profile_table/column_stats for full statistics —
-    this shows the rows themselves. Physical
-    tables read via the pyarrow profile-sampler posture (``head`` stops the
-    scan early); virtual tables route through the SQL path
-    (``SELECT ... LIMIT n``); attached external tables run the LIMIT
-    server-side. The sample is bounded by SQLHANDLER_PROFILE_MAX_ROWS and
-    the D4 limit semantics of scan_table (a negative limit resolves to the
-    SQLHANDLER_MAX_ROWS cap).
-    """
-    try:
-        handler = _handler()
-        col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
-        raw_limit = limit if isinstance(limit, int) else None
-        s = handler.sample_rows(table, limit=raw_limit, columns=col_list, caller=caller)
-        return _sample_rows_markdown(s)
-    except Exception as exc:
-        return f"Error sampling rows: {_errors.enrich(str(exc))}"
-
-
-# ---------------------------------------------------------------------------
-# async query jobs (query_submit / status / result / cancel)
-# ---------------------------------------------------------------------------
-
-
-def _job_owner(caller) -> str | None:
-    """The caller's owner scope for async query jobs (or None = unowned).
-
-    The SAME derivation the saved-query write gate uses (saved.py):
-    ``policy.owner_key(caller)`` — subject slug or key fingerprint, never a
-    raw key — but only when policy enforcement is ON; enforcement off keeps
-    jobs unowned and every owner-related behavior byte-identical (the
-    historical shared posture). jobs.py stores what it is given and never
-    derives identities itself.
-    """
-    if caller is not None and _policy.policy_enabled():
-        return _policy.owner_key(caller)
-    return None
-
-
-def query_submit(
-    sql: str,
-    limit: int | None = None,
-    params: object | None = None,
-    version_as_of: int | None = None,
-    *,
-    caller=None,
-) -> str:
-    """Start a read-only SQL query as a background job; returns JSON with the job_id.
-
-    Use INSTEAD of run_sql when the query may outlive the tool-call timeout
-    (big scans, heavy joins). Then: poll query_status, fetch the finished
-    result ONCE with query_result (a second fetch is refused — resubmit
-    instead), and query_cancel to stop a running job.
-
-    The D2 read-only guard runs at SUBMIT time (a DDL submission is refused
-    with the same error run_sql raises, before any job starts). The job runs
-    on the same engine path as run_sql — same SQLHANDLER_QUERY_TIMEOUT
-    (watchdog-enforced), same SQLHANDLER_MAX_ROWS cap, same audit. The
-    registry is in-memory and bounded by SQLHANDLER_MAX_JOBS (default 8).
-
-    Under policy enforcement the job is OWNER-SCOPED: only the submitting
-    caller's owner scope may poll/fetch/cancel it; anyone else sees the
-    same unknown-job 404 a bogus id gets.
-    """
-    result = _jobs.api_job_submit(
-        _handler(),
-        {"sql": sql, "limit": limit, "params": params, "version_as_of": version_as_of},
-        caller=caller,
-        owner=_job_owner(caller),
-    )
-    if result.get("error"):
-        raise JobError(result["error"], status=result.get("status", 429))
-    return json.dumps({k: result[k] for k in ("job_id", "state", "note") if k in result})
-
-
-def query_status(job_id: str, *, caller=None) -> str:
-    """Poll one query job: state, elapsed, error, columns/n_rows (no rows).
-
-    Owner-scoped under policy enforcement (a foreign caller's job reads as
-    unknown — see query_submit).
-    """
-    return json.dumps(_jobs.api_job_status(job_id, owner=_job_owner(caller)), default=str)
-
-
-def query_result(job_id: str, output_format: str = "markdown", *, caller=None) -> str:
-    """Fetch a finished job's result ONCE (markdown/json/csv); then freed.
-
-    A second fetch is refused — the result is released from the registry's
-    memory right after the first hand-over. Poll query_status first; a
-    running job returns an error telling you to do exactly that.
-    Owner-scoped under policy enforcement (see query_submit).
-    """
-    arrow = _jobs.api_job_result(job_id, owner=_job_owner(caller))
-    return _arrow_to_output(arrow, max_rows=None, fmt=_validate_output_format(output_format))
-
-
-def query_cancel(job_id: str, *, caller=None) -> str:
-    """Cancel a running query job (DuckDB interrupt, like the web async API).
-
-    Owner-scoped under policy enforcement (see query_submit).
-    """
-    return json.dumps(_jobs.api_job_cancel(job_id, owner=_job_owner(caller)), default=str)
-
-
-# NOTE on query_list_jobs: jobs.api_job_list() (the owner-scoped listing over
-# the registry) exists and is ready to expose, but the MCP tool is
-# deliberately NOT added yet: test_dispatch_arg_contract.py pins the exact
-# _TOOLS name→required-args map as the enforced contract, and advertising a
-# new tool requires updating that pinned expectation in the same change.
-# Add together when wanted: the tool function, the dispatch elif arm, the
-# _TOOLS Tool(...) and the pinned-map entry.
-
-
-# ---------------------------------------------------------------------------
-# saved parameterized queries (query_save / list / delete / saved)
-# ---------------------------------------------------------------------------
-
-
-def query_save(name, sql, params=None, description=None, request=None, *, caller=None) -> str:
-    """Save a parameterized query under a name (writes are auth-gated).
-
-    The SQL is validated at save time (parsed; SELECT-only while the MCP
-    read-only mode is on) and parameters are stored as BIND params — the
-    stored SQL keeps its $name / ? placeholders and is never
-    string-interpolated at run time.
-    """
-    entry = _saved.api_saved_save(
-        {"name": name, "sql": sql, "params": params, "description": description}, request, caller=caller
-    )
-    return json.dumps({"saved": True, **entry}, default=str)
-
-
-def query_list(*, caller=None) -> str:
-    """List saved queries (name, SQL, params, description).
-
-    ``caller`` (identity spine): owner-scoped when policy enforcement is on
-    (a saved query's SQL text can name hidden tables); the shared list when
-    enforcement is off (byte-identical).
-    """
-    entries = _saved.api_saved_list(caller=caller)
-    if not entries:
-        return "No saved queries yet. Save one with query_save(name, sql, params)."
-    lines = [f"Saved queries ({len(entries)}):"]
-    for e in entries:
-        line = f"  - {e['name']}: {e.get('sql', '')}"
-        if e.get("params"):
-            line += f" | params: {json.dumps(e['params'], default=str)}"
-        if e.get("description"):
-            line += f" — {e['description']}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def query_delete(name, request=None, *, caller=None) -> str:
-    """Delete a saved query by name (writes are auth-gated)."""
-    result = _saved.api_saved_delete(name, request, caller=caller)
-    return f"Deleted saved query {result['deleted']!r}."
-
-
-def query_saved(
-    name: str,
-    params: object | None = None,
-    limit: int | None = None,
-    output_format: str = "markdown",
-    version_as_of: int | None = None,
-    *,
-    caller=None,
-) -> str:
-    """Run a saved query by name; call-time params override stored ones.
-
-    Parameters travel as BIND params ($name / ?) — never string-interpolated
-    into the SQL. The read-only guard is re-applied to the stored SQL at run
-    time, so a hand-edited store cannot smuggle DDL past the read-only mode.
-    """
-    sql, merged, _entry = _saved.api_saved_run(name, {"params": params}, caller=caller)
-    arrow = _handler().query_duckdb(sql, limit=limit, params=merged, version_as_of=version_as_of, caller=caller)
-    return _arrow_to_output(arrow, max_rows=limit, fmt=_validate_output_format(output_format))
-
-
-# ---------------------------------------------------------------------------
-# agent pack: explain_query + ask_data (implementation review §2c / §2d)
-# ---------------------------------------------------------------------------
-
-# ask_data token-budget discipline (review §2d): the caps that keep one
-# question's answer inside a model context — candidates listed (5), columns
-# described per candidate table (20), columns profiled (6).
-_ASK_MAX_TABLES = 5
-_ASK_MAX_COLUMNS = 20
-_ASK_MAX_PROFILE_COLUMNS = 6
-
-
-def _confidence(value: object, label: str | None) -> str:
-    """Render one estimate as ``value (label)`` — never a bare number."""
-    if value is None or label is None:
-        return f"{value} (confidence: none)"
-    return f"{value} (confidence: {label})"
-
-
-def _explain_query_markdown(r: dict) -> str:
-    """Render one engine.explain_query dict as compact markdown."""
-    lines: list[str] = [f"Query plan estimate (NOT executed): `{r['sql']}`", ""]
-    if r.get("touches_external"):
-        lines.append(
-            "Touches an attached external database — no lake metadata exists for it, "
-            "so every count below is unknown (degraded honestly)."
-        )
-    tables = r.get("tables") or []
-    if tables:
-        lines += [
-            "| table | rows | rows confidence | bytes to scan | bytes confidence | snapshot |",
-            "|---|---|---|---|---|---|",
-        ]
-        for t in tables:
-            kind = " (VIRTUAL)" if t.get("virtual") else ""
-            snap = t.get("snapshot_version")
-            lines.append(
-                f"| {_md_cell(t['table'] + kind)} | {_md_cell(t.get('rows'))} "
-                f"| {_md_cell(t.get('rows_confidence', 'none'))} "
-                f"| {_md_cell(t.get('bytes_to_scan'))} "
-                f"| {_md_cell(t.get('bytes_confidence', 'none'))} "
-                f"| {_md_cell(snap if snap is not None else 'current')} |"
-            )
-        bytes_note = {"exact": "from Delta/Iceberg file metadata", "approx": "uncompressed parquet row-group totals"}
-        known = {t.get("bytes_confidence") for t in tables}
-        hints = [bytes_note[c] for c in ("exact", "approx") if c in known]
-        if hints:
-            lines.append("")
-            lines.append(f"Bytes note: {'; '.join(hints)}.")
-    else:
-        lines.append("(no recognizable table references)")
-    wc = r.get("warm_cold") or {}
-    if wc:
-        lines += ["", "Warm/cold (result cache):"]
-        if wc.get("l1"):
-            lines.append("- L1 (this replica, memory): WARM — run_sql serves it from the in-memory cache")
-        else:
-            lines.append("- L1 (this replica, memory): cold")
-        if wc.get("l2"):
-            lines.append("- L2 (shared disk): WARM — a replica already published this exact result")
-        elif wc.get("l2") is False and wc.get("l1") is False:
-            lines.append("- L2 (shared disk): cold (or the L2 layer is not configured)")
-        bc = wc.get("block_cache")
-        if bc is None:
-            lines.append("- Block cache: off (n/a)")
-        else:
-            lines.append("- Block cache: on; per-file warmth not tracked (mixed/unknown)")
-    plan = r.get("plan")
-    if plan:
-        summary = plan.get("summary")
-        if summary:
-            lines += [
-                "",
-                "Plan summary (DuckDB's own EXPLAIN — planning only, nothing ran):",
-                f"- operators: {summary.get('operators')}, scan nodes: {summary.get('scan_nodes')}",
-                (
-                    f"- estimated result rows: {_confidence(summary.get('estimated_root_rows'), 'approx')}"
-                    if summary.get("estimated_root_rows") is not None
-                    else "- estimated result rows: unknown (confidence: none)"
-                ),
-                (
-                    "- pushdown: filters reached the scan operator"
-                    if summary.get("pushdown") is True
-                    else "- pushdown: no filter observed at any scan (nothing to push, or not pushed)"
-                ),
-            ]
-        elif plan.get("error"):
-            lines += ["", f"(plan unavailable: {plan.get('error')})"]
-    return "\n".join(lines)
-
-
-def explain_query(
-    sql: str,
-    params: object | None = None,
-    version_as_of: int | None = None,
-    include_plan: bool = False,
-    *,
-    caller=None,
-) -> str:
-    """Estimate one read-only query's cost WITHOUT running it.
-
-    Returns markdown: referenced tables with metadata row counts and
-    bytes-to-scan (each with a confidence label), the warm/cold band
-    (L1/L2/block-cache), and — when ``include_plan`` is set — DuckDB's
-    EXPLAIN (planning only; the query's data path never executes).
-    Attach-DB queries degrade to confidence "none" everywhere.
-    """
-    try:
-        if not isinstance(sql, str) or not sql.strip():
-            raise ValueError("Provide the SQL to estimate (a SELECT / EXPLAIN SELECT statement).")
-        r = _handler().explain_query(
-            sql, params=params, version_as_of=version_as_of, include_plan=include_plan, caller=caller
-        )
-        return _explain_query_markdown(r)
-    except Exception as exc:
-        return f"Error explaining query: {_errors.enrich(str(exc))}"
-
-
-def _draft_sql(question: str, describe: dict) -> str:
-    """Draft one SELECT for a question over a described table.
-
-    A template over the table's real columns — deliberately generic and
-    deliberately NOT executed (execution stays a separate, confirmable
-    run_sql call). Catalog column docs steer the default projection when
-    present; otherwise the draft is a bounded preview the agent refines.
-    ``describe["draft_target"]`` (set by ``ask_data`` from the search hit's
-    SQL-addressable name) picks the relation; the fallback quotes whatever
-    name the describe carries.
-    """
-    target = _safe_sql_target(describe)
-    columns = [c.get("name", "") for c in describe.get("columns", []) if c.get("name")]
-    selected = ", ".join(_safe_ident_col(c) for c in columns[:_ASK_MAX_PROFILE_COLUMNS]) or "*"
-    limit = _max_rows()
-    return f"SELECT {selected} FROM {target} LIMIT {max(limit, 1)}"
-
-
-def _safe_sql_target(describe: dict) -> str:
-    """The SQL-addressable relation name for a draft, quoted when needed.
-
-    DuckDB cannot reference the logical ``schema/name`` path form (that's
-    the discovery key, not SQL): registered views are the qualified name
-    (``schema_name``) — or the bare name when globally unique. ``ask_data``
-    stamps the search hit's ``qualified_name`` into the describe as
-    ``draft_target``; describe/external describes carry their own
-    addressable form in ``table`` already (external qualified names are
-    valid SQL).
-    """
-    name = str(describe.get("draft_target") or describe.get("table", ""))
-    return name if name.replace("_", "").isalnum() else '"' + name.replace('"', '""') + '"'
-
-
-def _safe_ident_col(name: str) -> str:
-    """Quote one column identifier for the draft SQL when needed."""
-    return name if name.replace("_", "").isalnum() else '"' + name.replace('"', '""') + '"'
-
-
-def _suggest_follow_up(question: str, top: dict, describe: dict) -> str:
-    """One concrete next step after the draft (the plan's suggested follow-up)."""
-    cols = describe.get("columns") or []
-    name = top.get("table", describe.get("table", ""))
-    if cols:
-        first = str(cols[0].get("name", ""))
-        return f"Profile one column before filtering: column_stats(table='{name}', column='{first}')."
-    return f"Run describe_table('{name}') to see the full column list before refining the draft."
 
 
 def _ask_data_markdown(
@@ -2362,6 +1737,334 @@ def ask_data(question: str, execute: bool = False) -> str:
         return f"Error planning question: {_errors.enrich(str(exc))}"
 
 
+# ask_data token-budget discipline (review 2d): the caps that keep one
+# question's answer inside a model context - candidates listed (5), columns
+# described per candidate table (20), columns profiled (6).
+_ASK_MAX_TABLES = 5
+_ASK_MAX_COLUMNS = 20
+_ASK_MAX_PROFILE_COLUMNS = 6
+
+
+# E_ROWS_CAPPED fix hints (rendered in the structured tail of capped results).
+_ROWS_CAPPED_HINTS = [
+    "The result was capped (SQLHANDLER_MAX_OUTPUT_ROWS / the requested limit) — more rows exist upstream.",
+    "Narrow with WHERE filters or aggregate; raise the limit for a bounded next page.",
+]
+
+
+def _confidence(value: object, label: str | None) -> str:
+    """Render one estimate as ``value (label)`` - never a bare number."""
+    if value is None or label is None:
+        return f"{value} (confidence: none)"
+    return f"{value} (confidence: {label})"
+
+
+def _explain_query_markdown(r: dict) -> str:
+    """Render one engine.explain_query dict as compact markdown."""
+    lines: list[str] = [f"Query plan estimate (NOT executed): `{r['sql']}`", ""]
+    if r.get("touches_external"):
+        lines.append(
+            "Touches an attached external database — no lake metadata exists for it, "
+            "so every count below is unknown (degraded honestly)."
+        )
+    tables = r.get("tables") or []
+    if tables:
+        lines += [
+            "| table | rows | rows confidence | bytes to scan | bytes confidence | snapshot |",
+            "|---|---|---|---|---|---|",
+        ]
+        for t in tables:
+            kind = " (VIRTUAL)" if t.get("virtual") else ""
+            snap = t.get("snapshot_version")
+            lines.append(
+                f"| {_md_cell(t['table'] + kind)} | {_md_cell(t.get('rows'))} "
+                f"| {_md_cell(t.get('rows_confidence', 'none'))} "
+                f"| {_md_cell(t.get('bytes_to_scan'))} "
+                f"| {_md_cell(t.get('bytes_confidence', 'none'))} "
+                f"| {_md_cell(snap if snap is not None else 'current')} |"
+            )
+        bytes_note = {"exact": "from Delta/Iceberg file metadata", "approx": "uncompressed parquet row-group totals"}
+        known = {t.get("bytes_confidence") for t in tables}
+        hints = [bytes_note[c] for c in ("exact", "approx") if c in known]
+        if hints:
+            lines.append("")
+            lines.append(f"Bytes note: {'; '.join(hints)}.")
+    else:
+        lines.append("(no recognizable table references)")
+    wc = r.get("warm_cold") or {}
+    if wc:
+        lines += ["", "Warm/cold (result cache):"]
+        if wc.get("l1"):
+            lines.append("- L1 (this replica, memory): WARM — run_sql serves it from the in-memory cache")
+        else:
+            lines.append("- L1 (this replica, memory): cold")
+        if wc.get("l2"):
+            lines.append("- L2 (shared disk): WARM — a replica already published this exact result")
+        elif wc.get("l2") is False and wc.get("l1") is False:
+            lines.append("- L2 (shared disk): cold (or the L2 layer is not configured)")
+        bc = wc.get("block_cache")
+        if bc is None:
+            lines.append("- Block cache: off (n/a)")
+        else:
+            lines.append("- Block cache: on; per-file warmth not tracked (mixed/unknown)")
+    plan = r.get("plan")
+    if plan:
+        summary = plan.get("summary")
+        if summary:
+            lines += [
+                "",
+                "Plan summary (DuckDB's own EXPLAIN — planning only, nothing ran):",
+                f"- operators: {summary.get('operators')}, scan nodes: {summary.get('scan_nodes')}",
+                (
+                    f"- estimated result rows: {_confidence(summary.get('estimated_root_rows'), 'approx')}"
+                    if summary.get("estimated_root_rows") is not None
+                    else "- estimated result rows: unknown (confidence: none)"
+                ),
+                (
+                    "- pushdown: filters reached the scan operator"
+                    if summary.get("pushdown") is True
+                    else "- pushdown: no filter observed at any scan (nothing to push, or not pushed)"
+                ),
+            ]
+        elif plan.get("error"):
+            lines += ["", f"(plan unavailable: {plan.get('error')})"]
+    return "\n".join(lines)
+
+
+def sample_rows(table: str, limit: int = 20, columns: str | None = None, *, caller=None) -> str:
+    """Preview a table's actual rows plus per-column fill rates, in one call.
+
+    The "what does this data look like" step before writing SQL. Use
+    describe_table for types, profile_table/column_stats for full statistics —
+    this shows the rows themselves. Physical
+    tables read via the pyarrow profile-sampler posture (``head`` stops the
+    scan early); virtual tables route through the SQL path
+    (``SELECT ... LIMIT n``); attached external tables run the LIMIT
+    server-side. The sample is bounded by SQLHANDLER_PROFILE_MAX_ROWS and
+    the D4 limit semantics of scan_table (a negative limit resolves to the
+    SQLHANDLER_MAX_ROWS cap).
+    """
+    try:
+        handler = _handler()
+        col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+        raw_limit = limit if isinstance(limit, int) else None
+        s = handler.sample_rows(table, limit=raw_limit, columns=col_list, caller=caller)
+        return _sample_rows_markdown(s)
+    except Exception as exc:
+        return f"Error sampling rows: {_errors.enrich(str(exc))}"
+
+
+def explain_query(
+    sql: str,
+    params: object | None = None,
+    version_as_of: int | None = None,
+    include_plan: bool = False,
+    *,
+    caller=None,
+) -> str:
+    """Estimate one read-only query's cost WITHOUT running it.
+
+    Returns markdown: referenced tables with metadata row counts and
+    bytes-to-scan (each with a confidence label), the warm/cold band
+    (L1/L2/block-cache), and — when ``include_plan`` is set — DuckDB's
+    EXPLAIN (planning only; the query's data path never executes).
+    Attach-DB queries degrade to confidence "none" everywhere.
+    """
+    try:
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("Provide the SQL to estimate (a SELECT / EXPLAIN SELECT statement).")
+        r = _handler().explain_query(
+            sql, params=params, version_as_of=version_as_of, include_plan=include_plan, caller=caller
+        )
+        return _explain_query_markdown(r)
+    except Exception as exc:
+        return f"Error explaining query: {_errors.enrich(str(exc))}"
+
+
+def _draft_sql(question: str, describe: dict) -> str:
+    """Draft one SELECT for a question over a described table.
+
+    A template over the table's real columns — deliberately generic and
+    deliberately NOT executed (execution stays a separate, confirmable
+    run_sql call). Catalog column docs steer the default projection when
+    present; otherwise the draft is a bounded preview the agent refines.
+    ``describe["draft_target"]`` (set by ``ask_data`` from the search hit's
+    SQL-addressable name) picks the relation; the fallback quotes whatever
+    name the describe carries.
+    """
+    target = _safe_sql_target(describe)
+    columns = [c.get("name", "") for c in describe.get("columns", []) if c.get("name")]
+    selected = ", ".join(_safe_ident_col(c) for c in columns[:_ASK_MAX_PROFILE_COLUMNS]) or "*"
+    limit = _max_rows()
+    return f"SELECT {selected} FROM {target} LIMIT {max(limit, 1)}"
+
+
+def _safe_sql_target(describe: dict) -> str:
+    """The SQL-addressable relation name for a draft, quoted when needed.
+
+    DuckDB cannot reference the logical ``schema/name`` path form (that's
+    the discovery key, not SQL): registered views are the qualified name
+    (``schema_name``) — or the bare name when globally unique. ``ask_data``
+    stamps the search hit's ``qualified_name`` into the describe as
+    ``draft_target``; describe/external describes carry their own
+    addressable form in ``table`` already (external qualified names are
+    valid SQL).
+    """
+    name = str(describe.get("draft_target") or describe.get("table", ""))
+    return name if name.replace("_", "").isalnum() else '"' + name.replace('"', '""') + '"'
+
+
+def _safe_ident_col(name: str) -> str:
+    """Quote one column identifier for the draft SQL when needed."""
+    return name if name.replace("_", "").isalnum() else '"' + name.replace('"', '""') + '"'
+
+
+def _suggest_follow_up(question: str, top: dict, describe: dict) -> str:
+    """One concrete next step after the draft (the plan's suggested follow-up)."""
+    cols = describe.get("columns") or []
+    name = top.get("table", describe.get("table", ""))
+    if cols:
+        first = str(cols[0].get("name", ""))
+        return f"Profile one column before filtering: column_stats(table='{name}', column='{first}')."
+
+
+# ---------------------------------------------------------------------------
+# async query jobs (query_submit / status / result / cancel)
+# ---------------------------------------------------------------------------
+
+
+def _job_owner(caller) -> str | None:
+    """The caller's owner scope for async query jobs (or None = unowned).
+
+    The SAME derivation the saved-query write gate uses (saved.py):
+    ``policy.owner_key(caller)`` - subject slug or key fingerprint, never a
+    raw key - but only when policy enforcement is ON; enforcement off keeps
+    jobs unowned and every owner-related behavior byte-identical (the
+    historical shared posture). jobs.py stores what it is given and never
+    derives identities itself.
+    """
+    if caller is not None and _policy.policy_enabled():
+        return _policy.owner_key(caller)
+    return None
+
+
+def query_submit(
+    sql: str,
+    limit: int | None = None,
+    params: object | None = None,
+    version_as_of: int | None = None,
+    *,
+    caller=None,
+) -> str:
+    """Start a read-only query job; returns JSON with the job_id.
+
+    The D2 read-only guard runs at SUBMIT time (a DDL submission is refused
+    with the same error run_sql raises, before any job starts). The job runs
+    on the same engine path as run_sql — same SQLHANDLER_QUERY_TIMEOUT
+    (watchdog-enforced), same SQLHANDLER_MAX_ROWS cap, same audit. The
+    registry is in-memory and bounded by SQLHANDLER_MAX_JOBS (default 8).
+    """
+    result = _jobs.api_job_submit(
+        _handler(),
+        {"sql": sql, "limit": limit, "params": params, "version_as_of": version_as_of},
+        caller=caller,
+        owner=_job_owner(caller),
+    )
+    if result.get("error"):
+        raise JobError(result["error"], status=result.get("status", 429))
+    return json.dumps({k: result[k] for k in ("job_id", "state", "note") if k in result})
+
+
+def query_status(job_id: str, *, caller=None) -> str:
+    """Poll one query job: state, elapsed, error, columns/n_rows (no rows)."""
+    return json.dumps(_jobs.api_job_status(job_id, owner=_job_owner(caller)), default=str)
+
+
+def query_result(job_id: str, output_format: str = "markdown", *, caller=None) -> str:
+    """Fetch a finished job's result ONCE (markdown/json/csv); then freed.
+
+    A second fetch is refused — the result is released from the registry's
+    memory right after the first hand-over. Poll query_status first; a
+    running job returns an error telling you to do exactly that.
+    """
+    arrow = _jobs.api_job_result(job_id, owner=_job_owner(caller))
+    return _arrow_to_output(arrow, max_rows=None, fmt=output_format)
+
+
+def query_cancel(job_id: str, *, caller=None) -> str:
+    """Cancel a running query job (DuckDB interrupt, like the web async API)."""
+    return json.dumps(_jobs.api_job_cancel(job_id, owner=_job_owner(caller)), default=str)
+
+
+# ---------------------------------------------------------------------------
+# saved parameterized queries (query_save / list / delete / saved)
+# ---------------------------------------------------------------------------
+
+
+def query_save(name, sql, params=None, description=None, request=None) -> str:
+    """Save a parameterized query under a name (writes are auth-gated).
+
+    The SQL is validated at save time (parsed; SELECT-only while the MCP
+    read-only mode is on) and parameters are stored as BIND params — the
+    stored SQL keeps its $name / ? placeholders and is never
+    string-interpolated at run time.
+    """
+    # Caller attribution rides the saved entry when the store supports it
+    # (owner-scoped listing under policy enforcement); forward-compatible
+    # with the pre-attribution saved.py signature.
+    import inspect as _inspect
+
+    kwargs: dict = {}
+    if "caller" in _inspect.signature(_saved.api_saved_save).parameters:
+        kwargs["caller"] = _identity.caller_from_request_state(request)
+    entry = _saved.api_saved_save(
+        {"name": name, "sql": sql, "params": params, "description": description},
+        request,
+        **kwargs,
+    )
+    return json.dumps({"saved": True, **entry}, default=str)
+
+
+def query_list() -> str:
+    """List saved queries (name, SQL, params, description)."""
+    entries = _saved.api_saved_list()
+    if not entries:
+        return "No saved queries yet. Save one with query_save(name, sql, params)."
+    lines = [f"Saved queries ({len(entries)}):"]
+    for e in entries:
+        line = f"  - {e['name']}: {e.get('sql', '')}"
+        if e.get("params"):
+            line += f" | params: {json.dumps(e['params'], default=str)}"
+        if e.get("description"):
+            line += f" — {e['description']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def query_delete(name, request=None) -> str:
+    """Delete a saved query by name (writes are auth-gated)."""
+    result = _saved.api_saved_delete(name, request)
+    return f"Deleted saved query {result['deleted']!r}."
+
+
+def query_saved(
+    name: str,
+    params: object | None = None,
+    limit: int | None = None,
+    output_format: str = "markdown",
+    version_as_of: int | None = None,
+) -> str:
+    """Run a saved query by name; call-time params override stored ones.
+
+    Parameters travel as BIND params ($name / ?) — never string-interpolated
+    into the SQL. The read-only guard is re-applied to the stored SQL at run
+    time, so a hand-edited store cannot smuggle DDL past the read-only mode.
+    """
+    sql, merged, _entry = _saved.api_saved_run(name, {"params": params})
+    arrow = _handler().query_duckdb(sql, limit=limit, params=merged, version_as_of=version_as_of)
+    return _arrow_to_output(arrow, max_rows=limit, fmt=output_format)
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -2371,12 +2074,6 @@ def ask_data(question: str, execute: bool = False) -> str:
 # limit (SQLHANDLER_MAX_OUTPUT_ROWS, default 1000). Guards against a client
 # asking for an unbounded result set producing a huge payload / OOM.
 _MAX_OUTPUT_ROWS = 1000
-
-# E_ROWS_CAPPED fix hints (rendered in the structured tail of capped results).
-_ROWS_CAPPED_HINTS = [
-    "The result was capped (SQLHANDLER_MAX_OUTPUT_ROWS / the requested limit) — more rows exist upstream.",
-    "Narrow with WHERE filters or aggregate; raise the limit for a bounded next page.",
-]
 
 
 def _resolve_scan_limit(limit: int | None) -> int | None:
@@ -2397,20 +2094,7 @@ def _resolve_scan_limit(limit: int | None) -> int | None:
 
 
 def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
-    """Render a pyarrow Table as a compact markdown table for an LLM.
-
-    Bench follow-up (2026-09): the pure-Arrow renderer (fastrender) renders
-    from Arrow chunks — no pandas DataFrame materialization, no per-cell
-    boxing — and is byte-identical to the pandas path for every type in its
-    proven contract (tests/test_fastrender.py pins the contract per-type
-    against the real pandas/tabulate stack, plus a seeded differential fuzz).
-    When the table falls outside the contract (nested/binary/decimal types,
-    multiline cells, tabulate internals moved) fastrender returns None and
-    the historical pandas renderer below runs — pandas stays the source of
-    truth for every shape the pure renderer has not proven. One pinned
-    divergence: naive timestamps render ISO instead of pandas 3.x's
-    sci-notation epoch floats (an LLM-facing defect; see fastrender docstring).
-    """
+    """Render a pyarrow Table as a compact markdown table for an LLM."""
     try:
         raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
         try:
@@ -2422,17 +2106,10 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
             max_rows = min(max_rows, cap)
         if cap > 0 and arrow.num_rows > cap:
             arrow = arrow.slice(0, cap)
-        # Boundary rule (unchanged): only a POSITIVE max_rows may reach
-        # .head()/the renderer. 0 means unlimited (no head at all), and a
-        # negative count would silently drop the last row — never allowed.
-        if max_rows is not None and max_rows <= 0:
-            max_rows = None
-        from .fastrender import arrow_to_markdown_fast
-
-        fast = arrow_to_markdown_fast(arrow, max_rows=max_rows)
-        if fast is not None:
-            return fast
         df = arrow.to_pandas()
+        # Boundary rule: only a POSITIVE max_rows may reach .head(). 0 means
+        # unlimited (no head at all), and a negative count would silently
+        # drop the last row (pandas head(-N) semantics) — never allowed.
         if max_rows is not None and max_rows > 0 and len(df) > max_rows:
             df = df.head(max_rows)
         return df.to_markdown(index=False)
@@ -2440,20 +2117,31 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
         return str(arrow)
 
 
+def _validate_output_format(output_format: str) -> str:
+    """Normalize one output_format name; ValueError names the valid set.
+
+    Flows through each tool's catch-all, so a bad name surfaces as the
+    same "Error <verb> ... {"error": {...}}" shape any other bad input
+    produces (E_PARAM_INVALID - see errors.py).
+    """
+    fmt = str(output_format or "markdown").strip().lower()
+    if fmt not in ("markdown", "json", "csv", "arrow"):
+        raise ValueError(f"Unsupported output_format {fmt!r}; use 'markdown', 'json', 'csv' or 'arrow'.")
+    return fmt
+
+
 def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
-    """Render a pyarrow Table as markdown (default), JSON, CSV, or Arrow IPC.
+    """Render a pyarrow Table as markdown (default), JSON, or CSV.
 
     All formats share the same row cap (SQLHANDLER_MAX_OUTPUT_ROWS) so a
     machine-readable format can't smuggle an unbounded payload either. JSON
     reuses the web API's payload shape ({columns, rows, n_rows, truncated});
-    CSV is pandas' RFC-style rendering (header row, no index); arrow
-    base64-encodes the Arrow IPC stream bytes under a one-line header —
-    the only text format that round-trips decimals/timestamps/nulls exactly.
+    CSV is pandas' RFC-style rendering (header row, no index).
     """
     import csv
     import io
 
-    from .webui import arrow_to_ipc_text, arrow_to_payload
+    from .webui import arrow_to_payload
 
     # Boundary rule (decision D4): a non-positive max_rows is "unlimited",
     # never a row count — .head(-1) drops the LAST row and .head(0) drops
@@ -2475,17 +2163,23 @@ def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
         capped = True
 
     fmt = (fmt or "markdown").strip().lower()
+    if fmt == "arrow":
+        # The IPC stream is written AFTER the row cap above, so the payload
+        # stays bounded like every other format; the header names the cap
+        # when it bit (same additive notice posture as the markdown tail).
+        from .webui import arrow_to_ipc_text
+
+        body = arrow_to_ipc_text(arrow)
+        if capped:
+                body += "\n# rows capped at SQLHANDLER_MAX_OUTPUT_ROWS (more rows exist upstream)"
+        return body
     if fmt == "json":
         payload = arrow_to_payload(arrow, limit=max_rows)
         # E_ROWS_CAPPED: JSON already carries `truncated`; the structured
         # tail tells an agent WHY more rows exist and how to reach them.
         if capped or payload.get("truncated"):
             payload["error"] = {"code": _errors.E_ROWS_CAPPED, "fix_hints": _ROWS_CAPPED_HINTS}
-        # fastrender.dumps: orjson when available (3-8x faster than stdlib on
-        # this row-dict-heavy payload), parse-identical, stdlib fallback.
-        from .fastrender import dumps as _fast_json
-
-        return _fast_json(payload, default=str)
+        return json.dumps(payload, default=str)
     if fmt == "csv":
         payload = arrow_to_payload(arrow, limit=max_rows)
         buf = io.StringIO()
@@ -2493,17 +2187,9 @@ def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
         writer.writerow(payload["columns"])
         writer.writerows(payload["rows"])
         return buf.getvalue()
-    if fmt == "arrow":
-        # The IPC stream is written AFTER the row cap above, so the payload
-        # stays bounded like every other format; the header names the cap
-        # when it bit (same additive notice posture as the markdown tail).
-        body = arrow_to_ipc_text(arrow)
-        if capped:
-            body += "\n# rows capped at SQLHANDLER_MAX_OUTPUT_ROWS (more rows exist upstream)"
-        return body
     body = _arrow_to_markdown(arrow, max_rows=max_rows)
     if capped or (max_rows is not None and max_rows > 0 and arrow.num_rows >= max_rows):
-        # Markdown has no truncated field — the machine-readable cap notice
+        # Markdown has no truncated field - the machine-readable cap notice
         # rides as a structured tail line (same additive posture as errors).
         return body + _errors.structured(_errors.E_ROWS_CAPPED, _ROWS_CAPPED_HINTS)
     return body
@@ -3538,7 +3224,6 @@ def _admin_revoke_key(fp: str, by: str = "") -> dict:
 #: Process start time (wall anchor) for the /metrics uptime header.
 _START_TIME = time.time()
 
-
 class _ApiTokenMiddleware:
     """ASGI middleware: require a shared token on every /api/* request.
 
@@ -3565,35 +3250,6 @@ class _ApiTokenMiddleware:
                 resp = JSONResponse({"error": "Unauthorized: missing or invalid API token."}, status_code=401)
                 await resp(scope, receive, send)
                 return
-        await self.app(scope, receive, send)
-
-
-class _MetricsPodIdentityMiddleware:
-    """ASGI middleware: add the serving replica's identity to /metrics.
-
-    Deliberately a header, not a body annotation: the exposition body stays
-    byte-identical (the whole fleet contract on additive metrics), while an
-    aggregate alert can still name the replica that answered. The header is
-    also how a human correlating a scrape with kubectl output confirms
-    which pod they are looking at.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path", "") == "/metrics":
-            pod = os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or ""
-
-            async def send_wrapper(message):
-                if message["type"] == "http.response.start" and pod:
-                    headers = list(message.get("headers", []))
-                    headers.append((b"x-sqlhandler-pod", pod.encode("latin-1")))
-                    message = {**message, "headers": headers}
-                await send(message)
-
-            await self.app(scope, receive, send_wrapper)
-            return
         await self.app(scope, receive, send)
 
 
@@ -3933,7 +3589,6 @@ class _IdentityRequiredMiddleware:
                 return
         await self.app(scope, receive, send)
 
-
 def main(argv: list | None = None) -> None:
     # Load .env FIRST so every setting -- including SQLHANDLER_TRANSPORT,
     # which is read by argparse below -- can come from the env file. The
@@ -3962,55 +3617,6 @@ def main(argv: list | None = None) -> None:
         return
 
     app = _build_http_app()
-
-    # Event loop (bench follow-up, 2026-09): uvloop's C loop instead of the
-    # default asyncio selector loop — the ASGI hop (uvicorn + Starlette
-    # middleware stack) is pure-Python callback churn, and uvloop cuts that
-    # overhead measurably on the warm/cache-hit path that dominates
-    # agent-facing traffic. Guarded on three axes so it can never become a
-    # hard dependency or a behavior change:
-    #   * importable (the wheel ships in pyproject, but a stripped install
-    #     without it still runs on the default loop);
-    #   * opt-out (SQLHANDLER_EVENT_LOOP=asyncio) for incident triage — if a
-    #     uvloop regression is ever suspected, flip the env and restart,
-    #     no code change;
-    #   * stdio transport untouched (asyncio.run above — uvloop adds nothing
-    #     to a single-session pipe and stdio tooling expects default asyncio).
-    # The engine is unaffected: DuckDB/pyarrow calls release the GIL and run
-    # on worker threads regardless of which loop schedules them.
-    _loop_pref = os.environ.get("SQLHANDLER_EVENT_LOOP", "uvloop").strip().lower()
-    _loop_log = logging.getLogger("sqlhandler.server")
-    if _loop_pref in ("", "uvloop", "auto"):
-        try:
-            import uvloop
-
-            uvloop.install()
-            _loop_log.info("Event loop: uvloop (SQLHANDLER_EVENT_LOOP=asyncio to opt out)")
-        except ImportError:
-            _loop_log.info("Event loop: asyncio (uvloop not installed — add the wheel for the fast loop)")
-    else:
-        _loop_log.info("Event loop: asyncio (SQLHANDLER_EVENT_LOOP=%s)", _loop_pref)
-    # Engine PRE-WARM (G2 2026-10-01 lesson): fire the cold engine build in a
-    # background thread the moment main() starts — BEFORE uvicorn binds — so
-    # the first readiness probe never races a cold `_handler()` under
-    # `_handler_lock`. Without this, a slow provider init turned the probe
-    # cadence into a self-sustaining 503 cascade (wait_for cancels the WAIT,
-    # not the thread; every subsequent probe blocked on the lock and timed
-    # out) for as long as init took. Pre-warm idempotent: `_handler()` is
-    # lock-guarded and singleton — this thread and the first probe converge
-    # on one build; whoever arrives second blocks on the lock briefly and
-    # gets the finished engine. Failures land in the thread's log line AND
-    # surface normally on the next probe (no swallowed errors).
-    import threading as _threading
-
-    def _prewarm() -> None:
-        try:
-            _handler()
-            _loop_log.info("Engine pre-warm complete — readiness can pass immediately")
-        except Exception as exc:  # the probe path re-raises with the real error
-            _loop_log.warning("Engine pre-warm FAILED (first /ready will carry the real error): %s", exc)
-
-    _threading.Thread(target=_prewarm, name="sqlhandler-prewarm", daemon=True).start()
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -4038,25 +3644,29 @@ def _build_http_app():
 
     # Liveness/readiness routes for the k8s probes.
     async def _health(_request) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+        # policy_health (additive, probe-safe): the enforcement posture -
+        # enabled / loaded / broken - rides the liveness body so a broken
+        # policy file is diagnosable from the probe alone. Never fails the
+        # probe: liveness answers process-up regardless of policy state.
+        body = {"status": "ok"}
+        try:
+            policy = _policy.policy_health()
+            # Additive ONLY when enforcement is on (or the store is in a
+            # broken/degraded state): the historical liveness shape stays
+            # byte-identical for deployments without a policy file, while a
+            # broken policy file is still diagnosable from the probe body.
+            if policy and (policy.get("enabled") or policy.get("broken") or policy.get("degraded")):
+                body["policy"] = policy
+        except Exception:
+            pass
+        return JSONResponse(body)
 
     async def _ready(_request) -> JSONResponse:
-        # Backend-aware readiness: report "ready" when the configured data
+        # Backend-aware readiness: only report "ready" when the configured data
         # source is actually reachable (OneLake DFS token+list, S3 list,
-        # Iceberg catalog, NFS root, or Delta Sharing GET /shares). If the
-        # credential/endpoint breaks, the pod drops out of the Service so
-        # traffic stops reaching a dead backend and the failure becomes
-        # visible. Disable with SQLHANDLER_READINESS_CHECK=0.
-        #
-        # DEGRADED band (HA review 2026-09): a failing check is NOT reported
-        # to the kubelet until SQLHANDLER_READY_DEGRADED_GRACE (default 60s)
-        # of CONTINUOUS failure has elapsed. One flaky storage blip used to
-        # drain every replica of a scaled-out deployment simultaneously (a
-        # correlated outage the replicas were bought to prevent); within the
-        # grace the pod stays Ready, keeps serving cached/metadata paths,
-        # and the /metrics gauge drops to 0.5 so alerting still sees the
-        # degradation. Persistent failure still goes NotReady (the
-        # historical outcome) and a healthy check resets the clock.
+        # Iceberg catalog, or NFS root). If the credential/endpoint breaks, the
+        # pod drops out of the Service so traffic stops reaching a dead backend
+        # and the failure becomes visible. Disable with SQLHANDLER_READINESS_CHECK=0.
         if os.environ.get("SQLHANDLER_READINESS_CHECK", "1").strip().lower() not in (
             "1",
             "true",
@@ -4064,54 +3674,29 @@ def _build_http_app():
             "on",
         ):
             return JSONResponse({"status": "ready"})
-        # Probe cadence is 10s with a 20s timeout (chart readiness values) —
-        # the INIT budget must absorb a cold engine build (env + provider
-        # construction) without racing it: a 2s budget turned every early
-        # probe into a silent timeout CASCADE (asyncio.wait_for cancels the
-        # wait, not the to_thread — init keeps running under _handler_lock,
-        # so each subsequent probe blocks on the lock and times out too,
-        # pegging /ready at 503 for the whole cold-start even though the
-        # process itself was healthy; live-seen on G2 2026-10-01, 13-minute
-        # zero-exception 503 streaks that cleared on their own). 30s also
-        # stays inside the probe's own 20s timeout? No — 30s EXCEEDS it;
-        # that is deliberate: the kubelet probe timing out is FINE (it
-        # retries), what must never happen is the readiness path reporting
-        # a backend outage because engine init was slow. Every failure now
-        # LOGS (all three branches were silent before — the reason string
-        # rode only in the JSON body, which the gateway strips on
-        # empty-endpoint 503s, leaving nothing to debug from).
-        # Two separate budgets with DISTINCT handling (asyncio.wait_for raises
-        # a bare TimeoutError either way — a combined try can't tell which
-        # budget fired, and the distinction is the whole diagnostic value).
         try:
-            engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=30)
-        except TimeoutError:
-            logger.warning(
-                "readiness: ENGINE INIT timed out after 30s — engine build still "
-                "grinding in its thread (lock held); later probes will succeed once warm"
-            )
-            observability.drift.note_backend(False)
-            return _ready_response(503, "engine init timed out")
-        except Exception as exc:
-            logger.warning("readiness: engine init FAILED: %s", exc)
-            observability.drift.note_backend(False)
-            return _ready_response(503, f"engine init failed: {exc}")
-        try:
+            engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=2)
             err = await asyncio.wait_for(asyncio.to_thread(engine.provider.check_connection), timeout=15)
         except TimeoutError:
-            logger.warning("readiness: backend check timed out after 15s (endpoint slow/unreachable)")
-            observability.drift.note_backend(False)
-            return _ready_response(503, "backend check timed out")
+            return JSONResponse({"status": "not ready", "error": "backend check timed out"}, status_code=503)
         except Exception as exc:
-            logger.warning("readiness: backend check FAILED: %s", exc)
-            observability.drift.note_backend(False)
-            return _ready_response(503, str(exc))
+            return JSONResponse({"status": "not ready", "error": str(exc)}, status_code=503)
         if err:
-            logger.warning("readiness: backend check reported: %s", err)
-            observability.drift.note_backend(False)
-            return _ready_response(503, err)
-        observability.drift.note_backend(True)
-        return JSONResponse({"status": "ready"})
+            return JSONResponse({"status": "not ready", "error": err}, status_code=503)
+        # Policy posture rides readiness additively: a BROKEN policy file
+        # (failing closed, every covered table hidden) is an operational
+        # incident even while the backend is healthy - surface it as a
+        # warning field WITHOUT failing the probe (the data source is up;
+        # the ACL floor is safe-by-default). probes never reload policy.
+        body = {"status": "ready"}
+        try:
+            ph = _policy.policy_health()
+            if ph.get("enabled") and not ph.get("loaded"):
+                body["policy_warning"] = "policy enabled but no valid file has ever loaded (failing closed)"
+                body["policy"] = ph
+        except Exception:
+            pass
+        return JSONResponse(body)
 
     app.add_route("/health", _health)
     app.add_route("/ready", _ready)
@@ -4124,18 +3709,10 @@ def _build_http_app():
             engine = await asyncio.to_thread(_handler)
         except Exception:
             engine = None
-        response = Response(
+        return Response(
             content=observability.metrics.render(engine),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
-        # Explicit value first (set only when the operator wires it); the
-        # hostname fallback (empty on stdio/local runs) renders NO header
-        # at all — never a misleading "pod=unknown" label.
-        pod = os.environ.get("SQLHANDLER_POD_NAME") or os.environ.get("HOSTNAME") or ""
-        if pod:
-            response.headers["X-Sqlhandler-Pod"] = pod
-        response.headers["X-Sqlhandler-Ready-Seconds"] = f"{time.time() - _START_TIME:.1f}"
-        return response
 
     app.add_route("/metrics", _metrics)
 
@@ -4147,20 +3724,6 @@ def _build_http_app():
     if api_token:
         app.add_middleware(_ApiTokenMiddleware, token=api_token)
 
-    # Label /metrics responses with the serving replica (HA review 2026-09):
-    # aggregate alerts over per-pod series need to know WHICH replica
-    # answered (pod identity is otherwise only in the k8s scrape labels).
-    # ON by default for /metrics only; SQLHANDLER_METRICS_POD_LABEL=0 opts
-    # out. Additive response headers — body bytes unchanged, so scrapers
-    # see the same exposition.
-    if os.environ.get("SQLHANDLER_METRICS_POD_LABEL", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        app.add_middleware(_MetricsPodIdentityMiddleware)
-
     # OPTIONAL /mcp API-key gate (fleet decision 2026-09 — SQL is optional
     # until per-user keys/roles land): when neither MCP_API_KEYS (the
     # fleet-universal var) nor SQLHANDLER_API_KEYS is set, /mcp behaves
@@ -4170,32 +3733,17 @@ def _build_http_app():
     # Caller-identity resolution (identity spine) is added BEFORE the key
     # middleware: Starlette applies middleware LIFO, so _CallerIdentity runs
     # INSIDE the key check and sees the matched key's fingerprint that
-    # _McpApiKeyMiddleware records into scope["state"]. Resolution-only —
+    # _McpApiKeyMiddleware records into scope["state"]. Resolution-only -
     # it never rejects (the 401 posture stays the key middleware's).
     app.add_middleware(_CallerIdentityMiddleware)
-    # Identity-required gate: registered AFTER the resolver → LIFO puts it
-    # OUTSIDE the resolver but still INSIDE the key middleware — the gate
+    # Identity-required gate: registered AFTER the resolver -> LIFO puts it
+    # OUTSIDE the resolver but still INSIDE the key middleware - the gate
     # reads the resolver's Caller from scope state and adds the anonymous
     # 401 on /mcp + /api/* when SQLHANDLER_REQUIRE_IDENTITY is truthy.
     # Registered unconditionally so the env stays per-request flippable;
     # unset env = byte-identical pass-through inside the middleware.
     app.add_middleware(_IdentityRequiredMiddleware)
     app.add_middleware(_McpApiKeyMiddleware)
-    if _identity.browser_headers_trusted():
-        logging.getLogger("sqlhandler.server").info(
-            "Browser-header identity TRUSTED on all routes (%s) — requires the "
-            "workload AuthorizationPolicy pinning ingress to the gateway "
-            "(identity.trustBrowserHeaders); oauth2-proxy headers resolve the "
-            "caller when present.",
-            _identity.TRUST_BROWSER_HEADERS_ENV,
-        )
-    else:
-        logging.getLogger("sqlhandler.server").info(
-            "Browser-header identity OFF (%s unset) — oauth2-proxy headers are "
-            "ignored; identity resolves via relay attribution (over a valid key), "
-            "key fingerprint, or anonymous.",
-            _identity.TRUST_BROWSER_HEADERS_ENV,
-        )
     if _mcp_keys:
         logging.getLogger("sqlhandler.server").info(
             "API-key auth ENABLED on /mcp (sources: MCP_API_KEYS/SQLHANDLER_API_KEYS; "
@@ -4203,51 +3751,15 @@ def _build_http_app():
             len(_mcp_keys),
         )
     else:
-        logging.getLogger("sqlhandler.server").warning("=" * 72)
+        logging.getLogger("sqlhandler.server").warning(
+            "=" * 72
+        )
         logging.getLogger("sqlhandler.server").warning(
             "Neither MCP_API_KEYS nor SQLHANDLER_API_KEYS is set — /mcp is OPEN "
             "(optional-auth mode). Set one from a Secret for service-level auth "
             "(the gateway remains the outer layer)."
         )
         logging.getLogger("sqlhandler.server").warning("=" * 72)
-
-    # Identity-required posture (the gate + its two misconfiguration notes).
-    _require_identity = os.environ.get(_IdentityRequiredMiddleware.ENV_NAME, "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    if _require_identity:
-        _log_gate = logging.getLogger("sqlhandler.server")
-        if not _mcp_keys and not _oidc_identity.oidc_enabled():
-            _log_gate.warning("=" * 72)
-            _log_gate.warning(
-                "%s is SET but no key gate is configured (MCP_API_KEYS/SQLHANDLER_API_KEYS) "
-                "and OIDC is not enabled (SQLHANDLER_OIDC_ENABLED/SQLHANDLER_OIDC_ISSUER) — "
-                "the ONLY rung that can resolve an identity is the browser-header rung "
-                "(%s). Every other caller gets 401 on /mcp and /api/* (probes stay open). "
-                "Configure a key gate or OIDC, or enable %s deliberately.",
-                _IdentityRequiredMiddleware.ENV_NAME,
-                _identity.TRUST_BROWSER_HEADERS_ENV,
-                _identity.TRUST_BROWSER_HEADERS_ENV,
-            )
-            _log_gate.warning("=" * 72)
-        else:
-            _log_gate.info(
-                "Identity REQUIRED on /mcp and /api/* (%s) — anonymous callers get 401 "
-                "(WWW-Authenticate: Bearer); /health /ready /metrics and the /ui shell stay ungated.",
-                _IdentityRequiredMiddleware.ENV_NAME,
-            )
-    elif os.environ.get("SQLHANDLER_POLICY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
-        logging.getLogger("sqlhandler.server").info(
-            "SQLHANDLER_POLICY_ENABLED is on but %s is unset — ACLs are ADVISORY without it: "
-            "anonymous callers resolve the default group. Set %s=1 to make identity required.",
-            _IdentityRequiredMiddleware.ENV_NAME,
-            _IdentityRequiredMiddleware.ENV_NAME,
-        )
-    if _oidc_identity.warn_if_misconfigured("sqlhandler"):
-        pass  # the vendored module prints the loud fail-closed banner itself
 
     # MCP read-only mode (decision D2): run_sql is SELECT-only unless the
     # operator sets SQLHANDLER_MCP_READONLY=0. Enforced in run_sql(); logged
@@ -4260,29 +3772,6 @@ def _build_http_app():
             "SQLHANDLER_MCP_READONLY=0 — MCP run_sql accepts multi-statement DDL. "
             "Attached external catalogs stay read-only regardless."
         )
-
-    # Write tier (review §4): GLOBAL FLAG, DEFAULT FALSE. Logged either way
-    # so the posture is never ambiguous; the roots count is named so an
-    # operator who flips the flag but forgets the allowlist sees why every
-    # write still refuses (fail closed).
-    if _writes.writes_enabled():
-        _roots = _writes.scratch_roots()
-        if _roots:
-            _log.warning(
-                "WRITE TIER ENABLED (SQLHANDLER_WRITES_ENABLED=1): run_sql admits classified "
-                "scratch writes (CTAS/INSERT/COPY) under %d allowlisted root(s) — "
-                "<root>/<subject-slug>/... only, single-writer lease enforced. "
-                "SQLHANDLER_MCP_READONLY continues to govern multi-statement/DDL exactly as before.",
-                len(_roots),
-            )
-        else:
-            _log.warning(
-                "WRITE TIER ENABLED but %s is empty — no target can classify "
-                "(fail closed). Configure scratch roots to make writes possible.",
-                _writes.WRITE_SCRATCH_ROOTS_ENV,
-            )
-    else:
-        _log.info("Write tier OFF (SQLHANDLER_WRITES_ENABLED unset/0 — the default): run_sql is SELECT-only.")
 
     # Async query jobs (additive): submit/status/result/cancel as MCP tools
     # + /api/jobs/* — the registry is in-memory (a restart clears it), so
@@ -4311,16 +3800,6 @@ def _build_http_app():
             "(known single-user-local mode). Set a credential to gate them."
         )
 
-    # Cross-replica readiness drift gate (HA review 2026-09): while the
-    # backend check is failing (the /ready degraded band), stop admitting
-    # NEW SQL work so a pod in a dead-backend window answers cheap calls
-    # instead of starting doomed scans. OFF by default
-    # (SQLHANDLER_READY_DRIFT_GATE: kubelet-independent, byte-identical
-    # behavior until enabled). /mcp is exempt — MCP responses self-describe
-    # errors and an agent should still be able to ask "why is my query
-    # failing".
-    app.add_middleware(_DriftGateMiddleware)
-
     # DNS-rebinding protection on /mcp (ON by default — Origin validation
     # always; strict Host validation when SQLHANDLER_ALLOWED_HOSTS is set).
     _allowed_hosts = _env_list("SQLHANDLER_ALLOWED_HOSTS")
@@ -4328,9 +3807,7 @@ def _build_http_app():
     _log.info(
         "MCP transport guard ON (/mcp): origin validation %s, host validation %s",
         "SQLHANDLER_ALLOWED_ORIGINS" if _env_list("SQLHANDLER_ALLOWED_ORIGINS") else "(default: no browser origins)",
-        f"SQLHANDLER_ALLOWED_HOSTS={_allowed_hosts}"
-        if _allowed_hosts
-        else "(no allowlist set — set mcp.allowedHosts to pin)",
+        f"SQLHANDLER_ALLOWED_HOSTS={_allowed_hosts}" if _allowed_hosts else "(no allowlist set — set mcp.allowedHosts to pin)",
     )
 
     # Browser CORS (decision D3): same-origin only by default. The old
@@ -4356,33 +3833,23 @@ def _build_http_app():
     else:
         _log.info("CORS: same-origin only (no SQLHANDLER_ALLOWED_ORIGINS configured).")
 
-    # Response compression (default ON — agent-facing tool results are
+    # Response compression (default ON - agent-facing tool results are
     # markdown/JSON-heavy text, so gzip compresses them 5-10x; the ingress hop
-    # and slow callers both win). Two deliberate properties:
-    #
-    # ORDER — added BETWEEN the CORS block and the outermost probes gate, and
-    # Starlette applies middleware LIFO, so the effective request flow is
-    # _ProbesAuthMiddleware -> GZip -> CORS -> _McpTransportGuard -> key gates
-    # (verified against build_middleware_stack in tests/test_compression.py).
-    # GZip runs INNERMOST of the policy layers: auth/guard/CORS all see the
-    # request first and decide on the uncompressed request; responses are
-    # compressed only after every outer layer has signed off, so no auth layer
-    # ever inspects (or must decompress) a compressed body, and a 401/421
-    # refusal still reaches the client as plain bytes. CORS sits directly
-    # outside GZip — it only rewrites headers, so compressed bodies pass
-    # through it untouched.
-    #
-    # STREAMING SAFETY — the MCP streamable-HTTP transport can answer with SSE
-    # (EventSourceResponse, media_type text/event-stream) and Starlette's
-    # GZipMiddleware handles both shapes correctly: text/event-stream is in its
-    # default EXCLUDED content types (passes through byte-for-byte, no
-    # buffering), and plain chunked responses are compressed CHUNK-WISE with a
-    # Z_SYNC_FLUSH per chunk — verified in tests/test_compression.py by reading
-    # a streamed response incrementally. json_response=True (our /mcp mode)
-    # answers POSTs with buffered JSON anyway; only the optional GET/SSE side
-    # streams. /metrics and /health|/ready are ordinary buffered responses:
-    # /metrics compresses fine (Prometheus scrapers send Accept-Encoding), the
-    # tiny probe bodies fall under min_size and pass through untouched.
+    # and slow callers both win). ORDER: added between the CORS block and the
+    # outermost probes/body gates, and Starlette applies middleware LIFO, so
+    # the effective request flow is ProbesAuth/BodyLimit -> GZip -> CORS ->
+    # _McpTransportGuard -> key/identity gates: auth and policy layers always
+    # see the UNCOMPRESSED request first, and a 401/421 refusal still reaches
+    # the client as plain bytes. GZip runs INNERMOST of the policy layers.
+    # Streaming safety: the MCP streamable-HTTP transport can answer with SSE
+    # (text/event-stream); Starlette's GZipMiddleware excludes that media
+    # type by default (byte-for-byte pass-through, no buffering) and
+    # compresses plain chunked responses chunk-wise with Z_SYNC_FLUSH
+    # (pinned by tests/test_compression.py reading a streamed response
+    # incrementally). json_response=True (our /mcp mode) answers POSTs with
+    # buffered JSON anyway; /metrics and /health|/ready are ordinary buffered
+    # responses (the tiny probe bodies fall under min_size and pass through
+    # untouched).
     _compression = load_compression_config()
     if _compression.mode == "gzip":
         app.add_middleware(GZipMiddleware, minimum_size=_compression.min_size, compresslevel=3)
@@ -4395,6 +3862,12 @@ def _build_http_app():
     else:
         _log.info("Response compression OFF (SQLHANDLER_COMPRESSION=off).")
 
+    # P1-6 (audit): systemic /api/* request-body cap (default 2 MB,
+    # SQLHANDLER_API_BODY_MAX_BYTES). Registered so it wraps the /api
+    # surface before any handler buffers a body; the per-route bounded
+    # reads in webui.py stay as the inner net with the larger upload cap.
+    app.add_middleware(webui._ApiBodyLimitMiddleware)
+
     # Optional auth gate on /metrics + /ready (default OFF = unchanged).
     app.add_middleware(_ProbesAuthMiddleware)
     if _truthy("SQLHANDLER_METRICS_AUTH"):
@@ -4405,18 +3878,7 @@ def _build_http_app():
                 "/metrics and /ready will 401 for EVERYONE (fail closed)."
             )
         else:
-            _log.info("Auth gate ON for /metrics (SQLHANDLER_METRICS_AUTH); /ready stays open for kubelet probes.")
-
-    # Request body cap + security headers — added LAST so BOTH are the
-    # OUTERMOST middleware (Starlette LIFO; cross-review finding: every
-    # gate that short-circuits with its own response — ProbesAuth 401,
-    # DriftGate 503, IdentityRequired/ApiToken 401, CORS preflight — sits
-    # OUTSIDE anything added before it, and those were exactly the
-    # responses missing CSP/nosniff/frame-deny). Oversized POST/PUT bodies
-    # are counted and refused as they flow off the wire; per-route bounded
-    # reads stay in webui.py as the inner net.
-    app.add_middleware(_BodyLimitMiddleware)
-    app.add_middleware(_SecurityHeadersMiddleware)
+            _log.info("Auth gate ON for /metrics + /ready (SQLHANDLER_METRICS_AUTH).")
     return app
 
 

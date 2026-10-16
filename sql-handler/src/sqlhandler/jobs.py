@@ -132,10 +132,27 @@ class JobError(Exception):
         self.status = status
 
 
+def _job_finished_monotonic(job) -> float:
+    """The job's finish time (monotonic): the engine's public hook when it
+    provides one, else the observation moment. A raising hook degrades to
+    the observation moment - TTL aging is best-effort by design."""
+    hook = getattr(job, "finished_monotonic", None)
+    if hook is not None:
+        try:
+            v = hook()
+            if isinstance(v, (int, float)):
+                return float(v)
+        except Exception:
+            pass
+    return time.monotonic()
+
+
 class _JobRecord:
     """One tracked job: the QueryJob plus its lifecycle bookkeeping."""
 
     __slots__ = (
+        "_finished_monotonic",
+        "_state",
         "fetched",
         "fetched_at",
         "job",
@@ -157,23 +174,32 @@ class _JobRecord:
         self.fetched = False
         self.fetched_at: float | None = None
         self.shared_published = False
+        # The terminal state is sampled ONCE, with its monotonic finish time
+        # recorded on first observation - the record never re-derives it, so
+        # TTL aging cannot jitter and no private attribute of the engine's
+        # QueryJob is ever read (the audit's coupling complaint).
+        self._state: str = "running"
+        self._finished_monotonic: float | None = None
+
+    def snapshot_state(self) -> tuple[str, float | None]:
+        """(effective_state, finished_monotonic), sampled atomically."""
+        if self.timed_out and self.job.state != "done":
+            return "error", self._finished_monotonic
+        state = self.job.state
+        if state != "running" and self._finished_monotonic is None:
+            self._finished_monotonic = _job_finished_monotonic(self.job)
+            self._state = state
+        return (self._state if state != "running" else "running"), self._finished_monotonic
+
+    def effective_state(self) -> str:
+        """The user-visible state (a timed-out job reports `error`)."""
+        return self.snapshot_state()[0]
 
     def finished_at(self) -> float | None:
         """Monotonic timestamp the job finished (best-effort, for TTL aging)."""
         if self.fetched_at is not None:
             return self.fetched_at
-        if self.job.state == "running":
-            return None
-        elapsed = self.job.elapsed_ms
-        if elapsed is None:
-            return None
-        return self.job._t0 + elapsed / 1000.0
-
-    def effective_state(self) -> str:
-        """The user-visible state (a timed-out job reports `error`)."""
-        if self.timed_out and self.job.state != "done":
-            return "error"
-        return self.job.state
+        return self.snapshot_state()[1]
 
 
 def _atomic_tmp(root: Path, job_id: str) -> tuple[int, str]:

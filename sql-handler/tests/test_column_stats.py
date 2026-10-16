@@ -14,14 +14,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from sqlhandler import server
-from sqlhandler.engine import (
-    LakehouseError,
-    SqlEngine,
-    _column_stats_queries,
-    _profile_max_rows,
-    _validate_column,
-)
-from sqlhandler.provider import DataProvider, TableInfo
+from sqlhandler.engine import LakehouseError, SqlEngine, _column_stats_queries, _profile_max_rows, _validate_column
+from sqlhandler.provider import TableInfo
 
 
 def _make_engine(tmp_path, catalog=None, monkeypatch=None):
@@ -38,7 +32,7 @@ def _make_engine(tmp_path, catalog=None, monkeypatch=None):
         d / "part.parquet",
     )
 
-    class P(DataProvider):
+    class P:
         kind = "fake"
 
         def list_tables(self):
@@ -130,7 +124,9 @@ def test_sample_cap_zero_means_full_column(tmp_path, monkeypatch):
 
 
 def test_top_n_clamped(eng):
-    assert eng.column_stats("work_order", "kind", top_n=0)["top_values"] == [{"value": "a", "count": 3}]  # clamp to 1
+    assert eng.column_stats("work_order", "kind", top_n=0)["top_values"] == [
+        {"value": "a", "count": 3}
+    ]  # clamp to 1
     assert len(eng.column_stats("work_order", "kind", top_n=99)["top_values"]) == 2  # clamp to 20, table has 2
 
 
@@ -244,23 +240,9 @@ def test_markdown_cell_escaping(eng, monkeypatch):
     """A value containing markdown-breaking characters cannot corrupt the table."""
     monkeypatch.setattr(server, "_handler", lambda: eng)
     text = server._column_stats_markdown(
-        {
-            "table": "t",
-            "column": "c",
-            "type": "string",
-            "n_rows": 2,
-            "sampled_rows": 2,
-            "sample_cap": 0,
-            "distinct_count": 1,
-            "approx_unique": 1,
-            "null_count": 0,
-            "null_pct": 0.0,
-            "min": "a|b",
-            "max": "x",
-            "q25": None,
-            "q50": None,
-            "q75": None,
-            "top_values": [{"value": "a|b", "count": 2}],
-        }
+        {"table": "t", "column": "c", "type": "string", "n_rows": 2, "sampled_rows": 2, "sample_cap": 0,
+         "distinct_count": 1, "approx_unique": 1, "null_count": 0, "null_pct": 0.0,
+         "min": "a|b", "max": "x", "q25": None, "q50": None, "q75": None,
+         "top_values": [{"value": "a|b", "count": 2}]}
     )
     assert "a\\|b" in text  # escaped, not a broken row

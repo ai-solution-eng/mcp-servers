@@ -618,7 +618,7 @@ def _make_presto(args):
         user = claims.get("preferred_username") or user
     return PrestoEngine(
         args.presto_url, args.bearer, args.timeout, user,
-        refresh_token=args.refresh_token, token_url=args.keycloak_token_url,
+        refresh_token=args.refresh_token,  # secret-scan:allow (reads CLI arg, no literal)  token_url=args.keycloak_token_url,
         client_id=args.keycloak_client_id, client_secret=args.keycloak_client_secret)
 
 

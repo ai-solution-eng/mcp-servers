@@ -385,12 +385,15 @@ class AdlsProvider(DataProvider):
             entries = self._adlsfs().get_file_info(pafs.FileSelector(log_dir, recursive=False))
         except Exception:
             return None
-        versions = [0]
+        # No numeric log file seen -> None, NOT 0 (audit P2): seeding
+        # versions=[0] made "no _delta_log listing" indistinguishable from
+        # "table at version 0". None tells the engine to fall back to TTL.
+        versions: list[int] = []
         for fi in entries:
             stem = fi.path.split("/")[-1].split(".", 1)[0]
             if stem.isdigit():
                 versions.append(int(stem))
-        return max(versions)
+        return max(versions) if versions else None
 
     def check_version(self, info: TableInfo) -> int | None:
         """Cheap version token: Delta log listing (delta) / None (parquet)."""

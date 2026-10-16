@@ -113,9 +113,18 @@ class NamespacePolicy:
     # -- the predicate -----------------------------------------------------------
 
     def check(self, ns: str) -> PolicyDecision:
-        """One namespace against the current env — blocked ALWAYS wins."""
+        """One namespace against the current env — blocked ALWAYS wins.
+
+        Normalization (fleet D12 / K8S-MCP parity): the namespace is
+        strip()+lower()ed and every pattern is matched case-insensitively,
+        so "Prod" or " Team-A " can never slip past (or be wrongly refused
+        by) a blocklist/allowlist written in the canonical lowercase form.
+        Kubernetes namespace names are lowercase DNS labels — the policy is
+        stricter than reality, never weaker.
+        """
+        ns = (ns or "").strip().lower()
         for pattern in _env_csv(self.blocked_env):
-            if fnmatch.fnmatchcase(ns, pattern):
+            if fnmatch.fnmatchcase(ns, pattern.strip().lower()):
                 return PolicyDecision(
                     False,
                     f"namespace {ns!r} matches {self.blocked_env} pattern {pattern!r} — the blocklist always wins",
@@ -142,7 +151,7 @@ class NamespacePolicy:
                 "to make anything writable.",
             )
         for pattern in allowed:
-            if fnmatch.fnmatchcase(ns, pattern):
+            if fnmatch.fnmatchcase(ns, pattern.strip().lower()):
                 return PolicyDecision(True)
         return PolicyDecision(
             False,

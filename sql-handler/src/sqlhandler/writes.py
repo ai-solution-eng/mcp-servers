@@ -82,8 +82,10 @@ import hashlib
 import logging
 import os
 import re
+import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 from . import errors as _errors
@@ -197,13 +199,46 @@ def scratch_roots(environ: dict[str, str] | None = None) -> list[tuple[str, str]
     return roots
 
 
+#: A lease shorter than this cannot outlive a real scratch write, so
+#: breaking a "stale" lease at that age is a guaranteed double-writer. The
+#: audit (2026-10-16) found the old ``max(value, 1)`` clamp turned a
+#: configured 0 into a ONE-SECOND lease. Refuse instead of clamping: the
+#: value is operator-authored and a silent clamp hides the misconfiguration.
+LEASE_TTL_MIN = 60
+LEASE_TTL_DEFAULT = 300
+
+
 def lease_ttl(environ: dict[str, str] | None = None) -> int:
-    """Advisory lease seconds (``SQLHANDLER_WRITE_LEASE_TTL``, default 300)."""
+    """Advisory lease seconds (``SQLHANDLER_WRITE_LEASE_TTL``, default 300).
+
+    Values below :data:`LEASE_TTL_MIN` (or above 24h) are a LOUD config
+    error, not a clamp (audit 2026-10-16 P3): the old ``max(value, 1)`` clamp
+    turned a configured 0 into a ONE-SECOND lease, so ``_break_stale``
+    displaced live writers. Non-numeric garbage raises too -- a typo must not
+    silently take the default.
+    """
     env = os.environ if environ is None else environ
+    raw = env.get(WRITE_LEASE_TTL_ENV, "").strip()
+    if not raw:
+        return LEASE_TTL_DEFAULT
     try:
-        return max(int(env.get(WRITE_LEASE_TTL_ENV, "")), 1) if env.get(WRITE_LEASE_TTL_ENV, "") else 300
+        ttl = int(raw)
     except ValueError:
-        return 300
+        raise WriteError(
+            f"{WRITE_LEASE_TTL_ENV}={raw!r} is not an integer (lease seconds)",
+            code="E_WRITE_LEASE_TTL",
+        ) from None
+    if ttl < LEASE_TTL_MIN or ttl > 86400:
+        raise WriteError(
+            f"{WRITE_LEASE_TTL_ENV}={ttl} is outside the supported range "
+            f"[{LEASE_TTL_MIN}, 86400]: a lease shorter than {LEASE_TTL_MIN}s "
+            "cannot outlive a real scratch write, so _break_stale would "
+            "displace a LIVE writer and two writers would corrupt a "
+            "catalog-less Delta target. Use the default "
+            f"({LEASE_TTL_DEFAULT}) or another value in range.",
+            code="E_WRITE_LEASE_TTL",
+        )
+    return ttl
 
 
 # ---------------------------------------------------------------------------
@@ -289,13 +324,110 @@ _INSERT_RE = re.compile(rf"^\s*INSERT\s+(?:INTO|OVERWRITE\s+INTO)\s+({_IDENT})",
 _MERGE_RE = re.compile(rf"^\s*MERGE\s+INTO\s+({_IDENT})", re.IGNORECASE)
 _UPDATE_RE = re.compile(rf"^\s*UPDATE\s+({_IDENT})", re.IGNORECASE)
 _DELETE_RE = re.compile(rf"^\s*DELETE\s+FROM\s+({_IDENT})", re.IGNORECASE)
-_COPY_TO_RE = re.compile(r"\bTO\s+('(?:[^']|'')*'|\"[^\"]*\")", re.IGNORECASE)
+#: A quoted string literal, comment, or double-quoted identifier — the
+#: regions a bare regex scan must NOT read as SQL structure. Used by the
+#: "code-only" view of a span before any ``TO``/``SELECT`` keyword hunt.
+_SQL_NOISE_RE = re.compile(
+    r"--[^\n]*"  # line comment
+    r"|/\*.*?\*/"  # block comment
+    r"|'(?:[^']|'')*'"  # single-quoted literal (doubled-quote escape)
+    r'|"(?:[^"]|"")*"'  # double-quoted identifier
+    r"|\$\$.*?\$\$"  # dollar-quoted string
+    r"|\$[A-Za-z_][A-Za-z0-9_]*\$.*?\$[A-Za-z_][A-Za-z0-9_]*\$",
+    re.DOTALL,
+)
+#: The COPY ``TO`` KEYWORD. Located on the CODE-ONLY view (literals and
+#: comments blanked), so a ``TO '...'`` inside a comment or an inner string
+#: can never be mistaken for the destination clause; the literal itself is
+#: then read from the ORIGINAL span at that offset (the code-only view has
+#: it blanked). The LAST match is the destination — DuckDB's grammar puts
+#: the target last, and the optional ``(options)`` that may follow carries
+#: no ``TO``.
+#: Deliberately the bare keyword (no trailing \s+): the code-only view has
+#: the destination literal blanked, so consuming whitespace there would run
+#: past the offset the ORIGINAL span must be read at. The literal is located
+#: by skipping whitespace in the original.
+_COPY_TO_KW_RE = re.compile(r"\bTO\b", re.IGNORECASE)
+#: A quoted string literal / quoted identifier, anchored at a given offset.
+_COPY_LITERAL_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 # The SELECT payload of a CTAS: after the table name (and optional column
 # list), DuckDB's grammar puts AS (or nothing) before the query.
 _CTAS_QUERY_RE = re.compile(r"\bAS\s*(\(?\s*SELECT\b.*)$", re.IGNORECASE | re.DOTALL)
 # INSERT ... SELECT (the round-trip shape; VALUES writes are refused — the
 # tier writes QUERY results, and a literal-only write is always rewritable).
+# Matched against the CODE-ONLY view (literals/comments blanked), so a
+# literal or comment that merely CONTAINS the word SELECT cannot smuggle a
+# VALUES write past the refusal (audit 2026-10-16 P2: "INSERT INTO t
+# VALUES ('SELECT')" was admitted).
 _INSERT_SELECT_RE = re.compile(r"\bSELECT\b", re.IGNORECASE)
+#: The INSERT payload forms the tier REFUSES structurally, independent of any
+#: literal text: ``VALUES ...`` and ``DEFAULT VALUES`` write constants, and
+#: ``BY NAME``/``SET`` shapes are not query results either.
+_INSERT_NON_QUERY_RE = re.compile(r"^\s*(?:DEFAULT\s+VALUES\b|VALUES\b|BY\s+NAME\b)", re.IGNORECASE)
+
+
+def _code_only(statement: str) -> str:
+    """A same-length view of the span with literals/comments blanked.
+
+    Keyword hunting (``TO``, ``SELECT``, ``VALUES``) must never be decided by
+    TEXT inside a string literal, a comment or a quoted identifier — that was
+    the audit's COPY-decoy and INSERT-VALUES bypass. Every noise region is
+    replaced by spaces of the SAME length so all offsets stay valid and the
+    result can still be matched with the original span-local regexes.
+    """
+    if not statement:
+        return statement
+    out = list(statement)
+
+    def _blank(match: re.Match) -> str:
+        start, end = match.span()
+        for i in range(start, end):
+            # Newlines survive so ``^``-anchored multi-line matching and any
+            # line-oriented reasoning stay sane.
+            if out[i] != "\n":
+                out[i] = " "
+        return " " * (end - start)
+
+    _SQL_NOISE_RE.sub(_blank, statement)
+    return "".join(out)
+
+
+def _copy_to_target(statement: str) -> str | None:
+    """The COPY destination: the LAST top-level ``TO <literal>`` in the span.
+
+    Two-step on purpose. The ``TO`` keyword is located in the CODE-ONLY
+    view (comments and string literals blanked to same-length filler), so a
+    decoy ``TO '<allowlisted>'`` hidden in a comment or an inner string can
+    never be selected; the literal itself is then read from the ORIGINAL
+    span at that exact offset. Returns None when the destination is not a
+    quoted literal — the caller refuses, which is the fail-closed direction.
+    """
+    code = _code_only(statement)
+    matches = list(_COPY_TO_KW_RE.finditer(code))
+    if not matches:
+        return None
+    at = matches[-1].end()
+    while at < len(statement) and statement[at] in " \t\r\n":
+        at += 1
+    lit = _COPY_LITERAL_RE.match(statement, at)
+    if not lit:
+        return None
+    raw = lit.group(0)
+    if raw.startswith("'"):
+        return raw[1:-1].replace("''", "'")
+    return raw[1:-1].replace('""', '"')
+
+
+def _insert_payload_start(statement: str) -> int:
+    """Offset where an INSERT's payload begins (after target + column list)."""
+    m = _INSERT_RE.match(statement)
+    if not m:
+        return -1
+    rest = statement[m.end() :]
+    col_list = re.match(r"\s*\((?:[^)(]|\([^)]*\))*\)", rest)
+    if col_list:
+        rest = rest[col_list.end() :]
+    return len(statement) - len(rest)
 
 
 def _unquote(ident: str) -> str:
@@ -440,6 +572,20 @@ def subject_scoped_root(caller, environ: dict[str, str] | None = None) -> tuple[
             "no scratch root is allowlisted, so no target can be writable.",
             code="E_WRITE_NO_ROOTS",
         )
+    if len(roots) > 1:
+        # Only roots[0] is ever consulted, so a second allowlisted root is
+        # DEAD CONFIG: an operator who adds one reasonably expects targets to
+        # land in it, and would silently get root[0] instead (audit
+        # 2026-10-16 P2). Refuse rather than lie about the allowlist.
+        names = ", ".join(repr(n) for n, _ in roots)
+        raise WriteError(
+            f"Write refused: {WRITE_SCRATCH_ROOTS_ENV} lists {len(roots)} roots "
+            f"({names}) but the write tier supports exactly ONE scratch root "
+            "(multi-root target selection is not implemented, and silently "
+            "using the first would ignore the rest of the allowlist). "
+            "Configure a single root.",
+            code="E_WRITE_MULTI_ROOT",
+        )
     name, prefix = roots[0]
     return name, prefix, f"{prefix}{slug}/"
 
@@ -466,10 +612,40 @@ def resolve_write_target(target: str, caller, environ: dict[str, str] | None = N
     if not logical:
         raise WriteError("Write refused: the statement's target could not be parsed.", code="E_WRITE_TARGET")
     # Path form: the dotted logical name becomes a relative path under the
-    # subject namespace. ``a.b`` -> <subject>/a/b — and any traversal
-    # segment (``..``, empty from quoting games) refuses here.
-    rel_parts = [p for p in logical.split(".") if p]
-    if not rel_parts or any(p in ("..", ".") for p in rel_parts):
+    # subject namespace. ``a.b`` -> <subject>/a/b.
+    #
+    # Two separators are folded, and BOTH are checked for traversal before
+    # any path is built (audit 2026-10-16 P2):
+    #
+    # * ``.`` — the logical-name separator;
+    # * `/` — which only ever reaches here through a QUOTED identifier
+    #   (``"a/b"``). Unchecked, one identifier produced two path levels
+    #   (``"a/b"`` -> <subject>/a/b) and ``"x/.."`` aliased the parent.
+    #
+    # A leading ``/`` (or a ``\\``) would make the joined path ABSOLUTE and
+    # discard the subject prefix entirely, so absolute shapes refuse first.
+    if logical.startswith(("/", "\\")):
+        raise WriteError(
+            f"Write refused: target {target!r} is an absolute path; write targets "
+            "must be a name under your scratch namespace.",
+            code="E_WRITE_TARGET",
+        )
+    rel_parts: list[str] = []
+    for segment in logical.split("."):
+        for part in segment.split("/"):
+            if part in ("", ".", ".."):
+                raise WriteError(
+                    f"Write refused: target {target!r} must be a name under your scratch "
+                    "namespace (path traversal is not a target).",
+                    code="E_WRITE_TARGET",
+                )
+            if "\x00" in part or "\\" in part:
+                raise WriteError(
+                    f"Write refused: target {target!r} contains an illegal path character.",
+                    code="E_WRITE_TARGET",
+                )
+            rel_parts.append(part)
+    if not rel_parts:
         raise WriteError(
             f"Write refused: target {target!r} must be a name under your scratch "
             "namespace (path traversal is not a target).",
@@ -563,7 +739,14 @@ def _classify_one(stmt_type: str, statement: str) -> StatementClass:
                 )
             return StatementClass(CLASS_WRITE_SCRATCH, statement, stmt_type, target=target, source_sql=m.group(1))
         if stmt_type == "INSERT":
-            if not _INSERT_SELECT_RE.search(statement):
+            # Structural decision, on the CODE-ONLY view: the payload must
+            # actually START a query. A bare \bSELECT\b search over the raw
+            # span let a literal or comment containing the word decide the
+            # classification (audit 2026-10-16 P2: "INSERT INTO t
+            # VALUES ('SELECT')" was admitted as a scratch write).
+            payload_at = _insert_payload_start(statement)
+            payload_code = _code_only(statement[payload_at:]) if payload_at >= 0 else ""
+            if _INSERT_NON_QUERY_RE.match(payload_code) or not _INSERT_SELECT_RE.search(payload_code):
                 return StatementClass(
                     CLASS_WRITE_OTHER,
                     statement,
@@ -578,16 +761,18 @@ def _classify_one(stmt_type: str, statement: str) -> StatementClass:
             source = _insert_payload_select(statement)
             return StatementClass(CLASS_WRITE_SCRATCH, statement, stmt_type, target=target, source_sql=source)
         if stmt_type == "COPY":
-            m = _COPY_TO_RE.search(statement)
-            if not m:
+            # The destination is the LAST top-level TO in the code-only view,
+            # never a TO inside a comment or an inner string (audit
+            # 2026-10-16 P2: a comment decoy decided the allowlisted path
+            # while the real destination was unvalidated).
+            target = _copy_to_target(statement)
+            if not target:
                 return StatementClass(
                     CLASS_WRITE_OTHER,
                     statement,
                     stmt_type,
                     reason="COPY without a TO target",
                 )
-            raw = m.group(1)
-            target = raw[1:-1].replace("''", "'") if raw.startswith("'") else raw
             return StatementClass(CLASS_WRITE_SCRATCH, statement, stmt_type, target=target, source_sql=statement)
         if stmt_type == "MERGE_INTO":
             # Recognized and NAMED: v1 refuses (delta-rs has no MERGE; the
@@ -633,10 +818,7 @@ def _target_of(stmt_type: str, statement: str) -> str | None:
         m = _DELETE_RE.match(statement)
         return _target_name(m.group(1)) if m else None
     if stmt_type == "COPY":
-        m = _COPY_TO_RE.search(statement)
-        if m:
-            raw = m.group(1)
-            return raw[1:-1].replace("''", "'") if raw.startswith("'") else raw
+        return _copy_to_target(statement)
     return None
 
 
@@ -674,9 +856,13 @@ def classify_sql_for_caller(sql: str, caller, environ: dict[str, str] | None = N
                     code="E_WRITE_TARGET",
                 )
             backend, canonical, _uri = resolve_write_target(c.target, caller, environ)
-            object.__setattr__(c, "target", c.target)
-            c.write_backend = backend  # type: ignore[attr-defined]
-            c.write_path = canonical  # type: ignore[attr-defined]
+            # ``StatementClass`` is a FROZEN dataclass, so the resolved plan
+            # rides the instance through object.__setattr__ -- exactly like
+            # assert_writable_sql below. Plain attribute assignment here
+            # raised FrozenInstanceError on EVERY call, so this public entry
+            # point could never return a plan (audit 2026-10-16 P0-3).
+            object.__setattr__(c, "write_backend", backend)
+            object.__setattr__(c, "write_path", canonical)
     return classes
 
 
@@ -743,28 +929,105 @@ _LOCK_MAP_LOCK = threading.Lock()
 _LOCK_MAP: dict[tuple[str, str], threading.Lock] = {}
 
 
+def _local_lease_path(path: str) -> str:
+    """The lease filename for a LOCAL scratch path; refuse anything else.
+
+    A scratch root may be authored as a URI (``s3://bucket/scratch``,
+    ``iceberg://name=...``), but the advisory lease is a POSIX
+    ``O_EXCL`` create on a shared filesystem. Joining a URI onto a local
+    filename produced a literal RELATIVE directory tree named ``s3:`` in
+    the process CWD and silently degraded cross-replica mutual exclusion to
+    a per-pod file (audit 2026-10-16 P1). Refuse loudly instead: a URI root
+    needs an object-store lease, which is not implemented.
+    """
+    text = str(path or "").strip()
+    if not text:
+        raise WriteError(
+            "Write refused: empty scratch target cannot carry a write lease.",
+            code="E_WRITE_TARGET",
+        )
+    if "://" in text:
+        scheme = text.split("://", 1)[0]
+        raise WriteError(
+            f"Write refused: scratch root {text!r} is a {scheme}:// URI. The "
+            "advisory write lease is a local O_EXCL create on the scratch "
+            "filesystem, so a URI root cannot be guarded against concurrent "
+            "writers (a catalog-less Delta writer without the lease can "
+            "corrupt the target). Point "
+            f"{WRITE_SCRATCH_ROOTS_ENV} at a local/shared POSIX path "
+            "(a PVC mount), or omit the write tier for this root.",
+            code="E_WRITE_LEASE_URI",
+        )
+    if text.startswith("\\") or (len(text) > 1 and text[1] == ":"):
+        raise WriteError(
+            f"Write refused: scratch target {text!r} is not a POSIX path "
+            "(a UNC/drive path cannot host the O_EXCL lease).",
+            code="E_WRITE_LEASE_URI",
+        )
+    return text.rstrip("/") + ".write-lease"
+
+
 class WriteLease:
     """Advisory cross-replica lease: O_EXCL create + TTL on the scratch PVC.
 
     ``acquire`` creates ``<target>.write-lease`` with O_EXCL (atomic on
     POSIX + every RWX filesystem). Contention raises :class:`WriteError`
     with the RETRYABLE ``E_WRITE_CONFLICT`` code and the holder's age, so
-    an agent can decide to wait. A STALE lease (older than the TTL) is
-    broken: unlinked and retried once — a crashed writer cannot wedge the
-    target forever. ``release`` unlinks our own lease (identity-checked by
-    content) best-effort.
+    an agent can decide to wait.
+
+    **Ownership.** Every lease carries a per-acquire random ``token`` (plus
+    the holder pid and acquisition time). ``release`` unlinks ONLY a lease
+    whose on-disk token still matches ours, so a writer whose lease was
+    legitimately broken as stale can never delete its successor's lease —
+    without the check, A's late ``release`` unlinked B's live lease and a
+    third writer walked straight in (audit 2026-10-16 P0-6). The unlink is
+    also performed on a verified file DESCRIPTOR rather than a path.
+
+    **Staleness.** A lease is broken only when it is past its TTL *and* (on
+    the same host) the recorded holder pid is no longer alive, so a
+    still-running writer is never displaced. A lease whose payload is
+    missing or unreadable is NOT broken (we cannot prove the holder is
+    dead; a transient read error must not hand the target to a second
+    writer).
     """
+
+    #: How many times ``acquire`` will break a stale lease and retry before
+    #: giving up. Bounded so a pathological break/steal loop cannot spin.
+    MAX_ACQUIRE_ATTEMPTS = 5
 
     def __init__(self, path: str, ttl: int | None = None):
         self.path = path
-        self.lease_path = path.rstrip("/") + ".write-lease"
+        self.lease_path = _local_lease_path(path)
         self.ttl = ttl if ttl is not None else lease_ttl()
+        self.token = uuid.uuid4().hex
         self._held = False
 
-    def acquire(self) -> None:
+    # -- payload ---------------------------------------------------------
+    def _payload(self) -> str:
         import json as _json
 
-        payload = _json.dumps({"pid": os.getpid(), "acquired": time.time(), "ttl": self.ttl})
+        return _json.dumps(
+            {
+                "token": self.token,
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "acquired": time.time(),
+                "ttl": self.ttl,
+            }
+        )
+
+    def _read_holder(self) -> dict | None:
+        """The current on-disk holder payload, or None when unreadable."""
+        import json as _json
+
+        try:
+            with open(self.lease_path, encoding="utf-8") as fh:
+                held = _json.load(fh)
+        except Exception:
+            return None
+        return held if isinstance(held, dict) else None
+
+    def acquire(self) -> None:
         # The parent dir may not exist yet (first write to this namespace) —
         # create it (parents included) before the O_EXCL create. A mkdir
         # race is benign (exist_ok), and an unwritable root fails here with
@@ -776,48 +1039,124 @@ class WriteLease:
                 f"Write refused: scratch directory {os.path.dirname(self.lease_path)!r} is not writable ({exc}).",
                 code="E_WRITE_TARGET",
             ) from exc
-        try:
-            fd = os.open(self.lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if self._break_stale():
-                return self.acquire()
+        for _attempt in range(self.MAX_ACQUIRE_ATTEMPTS):
             try:
-                with open(self.lease_path, encoding="utf-8") as fh:
-                    held = _json.load(fh)
-                age = time.time() - float(held.get("acquired", 0))
-            except Exception:
-                age = None
-            age_note = f"held {age:.0f}s" if age is not None else "holder unknown"
-            raise WriteError(
-                f"Write conflict: another writer holds the lease on {self.path} "
-                f"({age_note}, TTL {self.ttl}s). Retry after it completes.",
-                code=E_WRITE_CONFLICT,
-                retryable=True,
-            ) from None
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        self._held = True
+                fd = os.open(self.lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                if self._break_stale():
+                    continue  # the stale holder is gone: retry the create
+                held = self._read_holder()
+                age = time.time() - float(held.get("acquired", 0)) if held else None
+                age_note = f"held {age:.0f}s" if age is not None else "holder unknown"
+                raise WriteError(
+                    f"Write conflict: another writer holds the lease on {self.path} "
+                    f"({age_note}, TTL {self.ttl}s). Retry after it completes.",
+                    code=E_WRITE_CONFLICT,
+                    retryable=True,
+                ) from None
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(self._payload())
+            self._held = True
+            return
+        raise WriteError(
+            f"Write conflict: could not acquire the lease on {self.path} after "
+            f"{self.MAX_ACQUIRE_ATTEMPTS} attempts (another writer keeps "
+            "winning the race). Retry after it completes.",
+            code=E_WRITE_CONFLICT,
+            retryable=True,
+        )
+
+    def _holder_is_alive(self, held: dict) -> bool:
+        """Whether the recorded holder is provably still running.
+
+        Only answerable for a same-host holder (``pid`` + ``host`` in the
+        payload): a foreign-host holder is treated as ALIVE, because we
+        cannot prove otherwise and a wrong "dead" verdict double-writes.
+        """
+        pid = held.get("pid")
+        host = held.get("host")
+        if not isinstance(pid, int) or pid <= 0:
+            return True  # unknown shape: assume alive (fail safe)
+        if host and host != socket.gethostname():
+            return True  # another pod's pid tells us nothing
+        if pid == os.getpid():
+            return True  # our own process (a nested/overlapping acquire)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False  # provably dead
+        except PermissionError:
+            return True  # exists, owned by another user
+        except OSError:
+            return True
+        return True
 
     def _break_stale(self) -> bool:
-        """Break a lease past its TTL (a crashed writer must not wedge us)."""
+        """Break a lease that is BOTH past its TTL and provably unheld.
+
+        Never breaks a lease whose holder is alive (a long write must not be
+        displaced by the TTL) and never breaks one whose payload cannot be
+        read (an unreadable payload is not evidence of a dead holder).
+        """
+        held = self._read_holder()
+        if held is None:
+            return False
+        try:
+            age = time.time() - float(held.get("acquired", 0))
+        except (TypeError, ValueError):
+            return False
+        if age <= self.ttl:
+            return False
+        if self._holder_is_alive(held):
+            return False
+        # Unlink by descriptor identity: only remove the file whose content
+        # is still the payload we just judged stale (a concurrent release +
+        # re-acquire must not lose its lease).
         try:
             st = os.stat(self.lease_path)
-            if time.time() - st.st_mtime > self.ttl:
-                os.unlink(self.lease_path)
-                logger.warning("broke stale write lease %s (older than %ss)", self.lease_path, self.ttl)
-                return True
         except FileNotFoundError:
-            return True  # raced release: retry the acquire
+            return True  # raced release: retry the create
         except OSError:
             return False
-        return False
+        current = self._read_holder()
+        if current is None or current.get("token") != held.get("token"):
+            return True  # changed under us: retry the create without unlinking
+        try:
+            if os.stat(self.lease_path).st_ino != st.st_ino:
+                return True
+            os.unlink(self.lease_path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        logger.warning(
+            "broke stale write lease %s (age %.0fs > TTL %ss, holder pid %s gone)",
+            self.lease_path,
+            age,
+            self.ttl,
+            held.get("pid"),
+        )
+        return True
 
     def release(self) -> None:
+        """Unlink our own lease — only while our token is still on disk."""
         if not self._held:
             return
         self._held = False
+        held = self._read_holder()
+        if held is None or held.get("token") != self.token:
+            # Our lease was broken as stale and (possibly) re-acquired by
+            # another writer. Deleting it now would hand the target to a
+            # third writer -- exactly the double-writer this lease prevents.
+            logger.warning(
+                "write lease %s is no longer ours (token mismatch); leaving it alone",
+                self.lease_path,
+            )
+            return
         try:
             os.unlink(self.lease_path)
+        except FileNotFoundError:
+            pass
         except OSError:
             logger.debug("lease release failed for %s", self.lease_path, exc_info=True)
 

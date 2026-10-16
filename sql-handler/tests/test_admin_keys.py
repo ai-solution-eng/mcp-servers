@@ -86,6 +86,14 @@ def _keys_file(tmp_path: Path, entries=None) -> Path:
 
 
 def _policy_file(tmp_path: Path, spec: dict) -> Path:
+    # The fail-closed policy loader (P0-2 fix) refuses a groups-form doc
+    # without default_group (groups without it would resolve unbound
+    # identities to NO groups). The fixtures here exercise admin DESIGNATION,
+    # not the default-group rule, so inject the most restrictive sane
+    # default when the spec uses the groups form without one.
+    groups = spec.get("groups")
+    if groups and not spec.get("default_group"):
+        spec = {**spec, "default_group": sorted(groups)[0]}
     pf = tmp_path / "policy.json"
     pf.write_text(json.dumps(spec))
     return pf

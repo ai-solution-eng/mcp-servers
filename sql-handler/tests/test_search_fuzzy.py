@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import DataProvider, TableInfo
+from sqlhandler.provider import TableInfo
 
 
 def _make_engine(tmp_path, catalog=None, monkeypatch=None):
@@ -24,10 +24,10 @@ def _make_engine(tmp_path, catalog=None, monkeypatch=None):
         d / "part.parquet",
     )
 
-    class P(DataProvider):
+    class P:
         kind = "fake"
 
-        def list_tables(self, **kw):
+        def list_tables(self):
             return [
                 TableInfo(name="work_order", schema="workorder", format="parquet"),
                 TableInfo(name="orders_archive", schema="sales", format="parquet"),
@@ -84,9 +84,7 @@ def test_matched_on_records_the_reasons(tmp_path):
     # its own (harmless, strictly-bonus) reasons after it.
     assert hits[0]["matched_on"][0] == "exact-name"
     assert hits[0]["matched_on"] == list(dict.fromkeys(hits[0]["matched_on"]))  # deduped
-    assert all(
-        reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token") for reason in hits[0]["matched_on"]
-    )
+    assert all(reason in ("exact-name", "terms-name", "fuzzy-name", "fuzzy-name-token") for reason in hits[0]["matched_on"])
 
 
 def test_fuzzy_tokens_over_aliases(tmp_path, monkeypatch):

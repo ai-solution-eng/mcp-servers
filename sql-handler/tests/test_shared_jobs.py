@@ -22,6 +22,59 @@ from sqlhandler.jobs import JobError, McpJobManager
 from sqlhandler.provider import DataProvider, TableInfo
 
 
+def test_job_record_uses_no_private_job_attributes():
+    """TTL aging must not reach into QueryJob's private ``_t0``.
+
+    The old ``_JobRecord.finished_at`` computed ``self.job._t0 + elapsed``,
+    coupling jobs.py to a private attribute of engine.py (audit 2026-10-16).
+    The record now samples the terminal state ONCE and records the finish
+    time itself; a public ``QueryJob.finished_monotonic()`` is preferred when
+    the engine provides it.
+    """
+    import ast
+    import inspect
+
+    from sqlhandler import jobs as _jobs
+
+    # no private attribute is read off the job object anywhere in the module
+    tree = ast.parse(inspect.getsource(_jobs))
+    private_reads = [
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr.startswith("_")
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "job"
+    ]
+    assert private_reads == [], private_reads
+
+    class _FakeJob:
+        def __init__(self):
+            self.state = "running"
+
+    job = _FakeJob()
+    record = _jobs._JobRecord(job, "job-1")
+    assert record.finished_at() is None
+    assert record.snapshot_state() == ("running", None)
+    job.state = "done"
+    state, finished = record.snapshot_state()
+    assert state == "done" and isinstance(finished, float)
+    # the sampled time is stable, so TTL aging cannot jitter
+    assert record.finished_at() == finished
+    # a public engine-side hook wins when present, and a broken one is safe
+    class _EngineJob(_FakeJob):
+        def finished_monotonic(self):
+            return 4242.0
+
+    assert _jobs._job_finished_monotonic(_EngineJob()) == 4242.0
+
+    class _Broken(_FakeJob):
+        def finished_monotonic(self):
+            raise RuntimeError("boom")
+
+    assert isinstance(_jobs._job_finished_monotonic(_Broken()), float)
+
+
 def _make_engine(tmp_path):
     d = tmp_path / "workorder" / "work_order"
     d.mkdir(parents=True, exist_ok=True)

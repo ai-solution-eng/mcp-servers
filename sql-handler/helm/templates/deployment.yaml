@@ -43,16 +43,6 @@ spec:
           type: RuntimeDefault
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
-      {{- if and .Values.query.jobsDir (or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled) }}
-      {{- /* Async-job shared store must be visible to EVERY replica: a
-             ReadWriteOnce claim attaches on one node only, so the other
-             replicas would still answer "Unknown job id" — the exact outage
-             this feature exists to fix. Fail the render loudly, same guard
-             as semanticCatalog.store (values.yaml: RWX note). */}}
-      {{- if not (has "ReadWriteMany" (.Values.query.jobsAccessModes | default list)) }}
-      {{- fail "query.jobsDir on replicaCount > 1 / autoscaling requires query.jobsAccessModes to include ReadWriteMany (an RWX PVC must back SQLHANDLER_JOBS_DIR on every replica)" }}
-      {{- end }}
-      {{- end }}
       containers:
         - name: sqlhandler
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
@@ -163,208 +153,12 @@ spec:
                   name: {{ .Values.security.apiKey.existingSecret }}
                   key: {{ .Values.security.apiKey.existingSecretKey }}
             {{- end }}
-            {{- if or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
-            {{- /* Frontend admin-keys store (values: security.adminKeys):
-                   SECRET mode — the Secret's key IS the store's JSON file,
-                   mounted as a file (never env-rendered) so the store
-                   hot-reloads on mtime like the policy file; CLAIM mode —
-                   a WRITABLE RWX claim (the self-mint/frontend-mint path:
-                   the API writes the file; it is created on the first
-                   mint), shared across replicas. SQLHANDLER_ADMIN_KEYS_FILE
-                   names the mounted path either way. Both empty renders
-                   nothing (store disabled). Secret wins when both set. */}}
-            - name: SQLHANDLER_ADMIN_KEYS_FILE
-              value: {{ printf "%s/%s" (.Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys") .Values.security.adminKeys.existingSecretKey | quote }}
-            {{- end }}
-            {{- if and .Values.security.policy.enabled .Values.security.policy.existingClaim }}
-            {{- /* WRITABLE policy (values: security.policy.existingClaim):
-                   the file lives ON THE CLAIM — under the catalog-store
-                   mount (semanticCatalog.store.mountPath), NOT the legacy
-                   /etc read-only path (live 2026-10-05: mountPath's
-                   legacy default put the live file on the container's
-                   read-only rootfs — seeding failed Errno 30 and the
-                   store loaded empty, which 403'd every admin). The
-                   ConfigMap (when set) is the ONE-TIME SEED source,
-                   mounted at its own read-only ...-seed path. */}}
-            {{- $claimRoot := .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
-            - name: SQLHANDLER_POLICY_FILE
-              value: {{ printf "%s/policy/%s" $claimRoot (.Values.security.policy.fileName | default "policy.json") | quote }}
-            {{- if and .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
-            - name: SQLHANDLER_POLICY_SEED_FILE
-              value: {{ printf "%s-seed/%s" (.Values.security.policy.mountPath | default "/etc/sqlhandler/policy") .Values.security.policy.existingConfigMapKey | quote }}
-            {{- end }}
-            {{- else if .Values.security.policy.enabled }}
-            {{- /* Read-only ConfigMap mode (the legacy posture): hot-
-                   reloadable via kubectl edit cm but NOT writable from
-                   inside the pod — the policy editor / grant-by-name answer
-                   503 on this wiring. */}}
-            - name: SQLHANDLER_POLICY_FILE
-              value: {{ printf "%s/%s" .Values.security.policy.mountPath .Values.security.policy.existingConfigMapKey | quote }}
-            {{- end }}
-            {{- /* Identity + SSO rungs (values: security.identity.requireIdentity,
-                   security.oidc.*). Rendered UNCONDITIONALLY with "" when unset
-                   (the env contract: empty string = feature off, the same
-                   re-read-per-request discipline as every SQLHANDLER_* var)
-                   so the posture is visible and flippable in the PCAI Helm
-                   Values editor without a code change. REQUIRE_IDENTITY="1":
-                   /mcp + /api/* refuse anonymous callers with 401; /health
-                   /ready /metrics stay open (probes cannot carry secrets)
-                   and the webui shell stays open (data gated at /api). The
-                   OIDC trio turns on resource-server JWT verification via
-                   JWKS — NO client secret, NO redirect URIs (not the
-                   gateway's browser-SSO pattern; DECISIONS.md "OAuth
-                   REVISION" §3). */}}
-            - name: SQLHANDLER_REQUIRE_IDENTITY
-              value: {{ ternary "1" "" .Values.security.identity.requireIdentity | quote }}
-            - name: SQLHANDLER_OIDC_ISSUER
-              value: {{ .Values.security.oidc.issuer | default "" | quote }}
-            - name: SQLHANDLER_OIDC_AUDIENCE
-              value: {{ .Values.security.oidc.audience | default "" | quote }}
-            - name: SQLHANDLER_OIDC_JWKS_URL
-              value: {{ .Values.security.oidc.jwksUrl | default "" | quote }}
-            {{- /* Tuning knobs + master switch (values: security.oidc.*).
-                   Empty = module defaults (claim preferred_username, JWKS
-                   refresh 3600s, fetch timeout 3s, clock skew 60s).
-                   ENABLED="1" WITHOUT an issuer is a loud startup warning —
-                   the resolver stays inert and every JWT 401s (fail-closed). */}}
-            - name: SQLHANDLER_OIDC_ENABLED
-              value: {{ ternary "1" "" .Values.security.oidc.enabled | quote }}
-            - name: SQLHANDLER_OIDC_IDENTITY_CLAIM
-              value: {{ .Values.security.oidc.identityClaim | default "" | quote }}
-            - name: SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS
-              value: {{ .Values.security.oidc.jwksRefreshSeconds | default "" | quote }}
-            - name: SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS
-              value: {{ .Values.security.oidc.fetchTimeoutSeconds | default "" | quote }}
-            - name: SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS
-              value: {{ .Values.security.oidc.clockSkewSeconds | default "" | quote }}
-            {{- if .Values.security.oidc.sso.enabled }}
-            {{- /* Browser SSO (D22, the MM-RAG parity): /oauth/* routes +
-                   the pcai-sso HttpOnly session cookie. Rendered ONLY when
-                   sso.enabled — the default render is byte-identical. The
-                   client secret prefers an existing Secret (inline is the
-                   non-production back-compat). */}}
-            - name: SQLHANDLER_OIDC_SSO_ENABLED
-              value: "true"
-            - name: SQLHANDLER_OIDC_SSO_CLIENT_ID
-              value: {{ .Values.security.oidc.sso.clientId | quote }}
-            {{- if .Values.security.oidc.sso.clientExistingSecret }}
-            - name: SQLHANDLER_OIDC_SSO_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.security.oidc.sso.clientExistingSecret }}
-                  key: {{ .Values.security.oidc.sso.clientExistingSecretKey }}
-            {{- else }}
-            - name: SQLHANDLER_OIDC_SSO_CLIENT_SECRET
-              value: {{ .Values.security.oidc.sso.clientSecret | default "" | quote }}
-            {{- end }}
-            - name: SQLHANDLER_OIDC_SSO_REDIRECT_URI
-              value: {{ .Values.security.oidc.sso.redirectUri | quote }}
-            - name: SQLHANDLER_OIDC_SSO_PROVIDER_URL
-              value: {{ .Values.security.oidc.sso.providerUrl | default "" | quote }}
-            - name: SQLHANDLER_OIDC_SSO_SCOPES
-              value: {{ .Values.security.oidc.sso.scopes | quote }}
-            - name: SQLHANDLER_OIDC_SSO_COOKIE_NAME
-              value: {{ .Values.security.oidc.sso.cookieName | quote }}
-            - name: SQLHANDLER_OIDC_SSO_COOKIE_MAX_AGE
-              value: {{ .Values.security.oidc.sso.cookieMaxAge | quote }}
-            - name: SQLHANDLER_OIDC_SSO_COOKIE_SECURE
-              value: {{ .Values.security.oidc.sso.cookieSecure | quote }}
-            {{- if and .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
-            {{- /* Platform private-CA trust for the EXTERNAL providerUrl:
-                   REMOTE_CA_BUNDLE points at the mounted ezaf-root-ca bundle
-                   (the oidc_sso fetches + the JWT rung's JWKS fetch honor
-                   it — verified TLS, never verification-relaxed). */}}
-            - name: REMOTE_CA_BUNDLE
-              value: {{ printf "%s/%s" .Values.security.oidc.sso.platformCa.mountPath .Values.security.oidc.sso.platformCa.bundleFile | quote }}
-            {{- end }}
-            {{- end }}
-            {{- /* Relay attribution verification (security.identity.relayHmac.*).
-                   EMPTY default = the relay rung trusts attribution over a
-                   key-valid request exactly as before (byte-identical
-                   render). SET = attribution requires a valid
-                   X-MCP-Caller-Sig/X-MCP-Caller-Ts HMAC proof. The secret is
-                   a secretKeyRef (never ConfigMap-rendered) so rotation
-                   stays out of the audited config surface. */}}
-            - name: SQLHANDLER_RELAY_HMAC_SECRET
-              {{- if .Values.security.identity.relayHmac.existingSecret }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.security.identity.relayHmac.existingSecret }}
-                  key: {{ .Values.security.identity.relayHmac.existingSecretKey }}
-              {{- else }}
-              value: {{ .Values.security.identity.relayHmac.secret | default "" | quote }}
-              {{- end }}
             {{- if .Values.semanticCatalog.store.enabled }}
             # Upload store on the shared PVC (values: semanticCatalog.store):
             # UI/API uploads become cross-pod + durable and still hot-reload.
             # Falls back to SQLHANDLER_CATALOG until a first upload exists.
             - name: SQLHANDLER_CATALOG_STORE
               value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog") | quote }}
-            {{- end }}
-            {{- if hasKey .Values.query "concurrency" }}
-            {{- /* Legacy nesting guard (never shipped): reject a query.concurrency
-                   map so a mis-merged values file cannot silently drop the gate. */}}
-            {{- fail "query.concurrency: use the flat keys query.maxConcurrentQueries / query.queueTimeoutSeconds" }}
-            {{- end }}
-            # Per-pod query-concurrency gate (engine.py; values: query.*).
-            # Both vars are rendered unconditionally: the app's defaults (8 / 30s)
-            # match these values.yaml defaults, so explicit == default renders the
-            # same behavior while keeping the gate visible and adjustable in the
-            # PCAI Helm Values editor.
-            - name: SQLHANDLER_MAX_CONCURRENT_QUERIES
-              value: {{ .Values.query.maxConcurrentQueries | quote }}
-            - name: SQLHANDLER_QUEUE_TIMEOUT
-              value: {{ .Values.query.queueTimeoutSeconds | quote }}
-            {{- /* Pod identity for /metrics + audit lines (downward API; HA
-                   review 2026-09): an aggregate alert over per-pod series
-                   must be able to name the replica that answered. */}}
-            - name: SQLHANDLER_POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            {{- if .Values.query.auditLog }}
-            {{- /* JSONL query-audit log (values: query.auditLog). The value is a
-                   PATH; the chart only renders the env var and (below) a writable
-                   emptyDir for the path's directory — the file is pod-local by
-                   design (durable audit = point the path at your own PVC mount).
-                   Render guard: absolute path required so the mount math below
-                   cannot produce a relative nonsense mountPath. */}}
-            {{- if not (regexMatch "^/" .Values.query.auditLog) }}
-            {{- fail "query.auditLog must be an absolute path (e.g. /var/lib/sqlhandler-audit/audit.jsonl)" }}
-            {{- end }}
-            - name: SQLHANDLER_AUDIT_LOG
-              value: {{ .Values.query.auditLog | quote }}
-            {{- end }}
-            {{- if and (eq .Values.backend "sharing") .Values.sharing.enabled }}
-            {{- /* Delta Sharing (values: sharing.*): the profile FILE comes
-                   from the mounted ConfigMap (configmap.yaml renders
-                   DELTA_SHARING_PROFILE); the Secret path wires endpoint +
-                   bearer token directly via secretKeyRef. Either way the
-                   token never renders into the ConfigMap. */}}
-            {{- if .Values.sharing.existingSecret }}
-            - name: DELTA_SHARING_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.sharing.existingSecret }}
-                  key: {{ .Values.sharing.existingSecretEndpointKey }}
-            - name: DELTA_SHARING_BEARER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.sharing.existingSecret }}
-                  key: {{ .Values.sharing.existingSecretBearerTokenKey }}
-            {{- end }}
-            {{- end }}
-            {{- if and (eq .Values.backend "adls") .Values.adls.enabled (eq (.Values.adls.auth | default "anon") "client-secret") .Values.adls.existingSecret }}
-            {{- /* ADLS Gen2 (values: adls.*): the client secret NEVER renders
-                   into the ConfigMap — ADLS_CLIENT_SECRET_ENV (rendered there)
-                   names THIS env var, whose VALUE arrives from the operator's
-                   Secret via secretKeyRef. Identical posture to the FABRIC_
-                   credential block above. */}}
-            - name: ADLS_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.adls.existingSecret }}
-                  key: {{ .Values.adls.existingSecretClientSecretKey | default "client-secret" }}
             {{- end }}
           {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
                  backend additionally mounts its PVC; the semantic catalog
@@ -375,68 +169,25 @@ spec:
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
           {{- $needCatalog := .Values.semanticCatalog.enabled }}
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
-          {{- $needPolicy := and .Values.security.policy.enabled (or .Values.security.policy.existingConfigMap .Values.security.policy.existingClaim) }}
-          {{- /* CLAIM mode whose mountPath lives under the catalog-store
-                 mount: the policy file rides that mount (same live-learned
-                 rule as the admin-keys store — mounting the SAME PVC TWICE
-                 in one pod wedges some CSI drivers). One mount per PVC. */}}
-          {{- $policyOnCatalog := and .Values.security.policy.enabled .Values.security.policy.existingClaim $needStore }}
-          {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
-          {{- $needSharing := and (eq .Values.backend "sharing") .Values.sharing.enabled .Values.sharing.existingConfigMap }}
-          {{- $needAudit := and (.Values.query.auditLog) (ne (dir .Values.query.auditLog) "/") }}
-          {{- $needAdminKeys := or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
-          {{- /* CLAIM mode whose mountPath lives under the catalog-store mount (semanticCatalog.store): the store rides that mount — mounting the SAME PVC TWICE in one pod wedges some CSI drivers on the second publish (live 2026-10-05: v3.4.3 pods stuck in ContainerCreating 30+ min, no pull events, Vast CSI). One mount per PVC per pod. */}}
-          {{- $adminKeysOnCatalog := and .Values.security.adminKeys.existingClaim (not .Values.security.adminKeys.existingSecret) $needStore }}
-          {{- $needPlatformCa := and .Values.security.oidc.enabled .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
-          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needSharing $needAudit $needAdminKeys $needPlatformCa }}
+          {{- if or $needTmp $needData $needCatalog $needStore }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
               mountPath: /tmp
             {{- end }}
-            {{- if $needCatalog }}
-            {{- /* Directory mount, NOT subPath: the kubelet only propagates
-                   ConfigMap edits into non-subPath mounts, and the engine
-                   hot-reloads on mtime — so a catalog edit reaches the pod
-                   without a restart.
-                   ORDER MATTERS: this mounts the PARENT dir
-                   (/etc/sqlhandler). It MUST come before any mount whose
-                   path is a CHILD of it (the policy mount below) — kubelet
-                   binds volumeMounts in list order, and a parent-dir bind
-                   landing AFTER a child bind shadows it (live-seen
-                   2026-10-01: policy mounted before the parent produced an
-                   empty /etc/sqlhandler/policy). */}}
-            - name: semantic-catalog
-              mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
-              readOnly: true
-            {{- end }}
-            {{- if and $needPolicy $policyOnCatalog .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
-            {{- /* The SEED ConfigMap at its own read-only path (claim mode
-                   only): the server copies it to the claim on first boot. */}}
-            - name: policy-seed
-              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}-seed
-              readOnly: true
-            {{- end }}
-            {{- if and $needPolicy (not $policyOnCatalog) }}
-            {{- /* The policy ConfigMap as a DIRECTORY mount (never subPath):
-                   the kubelet only propagates ConfigMap edits into
-                   non-subPath mounts and PolicyStore hot-reloads on mtime —
-                   a grant edit reaches every replica without a restart.
-                   Without this mount the env var names a file that never
-                   changes (grants stale until rollout). Child of the
-                   semantic-catalog parent mount — MUST follow it (see the
-                   order comment above). CLAIM mode mounts NOTHING here:
-                   the policy file lives under the catalog-store mount
-                   (writable); a second mount of the same PVC wedges some
-                   CSI drivers (live 2026-10-05). */}}
-            - name: policy
-              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler/policy" }}
-              readOnly: true
-            {{- end }}
             {{- if $needData }}
             - name: data
               mountPath: {{ .Values.nfs.mount.mountPath | default "/data" | quote }}
               readOnly: {{ .Values.nfs.mount.readOnly }}
+            {{- end }}
+            {{- if $needCatalog }}
+            {{- /* Directory mount, NOT subPath: the kubelet only propagates
+                   ConfigMap edits into non-subPath mounts, and the engine
+                   hot-reloads on mtime — so a catalog edit reaches the pod
+                   without a restart. */}}
+            - name: semantic-catalog
+              mountPath: {{ .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
+              readOnly: true
             {{- end }}
             {{- if $needStore }}
             {{- /* Read-write on purpose: the upload API writes the store file
@@ -444,58 +195,6 @@ spec:
                    hot-reloads. */}}
             - name: catalog-store
               mountPath: {{ .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
-            {{- end }}
-            {{- if $needScratch }}
-            {{- /* Read-write on purpose: the write tier writes scratch tables
-                   (and the single-writer lease files) here. RWX discipline:
-                   see values.yaml writes.scratch.pvc + the scratch-pvc.yaml
-                   render guard. */}}
-            - name: scratch
-              mountPath: {{ .Values.writes.scratch.pvc.mountPath | default "/scratch" }}
-            {{- end }}
-            {{- if $needAudit }}
-            {{- /* Read-write on purpose: the audit JSONL writer appends here.
-                   Pod-local emptyDir keyed to the path's DIRECTORY (e.g.
-                   /var/lib/sqlhandler-audit for .../sqlhandler-audit/a.jsonl);
-                   a root-level path ("/a.jsonl") skips the mount entirely —
-                   only a hardened (read-only-rootfs) pod needs the dir. */}}
-            - name: audit-log
-              mountPath: {{ dir .Values.query.auditLog }}
-            {{- end }}
-            {{- if $needSharing }}
-            {{- /* Directory mount, NOT subPath — same mtime-hot-reload
-                   reasoning as the semantic catalog (though the sharing
-                   profile is read once at startup today). */}}
-            - name: sharing-profile
-              mountPath: /etc/sqlhandler-sharing
-              readOnly: true
-            {{- end }}
-            {{- if and $needAdminKeys (not $adminKeysOnCatalog) }}
-            {{- /* Directory mount, NOT subPath — the store hot-reloads on
-                   mtime exactly like the policy file; a subPath mount never
-                   sees updates. SECRET mode is read-only (the Secret's
-                   lifecycle is kubectl's); standalone CLAIM mode is
-                   READ-WRITE on purpose — the self-mint/frontend-mint API
-                   writes the store file through this mount (that is its
-                   whole point). CLAIM-over-catalog-store mode mounts
-                   NOTHING here (the store path lives under the existing
-                   catalog-store mount — a second mount of the same PVC
-                   wedges some CSI drivers). */}}
-            - name: admin-keys
-              mountPath: {{ .Values.security.adminKeys.mountPath | default "/etc/sqlhandler/admin-keys" }}
-              {{- if .Values.security.adminKeys.existingClaim }}
-              {{- /* Writable store: minted keys survive pod reschedules and
-                     are visible to every replica via the shared RWX claim. */}}
-              {{- else }}
-              readOnly: true
-              {{- end }}
-            {{- end }}
-            {{- if $needPlatformCa }}
-            {{- /* The platform root-CA bundle (values: security.oidc.sso.
-                   platformCa) — read-only; REMOTE_CA_BUNDLE points here. */}}
-            - name: platform-ca
-              mountPath: {{ .Values.security.oidc.sso.platformCa.mountPath }}
-              readOnly: true
             {{- end }}
           {{- end }}
           # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
@@ -509,20 +208,6 @@ spec:
             {{- range .Values.containerArgs }}
             - {{ . | quote }}
             {{- end }}
-          {{- if gt (.Values.preStopDelaySeconds | int) 0 }}
-          {{- /* Drain before SIGTERM (HA review 2026-09): preStop sleeps so
-                 the endpoint deregistration (readiness flip) lands FIRST and
-                 in-flight MCP tool calls stop being routed to this replica
-                 before it dies — without the delay every rollout dropped the
-                 calls in flight (the gateway allows 3600s per call, the pod
-                 only terminationGracePeriodSeconds). The sleep runs INSIDE
-                 the terminationGracePeriodSeconds budget, so the app still
-                 gets the remainder to finish draining. 0 disables the hook. */}}
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep {{ .Values.preStopDelaySeconds }}"]
-          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- /* Probes render via the shared fleet library (pcai-fleet-lib,
@@ -556,35 +241,11 @@ spec:
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
-      {{- $needPolicy := and .Values.security.policy.enabled (or .Values.security.policy.existingConfigMap .Values.security.policy.existingClaim) }}
-      {{- $policyOnCatalog := and .Values.security.policy.enabled .Values.security.policy.existingClaim $needStore }}
-      {{- $needScratch := and .Values.writes.enabled .Values.writes.scratch.pvc.enabled }}
-      {{- $needAdminKeys := or .Values.security.adminKeys.existingSecret .Values.security.adminKeys.existingClaim }}
-      {{- /* CLAIM mode whose mountPath lives under the catalog-store mount (semanticCatalog.store): the store rides that mount — mounting the SAME PVC TWICE in one pod wedges some CSI drivers on the second publish (live 2026-10-05: v3.4.3 pods stuck in ContainerCreating 30+ min, no pull events, Vast CSI). One mount per PVC per pod. */}}
-      {{- $adminKeysOnCatalog := and .Values.security.adminKeys.existingClaim (not .Values.security.adminKeys.existingSecret) $needStore }}
-      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needScratch $needAudit $needAdminKeys $needPlatformCa }}
+      {{- if or $needTmp $needData $needCatalog $needStore }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
           emptyDir: {}
-        {{- end }}
-        {{- if and $needPolicy $policyOnCatalog .Values.security.policy.existingConfigMap .Values.security.policy.seedFromConfigMap }}
-        {{- /* The SEED ConfigMap volume (claim mode only). */}}
-        - name: policy-seed
-          configMap:
-            name: {{ .Values.security.policy.existingConfigMap }}
-        {{- end }}
-        {{- if and $needPolicy (not $policyOnCatalog) }}
-        {{- /* An out-of-band operator ConfigMap (security.policy.existingConfigMap,
-               must carry the policy.existingConfigMapKey key) — directory
-               volume so ConfigMap edits propagate to the mounted file and
-               PolicyStore hot-reloads them (the grants-edit workflow).
-               CLAIM mode renders NO volume: the file lives under the
-               catalog-store claim mount (writable; the ConfigMap is the
-               one-time seed only). */}}
-        - name: policy
-          configMap:
-            name: {{ .Values.security.policy.existingConfigMap }}
         {{- end }}
         {{- if $needData }}
         - name: data
@@ -605,63 +266,6 @@ spec:
         - name: catalog-store
           persistentVolumeClaim:
             claimName: {{ .Values.semanticCatalog.store.existingClaim | default (printf "%s-catalog" (include "sqlhandler.fullname" .)) }}
-        {{- end }}
-        {{- if $needScratch }}
-        {{- /* The chart-created <release>-scratch PVC (RWX render-guarded),
-               or an existing claim via writes.scratch.pvc.existingClaim. */}}
-        - name: scratch
-          persistentVolumeClaim:
-            claimName: {{ .Values.writes.scratch.pvc.existingClaim | default (printf "%s-scratch" (include "sqlhandler.fullname" .)) }}
-        {{- end }}
-        {{- if $needSharing }}
-        {{- /* Operator-owned profile ConfigMap (sharing.existingConfigMap);
-               the key must carry the Delta Sharing profile YAML/JSON. Never
-               a values-rendered credential — profiles carry the token. */}}
-        - name: sharing-profile
-          configMap:
-            name: {{ required "sharing.existingConfigMap is required for the profile-file path" .Values.sharing.existingConfigMap }}
-        {{- end }}
-        {{- if $needAudit }}
-        {{- /* Pod-local writable dir for the audit JSONL (values: query.auditLog).
-               emptyDir is the deliberate choice: audit is a diagnostic stream,
-               not a system of record — the append-only file survives container
-               restarts but not rescheduling. Durable audit = target a path on
-               your own PVC-backed mount. */}}
-        - name: audit-log
-          emptyDir: {}
-        {{- end }}
-        {{- if .Values.security.adminKeys.existingSecret }}
-        {{- /* Operator-owned Secret (security.adminKeys.existingSecret); the
-               key must carry the FULL JSON keys file ({"keys": [...]}). The
-               mounted file is the store's live backend — the frontend mints
-               and revokes through the server's API, which writes the file
-               atomically; the Secret is the bootstrap copy. Never a values-
-               rendered credential. Secret WINS when both modes are set. */}}
-        - name: admin-keys
-          secret:
-            secretName: {{ required "security.adminKeys.existingSecret is required for the admin-keys file" .Values.security.adminKeys.existingSecret }}
-        {{- else if and .Values.security.adminKeys.existingClaim (not $adminKeysOnCatalog) }}
-        {{- /* WRITABLE store (self-service minting): an RWX PVC mounted as a
-               DIRECTORY — the API creates/updates the JSON store file in
-               place (atomic writes), shared across replicas, durable across
-               reschedules. Directory mount (never subPath) so the mtime
-               hot-reload sees every write. When the store path rides the
-               catalog-store mount ($adminKeysOnCatalog), NO extra volume —
-               a second mount of the same PVC in one pod wedges some CSI
-               drivers (live 2026-10-05). */}}
-        - name: admin-keys
-          persistentVolumeClaim:
-            claimName: {{ .Values.security.adminKeys.existingClaim }}
-        {{- end }}
-        {{- if and .Values.security.oidc.enabled .Values.security.oidc.sso.enabled .Values.security.oidc.sso.platformCa.enabled }}
-        {{- /* The platform root-CA ConfigMap (ezaf-root-ca on PCAI), keyed
-               to the single .crt file the bundle path expects. */}}
-        - name: platform-ca
-          configMap:
-            name: {{ .Values.security.oidc.sso.platformCa.configMapName }}
-            items:
-              - key: {{ .Values.security.oidc.sso.platformCa.configMapKey }}
-                path: {{ .Values.security.oidc.sso.platformCa.bundleFile }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

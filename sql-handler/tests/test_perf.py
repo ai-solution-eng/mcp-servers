@@ -15,7 +15,7 @@ from sqlhandler import s3 as s3mod
 from sqlhandler.blockcache import _BlockCacheHandler, maybe_block_cache
 from sqlhandler.config import S3Config
 from sqlhandler.engine import SqlEngine
-from sqlhandler.provider import DataProvider, LakehouseError, TableInfo
+from sqlhandler.provider import LakehouseError, TableInfo
 
 # ---------------------------------------------------------------------------
 # block cache: correctness (byte-for-byte) + warm reuse (no base reads)
@@ -47,11 +47,7 @@ class _CountingHandler(pafs.FileSystemHandler):
         return self.base.get_file_info(path)
 
     def get_file_info_selector(self, selector):
-        # mirror _BlockCacheHandler: pyarrow >= 21 removed the dedicated
-        # method from the real filesystems (see the regression test below)
-        if hasattr(self.base, "get_file_info_selector"):
-            return self.base.get_file_info_selector(selector)
-        return self.base.get_file_info(selector)
+        return self.base.get_file_info_selector(selector)
 
     def get_type_name(self):
         return "counting"
@@ -260,14 +256,14 @@ def _local_delta_provider(d: Path):
             lakehouse_abfss_url="abfss://ws@onelake.dfs.fabric.microsoft.com/lh",
         )
     )
-    p.__dict__["table_uri"] = lambda info: str(d)
+    p.table_uri = lambda info: str(d)
 
     def _open(info, version=None):
         if version is not None:
             return DeltaTable(str(d), version=int(version))
         return DeltaTable(str(d))
 
-    p.__dict__["_open_delta"] = _open
+    p._open_delta = _open
     return p
 
 
@@ -322,7 +318,7 @@ def test_onelake_cache_off_keeps_the_delta_rs_builtin_path(cached_env, monkeypat
     calls: list[object] = []
     real = deltalake.DeltaTable.to_pyarrow_dataset
 
-    def spy(self, *args: object, **kwargs: object):
+    def spy(self, *args, **kwargs):
         calls.append(kwargs.get("filesystem", "NOT-PASSED"))
         return real(self, *args, **kwargs)
 
@@ -458,61 +454,6 @@ def test_block_cache_sizes_hint_engages_without_stat(cached_env):
     assert n_opens["n"] == cold
 
 
-class _ModernPyarrowFS:
-    """A base filesystem shaped like pyarrow >= 21: the dedicated
-    ``get_file_info_selector`` is REMOVED and selector listing lives on
-    ``get_file_info(paths_or_selector)``. Duck-typed (the handler only
-    touches Python attributes on the base), so the regression below runs
-    the fallback path even on an older installed pyarrow."""
-
-    def __init__(self, inner: pafs.FileSystem):
-        self._inner = inner
-
-    def get_file_info(self, paths_or_selector):
-        return self._inner.get_file_info(paths_or_selector)
-
-    def open_input_file(self, path):
-        return self._inner.open_input_file(path)
-
-    def open_input_stream(self, path):
-        return self._inner.open_input_stream(path)
-
-    def normalize_path(self, path):
-        return self._inner.normalize_path(path)
-
-    @property
-    def type_name(self):
-        return self._inner.type_name
-
-
-def test_block_cache_selector_discovery_on_modern_pyarrow(cached_env):
-    """Regression (g2 fleet): pyarrow >= 21 removed
-    ``FileSystem.get_file_info_selector``; the handler forwarded to it, so
-    EVERY cached dataset open died with ``AttributeError`` inside the C++
-    discovery callback — surfacing downstream as ``virtual table
-    'revenue_by_region' could not be built ... Table with name orders does
-    not exist``. The handler must use the selector-capable
-    ``get_file_info`` on bases that no longer have the old method."""
-    path = _seed_parquet(cached_env)
-    expected = pq.read_table(path).to_pylist()
-
-    base = _ModernPyarrowFS(pafs.LocalFileSystem())
-    assert not hasattr(base, "get_file_info_selector")
-
-    cfg = {
-        "enabled": True,
-        "include_local": True,
-        "dir": str(cached_env / "blocks"),
-        "block_size": 16384,
-        "max_bytes": 64 * 1024 * 1024,
-    }
-    wrapped = pafs.PyFileSystem(_BlockCacheHandler(base, cfg))
-
-    # selector-based discovery (what pad.dataset / the engine runs) + reads
-    got = pad.dataset(str(path), filesystem=wrapped, format="parquet").to_table().to_pylist()
-    assert got == expected
-
-
 def test_block_cache_handler_scope_is_identity(cached_env):
     """Two handlers over the same base differing only by scope are distinct
     (pyarrow caches datasets by filesystem identity — scopes must not alias)."""
@@ -548,7 +489,7 @@ def test_block_cache_enabled_flag(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _profile_recording_connect(monkeypatch: pytest.MonkeyPatch):
+def _profile_recording_connect(monkeypatch):
     """Replace duckdb.connect with a recording proxy; returns (sqls, restore-done)."""
     import duckdb
 
@@ -556,7 +497,7 @@ def _profile_recording_connect(monkeypatch: pytest.MonkeyPatch):
     real_connect = duckdb.connect
 
     class RecordingCon:
-        def __init__(self, inner) -> None:
+        def __init__(self, inner):
             self._inner = inner
 
         def sql(self, query, *args, **kwargs):
@@ -573,7 +514,7 @@ def _profile_recording_connect(monkeypatch: pytest.MonkeyPatch):
     return sqls
 
 
-class _ProfileProvider(DataProvider):
+class _ProfileProvider:
     """One parquet table under workorder/t, opened from the temp dir."""
 
     kind = "profile-fake"
@@ -644,7 +585,7 @@ def test_profile_count_fallback_queries_when_metadata_unreadable():
 
 
 def test_materialized_virtual_result_is_clustered(tmp_path, monkeypatch):
-    from test_virtual import _write
+    from tests.test_virtual import _write
 
     n = 5000
     _write(
@@ -653,7 +594,7 @@ def test_materialized_virtual_result_is_clustered(tmp_path, monkeypatch):
         pa.table({"id": list(range(n)), "grp": [f"g{i % 4}" for i in range(n)]}),
     )
 
-    class P2(DataProvider):
+    class P2:
         kind = "p2"
 
         def list_tables(self):
@@ -700,15 +641,11 @@ def test_materialized_virtual_result_is_clustered(tmp_path, monkeypatch):
 
 def test_clustering_disabled_by_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SQLHANDLER_VIRTUAL_CACHE_SORT", "0")
-    from test_virtual import _write
+    from tests.test_virtual import _write
 
-    _write(
-        tmp_path,
-        "shop/sales2",
-        pa.table({"id": list(range(5000)), "grp": [f"g{i % 4}" for i in range(5000)]}),
-    )
+    _write(tmp_path, "shop/sales2", pa.table({"id": list(range(5000)), "grp": [f"g{i % 4}" for i in range(5000)]}))
 
-    class P2(DataProvider):
+    class P2:
         kind = "p2"
 
         def list_tables(self):

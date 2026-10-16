@@ -28,7 +28,7 @@ from sqlhandler.engine import SqlEngine
 from sqlhandler.provider import LakehouseError, TableInfo, make_provider
 from sqlhandler.sharing import SharingClient, SharingProvider, _arrow_schema_from_delta
 
-TOKEN = "tok-super-secret-123456"
+TOKEN = "tok-super-secret-123456"  # secret-scan:allow (test fixture, not a real secret)
 DELTA_SCHEMA = {
     "type": "struct",
     "fields": [
@@ -562,3 +562,89 @@ def test_engine_run_sql_over_sharing_table(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# P1-11: malformed JSONL lines AFTER the first valid action fail the query
+# (a silently-skipped truncation line = silently incomplete query results).
+# ---------------------------------------------------------------------------
+
+
+def test_consume_query_stream_tolerates_prefix_junk_fails_suffix_junk():
+    """Unit-level: the parser directly, both malformed-line positions."""
+    client = SharingClient.__new__(SharingClient)  # bypass config check
+
+    class _Resp:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    good_meta = json.dumps({"metaData": {"id": "t", "schemaString": json.dumps(DELTA_SCHEMA)}})
+    good_add = json.dumps({"add": {"url": "https://f/p1", "size": 10, "id": "a"}})
+
+    # junk BEFORE the first action: tolerated (keep-alive padding)
+    result = client._consume_query_stream(_Resp(["not-json", good_meta, good_add]))
+    assert len(result["files"]) == 1
+
+    # junk AFTER real actions: LOUD failure - never a silently short table
+    with pytest.raises(LakehouseError, match="malformed line"):
+        client._consume_query_stream(_Resp([good_meta, good_add, "{truncated"]))
+
+
+# ---------------------------------------------------------------------------
+# P2: _HTTPRandomAccessFile - a 200 to a Range request must NEVER be read as
+# if it began at the requested offset (silent parquet corruption); whence=2
+# with an unknown size refuses instead of computing a bogus offset.
+# ---------------------------------------------------------------------------
+
+
+def test_http_file_200_without_range_rejects_offset():
+    from sqlhandler.sharing import _HTTPRandomAccessFile
+
+    class _FakeResp:
+        status = 200
+
+        def read(self, n=-1):
+            return b""
+
+        def close(self):
+            pass
+
+    class _FakeConn:
+        def request(self, method, path, headers=None):
+            self.last_headers = dict(headers or {})
+
+        def getresponse(self):
+            return _FakeResp()  # a host that ignores Range: always 200
+
+    f = _HTTPRandomAccessFile("http://host/file", 5, None)
+    f._conn = _FakeConn()
+    with pytest.raises(OSError, match="ignored Range"):
+        f._open_at(100)
+
+
+def test_http_file_seek_end_without_size_raises():
+    from sqlhandler.sharing import _HTTPRandomAccessFile
+
+    f = _HTTPRandomAccessFile("http://host/file", 5, None)
+    f._size = -1  # HEAD returned no Content-Length
+    with pytest.raises(OSError, match="no known size"):
+        f.seek(0, 2)
+
+
+# ---------------------------------------------------------------------------
+# P2: share/schema fold collision - first claim keeps the naive label, a
+# colliding (share, schema) pair gets a deterministic hash-qualified label.
+# ---------------------------------------------------------------------------
+
+
+def test_fold_share_schema_collision_is_disambiguated():
+    from sqlhandler.sharing import _fold_share_schema
+
+    a = _fold_share_schema("coll_sh", "c")
+    b = _fold_share_schema("coll", "sh_c")
+    assert a == "coll_sh_c"
+    assert b != a and b.startswith("coll_sh_c_"), b
+    assert _fold_share_schema("coll", "sh_c") == b  # deterministic

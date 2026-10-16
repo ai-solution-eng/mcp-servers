@@ -1,5 +1,7 @@
 """Unit tests for SQLhandler config + backend selection (no network)."""
 
+import os
+
 import pytest
 
 from sqlhandler.config import (
@@ -15,23 +17,7 @@ from sqlhandler.config import (
 from sqlhandler.provider import LakehouseError, make_provider
 
 
-def test_config_from_env(monkeypatch):
-    # Pin the dotenv seam AND scrub the FABRIC_* ambient vars: app-building
-    # suites (test_require_identity / test_webui / ...) import the operator's
-    # config/.env into os.environ via server.load_dotenv(), and _getenv
-    # reads os.environ FIRST (deliberate: real env must beat the default) —
-    # without the delenv this test's explicit env dict is a floor, not an
-    # override, and the assertion fails on suite ORDER, not content
-    # (seen 2026-09-30: 'abfss://8168...f1f233/Tables' != 'abfss://w@...').
-    monkeypatch.setenv("SQLHANDLER_ENV_FILE", "/nonexistent/.env")
-    for var in (
-        "FABRIC_TENANT_ID",
-        "FABRIC_CLIENT_ID",
-        "FABRIC_CLIENT_SECRET",
-        "FABRIC_WORKSPACE_ID",
-        "FABRIC_LAKEHOUSE_ID",
-    ):
-        monkeypatch.delenv(var, raising=False)
+def test_config_from_env():
     env = {
         "FABRIC_TENANT_ID": "t",
         "FABRIC_CLIENT_ID": "c",
@@ -64,13 +50,10 @@ def test_unconfigured_onelake_raises():
 
 def test_env_not_polluted_by_dotenv(tmp_path, monkeypatch):
     # load_dotenv should not clobber existing variables.
-    # monkeypatch restores the var after the test — a bare os.environ write
-    # here leaked into every later test in the same session: load_dotenv()
-    # then saw SQLHANDLER_ENV_FILE pointing at this (garbage-collected)
-    # tmp_path and skipped config/.env, so provider-configured tests failed
-    # or passed depending on suite ORDER, not content.
+    # (monkeypatch, not a bare os.environ write: a leaked SQLHANDLER_ENV_FILE
+    # disables the conventional config/.env fallback for EVERY later test in
+    # the same session — the 2026-10-16 wave's last ordering failure.)
     monkeypatch.setenv("SQLHANDLER_ENV_FILE", str(tmp_path / "missing.env"))
-
     from sqlhandler.config import load_dotenv
 
     load_dotenv()  # no crash when file absent

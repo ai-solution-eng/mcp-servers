@@ -51,7 +51,12 @@ _TOKEN_ATTEMPTS = 3
 _TOKEN_RETRY_BASE_SLEEP = 0.5
 
 # Upper bound on DFS list continuation pages per directory (safety guard).
-_DFS_LIST_MAX_PAGES = 5
+# Raised from 5 (audit P2): a 5-page cap silently truncated any schema with
+# >~5000 entries — list_tables returned a SHORT list and callers could not
+# tell. The bound is now large enough to be unreachable in practice, and if
+# it IS hit the truncation is LOUD: a warning is logged and the
+# sqlhandler_onelake_listing_truncated_total metric is incremented.
+_DFS_LIST_MAX_PAGES = 5000
 
 
 class OneLakeProvider(DataProvider):
@@ -182,13 +187,17 @@ class OneLakeProvider(DataProvider):
             entries = self._dfs_list(f"{self._lh_root}/Tables/{info.path}/_delta_log")
         except Exception:
             return None
-        versions = [0]
+        # No numeric log file seen -> None, NOT 0 (audit P2): seeding
+        # versions=[0] made "no _delta_log listing" indistinguishable from
+        # "table at version 0", so a stale cache token could pin a table that
+        # has no log at all. None tells the engine to fall back to TTL.
+        versions: list[int] = []
         for entry in entries:
             name = entry.get("name", "").rstrip("/").split("/")[-1]
             stem = name.split(".", 1)[0]
             if stem.isdigit():
                 versions.append(int(stem))
-        return max(versions)
+        return max(versions) if versions else None
 
     def check_connection(self) -> str | None:
         """Cheap readiness check: acquire token and list the Tables root."""
@@ -232,7 +241,25 @@ class OneLakeProvider(DataProvider):
             continuation = payload.get("continuation")
             if not continuation:
                 return paths
-        raise LakehouseError(f"DFS list of {path} failed: too many continuation pages")
+        # The page bound was hit: NEVER return a silently truncated list.
+        # Log a warning and bump the truncation counter, then raise — callers
+        # must see the failure, not a short table list that looks complete.
+        logger.warning(
+            "DFS list of %s hit the %d-page continuation bound — listing TRUNCATED; "
+            "raising instead of returning a partial result",
+            path,
+            _DFS_LIST_MAX_PAGES,
+        )
+        try:
+            from .observability import metrics as _metrics
+
+            _metrics.onelake_listing_truncated.inc(path)
+        except Exception:  # metrics must never break the error path
+            pass
+        raise LakehouseError(
+            f"DFS list of {path} failed: exceeded {_DFS_LIST_MAX_PAGES} continuation pages "
+            "(listing truncated — widen the prefix or raise _DFS_LIST_MAX_PAGES)"
+        )
 
     def list_tables(self) -> list[TableInfo]:
         """List the Delta tables under the lake Tables dir.

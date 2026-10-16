@@ -124,7 +124,7 @@ HEADER_CALLER_TS = "X-MCP-Caller-Ts"
 #: (backward compatible, exactly today's behavior). SET = the headers are
 #: honored ONLY with a valid signature, so a key holder can no longer claim
 #: another subject (in particular an admin subject).
-RELAY_HMAC_SECRET_ENV = "SQLHANDLER_RELAY_HMAC_SECRET"
+RELAY_HMAC_SECRET_ENV = "SQLHANDLER_RELAY_HMAC_SECRET"  # secret-scan:allow (env var NAME, not a secret)
 #: Max |now - ts| accepted for a relay signature (replay window).
 RELAY_SIG_MAX_SKEW_SECONDS = 300
 
@@ -142,7 +142,7 @@ HEADER_BROWSER_GROUPS = "X-Forwarded-Groups"
 #: while X-Auth-Request-User is an injected assertion — and it carries the
 #: ``preferred_username`` claim, the human-meaningful identity the header
 #: rung lacks (the header carries the IdP's ``sub``, a UUID on this realm).
-HEADER_BROWSER_ACCESS_TOKEN = "X-Auth-Request-Access-Token"
+HEADER_BROWSER_ACCESS_TOKEN = "X-Auth-Request-Access-Token"  # secret-scan:allow (HTTP header name)
 
 #: The app's OWN D22 SSO session cookie (the oidc_sso flow's session): the
 #: VERIFIED access token planted by /oauth/oidc/callback. The LOWEST-priority

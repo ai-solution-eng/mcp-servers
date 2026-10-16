@@ -21,8 +21,11 @@ The contract (DECISIONS.md + review §4):
 
 import hashlib
 import json
+import os
 import re
 import threading
+import time
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -124,6 +127,53 @@ def test_classification_matrix():
     ]
     for sql, _typ in others:
         assert writes.classify_sql(sql)[0].kind == writes.CLASS_WRITE_OTHER, sql
+
+
+def test_classification_insert_values_literal_cannot_decide():
+    """The word SELECT in a LITERAL or COMMENT must not admit a VALUES write.
+
+    Reproduced before the fix: `INSERT INTO t VALUES ('SELECT')` classified as
+    write_scratch (source_sql "VALUES ('SELECT')") and `assert_writable_sql`
+    ADMITTED it, so a literal-only write walked past the documented refusal
+    (audit 2026-10-16 P2). The decision is structural now.
+    """
+    for sql in (
+        "INSERT INTO t VALUES ('SELECT')",
+        "INSERT INTO t VALUES (1) /* SELECT */",
+        "INSERT INTO t VALUES (1) -- SELECT",
+        "INSERT INTO t DEFAULT VALUES",
+        "INSERT INTO t BY NAME SELECT 1",
+    ):
+        c = writes.classify_sql(sql)[0]
+        assert c.kind == writes.CLASS_WRITE_OTHER, sql
+        assert c.source_sql is None, sql
+
+    # a genuine INSERT ... SELECT is still a scratch write
+    for sql in ("INSERT INTO t SELECT 1", "INSERT INTO t (a, b) SELECT 1, 2"):
+        assert writes.classify_sql(sql)[0].kind == writes.CLASS_WRITE_SCRATCH, sql
+
+
+def test_classification_copy_target_is_the_real_destination():
+    """A decoy TO inside a COMMENT or an inner literal must not be selected.
+
+    Reproduced before the fix: the statement below classified with the
+    allowlisted DECOY path as its target (the real destination was never
+    validated). The destination is now the LAST top-level TO, located in the
+    code-only view.
+    """
+    decoy = (
+        "COPY /* TO '/srv/scratch/alice/decoy.parquet' */ "
+        "(SELECT 1 AS c) TO '/etc/cron.d/pwn'"
+    )
+    c = writes.classify_sql(decoy)[0]
+    assert c.target == "/etc/cron.d/pwn", c.target
+
+    inner = "COPY (SELECT 'TO ''x.parquet''' AS c) TO 'real.parquet'"
+    assert writes.classify_sql(inner)[0].target == "real.parquet"
+
+    # options after the destination do not confuse it; doubled quotes unescape
+    assert writes.classify_sql("COPY (SELECT 1) TO 'o.parquet' (FORMAT PARQUET)")[0].target == "o.parquet"
+    assert writes.classify_sql("COPY (SELECT 1) TO 'a''b.parquet'")[0].target == "a'b.parquet"
 
 
 def test_classification_merges_into_is_named_and_refused():
@@ -300,10 +350,39 @@ def test_target_traversal_refused(monkeypatch, tmp_path):
     eng, alice, _ = _delta_engine(tmp_path, monkeypatch)
     with pytest.raises(writes.WriteError, match="traversal"):
         writes.resolve_write_target("..", alice)
-    for bad in ("a..b",):
-        # a plain name containing dots-as-text is fine (single dir part)
-        writes.resolve_write_target(bad, alice)
+    # "a..b" is now REFUSED too: the empty segment between the two dots is
+    # traversal-shaped, and folding it used to create a bare "b" under the
+    # subject namespace (audit 2026-10-16 P2).
+    with pytest.raises(writes.WriteError, match="traversal"):
+        writes.resolve_write_target("a..b", alice)
     del eng
+
+
+def test_quoted_identifier_traversal_refused(monkeypatch, tmp_path):
+    """A quoted identifier must not smuggle separators or traversal.
+
+    Reproduced before the fix: `CREATE TABLE "x/../../../etc/passwd"` resolved to
+    `<subject>/x///////etc/passwd"` (the trailing quote was the only thing
+    stopping an upward walk), `"a/b"` created TWO path levels from one
+    identifier, and `"x/.."` aliased the parent directory.
+    """
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=/srv/scratch")
+    alice = Caller(cls="user", subject="alice", via="relay")
+    for ident in ('"x/../../../etc/passwd"', '"../../etc/passwd"', '"x/.."', '"/abs"', '"a//b"'):
+        with pytest.raises(writes.WriteError):
+            c = writes.classify_sql(f"CREATE TABLE {ident} AS SELECT 1")[0]
+            writes.resolve_write_target(c.target, alice)
+
+
+def test_write_target_stays_under_subject_namespace(monkeypatch, tmp_path):
+    """Every accepted target normalizes to a path UNDER <root>/<slug>/."""
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=/srv/scratch")
+    alice = Caller(cls="user", subject="alice", via="relay")
+    prefix = f"/srv/scratch/{ALICE_SLUG}/"
+    for target in ("t", "reports.daily", "a.b.c"):
+        _b, canonical, _u = writes.resolve_write_target(target, alice)
+        assert canonical.startswith(prefix), canonical
+        assert os.path.normpath(canonical).startswith(prefix.rstrip("/") + "/"), canonical
 
 
 def test_sibling_slug_not_aliased(monkeypatch, tmp_path):
@@ -349,15 +428,85 @@ def test_lease_conflict_is_retryable(tmp_path, monkeypatch):
     writes.WriteLease(target).acquire()
 
 
-def test_lease_stale_break(tmp_path, monkeypatch):
-    monkeypatch.setenv("SQLHANDLER_WRITE_LEASE_TTL", "1")
-    target = str(tmp_path / "tbl")
-    lease = writes.WriteLease(target)
-    lease.acquire()
-    import time
+def test_lease_ttl_floor_is_refused_not_clamped(tmp_path, monkeypatch):
+    """A sub-minute TTL is REFUSED, never clamped to 1s.
 
-    time.sleep(1.1)
-    writes.WriteLease(target).acquire()  # stale lease broken, not refused
+    The old `max(value, 1)` clamp turned a configured 0 into a ONE-SECOND
+    lease, so `_break_stale` displaced live writers (audit 2026-10-16 P3).
+    """
+    for bad in ("0", "1", "59", "-5", "abc", "99999"):
+        monkeypatch.setenv("SQLHANDLER_WRITE_LEASE_TTL", bad)
+        with pytest.raises(writes.WriteError) as exc:
+            writes.lease_ttl()
+        assert exc.value.code == "E_WRITE_LEASE_TTL", bad
+    monkeypatch.setenv("SQLHANDLER_WRITE_LEASE_TTL", "60")
+    assert writes.lease_ttl() == 60
+    monkeypatch.delenv("SQLHANDLER_WRITE_LEASE_TTL", raising=False)
+    assert writes.lease_ttl() == writes.LEASE_TTL_DEFAULT == 300
+
+
+def test_lease_uri_root_refused(tmp_path, monkeypatch):
+    """A URI scratch root cannot host the O_EXCL lease -> loud refusal.
+
+    Before the fix the lease path was built by string concatenation, so an
+    `s3://bucket/scratch` root created a literal relative `s3:/...` tree in
+    the process CWD and the cross-replica lock silently became per-pod.
+    """
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=s3://bucket/scratch")
+    alice = Caller(cls="user", subject="alice", via="relay")
+    _b, canonical, _u = writes.resolve_write_target("t", alice)
+    assert canonical.startswith("s3://")
+    with pytest.raises(writes.WriteError) as exc:
+        writes.WriteLease(canonical)
+    assert exc.value.code == "E_WRITE_LEASE_URI"
+
+
+def test_multi_root_config_refused(tmp_path, monkeypatch):
+    """>1 scratch root is dead config -> refuse instead of silently using [0]."""
+    monkeypatch.setenv("SQLHANDLER_WRITE_SCRATCH_ROOTS", "main=/srv/a, hot=/srv/b")
+    alice = Caller(cls="user", subject="alice", via="relay")
+    with pytest.raises(writes.WriteError) as exc:
+        writes.subject_scoped_root(alice)
+    assert exc.value.code == "E_WRITE_MULTI_ROOT"
+
+
+def test_lease_stale_break_requires_dead_holder(tmp_path, monkeypatch):
+    """Stale = past TTL **and** provably unheld; a live holder is protected."""
+    target = str(tmp_path / "tbl")
+    holder = writes.WriteLease(target, ttl=60)
+    holder.acquire()
+    # age the payload past the TTL but keep OUR (live) pid in it
+    payload = json.loads(Path(holder.lease_path).read_text())
+    payload["acquired"] = time.time() - 3600
+    Path(holder.lease_path).write_text(json.dumps(payload))
+    with pytest.raises(writes.WriteError, match="another writer holds"):
+        writes.WriteLease(target, ttl=60).acquire()  # live pid -> NOT broken
+
+    # now make the holder provably dead: the break succeeds
+    payload["pid"] = 2**22 + 12345  # no such process
+    payload["host"] = os.uname().nodename
+    Path(holder.lease_path).write_text(json.dumps(payload))
+    stolen = writes.WriteLease(target, ttl=60)
+    stolen.acquire()
+    assert stolen._held is True
+
+    # ...and the ORIGINAL holder's late release must NOT delete it
+    holder.release()
+    assert Path(stolen.lease_path).exists(), "late release deleted the new holder's lease"
+    with pytest.raises(writes.WriteError, match="another writer holds"):
+        writes.WriteLease(target, ttl=60).acquire()
+    stolen.release()
+
+
+def test_lease_unreadable_payload_is_not_broken(tmp_path):
+    """An unreadable lease is not evidence of a dead holder -> never broken."""
+    target = str(tmp_path / "tbl")
+    holder = writes.WriteLease(target, ttl=60)
+    holder.acquire()
+    Path(holder.lease_path).write_text("{ not json")
+    with pytest.raises(writes.WriteError, match="another writer holds"):
+        writes.WriteLease(target, ttl=60).acquire()
+    holder.release()
 
 
 def test_in_process_lock_serializes(tmp_path):
@@ -535,6 +684,10 @@ def test_write_source_query_policy_masked(monkeypatch, tmp_path):
     policy_file.write_text(
         json.dumps(
             {
+                # policy.py requires an explicit default_group whenever groups
+                # exist: an unbound identity would otherwise resolve to NO
+                # groups, i.e. unrestricted (fail-closed validation).
+                "default_group": "analysts",
                 "groups": {"analysts": {"tables": {"workorder/*": {"column_masks": {"amount": "redact"}}}}},
                 "subjects": {"alice": ["analysts"]},
             }

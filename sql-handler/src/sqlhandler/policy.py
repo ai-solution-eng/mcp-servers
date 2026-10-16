@@ -133,6 +133,7 @@ __all__ = [
     "owner_key",
     "policy_enabled",
     "policy_file_path",
+    "policy_health",
     "policy_store",
     "reset_policy_store",
     "validate_row_filter",
@@ -371,6 +372,41 @@ class Policy:
         if self.datasets is not None:
             effective["datasets"] = self.datasets
         return canonical_hash(effective)
+
+
+# ---------------------------------------------------------------------------
+# the BROKEN sentinel: a PRESENT but INVALID policy file, with no previous
+# valid policy to keep enforcing
+# ---------------------------------------------------------------------------
+#
+# Returning a plain Policy() for this state (the old behavior) made it
+# indistinguishable from "no policy configured": an empty Policy hides
+# nothing and masks nothing, so a typo or a truncated mount silently resolved
+# every caller to UNRESTRICTED while the log claimed "fail-closed". The
+# sentinel makes the two states behave differently AND observably:
+#
+#   * no file / no enforcement  -> Policy(), groups {} (unchanged);
+#   * file present but invalid  -> _BROKEN_POLICY: every caller resolves to a
+#     group whose visible_tables glob matches nothing, i.e. default-deny —
+#     every covered table is HIDDEN until the file is fixed.
+#
+# It is a real Policy (frozen dataclass) so every downstream path — list,
+# describe, search, profile, scan, query — applies its existing hidden-table
+# handling with no special-casing. _BROKEN_NEVER cannot match a real table
+# path or name, and a non-empty visible_tables counts as CONTENT in
+# _compose_empty_check, so effective_hash is non-empty: broken-state entries
+# get their own cache-key space rather than sharing the unmasked one.
+_BROKEN_GROUP = "_policy_broken"
+_BROKEN_NEVER = "__sqlhandler_policy_broken_never_matches__"
+
+_BROKEN_POLICY = Policy(
+    groups={_BROKEN_GROUP: {"visible_tables": [_BROKEN_NEVER]}},
+    subjects={},
+    key_fps={},
+    default_group=_BROKEN_GROUP,
+    source="<broken>",
+    hash=canonical_hash({"policy_broken": True}),
+)
 
 
 def _canonicalize_group(spec: dict) -> dict:
@@ -840,6 +876,25 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
             default_group = default_group.strip()
             if default_group not in groups:
                 raise PolicyError(f"{origin}: default_group {default_group!r} is not a defined group")
+        elif groups:
+            # A file that DEFINES groups but names no default is ambiguous
+            # about every identity it does not bind: Policy.groups_for falls
+            # back to default_group, and with none set that fallback returns
+            # () — NO groups — which rule_for_table treats as "no rules",
+            # i.e. FULLY UNRESTRICTED. An operator who wrote a group but
+            # forgot the default therefore got the opposite of the
+            # fail-closed intent for every unbound key. Refuse the file at
+            # LOAD time (loud, before any request is served) instead of
+            # silently resolving unbound callers to unrestricted.
+            #
+            # The datasets document is exempt: _compile_datasets always
+            # synthesizes _acl_global as the default, so it cannot be
+            # ambiguous.
+            raise PolicyError(
+                f"{origin}: 'default_group' is required when 'groups' is non-empty — "
+                "without it, identities that match no subject/key_fps binding would resolve to "
+                "NO groups (unrestricted). Name the most restrictive group as the default."
+            )
     else:
         # The compiled document owns identity + default_group; the file's
         # hand-written spelling of either alongside datasets would silently
@@ -954,13 +1009,28 @@ class PolicyStore:
             fresh = load_policy(path, table_columns=self._columns())
         except PolicyError as exc:
             with self._lock:
+                self._broken_since = time.time()
                 if self._policy is not None:
                     # A bad edit never unmasks callers.
                     logger.warning("policy file %s invalid (%s); keeping the previous policy", path, exc)
                     return self._policy
-                logger.error("policy file %s invalid: %s — NO policy is active (fail-closed, loud)", path, exc)
-                self._broken_since = time.time()
-                return Policy()
+                # FIRST-FILE failure: there is no previous policy to keep, and
+                # this is NOT the same state as "no policy configured".
+                # Returning a plain Policy() here made an operator's typo
+                # (or a truncated mount) resolve to an UNRESTRICTED policy —
+                # the log line said "fail-closed" while the behavior was
+                # fail-OPEN, because an empty Policy hides nothing and masks
+                # nothing. Return the BROKEN sentinel instead: a Policy whose
+                # groups resolve every caller to a fully-hidden rule, so a
+                # present-but-invalid file refuses covered tables rather than
+                # silently exposing them.
+                logger.error(
+                    "policy file %s invalid: %s — NO valid policy has EVER loaded; "
+                    "failing CLOSED (all covered tables hidden) until the file is fixed",
+                    path,
+                    exc,
+                )
+                return _BROKEN_POLICY
             # (unreachable)
         with self._lock:
             self._policy = fresh
@@ -994,6 +1064,44 @@ class PolicyStore:
             )
         return fresh
 
+    def health(self) -> dict:
+        """Machine-readable enforcement posture for /health and /ready.
+
+        Surfaces ``_broken_since`` — the state that previously existed only as
+        a log line. A present-but-invalid FIRST policy file now FAILS CLOSED
+        (_BROKEN_POLICY hides every covered table), and an operator needs to
+        see that from the probe surface rather than infer it from a refusal:
+
+        * ``enabled``    — enforcement configured (file + flag);
+        * ``loaded``     — a VALID policy is currently enforcing;
+        * ``broken``     — the file is present but invalid AND no previous
+        *                  valid policy exists (fail-closed sentinel active);
+        * ``degraded``   — the file went invalid but a previous policy is
+                           still enforcing (serving stale-but-safe rules);
+        * ``broken_since`` — epoch seconds of the first failure in this state;
+        * ``source``     — the file path (None when unconfigured).
+
+        Read-only and never raises: a probe must not be able to fail the
+        process it is checking. ``groups`` is the count of loaded groups, so
+        a silent "loaded but empty" file is visible too.
+        """
+        path = policy_file_path()
+        enabled = bool(path) and policy_enabled()
+        with self._lock:
+            pol = self._policy
+            broken_since = self._broken_since
+        broken = broken_since is not None and pol is None
+        return {
+            "enabled": enabled,
+            "loaded": pol is not None,
+            "broken": broken,
+            "degraded": broken_since is not None and pol is not None,
+            "broken_since": broken_since,
+            "source": path,
+            "groups": len(pol.groups) if pol is not None else 0,
+            "default_group": pol.default_group if pol is not None else None,
+        }
+
     def reset(self) -> None:
         """Test hook: drop the cached policy (the next get() reloads)."""
         with self._lock:
@@ -1013,6 +1121,29 @@ def policy_store() -> PolicyStore:
         if _store is None:
             _store = PolicyStore()
         return _store
+
+
+def policy_health() -> dict:
+    """The process-wide enforcement posture (see PolicyStore.health).
+
+    The accessor /health and /ready should call: it reports whether policy is
+    enforcing, whether a valid file has EVER loaded, and since when a broken
+    file has been failing closed. Deliberately does NOT call get() — a probe
+    must not trigger a reload or depend on one succeeding.
+    """
+    try:
+        return policy_store().health()
+    except Exception:  # a probe must never raise
+        return {
+            "enabled": False,
+            "loaded": False,
+            "broken": False,
+            "degraded": False,
+            "broken_since": None,
+            "source": None,
+            "groups": 0,
+            "default_group": None,
+        }
 
 
 def reset_policy_store() -> None:

@@ -178,6 +178,118 @@ def test_gate_disabled_by_default(monkeypatch, tmp_path):
     assert all(j.state == "done" for j in jobs)
 
 
+# ------------------------------------------------- gate-leak regressions
+#
+# The gate has a SMALL fixed number of slots (default 8). A slot acquired but
+# never released is therefore not a transient inefficiency — it is permanent
+# capacity loss: after 8 such events every query queues out until the pod
+# restarts. TWO failure paths used to leak exactly that way, because the sole
+# release site is the finally inside QueryJob._run:
+#
+#   1. threading.Thread.start() raising (fd/PID exhaustion) — the thread never
+#      ran, so _run never executed and the finally never fired;
+#   2. duckdb.connect() raising (OOM / fd exhaustion) — it sat OUTSIDE the try
+#      whose finally releases, so the exception escaped before the release.
+#
+# Both are tested by counting FREE slots before and after: the assertion is on
+# the semaphore's value, not on log output, so it fails for any future leak
+# regardless of how the release is implemented.
+
+
+def _free_gate_slots():
+    """Free slots on the engine's process-wide gate (None = gate disabled).
+
+    The gate is PROCESS-WIDE and its size is fixed at first use, so a test must
+    read the live semaphore rather than assume its own env var took effect (an
+    earlier test in the same process may have sized it already). The non-blocking
+    drain counts free slots without disturbing the gate.
+    """
+    from sqlhandler.engine import _query_gate
+
+    # _semaphore() sizes the gate from the CURRENT env on first use (and
+    # rebuilds it when the env changes), so call it rather than reading _sem:
+    # in a fresh process _sem is still None and a raw read would report the
+    # gate as disabled.
+    sem = _query_gate._semaphore()
+    if sem is None:
+        return None
+    taken = 0
+    while sem.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        sem.release()
+    return taken
+
+
+def test_gate_slot_released_when_thread_start_fails(monkeypatch, tmp_path):
+    """Thread.start() raising must NOT consume a gate slot (leak path 1)."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0, "gate must be enabled with free slots"
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("threading.Thread.start", boom)
+    with pytest.raises(RuntimeError, match="can.t start new thread"):
+        QueryJob(eng, "SELECT * FROM work_order")
+
+    # Measure BEFORE undoing the env: _semaphore() REBUILDS the gate when the
+    # configured size changes, so a post-undo read would measure a FRESH
+    # semaphore and silently mask the leak. Same env = same semaphore.
+    assert _free_gate_slots() == before, "a failed thread start leaked a gate slot"
+
+
+def test_gate_slot_released_when_duckdb_connect_fails(monkeypatch, tmp_path):
+    """duckdb.connect() raising must NOT consume a gate slot (leak path 2)."""
+    import duckdb
+
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0
+
+    def boom(*a, **k):
+        raise RuntimeError("out of file descriptors")
+
+    monkeypatch.setattr(duckdb, "connect", boom)
+    job = QueryJob(eng, "SELECT * FROM work_order")
+    job.wait(10)
+
+    # The job reports the failure honestly AND the slot came back. Measured
+    # BEFORE undo for the same reason as the thread-start test above.
+    assert job.state == "error"
+    assert "DuckDB connection" in (job.error or "")
+    assert _free_gate_slots() == before, "a failed duckdb.connect() leaked a gate slot"
+
+
+def test_gate_survives_repeated_start_failures(monkeypatch, tmp_path):
+    """The pathological case the leak made permanent: fail MORE times than the
+    gate has slots, then prove a real query still runs (all slots intact)."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("threading.Thread.start", boom)
+    for _ in range(before + 3):  # MORE failures than the gate has slots
+        with pytest.raises(RuntimeError):
+            QueryJob(eng, "SELECT * FROM work_order")
+
+    # All slots still free — with the leak, `before` failures would have
+    # exhausted the gate entirely.
+    assert _free_gate_slots() == before
+    monkeypatch.undo()
+    # A genuine query still completes — the gate was not exhausted.
+    job = QueryJob(eng, "SELECT * FROM work_order")
+    job.wait(10)
+    assert job.state == "done"
+
+
 # ---------------------------------------------------------------- api token
 
 

@@ -35,7 +35,10 @@ _PRAGMA_FUNCTION_RE = re.compile(r"\bpragma_[a-z0-9_]*\s*\(", re.IGNORECASE)
 
 _MCP_READONLY_ENV = "SQLHANDLER_MCP_READONLY"
 
-_MCP_OPT_OUT_NOTE = f" Set {_MCP_READONLY_ENV}=0 to restore multi-statement/DDL execution for trusted callers."
+_MCP_OPT_OUT_NOTE = (
+    f" Set {_MCP_READONLY_ENV}=0 to restore multi-statement/DDL execution "
+    "for trusted callers."
+)
 
 
 def extract_statement_spans(sql: str) -> list[tuple[str, str]]:
@@ -54,17 +57,101 @@ def extract_statement_spans(sql: str) -> list[tuple[str, str]]:
     return [(str(s.type).split(".")[-1], s.query) for s in statements]
 
 
+# First words that mean a parenthesized group is the STATEMENT itself
+# (``EXPLAIN (SELECT 1)``) rather than an option group
+# (``EXPLAIN (FORMAT JSON) SELECT 1``).
+_STATEMENT_LEAD_WORDS = frozenset(
+    (  # noqa: SIM905 - one compact literal beats a 29-line list literal
+        "select with values from table describe summarize show explain pragma "
+        "insert update delete create drop alter copy set call attach detach "
+        "export import begin commit rollback truncate merge use"
+    ).split()
+)
+
+
+def _matching_paren(text: str, open_at: int) -> int | None:
+    """Index of the ``)`` matching the ``(`` at ``open_at``; None if unbalanced.
+
+    Quote-aware (a paren inside a string literal or a quoted identifier does
+    not count) so an option group containing a literal is scanned correctly.
+    """
+    depth = 0
+    i = open_at
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            while i < n:
+                if text[i] == quote:
+                    if i + 1 < n and text[i + 1] == quote:
+                        i += 2  # escaped quote (SQL doubling)
+                        continue
+                    break
+                i += 1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
 def _explain_inner_sql(statement: str) -> str:
-    """Strip a leading ``EXPLAIN [ANALYZE] [VERBOSE]`` and return the rest."""
-    rest = statement
+    """Strip ``EXPLAIN [ANALYZE] [VERBOSE]`` (and any option group) from ``statement``.
+
+    DuckDB accepts an OPTION GROUP between EXPLAIN and the statement —
+    ``EXPLAIN (FORMAT JSON) SELECT ...``, ``EXPLAIN ANALYZE (FORMAT JSON)``,
+    ``EXPLAIN (FORMAT JSON, ANALYZE false)``. The previous implementation
+    lstripped the "(" and handed back ``FORMAT JSON) SELECT ...``, which does
+    not parse, so EVERY option-bearing EXPLAIN was refused with a misleading
+    "Could not parse SQL" — even a perfectly ordinary
+    ``EXPLAIN (FORMAT JSON) SELECT ...`` (reproduced).
+
+    The group is scanned as a BALANCED, quote-aware span (not a regex), so
+    nested parens and string literals inside it are handled. A group whose
+    first word is a statement lead (``EXPLAIN (SELECT 1)``) is treated as the
+    statement itself, not as options.
+    """
+    rest = statement.strip()
     for keyword in ("EXPLAIN", "ANALYZE", "VERBOSE"):
-        rest = rest.lstrip(" \t\r\n(")
         parts = rest.split(None, 1)
         if parts and parts[0].upper() == keyword:
-            rest = parts[1] if len(parts) > 1 else ""
+            rest = parts[1].strip() if len(parts) > 1 else ""
         else:
             break
+    rest = rest.lstrip(" \t\r\n")
+    if rest.startswith("("):
+        end = _matching_paren(rest, 0)
+        if end is not None:
+            group = rest[1:end].strip()
+            tail = rest[end + 1 :].strip()
+            first = group.split(None, 1)[0].lower().rstrip(",") if group else ""
+            if first in _STATEMENT_LEAD_WORDS:
+                return group
+            rest = tail
     return rest
+
+
+def _refuse_pragma(statement: str, *, context: str, env_note: str) -> None:
+    """Raise when ``statement`` is (or wraps) a PRAGMA / ``pragma_*()`` call.
+
+    Belt and braces: PRAGMA is a SET alias in DuckDB, and some table-valued
+    pragmas even parse as SELECT — so reject BOTH the keyword itself and the
+    ``pragma_*()`` function form the parser rewrites it into (no read-only
+    surface has a use for either). Extracted so the rule can be applied to an
+    EXPLAIN's INNER statement as well as to a top-level one.
+    """
+    head = statement.lstrip(" \t\r\n(\"'")
+    if head.upper().startswith("PRAGMA") or _PRAGMA_FUNCTION_RE.search(statement):
+        raise ValueError(
+            f"{context}: PRAGMA statements are not allowed. "
+            "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
+            f"{env_note}"
+        )
 
 
 def assert_readonly(sql: str, *, context: str = "Read-only", env_note: str = "") -> str:
@@ -85,19 +172,15 @@ def assert_readonly(sql: str, *, context: str = "Read-only", env_note: str = "")
         raise ValueError("Empty SQL statement.")
     spans = extract_statement_spans(text)
     for stmt_type, statement in spans:
-        # Belt and braces: PRAGMA is a SET alias in DuckDB, and some
-        # table-valued pragmas even parse as SELECT — reject the keyword
-        # itself and the ``pragma_*()`` function form the parser rewrites
-        # it into (no read-only surface has a use for either).
-        head = statement.lstrip(" \t\r\n(\"'")
-        if head.upper().startswith("PRAGMA") or _PRAGMA_FUNCTION_RE.search(statement):
-            raise ValueError(
-                f"{context}: PRAGMA statements are not allowed. "
-                "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
-                f"{env_note}"
-            )
+        _refuse_pragma(statement, context=context, env_note=env_note)
         if stmt_type == "EXPLAIN":
             inner = _explain_inner_sql(statement)
+            # The PRAGMA rule applies to the EXPLAINED statement too. Without
+            # this, ``EXPLAIN PRAGMA table_info(t)`` /
+            # ``EXPLAIN (FORMAT JSON) PRAGMA ...`` slipped past the outer
+            # check (whose statement is an EXPLAIN) and only had to satisfy
+            # "inner parses as SELECT" — a gap the outer-only rule left open.
+            _refuse_pragma(inner, context=context, env_note=env_note)
             for inner_type, _inner_span in extract_statement_spans(inner):
                 if inner_type != "SELECT":
                     raise ValueError(
@@ -150,5 +233,8 @@ def assert_attached_readonly(sql: str) -> str:
     return assert_readonly(
         sql,
         context="Read-only (attached external databases)",
-        env_note=(f" {_MCP_READONLY_ENV}=0 does not apply here: attached catalogs are read-only by design."),
+        env_note=(
+            f" {_MCP_READONLY_ENV}=0 does not apply here: attached catalogs are "
+            "read-only by design."
+        ),
     )

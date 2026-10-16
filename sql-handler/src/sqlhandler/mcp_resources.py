@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import urllib.parse
-from typing import Any
 
 from mcp_types import (
     GetPromptResult,
@@ -62,11 +61,9 @@ _MARKDOWN = "text/markdown"
 # ---------------------------------------------------------------------------
 
 
-def _schema_text(engine: SqlEngine, table: str, caller=None) -> str:
-    """Markdown schema (+ catalog docs) for one table (policy-aware: hidden
-    tables raise; masked columns are omitted — the describe result the
-    caller's policy produces)."""
-    d = engine.describe_table(table, caller=caller)
+def _schema_text(engine: SqlEngine, table: str) -> str:
+    """Markdown schema (+ catalog docs) for one table."""
+    d = engine.describe_table(table)
     lines = [f"# Table: {d['table']}", "", f"URI: `{d['uri']}`", ""]
     if d.get("description"):
         lines += [d["description"], ""]
@@ -78,10 +75,9 @@ def _schema_text(engine: SqlEngine, table: str, caller=None) -> str:
     return "\n".join(lines)
 
 
-def _catalog_text(engine: SqlEngine, caller=None) -> str:
-    """Markdown overview of every table + its semantic-catalog description
-    (policy-aware: hidden tables are omitted for the reading caller)."""
-    tables = engine.list_tables(caller=caller)
+def _catalog_text(engine: SqlEngine) -> str:
+    """Markdown overview of every table + its semantic-catalog description."""
+    tables = engine.list_tables()
     lines = ["# Table catalog", ""]
     if not tables:
         lines.append("No tables found in the configured data source.")
@@ -102,15 +98,9 @@ def _catalog_text(engine: SqlEngine, caller=None) -> str:
     return "\n".join(lines)
 
 
-def _query_memory_text(engine: SqlEngine, caller=None) -> str:
-    """Markdown of recent query outcomes (the agent's own query history).
-
-    ``caller`` (identity spine): owner-scoped when policy enforcement is on —
-    another caller's recorded SQL can name tables this caller's policy hides,
-    so the memory serves ONLY the reading caller's own entries. Enforcement
-    off keeps the shared history byte-identical.
-    """
-    memory = engine.query_memory(caller=caller)
+def _query_memory_text(engine: SqlEngine) -> str:
+    """Markdown of recent query outcomes (the agent's own query history)."""
+    memory = engine.query_memory()
     lines = [
         "# Query memory",
         "",
@@ -150,14 +140,11 @@ def _parse_table_uri(uri: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def handle_list_resources(ctx: Any, params: Any) -> ListResourcesResult:
+async def handle_list_resources(ctx, params) -> ListResourcesResult:
     """resources/list: static per-table schemas + the catalog + query memory."""
-    from . import identity as _identity
     from .server import _handler  # local import: avoids a server<->module cycle
 
-    caller = _identity.caller_from_request_state(getattr(ctx, "request", None))
-
-    def _build() -> list[Resource]:
+    def _build():
         engine = _handler()
         resources: list[Resource] = [
             Resource(
@@ -173,7 +160,7 @@ async def handle_list_resources(ctx: Any, params: Any) -> ListResourcesResult:
                 mime_type=_MARKDOWN,
             ),
         ]
-        for t in engine.list_tables(caller=caller):
+        for t in engine.list_tables():
             desc = engine.table_description(t) or None
             resources.append(
                 Resource(
@@ -188,7 +175,7 @@ async def handle_list_resources(ctx: Any, params: Any) -> ListResourcesResult:
     return ListResourcesResult(resources=await asyncio.to_thread(_build))
 
 
-async def handle_list_resource_templates(ctx: Any, params: Any) -> ListResourceTemplatesResult:
+async def handle_list_resource_templates(ctx, params) -> ListResourceTemplatesResult:
     return ListResourceTemplatesResult(
         resource_templates=[
             ResourceTemplate(
@@ -204,23 +191,21 @@ async def handle_list_resource_templates(ctx: Any, params: Any) -> ListResourceT
     )
 
 
-async def handle_read_resource(ctx: Any, params: Any) -> ReadResourceResult:
+async def handle_read_resource(ctx, params) -> ReadResourceResult:
     """resources/read for the sqlhandler:// scheme."""
-    from . import identity as _identity
     from .server import _handler
 
     uri = str(params.uri)
     table = _parse_table_uri(uri)
-    caller = _identity.caller_from_request_state(getattr(ctx, "request", None))
 
     def _render() -> str:
         engine = _handler()
         if table is not None:
-            return _schema_text(engine, table, caller=caller)
+            return _schema_text(engine, table)
         if uri == _CATALOG_URI:
-            return _catalog_text(engine, caller=caller)
+            return _catalog_text(engine)
         if uri == _QUERY_MEMORY_URI:
-            return _query_memory_text(engine, caller=caller)
+            return _query_memory_text(engine)
         raise LookupError(f"Unknown resource: {uri}")
 
     try:
@@ -233,7 +218,9 @@ async def handle_read_resource(ctx: Any, params: Any) -> ReadResourceResult:
 
         code = INVALID_PARAMS if isinstance(exc, LookupError) else INTERNAL_ERROR
         raise MCPError(code=code, message=str(exc)) from exc
-    return ReadResourceResult(contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)])
+    return ReadResourceResult(
+        contents=[TextResourceContents(uri=uri, mime_type=_MARKDOWN, text=text)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -256,21 +243,17 @@ _PROMPTS = [
         name="analyze-table",
         description="Deep-dive one table: schema, profile statistics, then targeted queries.",
         arguments=[
-            PromptArgument(
-                name="table",
-                description="Table name (schema/name when the source uses schemas)",
-                required=True,
-            )
+            PromptArgument(name="table", description="Table name (schema/name when the source uses schemas)", required=True)
         ],
     ),
 ]
 
 
-async def handle_list_prompts(ctx: Any, params: Any) -> ListPromptsResult:
+async def handle_list_prompts(ctx, params) -> ListPromptsResult:
     return ListPromptsResult(prompts=_PROMPTS)
 
 
-async def handle_get_prompt(ctx: Any, params: Any) -> GetPromptResult:
+async def handle_get_prompt(ctx, params) -> GetPromptResult:
     from mcp.shared.exceptions import MCPError
     from mcp_types import INVALID_PARAMS
 
