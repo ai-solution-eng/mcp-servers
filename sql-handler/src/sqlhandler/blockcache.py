@@ -199,9 +199,7 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
         )
 
     def __hash__(self) -> int:  # keep the wrapper usable as a dict key
-        return hash(
-            (type(self).__name__, str(self._base), self._cfg["dir"], self._scope, self._sizes_fingerprint())
-        )
+        return hash((type(self).__name__, str(self._base), self._cfg["dir"], self._scope, self._sizes_fingerprint()))
 
     # -- the two hot paths ----------------------------------------------------
 
@@ -286,7 +284,26 @@ class _BlockCacheHandler(pafs.FileSystemHandler):
         return [self._base.get_file_info(str(paths))]
 
     def get_file_info_selector(self, selector: pafs.FileSelector):
-        return self._base.get_file_info_selector(selector)
+        """Handler contract: a FileSelector in, a list of FileInfo out.
+
+        DELEGATE TO ``get_file_info``, NOT ``get_file_info_selector``.
+        ``get_file_info_selector`` is a FileSystemHandler-protocol method; the
+        pyarrow FileSystem classes this wraps (S3FileSystem, LocalFileSystem,
+        ...) do NOT implement it — they overload ``get_file_info`` to accept a
+        FileSelector instead. Delegating to the absent method raised
+
+            AttributeError: pyarrow._s3fs.S3FileSystem object has no attribute
+            "get_file_info_selector"
+
+        on every dataset open through the block cache, which surfaced as
+        "Could not open S3 dataset 'sales/orders'" for exactly the tables whose
+        open needs a selector (nested ``schema/name`` paths and single-file
+        roots) while flat folder tables kept working. Live incident
+        2026-10-20: three PARQUET tables unreadable and every virtual table
+        built on them failing to bind, with the real cause buried under
+        DuckDB's "table does not exist".
+        """
+        return self._base.get_file_info(selector)
 
     def normalize_path(self, path: str) -> str:
         return self._base.normalize_path(str(path))

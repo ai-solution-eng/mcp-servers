@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hmac
 import json
 import logging
@@ -59,14 +60,14 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import JSONResponse, Response
 
-from . import __version__, mcp_resources, observability
+from . import __version__, mcp_resources, observability, webui
 from . import admin_keys as _admin_keys
 from . import errors as _errors
 from . import identity as _identity
 from . import jobs as _jobs
-from . import oidc_identity as _oidc_identity
 from . import policy as _policy
 from . import saved as _saved
+from . import writes as _writes
 from .config import (
     load_backend_config,
     load_cache_config,
@@ -78,8 +79,6 @@ from .engine import SqlEngine, _max_rows
 from .jobs import JobError
 from .provider import make_provider
 from .sqlguard import assert_mcp_readonly, mcp_readonly_enabled
-from . import writes as _writes
-from . import webui
 from .webui import register_ui
 
 logger = logging.getLogger("sqlhandler")
@@ -1061,23 +1060,243 @@ def _seed_policy_from_configmap() -> None:
     (the live file is the truth from then on; ConfigMap edits stop
     applying — the documented trade of the writable-policy mode).
 
+    ATOMIC by construction (temp file in the live directory + os.replace).
+    This matters because the claim is RWX and SHARED: with 2+ replicas
+    booting together, a plain copyfile let a second replica's hot-reload
+    observe a HALF-WRITTEN policy. The store's reaction to a truncated file
+    is to keep the previous valid policy — but on FIRST boot there is no
+    previous policy, so the loader returns the _BROKEN_POLICY sentinel and
+    the pod fails CLOSED (every covered table hidden) until the next
+    successful reload. A torn read is therefore not a cosmetic blip: it is
+    a self-inflicted outage on the very rollout that was supposed to be
+    zero-downtime. os.replace is atomic on the same filesystem, so a reader
+    sees either "no file yet" or the complete document.
+
+    Concurrency: replicas may race, but every writer writes the SAME bytes
+    from the same seed, and each replace is atomic — last writer wins with a
+    complete document. No lock is needed.
+
     Best-effort: any failure logs loudly and continues (the pod must boot;
     an operator can seed by hand via kubectl exec cp).
     """
-    import shutil
-
     seed = os.environ.get("SQLHANDLER_POLICY_SEED_FILE", "").strip()
     live = os.environ.get("SQLHANDLER_POLICY_FILE", "").strip()
     if not seed or not live or seed == live:
         return
     if os.path.exists(live):
         return  # the live file exists — the seed's one-time job is done
+    tmp = ""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(live)), exist_ok=True)
-        shutil.copyfile(seed, live)
+        directory = os.path.dirname(os.path.abspath(live))
+        os.makedirs(directory, exist_ok=True)
+        # Read the seed fully BEFORE creating the temp file: a missing/
+        # unreadable seed must not leave an empty .tmp behind.
+        with open(seed, "rb") as fh:
+            payload = fh.read()
+        fd, tmp = tempfile.mkstemp(prefix=".policy-seed-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, live)
         logger.info("policy seeded: %s -> %s (one-time migration; ConfigMap edits stop applying)", seed, live)
     except OSError as exc:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         logger.error("policy seeding FAILED (%s -> %s): %s — seed by hand: kubectl exec cp", seed, live, exc)
+
+# --------------------------------------------------------------------------
+# Policy WRITE posture (read-only-filesystem detection) - additive.
+# --------------------------------------------------------------------------
+
+
+def _policy_write_posture() -> dict:
+    """Whether the configured policy file's location is WRITABLE, probed
+    side-effect-free (no probe file is ever created: on a read-only mount
+    that is just noise, and a probe must never leave litter behind).
+
+    WHY this exists: the live SQLhandler 3.9.0 deployment mounts the policy
+    file from a ConfigMap (read-only filesystem). Enforcement works (reads
+    fine) but every admin write - panel policy edits, key-mint grant
+    binding - fails at the LAST moment with a raw "[Errno 30] Read-only
+    file system" errno string. The operator discovered the degraded state
+    only by clicking a button. This posture makes the state visible at
+    startup (a loud warning), at the point of failure (an actionable
+    message naming both remedies), and on /health (a probe-visible flag).
+
+    Never raises: any probe failure degrades to ``writable=False`` with a
+    ``reason`` - a location we cannot prove writable is reported as not
+    writable (fail-safe for the warning path; the write path itself still
+    reports its real errno).
+
+    NOT SAFE TO CALL FROM A LIVENESS PROBE. ``os.access``/``exists`` are
+    synchronous syscalls: on a HUNG mount (a stale NFS handle - and claim mode
+    requires a network filesystem) they block the event loop until the kernel
+    gives up. The kubelet's livenessProbe has a 5s timeout, so probing here
+    from /health would restart-loop every replica of exactly the deployment
+    this feature exists to enable. /health therefore reads the STARTUP-CACHED
+    value (:func:`_cached_policy_write_posture`) and never touches the
+    filesystem; /ready (which gates traffic, not process life) may refresh it.
+    """
+    path = _policy.policy_file_path()
+    if not path:
+        return {
+            "path": None,
+            "writable": False,
+            "reason": "no policy file configured (SQLHANDLER_POLICY_FILE unset) - nothing to persist to",
+        }
+    target = Path(path)
+    parent = target.parent if str(target.parent) else Path(".")
+    try:
+        # W_OK on the DIRECTORY is the cheap read-only-mount detector: a
+        # ConfigMap mount refuses every create, and mode bits lie for root
+        # anyway (root ignores them but still hits EROFS). os.access(W_OK)
+        # answers "could THIS euid create files here" without creating
+        # anything.
+        if not os.access(parent, os.W_OK):
+            return {
+                "path": path,
+                "writable": False,
+                "reason": f"policy directory {parent} is not writable (read-only mount, e.g. ConfigMap mode)",
+            }
+        # The file itself may exist and be read-only even inside a
+        # writable directory (chmod 0444 policy.json); W_OK on the file
+        # catches that without mutating it.
+        if target.exists() and not os.access(target, os.W_OK):
+            return {
+                "path": path,
+                "writable": False,
+                "reason": f"policy file {path} exists but is not writable by this process",
+            }
+        return {
+            "path": path,
+            "writable": True,
+            "reason": "policy file location is writable (panel edits persist)",
+        }
+    except OSError as exc:
+        # A probe must never raise - degrade quietly to "not writable"
+        # (the warning path is fail-safe; the real write still surfaces
+        # its true errno at the point of failure).
+        return {"path": path, "writable": False, "reason": f"writability probe failed: {exc}"}
+
+
+#: Startup snapshot of the write posture. Computed ONCE (in main(), before
+#: the server accepts traffic) and read by /health, so the LIVENESS path never
+#: performs blocking filesystem I/O. A hung mount must never be able to
+#: restart-loop a pod - see _policy_write_posture's docstring.
+_POLICY_WRITE_POSTURE: dict = {}
+
+
+def _cached_policy_write_posture() -> dict:
+    """The cached write posture ({} before the first computation).
+
+    Read by /health. Deliberately does NOT recompute: a liveness probe must
+    answer from memory. /ready and the startup log refresh the cache via
+    :func:`_refresh_policy_write_posture`.
+    """
+    return dict(_POLICY_WRITE_POSTURE)
+
+
+def _refresh_policy_write_posture() -> dict:
+    """Recompute + cache the write posture (startup, and /ready)."""
+    global _POLICY_WRITE_POSTURE
+    posture = _policy_write_posture()
+    _POLICY_WRITE_POSTURE = posture
+    return posture
+
+
+def _log_saved_query_durability() -> None:
+    """Say WHERE saved queries persist, and whether that place survives a
+    restart — at startup, either way.
+
+    WHY this deserves a startup line at all: a saved query is operator
+    CONTENT (a template someone deliberately authored), not cache. Unset,
+    the store falls back to SQLHANDLER_CACHE_DIR, which the chart points at
+    /tmp/sqlhandler-cache — an emptyDir. Saved queries then vanish on every
+    pod restart AND diverge per replica (a query saved through one replica is
+    invisible to the others). That is silent data loss of the kind that only
+    surfaces when someone looks for a query they know they saved.
+
+    The catalog store got an explicit PVC path in the chart; saved queries
+    did not, which was an inconsistency rather than a decision. This line
+    makes whichever posture is in force visible without reading the chart.
+    """
+    try:
+        path = _saved.saved_queries_path()
+    except Exception:  # never let a posture line fail startup
+        return
+    if os.environ.get("SQLHANDLER_SAVED_QUERIES_PATH", "").strip():
+        logger.info("Saved queries persist to %s (durable: an explicit path is configured).", path)
+        return
+    logger.warning(
+        "Saved queries fall back to %s — NOT durable: this is the disk-warm "
+        "cache dir (an emptyDir in the chart's default deployment), so saved "
+        "queries are lost on restart and each replica keeps its own copy. "
+        "Set SQLHANDLER_SAVED_QUERIES_PATH (chart: "
+        "semanticCatalog.store.savedQueriesPath) to a PVC path to persist them.",
+        path,
+    )
+
+
+def _log_policy_enforcement_posture() -> None:
+    """State at startup whether policy restrictions are actually IN FORCE.
+
+    A missing policy file resolves to the PERMISSIVE default (no filters, no
+    masks, nothing hidden) so a fresh install can be administered. That is
+    deliberate — but "no restrictions" and "restrictions I configured" look
+    identical from a query result, so the distinction has to be said out
+    loud exactly once, at startup, where an operator will see it.
+
+    Writable posture is a separate question (can the PANEL persist edits) and
+    is logged by :func:`_log_policy_write_posture`.
+    """
+    if not _policy.policy_enabled():
+        return
+    path = _policy.policy_file_path()
+    if not path:
+        return
+    if os.path.exists(path):
+        return  # a file exists; load_policy has already logged its state
+    logger.warning("=" * 72)
+    logger.warning(
+        "POLICY IS NOT RESTRICTING ANYTHING: %s does not exist, so the server is "
+        "serving the PERMISSIVE DEFAULT (every table visible, no column masked). "
+        "This is the normal bootstrap state for a fresh install — author the policy "
+        "in the admin panel to restrict access. If you expected restrictions to be "
+        "in force, the policy file was never seeded or has been removed.",
+        path,
+    )
+    logger.warning("=" * 72)
+
+
+def _log_policy_write_posture() -> None:
+    """Say the policy write posture OUT LOUD at startup, either way.
+
+    Not-writable is a WARNING banner (matching the optional-auth style):
+    the deployment is silently degraded - policy enforcement works, but
+    the admin panel's policy editor and the key-mint grant binding cannot
+    persist, and the operator only finds out by clicking a button and
+    reading a raw errno. Writable is a single INFO line.
+    """
+    posture = _refresh_policy_write_posture()
+    if posture["writable"]:
+        logger.info("policy file is WRITABLE (%s): admin panel edits persist.", posture["path"])
+        return
+    logger.warning("=" * 72)
+    logger.warning(
+        "Policy file is served READ-ONLY (%s): %s. The admin panel's policy editor "
+        "and key-mint grant binding CANNOT persist (every admin write fails). "
+        "Remedy: switch the chart to claim mode (security.policy.existingClaim, "
+        "optionally with security.policy.seedFromConfigMap to migrate the current "
+        "policy) or administer the policy via kubectl.",
+        posture["path"] or "(no SQLHANDLER_POLICY_FILE)",
+        posture["reason"],
+    )
+    logger.warning("=" * 72)
 
 
 def _handler() -> SqlEngine:
@@ -2497,7 +2716,25 @@ def _policy_atomic_write(text: str) -> None:
     except AdminHTTPError:
         raise
     except OSError as exc:
-        raise AdminHTTPError(503, f"cannot write the policy file ({path}): {exc}") from exc
+        if exc.errno == errno.EROFS:
+            # The live 3.9.0 deployment hit exactly this: the policy file
+            # mounted from a ConfigMap (read-only filesystem) - every admin
+            # write failed at the LAST moment with a raw errno string. The
+            # message names BOTH remedies so the failure self-corrects:
+            # claim mode (panel edits persist again) or kubectl (the
+            # ConfigMap stays the source of truth).
+            raise AdminHTTPError(
+                503,
+                f"cannot write the policy file ({path}): read-only filesystem (errno 30) — the policy is mounted read-only (ConfigMap mode); "
+                "panel policy edits and key-mint grant binding CANNOT persist. Remedy: switch the chart to claim mode "
+                "(security.policy.existingClaim, optionally with security.policy.seedFromConfigMap) or administer "
+                "the policy via kubectl.",
+            ) from exc
+        raise AdminHTTPError(
+            503,
+            f"cannot write the policy file ({path}): {exc} (errno {exc.errno}) — check the file's directory is writable "
+            "(claim mode: security.policy.existingClaim) or fix the path (SQLHANDLER_POLICY_FILE).",
+        ) from exc
 
 
 def _policy_assignments_view(pol) -> dict:
@@ -2709,7 +2946,14 @@ def _self_mint_enforce_cap(subject: str, max_keys: int, *, keep_fp: str) -> None
             fp = str(e.get("fp", ""))
             if fp:
                 _admin_keys.remove_key(fp)
-                _admin_drop_assignment(fp)
+                # Self-minted keys are SUBJECT-bound (admin_keys.add_key
+                # records subject=) and the self-mint writes NO policy row
+                # (the policy volume is read-only on real deployments) —
+                # the drop is a guaranteed no-op file round-trip here. The
+                # marker is the store entry's subject field: only the
+                # self-mint path sets it (admin mints never do).
+                if not e.get("subject"):
+                    _admin_drop_assignment(fp)
                 _audit_admin_event("selfservice.key_rotated_out", fp=fp, subject=subject)
     except Exception:
         logging.getLogger("sqlhandler.server").debug("self-mint cap enforcement skipped", exc_info=True)
@@ -2734,7 +2978,13 @@ def _self_revoke_key(caller, fp: str) -> dict:
     if entry is None or entry.get("subject") != subject:
         raise AdminHTTPError(404, f"no self-minted key with fingerprint {fp}")
     _admin_keys.remove_key(str(entry["fp"]))
-    _admin_drop_assignment(str(entry["fp"]))
+    # Self-minted keys are SUBJECT-bound and have NO policy row (the
+    # self-mint writes none — read-only policy volume): the drop would be
+    # a guaranteed no-op round-trip. The entry's subject field is the
+    # self-minted marker (admin mints never set it). Behavior for
+    # admin-minted entries is unchanged.
+    if not entry.get("subject"):
+        _admin_drop_assignment(str(entry["fp"]))
     _audit_admin_event("selfservice.key_revoke", fp=str(entry["fp"]), subject=subject)
     return {"removed": str(entry["fp"])}
 
@@ -2978,7 +3228,18 @@ def _admin_drop_assignment(fp: str) -> bool:
         return False
     doc = data.get("datasets")
     if not isinstance(doc, dict):
-        return False
+        # Groups form: drop the fp from the top-level key_fps map instead.
+        key_fps = data.get("key_fps")
+        if not isinstance(key_fps, dict):
+            return False
+        dropped_kf = False
+        for key in [k for k in key_fps if _assignment_fp(k) == fp]:
+            del key_fps[key]
+            dropped_kf = True
+        if not dropped_kf:
+            return False
+        _policy_atomic_write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        return True
     assignments = doc.get("assignments")
     if not isinstance(assignments, dict):
         return False
@@ -2993,8 +3254,18 @@ def _admin_drop_assignment(fp: str) -> bool:
 
 
 def _assignment_fp(key: str) -> str:
-    """The bare fp an assignments key binds (the ``key:`` prefix normalized)."""
-    return key.removeprefix("key:").strip()
+    """The bare fp an assignments key binds — the loader's EXACT spelling.
+
+    Normalization must match policy.py's loader (strip FIRST, then
+    removeprefix, then strip): the loader strips the whole key before the
+    "key:" prefix comes off, so " key:sha256:X " and "key: sha256:X "
+    compile to the same fp. removeprefix-then-strip (the old spelling)
+    missed both, and a drop/merge keyed on it left padded bindings behind
+    (revoke removed nothing) or bound the same fp under two spellings
+    (the loader then refuses the whole file: "one fingerprint, one
+    binding").
+    """
+    return key.strip().removeprefix("key:").strip()
 
 
 def _admin_grants_text() -> str:
@@ -3138,7 +3409,7 @@ def _admin_mint_key(label: str, assign: list[str] | None, created_by: str) -> di
     # the compensating remove below keeps the store from stranding a
     # minted-but-never-granted key.
     try:
-        _admin_merge_assignment_with_fp(fp, assign if assign else ["*"])
+        merged = _admin_merge_assignment_with_fp(fp, assign if assign else ["*"])
     except AdminHTTPError:
         try:
             _admin_keys.remove_key(fp)
@@ -3146,21 +3417,66 @@ def _admin_mint_key(label: str, assign: list[str] | None, created_by: str) -> di
             pass
         raise
     _audit_admin_event("admin.key_mint", fp=fp, label=label, by=created_by, assign=list(assign) if assign else ["*"])
+    # The merge returns an UNAMBIGUOUS binding shape in both branches —
+    # {"form": "datasets", "assignments": {fp: globs}} vs {"form": "groups",
+    # "key_fps": {...}, "bound": {fp: groups}}. Dispatching on "form" (F3)
+    # replaces the old presence-of-"assignments" sniff, which inverted for
+    # the datasets merge ({fp: [globs]} has no "assignments" key and fell to
+    # the groups arm, reporting an empty binding). "assignment" always
+    # reflects what was ACTUALLY WRITTEN (F4): for groups form that is the
+    # resolved group list (assign ["*"] binds default_group there), not the
+    # authored ["*"] the datasets vocabulary would misread.
+    binding = {
+        "form": merged["form"],
+        "assignments": merged.get("assignments", {}),
+        "key_fps": merged.get("key_fps", {}),
+    }
     return {
         "key": raw,  # THE ONE TIME the raw key is returned — store it now.
         "fp": fp,
         "label": label,
-        "assignment": {fp: list(assign) if assign else ["*"]},
+        "form": merged["form"],
+        "assignment": merged.get("assignments") or merged.get("bound", {}),
+        "binding": binding,
         "entry": entry,
     }
+
+
+def _admin_merged_policy_write(data: dict) -> None:
+    """Serialize the MERGED document, validate it, then write it (F2).
+
+    The pre-merge validation sees the file AS IT WAS; the merge edits
+    data in place, so only the merged text can prove the write is
+    loadable. A padded assignment key (" key:sha256:X ") survives the
+    pre-merge load but collides with a bare-fp merge — validating only
+    the pre-merge text let the mint write both spellings and load_policy
+    then refused the WHOLE file ("binds X twice") at next restart: a
+    201 response that bricked the ACL. Same discipline as
+    _admin_write_policy: validate the exact planned bytes first.
+    PolicyError → AdminHTTPError(503) so the mint core's compensating
+    remove_key keeps the store clean (no minted-but-never-granted key).
+    """
+    serialized = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    try:
+        _admin_validate_policy_text(serialized)
+    except AdminHTTPError as exc:
+        # 503, not the validator's 400: the request input was fine —
+        # the FILE around it is what refuses to hold the merged doc.
+        raise AdminHTTPError(503, f"merged policy document would not load: {exc}") from exc
+    _policy_atomic_write(serialized)
 
 
 def _admin_merge_assignment_with_fp(fp: str, globs: list[str]) -> dict:
     """The assignment merge for the mint path (fp in hand — no round-trip).
 
     Reads the policy FILE (the authored truth, not the compiled Policy),
-    merges ``{fp: globs}`` into ``datasets.assignments``, and writes the
-    whole document back atomically. Returns the merged assignments map.
+merges ``{fp: globs}`` into ``datasets.assignments`` (or ``{fp: groups}``
+    into the top-level ``key_fps`` for the groups form), then writes the
+    whole document back atomically — AFTER revalidating the MERGED text
+    (_admin_merged_policy_write; the pre-merge validation sees only the
+    file AS IT WAS). Returns an unambiguous shape in BOTH branches (F3):
+    {"form": "datasets", "assignments": {fp: globs}} vs {"form": "groups",
+    "key_fps": {...}, "bound": {fp: groups}} — callers dispatch on "form".
 
     503 "bind via the policy form when a datasets doc is absent" when the
     file uses the hand-written groups form: silently creating a datasets
@@ -3180,7 +3496,56 @@ def _admin_merge_assignment_with_fp(fp: str, globs: list[str]) -> dict:
     data = _admin_validate_policy_text(text)
     doc = data.get("datasets")
     if not isinstance(doc, dict):
-        raise AdminHTTPError(503, "bind via the policy form when a datasets doc is absent")
+        # GROUPS-FORM BINDING. The hand-written groups shape has no
+        # datasets doc, and silently creating one is refused on principle
+        # (mutual exclusion). The fp binding that form DOES offer is the
+        # top-level ``key_fps`` map (policy.py: direct fp binding, the
+        # FIRST resolution in groups_for()) — so the mint binds there:
+        # assign globs are datasets-form vocabulary, so a groups-form
+        # mint ignores them and maps the key to the groups NAMED here,
+        # defaulting to the policy's default_group (the same grant an
+        # unbound key would drift to — but pinned, so a later
+        # default_group change does not move this key).
+        groups = data.get("groups")
+        if not isinstance(groups, dict) or not groups:
+            raise AdminHTTPError(
+            503,
+            "cannot bind: the policy defines no groups (neither a datasets doc nor a groups doc to bind into)",
+        )
+        policy_groups = data.get("default_group")
+        # ["*"] is the datasets-form "global" convention the mint core sends
+        # for an omitted assign (server.py: assign if assign else ["*"]) —
+        # NOT a group name. In groups form it means "no explicit assign":
+        # fall to the policy's default_group (a pinned version of the grant
+        # an unbound key would drift to).
+        explicit = [str(g).strip() for g in (globs or []) if str(g).strip() and str(g).strip() != "*"]
+        target = explicit or (
+            [policy_groups] if isinstance(policy_groups, str) and policy_groups.strip() else []
+        )
+        undefined = [g for g in target if g not in groups]
+        if undefined:
+            raise AdminHTTPError(
+                400,
+                f"assign references undefined group(s) {undefined} — the policy defines: {sorted(groups)}",
+            )
+        if not target:
+            raise AdminHTTPError(
+                400,
+                "no group to bind: pass assign naming defined group(s), or set default_group in the policy",
+            )
+        key_fps = data.get("key_fps")
+        if not isinstance(key_fps, dict):
+            key_fps = {}
+            data["key_fps"] = key_fps
+        # One fp, one binding: any prior entry for this fp (either spelling)
+        # is REPLACED — the fresh mint defines the grant.
+        for k in [k for k in key_fps if _assignment_fp(k) == fp]:
+            del key_fps[k]
+        key_fps[fp] = target
+        _admin_merged_policy_write(data)
+        # F3: the two binding vocabularies get UNAMBIGUOUS shapes — the
+        # caller dispatches on "form", never on the presence of a key.
+        return {"form": "groups", "key_fps": dict(key_fps), "bound": {fp: list(target)}}
     assignments = doc.get("assignments")
     if not isinstance(assignments, dict):
         assignments = {}
@@ -3193,8 +3558,9 @@ def _admin_merge_assignment_with_fp(fp: str, globs: list[str]) -> dict:
         del assignments[existing_key]
     assignments[fp] = list(globs) if globs else ["*"]
     doc["assignments"] = assignments
-    _policy_atomic_write(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    return dict(assignments)
+    _admin_merged_policy_write(data)
+    # F3: datasets form — same unambiguous contract as the groups branch.
+    return {"form": "datasets", "assignments": {fp: list(assignments[fp])}}
 
 
 def _admin_revoke_key(fp: str, by: str = "") -> dict:
@@ -3210,13 +3576,25 @@ def _admin_revoke_key(fp: str, by: str = "") -> dict:
     secret_fps = {e["fp"] for e in _admin_secret_keys()}
     if fp in secret_fps:
         raise AdminHTTPError(409, "Secret-managed key — revoke via kubectl (the Secret's lifecycle)")
+    # DROP THE ASSIGNMENT FIRST (audit 2026-10-20, defect 3a): the old order
+    # removed the store key, THEN tried the policy write — a read-only policy
+    # (the g2 ConfigMap-mount reality) raised 503 AFTER the key was gone,
+    # leaving the grant orphaned in the file while the operator stared at an
+    # error. Policy-write-first means a refusal leaves BOTH halves intact
+    # (the key still authenticates; nothing partial), and a success path
+    # where only the store write could subsequently fail — recoverable by
+    # re-running the revoke (idempotent: the assignment is already gone,
+    # remove_key on a missing fp 404s but the binding is clean).
+    assignment_removed = _admin_drop_assignment(fp)
     removed = _admin_keys.remove_key(fp)
     if not removed:
         # remove_key returns False for BOTH an unknown fp and a disabled
         # store; with no store configured the whole surface is moot and the
-        # fp cannot have been a file key — same 404, honest message.
+        # fp cannot have been a file key — same 404, honest message. NOTE:
+        # reaching here AFTER a successful drop means the policy binding
+        # named an fp with no store entry (an orphan from the pre-fix era) —
+        # the drop was the right thing; report the 404 as-is.
         raise AdminHTTPError(404, f"no minted key with fingerprint {fp}")
-    assignment_removed = _admin_drop_assignment(fp)
     _audit_admin_event("admin.key_revoke", fp=fp, by=by or None)
     return {"removed": fp, "assignment_removed": bool(assignment_removed)}
 
@@ -3620,6 +3998,69 @@ def main(argv: list | None = None) -> None:
     uvicorn.run(app, host=args.host, port=args.port)
 
 
+def _policy_readiness_warning() -> dict:
+    """The additive policy posture fields for /ready ({} when healthy).
+
+    Module-level so it can be unit-tested without standing up a backend: the
+    distinction it draws is the whole point and it must not regress into one
+    sentence again.
+
+    THREE states, and they must not be described with one sentence:
+
+      * file MISSING (never written) -> an EMPTY, PERMISSIVE Policy: no row
+        filters, no masks, nothing hidden. This is the intended BOOTSTRAP
+        state — a fresh install serves immediately so an operator can reach
+        the admin panel and author the restrictions. Verified against
+        policy_store().get(): an absent live file yields groups_for() == ()
+        and every rule default-permissive.
+      * file PRESENT but invalid -> _BROKEN_POLICY hides every covered table.
+        Fail-closed on DATA, but the pod still serves (and stays reachable).
+      * file PRESENT and valid -> enforced.
+
+    The missing-file state is reachable in CLAIM mode (the claim mounts empty
+    on first boot and _seed_policy_from_configmap is best-effort). It is
+    reported as a WARNING and does NOT gate readiness: gating it made a
+    first-boot pod unreachable, including the panel that would fix it.
+    """
+    out: dict = {}
+    try:
+        # Force a load FIRST: policy_health() deliberately never triggers a
+        # reload (a probe must not depend on one succeeding), so "loaded" is
+        # False for a perfectly valid file that simply has not been read yet.
+        # Reading it here is correct — /ready gates traffic, not process life.
+        _policy.policy_store().get()
+        ph = _policy.policy_health()
+        path = ph.get("source")
+        # MISSING vs INVALID are different states with different data-safety
+        # postures. A file that vanished AFTER a successful load keeps the last
+        # valid policy (safe, unchanged).
+        file_missing = bool(path) and not os.path.exists(path)
+        if ph.get("enabled") and not ph.get("loaded"):
+            out["policy"] = ph
+            if ph.get("broken"):
+                # Present but INVALID: the loader returned the broken
+                # sentinel, so every covered table is already hidden.
+                # Fail-closed on DATA; the pod still serves and stays reachable.
+                out["policy_warning"] = (
+                    "policy enabled but the file is invalid and no valid policy has ever "
+                    "loaded — failing CLOSED (all covered tables hidden)"
+                )
+            elif file_missing:
+                # MISSING: the PERMISSIVE BOOTSTRAP DEFAULT — no row filters,
+                # no masks, nothing hidden. Deliberate, so a fresh install can
+                # be administered. Warn loudly (an operator must never believe
+                # restrictions are in force when none are) but do NOT gate:
+                # /ready answers "can this pod serve", and it can.
+                out["policy_warning"] = (
+                    "policy enabled but NO policy file exists — serving the PERMISSIVE "
+                    "DEFAULT: every table is visible and no column is masked. This is the "
+                    "bootstrap state; author the policy in the admin panel to restrict access."
+                )
+    except Exception:  # a probe must never fail the pod it is checking
+        pass
+    return out
+
+
 def _build_http_app():
     """Assemble the streamable-HTTP Starlette app (MCP + UI + probes + auth).
 
@@ -3656,6 +4097,14 @@ def _build_http_app():
             # byte-identical for deployments without a policy file, while a
             # broken policy file is still diagnosable from the probe body.
             if policy and (policy.get("enabled") or policy.get("broken") or policy.get("degraded")):
+                # Write posture rides the same object. READ FROM THE
+                # STARTUP CACHE on purpose: this is the LIVENESS path, and
+                # os.access on a hung mount would block the event loop past
+                # the 5s probe timeout and restart-loop every replica. The
+                # cached value is computed once before traffic is accepted,
+                # so it can never be stale in a way that matters here.
+                # Liveness stays "ok": this is posture, not health.
+                policy["writable"] = _cached_policy_write_posture().get("writable") is True
                 body["policy"] = policy
         except Exception:
             pass
@@ -3667,13 +4116,38 @@ def _build_http_app():
         # Iceberg catalog, or NFS root). If the credential/endpoint breaks, the
         # pod drops out of the Service so traffic stops reaching a dead backend
         # and the failure becomes visible. Disable with SQLHANDLER_READINESS_CHECK=0.
+        # POLICY POSTURE IS REPORTED, NOT GATED.
+        #
+        # A MISSING policy file resolves to a PERMISSIVE default policy: no
+        # row filters, no column masks, nothing hidden. That is a deliberate
+        # product decision, not an oversight — a fresh install must come up
+        # SERVING so the operator can reach the admin panel and author the
+        # restrictions. Gating /ready on it (as an earlier revision did) made
+        # a first-boot claim with a failed seed into an unreachable pod:
+        # out of the Service, so the very panel that fixes it was unreachable.
+        #
+        # The safety boundary is therefore:
+        #   * MISSING file  -> permissive default, pod READY (bootstrap state;
+        #     the startup warning says the deployment is unrestricted);
+        #   * PRESENT but INVALID -> _BROKEN_POLICY, every covered table
+        #     hidden, pod READY (fails closed on data, still reachable);
+        #   * PRESENT and VALID -> enforced.
+        # An operator who wants a hard floor before any human signs in can
+        # author the policy file up front (it is seeded from the ConfigMap in
+        # claim mode) — the panel then never sees the permissive state.
+        #
+        # /ready keeps reporting the posture additively so the state is
+        # visible from the probe, but it must not fail: readiness answers
+        # "can this pod serve", and a permissive policy can.
+        _refresh_policy_write_posture()
+        posture = _policy_readiness_warning()
         if os.environ.get("SQLHANDLER_READINESS_CHECK", "1").strip().lower() not in (
             "1",
             "true",
             "yes",
             "on",
         ):
-            return JSONResponse({"status": "ready"})
+            return JSONResponse({"status": "ready", **posture})
         try:
             engine = await asyncio.wait_for(asyncio.to_thread(_handler), timeout=2)
             err = await asyncio.wait_for(asyncio.to_thread(engine.provider.check_connection), timeout=15)
@@ -3683,20 +4157,10 @@ def _build_http_app():
             return JSONResponse({"status": "not ready", "error": str(exc)}, status_code=503)
         if err:
             return JSONResponse({"status": "not ready", "error": err}, status_code=503)
-        # Policy posture rides readiness additively: a BROKEN policy file
-        # (failing closed, every covered table hidden) is an operational
-        # incident even while the backend is healthy - surface it as a
-        # warning field WITHOUT failing the probe (the data source is up;
-        # the ACL floor is safe-by-default). probes never reload policy.
-        body = {"status": "ready"}
-        try:
-            ph = _policy.policy_health()
-            if ph.get("enabled") and not ph.get("loaded"):
-                body["policy_warning"] = "policy enabled but no valid file has ever loaded (failing closed)"
-                body["policy"] = ph
-        except Exception:
-            pass
-        return JSONResponse(body)
+        # The policy gate already ran at the top of this route (it must not be
+        # bypassable by the backend check or READINESS_CHECK=0); here only the
+        # healthy-path body remains.
+        return JSONResponse({"status": "ready", **posture})
 
     app.add_route("/health", _health)
     app.add_route("/ready", _ready)
@@ -3773,6 +4237,17 @@ def _build_http_app():
             "Attached external catalogs stay read-only regardless."
         )
 
+
+    # Policy WRITE posture (the read-only-ConfigMap incident): policy
+    # enforcement can be perfectly healthy while every admin write fails
+    # at the last moment (ConfigMap mode) - say which posture this
+    # deployment is in, loudly, where the operator configures persistence.
+    _log_policy_write_posture()
+    # Policy ENFORCEMENT posture: a missing file means the deployment is
+    # serving the PERMISSIVE default. That is the intended bootstrap state,
+    # but it must never be silent — an operator who believes restrictions are
+    # in force when none are is the real hazard, not the permissiveness.
+    _log_policy_enforcement_posture()
     # Async query jobs (additive): submit/status/result/cancel as MCP tools
     # + /api/jobs/* — the registry is in-memory (a restart clears it), so
     # say so at startup where the operator configures persistence knobs.
@@ -3787,10 +4262,17 @@ def _build_http_app():
     # query is a template other agents run, so writes require a credential
     # whenever one is configured. No credential env = known
     # single-user-local mode — writes stay open, logged loudly either way.
+    # The gated branch also names the ADMIN escape hatch (saved.write_caller_
+    # is_admin): a deployment whose normal posture is SSO with no key in the
+    # browser needs to read, at startup, that its designated admins can still
+    # edit — otherwise "writes are refused" reads as "your own panel is
+    # broken" (which is exactly the incoherence this gate had).
     if _saved.auth_configured():
         _log.info(
             "Saved-query writes are gated: %s configured — unauthenticated "
-            "query_save/query_delete (MCP or /api/saved-queries) is refused.",
+            "query_save/query_delete (MCP or /api/saved-queries) is refused; "
+            "policy-designated admins may still write via their resolved "
+            "identity (SSO/OIDC session, browser headers, or key).",
             ", ".join(_saved.credential_sources()),
         )
     else:
@@ -3799,6 +4281,7 @@ def _build_http_app():
             "MCP_API_KEYS / SQLHANDLER_API_KEYS) — saved-query WRITES are OPEN "
             "(known single-user-local mode). Set a credential to gate them."
         )
+    _log_saved_query_durability()
 
     # DNS-rebinding protection on /mcp (ON by default — Origin validation
     # always; strict Host validation when SQLHANDLER_ALLOWED_HOSTS is set).

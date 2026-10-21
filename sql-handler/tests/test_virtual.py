@@ -8,6 +8,7 @@ letting a broken definition break the catalog.
 """
 
 import json
+import logging
 from pathlib import Path
 
 import pyarrow as pa
@@ -390,6 +391,107 @@ def test_materialization_failure_falls_back_to_live_view(tmp_path, monkeypatch):
     out = eng.query_duckdb("SELECT count(*) FROM vw_big_sales")  # must not raise
     assert out.column("count_star()").to_pylist() == [2]
     assert eng._virtual_cache_writes == 0
+
+
+# ---------------------------------------------------------------------------
+# Unreadable BASE table: the bind error must name the real cause
+# (live incident 2026-10-20: a base table that failed to OPEN was skipped at
+# DEBUG, so the virtual table built on it reported a phantom "table does not
+# exist" that was indistinguishable from a genuinely absent table)
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_with_failing_base(tmp_path, monkeypatch):
+    """Engine whose BASE table open fails, plus a virtual table over it.
+
+    The provider LISTS the table (so the closure resolves and the loop
+    iterates it) but OPENING it raises — exactly the live shape.
+    """
+    _write(tmp_path, "shop/sales", pa.table({"id": [1, 2, 3], "amount": [10.5, 20.0, 30.5]}))
+    cat = tmp_path / "catalog.yaml"
+    cat.write_text(yaml.safe_dump(_catalog_doc()), encoding="utf-8")
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))
+    eng = SqlEngine(FakeProvider(tmp_path), cache_ttl=0, cache_dir=str(tmp_path))
+
+    def _boom(info, version=None):
+        raise OSError("simulated object-store failure")
+
+    monkeypatch.setattr(eng, "_open_dataset", _boom)
+    return eng
+
+
+def test_unreadable_base_table_is_named_in_the_bind_error(tmp_path, monkeypatch):
+    """The error names the base table and its real reason, not just DuckDB.
+
+    Before the fix this read only "Table with name sales does not exist" —
+    the same text a genuinely missing table produces — so operators debugged
+    the catalog instead of the object store.
+    """
+    eng = _make_engine_with_failing_base(tmp_path, monkeypatch)
+    with pytest.raises(LakehouseError) as excinfo:
+        eng.describe_table("vw_big_sales")
+    msg = str(excinfo.value)
+    assert "could not be opened" in msg
+    assert "simulated object-store failure" in msg
+    assert "sales" in msg
+
+
+def test_unreadable_base_table_warns_at_warning_level(tmp_path, monkeypatch, caplog):
+    """The skip is logged at WARNING, so it is visible at the default level.
+
+    It was logger.debug, and the server logs at INFO unless -v is passed —
+    the single reason the live failure left no trace in production.
+    """
+    eng = _make_engine_with_failing_base(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="sqlhandler.engine"), pytest.raises(LakehouseError):
+        eng.describe_table("vw_big_sales")
+    assert any("its view is NOT registered" in r.getMessage() for r in caplog.records)
+
+
+def test_failed_base_hint_is_empty_when_no_base_failed(engine):
+    """No failed bases -> no hint; the plain DuckDB message is the whole story."""
+    assert engine._failed_base_hint(BIG_SALES_DEF, None) == ""
+    assert engine._failed_base_hint(BIG_SALES_DEF, {}) == ""
+
+
+def test_failed_base_hint_ignores_unrelated_tables():
+    """A failed table the definition does not reference must not be blamed."""
+    hint = SqlEngine._failed_base_hint("SELECT * FROM sales", {"other": "OSError: x"})
+    assert hint == ""
+
+
+def test_ambiguous_bare_name_is_explained(tmp_path, monkeypatch):
+    """Two tables sharing a bare name: the error says AMBIGUOUS, not "missing".
+
+    _register_schema suppresses the bare-name view when a name is not unique
+    (only qualified names are registered), so a definition written FROM that
+    bare name cannot bind. DuckDB then reports "table does not exist", which
+    sends the author hunting for a missing table instead of an ambiguous one.
+    """
+    _write(tmp_path, "shop/sales", pa.table({"id": [1, 2, 3], "amount": [10.5, 20.0, 30.5]}))
+    _write(tmp_path, "archive/sales", pa.table({"id": [9], "amount": [1.0]}))
+    cat = tmp_path / "catalog.yaml"
+    cat.write_text(yaml.safe_dump(_catalog_doc()), encoding="utf-8")
+    monkeypatch.setenv("SQLHANDLER_CATALOG", str(cat))
+
+    class TwoSalesProvider(FakeProvider):
+        def list_tables(self):
+            return [
+                TableInfo(name="sales", schema="shop", format="parquet"),
+                TableInfo(name="sales", schema="archive", format="parquet"),
+            ]
+
+    eng = SqlEngine(TwoSalesProvider(tmp_path), cache_ttl=0, cache_dir=str(tmp_path))
+    with pytest.raises(LakehouseError) as excinfo:
+        eng.describe_table("vw_big_sales")
+    assert "AMBIGUOUS" in str(excinfo.value)
+
+
+def test_ambiguous_hint_ignores_unreferenced_names():
+    """A duplicated name the definition does not use must not be blamed."""
+    hint = SqlEngine._ambiguous_base_hint("SELECT * FROM sales", {"other": 2})
+    assert hint == ""
+    assert "sales" in SqlEngine._ambiguous_base_hint("SELECT * FROM sales", {"sales": 2})
 
 
 # ---------------------------------------------------------------------------

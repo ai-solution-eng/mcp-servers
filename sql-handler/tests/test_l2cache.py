@@ -561,16 +561,27 @@ def test_sweep_on_missing_dir_is_noop(tmp_path):
 
 
 def test_sweeper_thread_started_once(tmp_path, monkeypatch):
-    """start_sweeper is idempotent; inert when ttl <= 0."""
+    """start_sweeper is idempotent; inert only when NOTHING needs sweeping.
+
+    CONTRACT CHANGE (with the size cap): inertness is now "no TTL AND no
+    cap", not "no TTL". A ttl=0 cache with a real max_bytes is exactly the
+    configuration where unbounded growth fills the volume, so it must arm —
+    bailing on ttl <= 0 alone left the cap unenforceable in that case.
+    """
     cache = L2ResultCache(str(tmp_path / "l2"), ttl=3600)
     cache.start_sweeper()
     t1 = cache._sweeper
     assert t1 is not None and t1.daemon and t1.name == "sqlhandler-l2-sweep"
     cache.start_sweeper()
     assert cache._sweeper is t1
-    zero = L2ResultCache(str(tmp_path / "l2b"), ttl=0)
-    zero.start_sweeper()
-    assert zero._sweeper is None
+    # no TTL but a cap -> still arms (the cap needs a checker)
+    capped = L2ResultCache(str(tmp_path / "l2b"), ttl=0, max_bytes=1024)
+    capped.start_sweeper()
+    assert capped._sweeper is not None
+    # neither TTL nor cap -> genuinely inert
+    inert = L2ResultCache(str(tmp_path / "l2c"), ttl=0, max_bytes=0)
+    inert.start_sweeper()
+    assert inert._sweeper is None
 
 
 def test_sweeper_loop_sweeps(tmp_path, monkeypatch):
@@ -1079,3 +1090,60 @@ def test_engine_write_evicts_only_written_table_l2(tmp_path, monkeypatch):
     stored_a = L2ResultCache(l2, ttl=3600).lookup(key_a)
     assert stored_a is not None
     assert stored_a.to_pylist() == r_a.to_pylist()
+
+
+# ---------------------------------------------------------------------------
+# Size cap (SQLHANDLER_L2_MAX_BYTES) — enforced, not decorative
+# ---------------------------------------------------------------------------
+
+
+def test_size_cap_evicts_oldest_until_under_cap(tmp_path):
+    """The cap must actually bound the directory.
+
+    It used to be a DEAD setting: load_l2_config() read it into the config
+    dict and nothing consulted it, so the volume grew until TTL expiry and
+    the only real bound was the PVC size. sweep() enforced age, never space.
+    """
+    cache = L2ResultCache(str(tmp_path), ttl=3600, max_bytes=1)  # anything exceeds
+    for i in range(5):
+        cache.store(f"{i:016x}" + "0" * 48, pa.table({"id": list(range(2000))}))
+    assert cache._cached_bytes() > 1
+
+    removed = cache.enforce_size_cap()
+
+    assert removed == 5
+    assert cache._cached_bytes() <= 1
+    assert list(tmp_path.glob("*.parquet")) == []
+    assert cache.stats()["evictions"] == 5
+
+
+def test_size_cap_leaves_a_fitting_cache_alone(tmp_path):
+    """A generous cap evicts nothing — the cap must not be destructive."""
+    cache = L2ResultCache(str(tmp_path), ttl=3600, max_bytes=100_000_000)
+    for i in range(3):
+        cache.store(f"{i:016x}" + "0" * 48, pa.table({"id": list(range(500))}))
+    kept = len(list(tmp_path.glob("*.parquet")))
+    assert cache.enforce_size_cap() == 0
+    assert len(list(tmp_path.glob("*.parquet"))) == kept == 3
+    assert cache.stats()["evictions"] == 0
+
+
+def test_size_cap_zero_means_unlimited(tmp_path):
+    """0 is the documented "no limit" value and must never evict."""
+    cache = L2ResultCache(str(tmp_path), ttl=3600, max_bytes=0)
+    for i in range(3):
+        cache.store(f"{i:016x}" + "0" * 48, pa.table({"id": list(range(500))}))
+    assert cache.enforce_size_cap() == 0
+    assert len(list(tmp_path.glob("*.parquet"))) == 3
+
+
+def test_size_cap_survives_ttl_zero(tmp_path):
+    """A cap-only cache (ttl=0) must still arm the sweeper.
+
+    start_sweeper() used to bail on ttl <= 0 — precisely the configuration
+    where unbounded growth is the whole risk.
+    """
+    cache = L2ResultCache(str(tmp_path), ttl=0, max_bytes=1000)
+    cache.start_sweeper()
+    assert cache._sweeper is not None
+    assert cache._sweeper.daemon is True

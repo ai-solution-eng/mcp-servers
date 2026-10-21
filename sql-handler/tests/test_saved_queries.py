@@ -9,7 +9,10 @@ run-time re-application of the read-only guard against a hand-poisoned store.
 """
 
 import json
+import logging
+import tempfile
 import time
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -64,10 +67,28 @@ def _make_engine(tmp_path):
 
 
 class FakeRequest:
-    """Mimics the transport's request enough for presented_credential()."""
+    """Mimics the transport's request enough for the write gate.
+
+    headers feeds presented_credential() (a plain lowercase dict, as the
+    credential helpers read it); scope is the ASGI shape the identity ladder
+    resolves from (identity.caller_from_request_state reads scope["state"] and
+    the raw header pairs). Both are derived from the same mapping, so a test
+    can present a key, a browser identity, or nothing at all and have the gate
+    see exactly that.
+    """
 
     def __init__(self, headers=None):
         self.headers = headers or {}
+        self.scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/saved-queries",
+            "headers": [
+                (str(k).lower().encode("latin-1"), str(v).encode("latin-1"))
+                for k, v in self.headers.items()
+            ],
+            "state": {},
+        }
 
 
 # --------------------------------------------------------------------- CRUD
@@ -413,6 +434,280 @@ def test_gate_token_configured_refuses_unauthenticated_writes():
         os.environ.pop("SQLHANDLER_API_TOKEN", None)
 
 
+def test_gate_accepts_minted_store_key(tmp_path, monkeypatch):
+    """F5: the minted/self-minted keys store is part of the accepted set —
+    a key the panel minted must be a first-class write credential here (it
+    already is on /mcp and /api/admin/*). The store was the one credential
+    resolver saved.py never consulted."""
+    from sqlhandler import admin_keys as _admin_keys
+
+    keys_file = tmp_path / "admin-keys.json"
+    monkeypatch.setenv("SQLHANDLER_ADMIN_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+
+    # a minted key in the store (raw exists only in this test)
+    raw = "minted-raw-key-abcdef0123456789"
+    _admin_keys.add_key(raw, label="t", created_by="test")
+
+    # env key still passes; WRONG env key still refused
+    assert saved_module.credential_ok("sekret") is True
+    assert saved_module.credential_ok("not-a-key") is False
+    # the MINTED key now passes too (the fix), including via the write gate
+    assert saved_module.credential_ok(raw) is True
+    assert_write_allowed(FakeRequest({"x-api-key": raw}))
+    # and the gate still refuses an unknown key
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({"x-api-key": "nope"}))
+
+
+def test_gate_message_mentions_minted_keys_and_sso():
+    """F6: the 401 text must not tell an SSO caller to 'present Bearer' as if
+    their session were the problem — it names minted keys and the panel."""
+    import os
+
+    os.environ["SQLHANDLER_API_TOKEN"] = "sekret"
+    try:
+        with pytest.raises(NotAuthorized) as ei:
+            assert_write_allowed(FakeRequest({}))
+        msg = str(ei.value)
+        assert "mint a key" in msg
+        assert "minted keys are accepted" in msg
+        assert "SSO" in msg
+    finally:
+        os.environ.pop("SQLHANDLER_API_TOKEN", None)
+
+
+# ------------------------------- the designated-admin path (SSO without keys)
+#
+# The deployment's normal posture is an SSO/OIDC browser session: the caller
+# presents NO api key at all. Gating on the key alone refused the very admins
+# who can rewrite the ACL through /api/admin/*, so the gate now ALSO admits a
+# caller the identity ladder resolves to a policy-designated admin. These
+# tests pin both halves: the admin gets in, and nobody else gains anything.
+
+
+def _policy_with_admins(monkeypatch, tmp_path, admins):
+    """A policy file with the given admins list; store reset around it."""
+    from sqlhandler.policy import reset_policy_store
+
+    pf = tmp_path / "policy.json"
+    pf.write_text(
+        json.dumps({"admins": admins, "datasets": {"global": ["*"]}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(pf))
+    reset_policy_store()
+    return pf
+
+
+@pytest.fixture()
+def _admins_reset():
+    """Drop the cached policy after a test that loaded one."""
+    from sqlhandler.policy import reset_policy_store
+
+    yield
+    reset_policy_store()
+
+
+def test_write_caller_is_admin_helper_is_fail_closed(monkeypatch, tmp_path, _admins_reset):
+    """The helper refuses everything that is not a resolved, designated admin.
+
+    Fail-closed shape, one clause per refusal: no request object (stdio), an
+    anonymous HTTP request, a resolved subject that is NOT designated, and no
+    policy at all. Each must be False -- this helper sits on a REFUSAL path, so
+    an "I could not tell" answer has to mean no.
+    """
+    from sqlhandler.policy import reset_policy_store
+
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    # no policy configured at all -> nobody is designated
+    reset_policy_store()
+    assert saved_module.write_caller_is_admin(None) is False
+    assert saved_module.write_caller_is_admin(FakeRequest({})) is False
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-auth-request-user": "andrew"})) is False
+
+    # a policy WITH admins: only the designated subject resolves True
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-auth-request-user": "andrew"})) is True
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-auth-request-user": "mallory"})) is False
+    assert saved_module.write_caller_is_admin(FakeRequest({})) is False
+    assert saved_module.write_caller_is_admin(None) is False
+
+
+def test_write_caller_is_admin_needs_the_browser_rung_trusted(monkeypatch, tmp_path, _admins_reset):
+    """The admin resolution is the LADDER's, including its trust gate: with
+    SQLHANDLER_TRUST_BROWSER_HEADERS unset the browser-header rung is closed,
+    so the same header resolves anonymous and the write is refused. The new
+    path must not become a way to claim an admin identity by header alone on
+    a deployment that never opted into trusting the gateway."""
+    monkeypatch.delenv("SQLHANDLER_TRUST_BROWSER_HEADERS", raising=False)
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-auth-request-user": "andrew"})) is False
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({"x-auth-request-user": "andrew"}))
+
+
+def test_gate_designated_admin_without_any_key_is_allowed(monkeypatch, tmp_path, _admins_reset):
+    """THE fix: an admin whose identity arrives as an SSO session (browser
+    headers, no api key anywhere on the request) may write.
+
+    Before the fix this exact request was 401 -- the gate read only the key
+    headers, found nothing, and refused a caller /api/admin/grants happily
+    served.
+    """
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    admin = FakeRequest({"x-auth-request-user": "andrew"})
+    assert saved_module.presented_credential(admin) == "", "the admin presents no key"
+    assert_write_allowed(admin)  # does not raise -- the admin path admits it
+
+    # ...and it reaches the store through the API layer too (both write verbs)
+    entry = saved_module.api_saved_save({"name": "admin_q", "sql": "SELECT 1"}, admin)
+    assert entry["name"] == "admin_q"
+    assert saved_module.api_saved_delete("admin_q", admin) == {"deleted": "admin_q"}
+
+
+def test_gate_sso_non_admin_without_key_is_still_refused(monkeypatch, tmp_path, _admins_reset):
+    """The crux: an SSO login that is NOT a designated admin gains NOTHING.
+
+    Same trusted browser rung, same policy -- the subject is simply not in the
+    admins list. Refused with the same NotAuthorized, and the message still
+    tells them to mint a key (never that their session was the problem).
+    """
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    with pytest.raises(NotAuthorized) as ei:
+        assert_write_allowed(FakeRequest({"x-auth-request-user": "mallory"}))
+    assert "mint a key" in str(ei.value)
+    with pytest.raises(NotAuthorized):
+        saved_module.api_saved_save({"name": "q", "sql": "SELECT 1"}, FakeRequest({"x-auth-request-user": "mallory"}))
+
+
+def test_gate_anonymous_http_caller_still_refused_with_policy_loaded(monkeypatch, tmp_path, _admins_reset):
+    """Regression guard for the whole change: with credentials configured and
+    an admins list loaded, a caller that resolves ANONYMOUS is still refused.
+    The admin path is an addition, not a general opening."""
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    with pytest.raises(NotAuthorized, match="SQLHANDLER_API_TOKEN"):
+        assert_write_allowed(None)  # stdio cannot carry credentials
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({}))
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({"authorization": "Bearer wrong"}))
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({"x-api-key": "wrong"}))
+
+
+def test_gate_designated_admin_fingerprint_rides_the_key_path(monkeypatch, tmp_path, _admins_reset):
+    """A key fingerprint in the admins list is served by the KEY path.
+
+    credential_ok accepts the minted key, so the write is allowed and the
+    admin helper is never consulted (it is the fallback for callers with no
+    key). Pinned explicitly because the division of labour is the design:
+    the helper deliberately does NOT re-derive a key identity — on /api/*
+    the key middleware records no fingerprint into the scope, so a
+    key-carrying caller is the key path's business, and only a keyless
+    session caller reaches the ladder.
+    """
+    from sqlhandler import admin_keys as _admin_keys
+    from sqlhandler.mcp_fleet_common.audit import key_fingerprint
+
+    raw = "minted-designated-admin-0123456789"
+    monkeypatch.setenv("SQLHANDLER_ADMIN_KEYS_FILE", str(tmp_path / "admin-keys.json"))
+    monkeypatch.setenv("MCP_API_KEYS", "some-other-key")
+    _admin_keys.add_key(raw, label="designated", created_by="test")
+    _policy_with_admins(monkeypatch, tmp_path, [key_fingerprint(raw)])
+
+    # the designated minted key writes through the key path (unchanged)
+    assert saved_module.credential_ok(raw) is True
+    assert_write_allowed(FakeRequest({"x-api-key": raw}))
+    # an UNRECOGNIZED key is not rescued by the admin path either
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(FakeRequest({"x-api-key": "not-a-key"})),
+
+    # the helper itself answers the SESSION question only: a bare key header
+    # resolves anonymous on /api/* (no middleware recorded the fp), which is
+    # why credential_ok must — and does — run first.
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-api-key": raw})) is False
+
+def test_gate_admin_path_ignores_a_stale_explicit_key(monkeypatch, tmp_path, _admins_reset):
+    """PINNED DIVERGENCE: a designated admin whose request ALSO carries a
+    stale/rotated explicit key is admitted by the write gate, while the admin
+    surface would 401 that exact shape.
+
+    The admin routes treat an unmatched explicit ``X-API-Key`` as a hard
+    refusal ("a wrong key is never redeemed as the browser user behind it").
+    This gate never inspects key headers, so it resolves the session instead.
+    The difference is deliberate (refusing a legitimate admin over a
+    credential they are not required to present would recreate the bug this
+    gate exists to fix) and elevates nothing: the caller must still be in the
+    policy ``admins`` list. Pinned so a future "make the two gates identical"
+    refactor has to face the trade explicitly.
+    """
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    stale = FakeRequest({"x-auth-request-user": "andrew", "x-api-key": "rotated-away"})
+    assert saved_module.presented_credential(stale) == "rotated-away"
+    assert saved_module.credential_ok("rotated-away") is False, "the key really is unrecognized"
+    assert_write_allowed(stale)  # admitted on the ADMIN path, not the key path
+
+    # ...and the same stale key on a NON-admin is still refused: the admin
+    # path is what admits, never the stray header.
+    mallory = FakeRequest({"x-auth-request-user": "mallory", "x-api-key": "rotated-away"})
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(mallory)
+
+
+def test_gate_admin_path_does_not_require_a_key_header(monkeypatch, tmp_path, _admins_reset):
+    """An explicit-but-unrecognized key claim must not shadow the admin's own
+    session: behind oauth2-proxy the browser's SSO access token rides in
+    Authorization on every request, so a hard refusal on an unmatched Bearer
+    would refuse the very session this path exists to admit. Nothing is
+    elevated -- the caller still has to be a designated admin."""
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    # ambient SSO bearer (not a key) + trusted browser identity of an admin
+    assert_write_allowed(
+        FakeRequest({"authorization": "Bearer <ambient-sso-token>", "x-auth-request-user": "andrew"})
+    )
+    # the same ambient bearer with a NON-admin identity is still refused
+    with pytest.raises(NotAuthorized):
+        assert_write_allowed(
+            FakeRequest({"authorization": "Bearer <ambient-sso-token>", "x-auth-request-user": "mallory"})
+        )
+
+
+def test_gate_message_names_the_designated_admin_path(monkeypatch, tmp_path, _admins_reset):
+    """The refusal must describe BOTH admissions honestly: a designated admin
+    may write from their resolved session, and a signed-in NON-admin still
+    needs a minted key (the SSO-authenticates-but-does-not-authorize sentence
+    stays true)."""
+    monkeypatch.setenv("SQLHANDLER_API_TOKEN", "sekret")
+    _policy_with_admins(monkeypatch, tmp_path, ["andrew"])
+
+    with pytest.raises(NotAuthorized) as ei:
+        assert_write_allowed(FakeRequest({}))
+    msg = str(ei.value)
+    assert "designated admin" in msg
+    assert "does NOT by itself authorize writes" in msg
+    assert "mint a key" in msg
+    assert "minted keys are accepted" in msg
+    assert "SQLHANDLER_API_TOKEN" in msg
+
+
 def test_gate_mcp_keys_configured_reach_the_mcp_tools(monkeypatch):
     """MCP keys configured: the /mcp middleware authenticates the transport,
     and the write tool re-verifies per call (defense in depth — covers
@@ -589,3 +884,175 @@ def test_mcp_over_http_write_gate_end_to_end(tmp_path, monkeypatch):
         )
         assert err is False
         assert json.loads(text)["saved"] is True
+
+# ---------------------------------------------------------------------------
+# Store LOCATION: operator content must not silently land on an emptyDir
+# ---------------------------------------------------------------------------
+
+
+def test_saved_queries_path_prefers_the_explicit_env(monkeypatch, tmp_path):
+    """An explicit SQLHANDLER_SAVED_QUERIES_PATH always wins."""
+    target = tmp_path / "explicit.json"
+    monkeypatch.setenv("SQLHANDLER_SAVED_QUERIES_PATH", str(target))
+    monkeypatch.setenv("SQLHANDLER_CACHE_DIR", str(tmp_path / "cache"))
+    assert saved_module.saved_queries_path() == str(target)
+
+
+def test_saved_queries_path_falls_back_to_cache_dir(monkeypatch, tmp_path):
+    """Unset, the path follows the disk-warm cache dir (the historical default).
+
+    Pinned as a DOCUMENTED FALLBACK, not as the recommended deployment shape:
+    the chart points SQLHANDLER_CACHE_DIR at /tmp/sqlhandler-cache (an
+    emptyDir), so this fallback is NOT durable and is per-replica. The chart
+    sets the env explicitly for that reason; this test keeps the local/stdio
+    behaviour from silently changing.
+    """
+    monkeypatch.delenv("SQLHANDLER_SAVED_QUERIES_PATH", raising=False)
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("SQLHANDLER_CACHE_DIR", str(cache))
+    assert saved_module.saved_queries_path() == str(cache / "sqlhandler-saved-queries.json")
+
+
+def test_saved_queries_path_last_resort_is_the_temp_dir(monkeypatch):
+    """Neither env set -> platform temp dir (never raises, always writable)."""
+    monkeypatch.delenv("SQLHANDLER_SAVED_QUERIES_PATH", raising=False)
+    monkeypatch.delenv("SQLHANDLER_CACHE_DIR", raising=False)
+    expected = str(Path(tempfile.gettempdir()) / "sqlhandler-saved-queries.json")
+    assert saved_module.saved_queries_path() == expected
+
+
+def test_startup_warns_when_saved_queries_are_not_durable(monkeypatch, tmp_path, caplog):
+    """The posture is stated at startup, either way.
+
+    A silent emptyDir fallback is how saved queries quietly vanish on the
+    next restart. The warning names the resolved path AND the fix.
+    """
+    monkeypatch.delenv("SQLHANDLER_SAVED_QUERIES_PATH", raising=False)
+    monkeypatch.setenv("SQLHANDLER_CACHE_DIR", str(tmp_path / "cache"))
+
+    with caplog.at_level(logging.WARNING):
+        server._log_saved_query_durability()
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("NOT durable" in m for m in msgs), msgs
+    assert any("savedQueriesPath" in m for m in msgs), msgs
+
+
+def test_startup_confirms_durability_when_a_path_is_configured(monkeypatch, tmp_path, caplog):
+    """An explicit path logs INFO, not a warning."""
+    monkeypatch.setenv("SQLHANDLER_SAVED_QUERIES_PATH", str(tmp_path / "sq.json"))
+
+    with caplog.at_level(logging.INFO):
+        server._log_saved_query_durability()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("persist to" in m for m in msgs), msgs
+    assert not any("NOT durable" in m for m in msgs), msgs
+
+
+
+
+def test_chart_pvcs_survive_upgrades():
+    """EVERY chart-created PVC must carry helm.sh/resource-policy: keep.
+
+    Live incident 2026-10-21: a redeploy recreated the catalog claim (new UID,
+    empty filesystem) and destroyed every minted API key in
+    admin-keys/admin-keys.json, plus the uploaded catalog and saved queries.
+    Callers saw "my key stopped working" with nothing in any log explaining
+    it. The policy claim is worse still: losing it silently reverts the
+    deployment to the PERMISSIVE default, because a missing policy file means
+    "no restrictions".
+
+    Without the annotation Helm deletes a PVC it owns as soon as the resource
+    drops out of the rendered set — so a values change must never be able to
+    destroy operator content or loosen an ACL. Renders the real chart, so a
+    new PVC template added later without the annotation fails here.
+    """
+    import shutil
+    import subprocess
+
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm not installed")
+    chart = Path(__file__).resolve().parent.parent / "helm"
+    if not chart.is_dir():
+        pytest.skip("helm chart not present")
+
+    out = subprocess.run(
+        [
+            helm, "template", "t", str(chart),
+            "--set", "semanticCatalog.store.enabled=true",
+            "--set", "security.policy.enabled=true",
+            "--set", "security.policy.existingConfigMap=sqlhandler-policy",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+
+    # Assert on the PARSED objects, not the raw text: a missing "---" between
+    # two PVC blocks makes YAML parsers keep only the LAST one (duplicate
+    # keys, last-wins) while the raw text still shows both. That exact bug
+    # shipped in this chart on 2026-10-21 — `helm lint` and a text-level grep
+    # both passed while a fresh install silently created only the policy
+    # claim. Parsing is the only check that reflects what reaches the cluster.
+    import yaml
+
+    docs = [d for d in yaml.safe_load_all(out) if d]
+    pvcs = [d for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+    names = sorted(d["metadata"]["name"] for d in pvcs)
+    assert len(pvcs) == 2, f"expected 2 PVCs (catalog + policy), got {len(pvcs)}: {names}"
+    assert any(n.endswith("-catalog") for n in names), names
+    assert any(n.endswith("-policy") for n in names), names
+
+    offenders = [
+        d["metadata"]["name"]
+        for d in pvcs
+        if (d["metadata"].get("annotations") or {}).get("helm.sh/resource-policy") != "keep"
+    ]
+    assert not offenders, (
+        f"PVC(s) {offenders} lack helm.sh/resource-policy: keep — a helm upgrade "
+        "can delete the volume and destroy minted keys / the catalog / the live policy"
+    )
+
+
+def test_chart_persists_saved_queries_onto_the_catalog_claim():
+    """The chart must SET the env, so saved queries never hit the emptyDir.
+
+    This is the deployment-level half of the fix: with the catalog store
+    enabled, the rendered Deployment carries SQLHANDLER_SAVED_QUERIES_PATH
+    pointing INSIDE the catalog claim's mount, not at the cache dir.
+    Renders the real chart, so a values/template drift fails here.
+    """
+    import shutil
+    import subprocess
+
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm not installed")
+    chart = Path(__file__).resolve().parent.parent / "helm"
+    if not chart.is_dir():
+        pytest.skip("helm chart not present")
+
+    out = subprocess.run(
+        [helm, "template", "t", str(chart), "--set", "semanticCatalog.store.enabled=true"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+    assert "SQLHANDLER_SAVED_QUERIES_PATH" in out, "chart does not set the saved-query path"
+    assert "/var/lib/sqlhandler-catalog/saved-queries.json" in out
+    # and it must NOT be the ephemeral cache dir
+    assert "sqlhandler-cache/sqlhandler-saved-queries.json" not in out
+
+    # store disabled -> env absent (historical pod-local behaviour preserved)
+    out2 = subprocess.run(
+        [helm, "template", "t", str(chart)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+    assert "SQLHANDLER_SAVED_QUERIES_PATH" not in out2

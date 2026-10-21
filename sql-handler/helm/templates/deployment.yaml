@@ -160,6 +160,126 @@ spec:
             - name: SQLHANDLER_CATALOG_STORE
               value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog") | quote }}
             {{- end }}
+            {{- /* Saved parameterized queries: OPERATOR CONTENT, not cache.
+
+                   With no SQLHANDLER_SAVED_QUERIES_PATH the server falls
+                   back to SQLHANDLER_CACHE_DIR — which this chart points at
+                   /tmp/sqlhandler-cache, an emptyDir. Saved queries then die
+                   with the pod AND diverge per replica (one replica cannot
+                   see what another saved). The catalog store got a PVC path;
+                   saved queries did not — an inconsistency, not a choice.
+
+                   Resolution order: an explicit savedQueriesPath wins;
+                   otherwise, when the catalog store is enabled, ride the
+                   same claim (operator content belongs next to operator
+                   content); otherwise leave the env unset, which keeps the
+                   historical pod-local default for deployments with no PVC. */}}
+            {{- $sqPath := .Values.semanticCatalog.store.savedQueriesPath }}
+            {{- if and (not $sqPath) .Values.semanticCatalog.store.enabled }}
+            {{- $sqPath = printf "%s/saved-queries.json" (.Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog") }}
+            {{- end }}
+            {{- if $sqPath }}
+            - name: SQLHANDLER_SAVED_QUERIES_PATH
+              value: {{ $sqPath | quote }}
+            {{- end }}
+            {{- if .Values.security.policy.enabled }}
+            {{- $pol := .Values.security.policy }}
+            {{- if not (or $pol.existingConfigMap $pol.existingClaim $pol.claim.create) }}
+            {{- fail "security.policy.enabled requires security.policy.existingConfigMap (or existingClaim / claim.create with seedFromConfigMap) — an enabled policy with no file source locks every gated surface for every caller." }}
+            {{- end }}
+            {{- if and (or $pol.existingClaim $pol.claim.create) $pol.seedFromConfigMap (not $pol.existingConfigMap) }}
+            {{- fail "security.policy: seedFromConfigMap requires existingConfigMap — claim mode with no seed boots an UNENFORCED pod (an empty/missing policy hides nothing and masks nothing, so every table is visible). Mount a seed ConfigMap, or seed the claim by hand before the upgrade." }}
+            {{- end }}
+            {{- /* MOUNT OVERLAP GUARD (live incident 2026-10-20).
+                   Nesting the policy/seed mounts under the read-only catalog
+                   ConfigMap mount (/etc/sqlhandler) left every pod stuck in
+                   ContainerCreating for 8+ minutes with the PVC attached and
+                   NO mount error in the events — the kubelet simply never
+                   finished assembling the mount set. Overlapping mountPaths
+                   are legal YAML and legal Helm, so lint and a successful
+                   render both passed while the pods could not start.
+                   Fail the render instead: a deploy-time error beats a
+                   silent outage. */}}
+            {{- $polPath := $pol.mountPath | default "/etc/sqlhandler-policy" }}
+            {{- $catalogPath := .Values.semanticCatalog.mountPath | default "/etc/sqlhandler" }}
+            {{- $storePath := .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
+            {{- range $other := list $catalogPath $storePath }}
+            {{- if or (eq (trimSuffix "/" $polPath) (trimSuffix "/" $other)) (hasPrefix (printf "%s/" (trimSuffix "/" $other)) (trimSuffix "/" $polPath)) (hasPrefix (printf "%s/" (trimSuffix "/" $polPath)) (trimSuffix "/" $other)) }}
+            {{- fail (printf "security.policy.mountPath %q overlaps another mountPath %q. Nested/equal mounts hang pods in ContainerCreating (live 2026-10-20). Set security.policy.mountPath to a DISJOINT path, e.g. /etc/sqlhandler-policy." $polPath $other) }}
+            {{- end }}
+            {{- end }}
+            {{- /* Enforcement is OFF by default in the server (policy.py);
+                   the chart's enabled flag turns it on here. */}}
+            - name: SQLHANDLER_POLICY_ENABLED
+              value: "1"
+            {{- /* The LIVE policy file. ConfigMap mode: the read-only
+                   mount below (hot-reloads on mtime). Claim mode: the
+                   read-write PVC (the admin panel writes it). */}}
+            - name: SQLHANDLER_POLICY_FILE
+              value: {{ printf "%s/%s" ($pol.mountPath | default "/etc/sqlhandler-policy") ($pol.fileName | default "policy.json") | quote }}
+            {{- if and (or $pol.existingClaim $pol.claim.create) $pol.seedFromConfigMap }}
+            {{- /* One-time seed source (server.py _seed_policy_from_
+                   configmap): copied to SQLHANDLER_POLICY_FILE on first
+                   boot only, when the live file does not exist yet. */}}
+            - name: SQLHANDLER_POLICY_SEED_FILE
+              value: {{ printf "%s-seed/%s" ($pol.mountPath | default "/etc/sqlhandler-policy") ($pol.existingConfigMapKey | default "policy.json") | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* OIDC identity rung (oidc_identity.py env contract):
+                   a verified Bearer JWT resolves Caller(via="jwt",
+                   subject=<identityClaim>) — the ONLY rung the self-mint
+                   accepts (server.py _self_mint_key requires via=="jwt";
+                   relay is spoofable, browser is trust-flag headers).
+                   The SSO session cookie verifies through the SAME path,
+                   so a browser login resolves via="jwt" too. */}}
+            {{- with .Values.security.oidc }}
+            {{- if .enabled }}
+            - name: SQLHANDLER_OIDC_ENABLED
+              value: "1"
+            - name: SQLHANDLER_OIDC_ISSUER
+              value: {{ .issuer | quote }}
+            - name: SQLHANDLER_OIDC_AUDIENCE
+              value: {{ .audience | quote }}
+            - name: SQLHANDLER_OIDC_IDENTITY_CLAIM
+              value: {{ (.identityClaim | default "preferred_username") | quote }}
+            {{- with .jwksUrl }}
+            - name: SQLHANDLER_OIDC_JWKS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .jwksRefreshSeconds }}
+            - name: SQLHANDLER_OIDC_JWKS_REFRESH_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .fetchTimeoutSeconds }}
+            - name: SQLHANDLER_OIDC_FETCH_TIMEOUT_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .clockSkewSeconds }}
+            - name: SQLHANDLER_OIDC_CLOCK_SKEW_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* Self-mint keys store (admin_keys.py): the JSON file the
+                   mint writes minted keys to. Without it self-mint answers
+                   503 "the keys store is not configured". */}}
+            {{- with .Values.security.adminKeys }}
+            {{- if or .existingClaim .existingSecret .mountPath }}
+            - name: SQLHANDLER_ADMIN_KEYS_FILE
+              value: {{ printf "%s/admin-keys.json" (.mountPath | default "/var/lib/sqlhandler-catalog/admin-keys") | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.security.selfMintMaxKeys }}
+            - name: SQLHANDLER_SELF_MINT_MAX_KEYS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.security.oidc }}
+            {{- $pcaEnv := .platformCa | default dict }}
+            {{- if and .enabled $pcaEnv.enabled }}
+            - name: REMOTE_CA_BUNDLE
+              value: {{ printf "%s/%s" ($pcaEnv.mountPath | default "/etc/platform-ca") ($pcaEnv.bundleFile | default "ca-certificates.crt") | quote }}
+            {{- end }}
+            {{- end }}
           {{- /* volumeMounts: read-only rootfs needs a writable /tmp; the nfs
                  backend additionally mounts its PVC; the semantic catalog
                  mounts its ConfigMap read-only; the upload store mounts its
@@ -169,7 +289,9 @@ spec:
           {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
           {{- $needCatalog := .Values.semanticCatalog.enabled }}
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
-          {{- if or $needTmp $needData $needCatalog $needStore }}
+          {{- $needPolicy := .Values.security.policy.enabled }}
+          {{- $needPolicySeed := and $needPolicy (or .Values.security.policy.existingClaim .Values.security.policy.claim.create) .Values.security.policy.seedFromConfigMap }}
+          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
@@ -195,6 +317,37 @@ spec:
                    hot-reloads. */}}
             - name: catalog-store
               mountPath: {{ .Values.semanticCatalog.store.mountPath | default "/var/lib/sqlhandler-catalog" }}
+            {{- end }}
+            {{- if $needPolicy }}
+            {{- /* Policy document (values: security.policy). Claim mode:
+                   the PVC mount is READ-WRITE — the admin panel writes the
+                   live file. Read-only would silently break panel edits
+                   exactly like the missing mount silently broke policy. */}}
+            {{- if or .Values.security.policy.existingClaim .Values.security.policy.claim.create }}
+            - name: policy
+              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler-policy" }}
+            {{- else }}
+            - name: policy
+              mountPath: {{ .Values.security.policy.mountPath | default "/etc/sqlhandler-policy" }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if $needPolicySeed }}
+            {{- /* Seed source, one directory beside the live mount: two
+                   volumes cannot share one mountPath. */}}
+            - name: policy-seed
+              mountPath: {{ printf "%s-seed" (.Values.security.policy.mountPath | default "/etc/sqlhandler-policy") }}
+              readOnly: true
+            {{- end }}
+            {{- $oidcCa := .Values.security.oidc.platformCa | default dict }}
+            {{- $needPlatformCa := and .Values.security.oidc.enabled $oidcCa.enabled }}
+            {{- if $needPlatformCa }}
+            {{- /* Private-CA bundle for the OIDC JWKS fetch (REMOTE_CA_BUNDLE
+                   in oidc_identity.py): the https issuer URL is unreachable
+                   without the platform root CA. Read-only. */}}
+            - name: platform-ca
+              mountPath: {{ $oidcCa.mountPath | default "/etc/platform-ca" }}
+              readOnly: true
             {{- end }}
           {{- end }}
           # The image has a CMD but no ENTRYPOINT; args alone would REPLACE the
@@ -241,7 +394,9 @@ spec:
       {{- $needData := and (eq .Values.backend "nfs") .Values.nfs.mount.enabled }}
       {{- $needCatalog := .Values.semanticCatalog.enabled }}
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
-      {{- if or $needTmp $needData $needCatalog $needStore }}
+      {{- $needPolicy := .Values.security.policy.enabled }}
+      {{- $needPolicySeed := and $needPolicy (or .Values.security.policy.existingClaim .Values.security.policy.claim.create) .Values.security.policy.seedFromConfigMap }}
+      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
@@ -266,6 +421,38 @@ spec:
         - name: catalog-store
           persistentVolumeClaim:
             claimName: {{ .Values.semanticCatalog.store.existingClaim | default (printf "%s-catalog" (include "sqlhandler.fullname" .)) }}
+        {{- end }}
+        {{- if $needPolicy }}
+        {{- /* The live policy volume: an existing PVC (claim mode,
+               read-write) or an out-of-band ConfigMap (read-only) — same
+               shape as the credential Secrets, nothing is created here. */}}
+        {{- if or .Values.security.policy.existingClaim .Values.security.policy.claim.create }}
+        - name: policy
+          persistentVolumeClaim:
+            {{- /* existingClaim (operator-managed) wins; otherwise the
+                   chart-created <release>-policy. Same precedence as
+                   pvc.yaml, which only renders the claim when existingClaim
+                   is empty. */}}
+            claimName: {{ .Values.security.policy.existingClaim | default (printf "%s-policy" (include "sqlhandler.fullname" .)) }}
+        {{- else }}
+        - name: policy
+          configMap:
+            name: {{ .Values.security.policy.existingConfigMap | required "security.policy.existingConfigMap is required when security.policy.enabled (no existingClaim)" }}
+        {{- end }}
+        {{- end }}
+        {{- if $needPolicySeed }}
+        - name: policy-seed
+          configMap:
+            name: {{ .Values.security.policy.existingConfigMap | required "security.policy.existingConfigMap is required with seedFromConfigMap" }}
+        {{- end }}
+        {{- $oidcCaV := .Values.security.oidc.platformCa | default dict }}
+        {{- if and .Values.security.oidc.enabled $oidcCaV.enabled }}
+        - name: platform-ca
+          configMap:
+            name: {{ $oidcCaV.configMapName | required "security.oidc.platformCa.configMapName is required when platformCa.enabled" }}
+            items:
+              - key: {{ $oidcCaV.configMapKey | required "security.oidc.platformCa.configMapKey is required" }}
+                path: {{ $oidcCaV.bundleFile | default "ca-certificates.crt" }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

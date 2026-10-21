@@ -1139,6 +1139,20 @@ class SqlEngine:
         # the throttle window, so a cache key stays STABLE between checks —
         # the property that lets a repeated query hit the cache at all.
         self._version_tokens: dict[tuple[str, str, int | None], object] = {}
+        # Metadata-call ACCOUNTING for the CACHE-KEY version check (BUG B
+        # visibility): one counter per provider round-trip paid by
+        # _throttled_version and one per throttled REUSE (a token answered
+        # from the throttle cache instead of the provider). With
+        # SQLHANDLER_CACHE_KEY_VERSION_THROTTLE off (the ratified default)
+        # every cache-key build pays the provider, INCLUDING on a pure cache
+        # hit — this is where an operator can SEE that. Exported through
+        # cache_stats()["version_checks"]; counters, never a behavior change.
+        #
+        # Scoped to _throttled_version on purpose: _safe_version also serves
+        # _open_dataset dataset-handle reuse, whose cost is governed by its own
+        # interval and would blur the number an operator is looking for.
+        self._version_provider_calls = 0
+        self._version_throttle_hits = 0
         self._lock = threading.RLock()
         # Semantic catalog (SQLHANDLER_CATALOG): an optional JSON **or YAML**
         # file of human-written table/column descriptions merged into
@@ -1230,7 +1244,9 @@ class SqlEngine:
         # stay excluded automatically: _result_cache_key already returns None
         # for both, and that must not "fixed".
         l2_cfg = load_l2_config()
-        self._l2_cache: L2ResultCache | None = L2ResultCache(l2_cfg["dir"], ttl=l2_cfg["ttl"]) if l2_cfg else None
+        self._l2_cache: L2ResultCache | None = (
+            L2ResultCache(l2_cfg["dir"], ttl=l2_cfg["ttl"], max_bytes=l2_cfg["max_bytes"]) if l2_cfg else None
+        )
         # Shared tier for small JSON outputs (profile / column_stats): same
         # dir discipline as the result L2, artifacts under <dir>/meta/. On
         # when the L2 dir is configured; SQLHANDLER_L2_METADATA=0 opts out.
@@ -2152,7 +2168,14 @@ class SqlEngine:
                     self._profile_cache.popitem(last=False)
 
     def _safe_version(self, info: TableInfo):
-        """Run the provider's cheap version check; never raise."""
+        """Run the provider's cheap version check; never raise.
+
+        NOT counted here: this helper also serves ``_open_dataset``'s
+        DATASET-HANDLE throttle, which is a different concern with its own
+        interval. The cache-key cost BUG B is about is counted in
+        ``_throttled_version``, the single place a cache key resolves a
+        version token.
+        """
         try:
             return self.provider.check_version(info)
         except Exception:
@@ -2195,8 +2218,22 @@ class SqlEngine:
         tested, and is not affected by this switch.
         """
         if not _cache_key_version_throttle_enabled():
+            # The ratified default. DEBUG, not INFO: this fires once per
+            # referenced table per query (including cache hits), so INFO would
+            # flood the log the counter exists to summarize. Operators who want
+            # the per-call trace enable DEBUG on this logger; the AGGREGATE is
+            # always available via cache_stats()["version_checks"].
+            logger.debug(
+                "cache-key version check: provider call for %s/%s (SQLHANDLER_CACHE_KEY_VERSION_THROTTLE is off)",
+                info.source,
+                info.path,
+            )
+            with self._lock:
+                self._version_provider_calls += 1
             return self._safe_version(info)
         if self.version_check_interval <= 0:
+            with self._lock:
+                self._version_provider_calls += 1
             return self._safe_version(info)
         key = (info.source, info.path, None)
         now = time.monotonic()
@@ -2204,7 +2241,13 @@ class SqlEngine:
             last = self._version_checked_at.get(key)
             cached = self._version_tokens.get(key)
             if last is not None and cached is not None and now - last < self.version_check_interval:
+                # Served from the throttle cache: the ONE path that does not
+                # pay a provider call. Counted so the operator can compare
+                # provider calls against reuses (see the counters' comment).
+                self._version_throttle_hits += 1
                 return cached
+        with self._lock:
+            self._version_provider_calls += 1
         current = self._safe_version(info)
         with self._lock:
             self._version_checked_at[key] = time.monotonic()
@@ -4752,12 +4795,24 @@ class SqlEngine:
         if self._l2_cache is not None:
             table = self._l2_cache.lookup(key)
             if table is not None:
-                self._result_cache_store(key, table)
+                # L1-ONLY warm (no L2 republish): the artifact was just read
+                # back from the shared dir, so writing it again would encode
+                # zstd + touch the PVC for data already there (and in async
+                # mode consume a write-queue slot) on EVERY cross-replica
+                # hit. The shared entry stays as published; only this
+                # replica memory gains a copy.
+                self._result_cache_store(key, table, publish_l2=False)
                 return table
         return None
 
     def _result_cache_store(
-        self, key: str, table: pa.Table, sql: str | None = None, *, l2_min_bytes: int | None = None
+        self,
+        key: str,
+        table: pa.Table,
+        sql: str | None = None,
+        *,
+        l2_min_bytes: int | None = None,
+        publish_l2: bool = True,
     ) -> None:
         """Cache one query result: memory L1 always, shared L2 when in band.
 
@@ -4782,8 +4837,15 @@ class SqlEngine:
         store API's ``tables`` parameter) so the write tier's
         ``drop_for_table`` can evict SELECTIVELY — only the written
         table's entries — instead of wiping the shared cache. Entries
-        stored without SQL (the L1-warm republish) carry the existing
-        sidecar's tables forward in the L2 store.
+        stored without SQL carry the existing sidecar's tables forward in the
+        L2 store.
+
+        ``publish_l2=False`` places the table in memory L1 ONLY. The L2-hit
+        path uses it: the artifact it just read IS the published one, so
+        re-publishing it would encode zstd + write the PVC (and, in async
+        mode, occupy a write-queue slot) for data already on the shared
+        volume — measured at ~74% of a 2 MB cross-replica hit's latency. The
+        L2 stays exactly as its original writer published it.
         """
         nbytes = table.nbytes
         # 0 = UNLIMITED (the documented meaning, and how the virtual-cache
@@ -4817,6 +4879,11 @@ class SqlEngine:
             self._result_cache_writes += 1
             if sql is not None:
                 self._result_cache_sql[key] = sql
+        # L1-ONLY warm (the L2-hit path): nothing to publish, and nothing to
+        # enqueue — see publish_l2 in the docstring. Returning here also keeps
+        # async mode honest: a hit must not occupy a write-queue slot.
+        if not publish_l2:
+            return
         # Write-through OFF the hot path when async mode is on: the caller's
         # result is already safe in L1; the disk publish races nothing and
         # other replicas pick the artifact up when it lands. async_store
@@ -4939,20 +5006,40 @@ class SqlEngine:
         effective_caller = caller if caller is not None else current_caller()
         physical, virtuals = self._expand_query_tables(self._referenced_tables(sql))
         base_seq = 0
+        # Names whose base view could NOT be registered, with the real reason.
+        #
+        # WHY THIS EXISTS (live incident 2026-10-20): a base table that failed
+        # to open was skipped with a DEBUG log, so the name simply never got a
+        # view. The virtual table built on it then failed to bind, and the
+        # operator saw only DuckDB's "Table with name orders does not exist" —
+        # the SAME message a genuinely absent table produces. Six virtual
+        # tables looked like a broken catalog when the real fault was one
+        # unreadable base table. Recording the failures lets the bind error
+        # name the cause instead of the symptom.
+        failed_bases: dict[str, str] = {}
         for info in physical:
             views = {_safe_ident(info.qualified_name)}
             if name_counts.get(info.name, 0) <= 1:
                 views.add(_safe_ident(info.name))
             try:
                 dset = self._open_dataset(info, version)
-            except Exception:
+            except Exception as exc:
                 if version is not None:
                     # A time-travel query must fail loudly: silently skipping
                     # the table would produce a misleading "table not found"
                     # instead of the real reason (e.g. plain Parquet has no
                     # version history).
                     raise
-                logger.debug("Could not open dataset for %s", info.path)
+                # WARNING, not debug: an unregistered base table is never a
+                # routine event, and at DEBUG it is invisible in production
+                # (the server logs at INFO unless -v is passed).
+                failed_bases[info.name] = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "could not open dataset for %s (%s: %s); its view is NOT registered",
+                    info.path,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
             rule = self._effective_rule(info, effective_caller)
             if rule.hidden:
@@ -4970,15 +5057,21 @@ class SqlEngine:
                     empty = self._empty_table_for(dset)
                     for view in views:
                         con.register(view, empty)
-                except Exception:
-                    logger.debug("hidden-table empty registration failed for %s", info.path, exc_info=True)
+                except Exception as exc:
+                    failed_bases[info.name] = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "hidden-table empty registration failed for %s (%s); its view is NOT registered",
+                        info.path,
+                        exc,
+                    )
                 continue
             if rule.empty:
                 for view in views:
                     try:
                         con.register(view, dset)
-                    except Exception:
-                        logger.debug("Could not register view %s from %s", view, info.path)
+                    except Exception as exc:
+                        failed_bases[info.name] = f"{type(exc).__name__}: {exc}"
+                        logger.warning("could not register view %s from %s (%s)", view, info.path, exc)
                 continue
             # POLICY-COVERED: raw dataset under a private base name, masking
             # view under every caller-visible name.
@@ -5004,7 +5097,15 @@ class SqlEngine:
             return
         self._apply_compat_macros(con)
         for info in virtuals:
-            self._register_virtual(con, info, version, materialize, name_counts, caller=effective_caller)
+            self._register_virtual(
+                con,
+                info,
+                version,
+                materialize,
+                name_counts,
+                caller=effective_caller,
+                failed_bases=failed_bases,
+            )
 
     def _empty_table_for(self, dset) -> pa.Table:
         """A zero-row arrow table with the dataset's REAL schema (hidden-table
@@ -5084,6 +5185,7 @@ class SqlEngine:
         materialize: bool,
         name_counts: dict[str, int],
         caller=None,
+        failed_bases: dict[str, str] | None = None,
     ) -> None:
         """Put virtual table ``info`` on the connection: from the
         materialization cache when valid, otherwise as a view built from the
@@ -5136,9 +5238,21 @@ class SqlEngine:
                 # is a binding problem (missing base table, type clash):
                 # fail the query with the real reason instead of letting a
                 # bare "table not found" mislead the caller.
-                raise LakehouseError(
-                    f"virtual table '{info.name}' could not be built from its catalog definition: {exc}"
-                ) from exc
+                #
+                # When a base table is in failed_bases, the real cause is that
+                # the base never registered - say so, and name it. Without this
+                # the message is DuckDB's "Table with name X does not exist",
+                # indistinguishable from a genuinely absent table, which sent
+                # operators hunting a catalog bug that was really one unreadable
+                # dataset (live incident 2026-10-20).
+                # The hint goes BEFORE the DuckDB text: exc is multi-line
+                # (message + LINE 1 + caret), so appending after it buries the
+                # actionable part below a caret pointing at the symptom.
+                hint = self._failed_base_hint(definition, failed_bases) or self._ambiguous_base_hint(
+                    definition, name_counts
+                )
+                prefix = f"virtual table '{info.name}' could not be built from its catalog definition: "
+                raise LakehouseError(f"{prefix}{hint}{exc}") from exc
 
     def _virtual_cache_base(self, info: TableInfo, definition: str, caller=None) -> dict:
         """Identity of a virtual table's cache entry.
@@ -5510,6 +5624,54 @@ class SqlEngine:
             i += 1
         parts.append(s[start:])
         return parts
+
+    @staticmethod
+    def _ambiguous_base_hint(definition: str, name_counts: dict[str, int]) -> str:
+        """Explain a bind failure caused by an AMBIGUOUS bare table name.
+
+        Two physical tables can share a bare name (``sales/orders`` and
+        ``demo/orders``). ``_register_schema`` then suppresses the bare-name
+        view and registers only the qualified ones (``sales_orders``,
+        ``demo_orders``), so a definition written ``FROM orders`` binds to
+        nothing and DuckDB reports "table does not exist" — which reads like
+        a missing table rather than an ambiguity the author can fix by
+        qualifying the reference.
+        """
+        ambiguous = [
+            name
+            for name, count in name_counts.items()
+            if count > 1 and re.search(rf"\b{re.escape(name)}\b", definition)
+        ]
+        if not ambiguous:
+            return ""
+        names = ", ".join(sorted(ambiguous))
+        return (
+            f" - NOTE: the bare name(s) {names} are AMBIGUOUS: more than one table "
+            "shares that name, so only their qualified names are registered. "
+            "Qualify the reference in the definition (e.g. schema_table)."
+        )
+
+    @staticmethod
+    def _failed_base_hint(definition: str, failed_bases: dict[str, str] | None) -> str:
+        """Explain a bind failure caused by a base table that never registered.
+
+        Returns "" when no base of this definition failed (the bind error is
+        then the whole story), otherwise a sentence naming the culprit(s) and
+        the underlying provider error. The point is to convert a phantom
+        "table does not exist" into an actionable "this table could not be
+        OPENED, here is why".
+        """
+        if not failed_bases:
+            return ""
+        named = [name for name in failed_bases if re.search(rf"\b{re.escape(name)}\b", definition)]
+        if not named:
+            return ""
+        details = "; ".join(f"'{name}' ({failed_bases[name]})" for name in sorted(named))
+        return (
+            f" - NOTE: base table(s) {details} could not be opened, so no view was "
+            "registered for them. The definition itself is probably fine; fix the "
+            "underlying table access."
+        )
 
     @staticmethod
     def _definition_table_names(definition: str, by_ident: dict[str, TableInfo]) -> list[str]:
@@ -6069,6 +6231,24 @@ class SqlEngine:
                     "bytes": self._result_cache_bytes,
                     "hits": self._result_cache_hits,
                     "writes": self._result_cache_writes,
+                },
+                # Metadata round-trips paid to build cache KEYS (BUG B
+                # visibility). "provider_calls" is the number of
+                # provider.check_version() calls — one _delta_log LIST per
+                # referenced table for Delta — and it is paid on cache HITS
+                # too while the throttle is off (the ratified default).
+                # "throttle_reuses" counts tokens answered from the throttle
+                # cache instead (only non-zero with
+                # SQLHANDLER_CACHE_KEY_VERSION_THROTTLE=1). "throttled"
+                # reports the switch itself so a dashboard can tell an
+                # economical deployment from a busy one. Additive: with the
+                # switch off the counters simply climb, and every
+                # pre-existing key renders unchanged.
+                "version_checks": {
+                    "provider_calls": self._version_provider_calls,
+                    "throttle_reuses": self._version_throttle_hits,
+                    "throttled": _cache_key_version_throttle_enabled(),
+                    "interval_s": self.version_check_interval,
                 },
                 # Shared-disk L2 behind the memory LRU (l2cache.py). Top-level
                 # l2_hits/l2_misses feed the `cache="l2"` metric series (the

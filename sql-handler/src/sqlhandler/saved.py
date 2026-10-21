@@ -1,11 +1,15 @@
 """Saved parameterized queries — name → SQL + bind-params store (additive, Wave 5).
 
-A small JSON-file store under the existing data/config path (default next to
-the disk-warm cache / catalog store; ``SQLHANDLER_SAVED_QUERIES_PATH``
-overrides) mapping a caller-chosen name to a SQL template plus optional bind
-parameters, exposed as MCP tools (``query_save`` / ``query_list`` /
-``query_delete`` / ``query_saved``) and REST routes under
-``/api/saved-queries/*``.
+A small JSON-file store (``SQLHANDLER_SAVED_QUERIES_PATH``) mapping a
+caller-chosen name to a SQL template plus optional bind parameters, exposed
+as MCP tools (``query_save`` / ``query_list`` / ``query_delete`` /
+``query_saved``) and REST routes under ``/api/saved-queries/*``.
+
+DURABILITY: this is operator content, not cache. Unset, the path falls back
+to the disk-warm cache dir / platform temp dir, which is NOT durable (an
+emptyDir in the chart's default deployment: lost on restart, private per
+replica). The chart points the env at a PVC for that reason — see
+:func:`saved_queries_path`.
 
 Injection safety: parameters are **bind parameters** — the stored SQL keeps
 its ``$name`` / ``?`` placeholders and the values travel to DuckDB through
@@ -21,9 +25,23 @@ POST/DELETE routes) require a configured credential whenever one exists:
   ``SQLHANDLER_API_KEYS``) configured → an unauthenticated write is refused
   (REST: 401; MCP over HTTP: the presented credential is verified per call —
   defense in depth on top of the /mcp middleware, which covers the
-  token-only deployments where /mcp itself stays open).
+  token-only deployments where /mcp itself stays open) UNLESS the request
+  resolves to a policy-DESIGNATED ADMIN (see below).
 * NO credential configured → the known **single-user-local mode**: writes are
   allowed and the posture is logged loudly at startup.
+
+The admin escape hatch (``write_caller_is_admin``): the normal posture of a
+deployed panel is an SSO/OIDC browser session, and such a caller presents NO
+api key at all — the identity arrives as a verified session cookie, a JWT, or
+a trusted gateway header. Gating on the key alone therefore refused the very
+admins who can rewrite the ACL through ``/api/admin/*``: the panel was
+administrable but its own editors were not, and an admin who may replace the
+whole policy could not edit a virtual table definition. The gate now asks the
+SAME question the admin routes ask (``identity.caller_from_request_state``
+→ ``admin_keys.is_admin``), so the extra path can only ever name a caller
+``require_admin`` would already accept. It is an ADDITIONAL admission for
+designated admins, never a relaxation for anyone else: an anonymous caller, a
+non-admin SSO user, and a wrong key all still get the same refusal.
 
 Reads (``query_list`` / ``query_saved``) follow the same posture as /mcp
 itself — no additional gate.
@@ -142,10 +160,21 @@ def max_entries() -> int:
 def saved_queries_path() -> str:
     """Where the saved-query store lives.
 
-    ``SQLHANDLER_SAVED_QUERIES_PATH`` wins; the default sits next to the
-    disk-warm cache (``SQLHANDLER_CACHE_DIR`` — a writable emptyDir in every
-    supported deployment) or the platform temp dir, mirroring the
-    semantic-catalog store's precedence.
+    ``SQLHANDLER_SAVED_QUERIES_PATH`` wins; the fallback sits next to the
+    disk-warm cache (``SQLHANDLER_CACHE_DIR``) or the platform temp dir,
+    mirroring the semantic-catalog store's precedence.
+
+    THE FALLBACK IS NOT DURABLE, and a saved query is operator CONTENT, not
+    cache — it is a template someone deliberately authored. In the chart's
+    default deployment SQLHANDLER_CACHE_DIR is /tmp/sqlhandler-cache, an
+    emptyDir, so the fallback loses every saved query on each pod restart
+    and gives each replica its own private copy (a query saved through one
+    replica is invisible to the others).
+
+    The chart therefore sets SQLHANDLER_SAVED_QUERIES_PATH explicitly
+    (semanticCatalog.store.savedQueriesPath, defaulting to the catalog-store
+    PVC). The fallback remains for local/stdio use, where a temp dir is the
+    only writable location and durability is not expected.
     """
     raw = os.environ.get(_SAVED_PATH_ENV, "").strip()
     if raw:
@@ -246,13 +275,28 @@ def presented_credential(request) -> str:
 
 
 def credential_ok(provided: str) -> bool:
-    """Constant-time check of a presented credential against the configured set."""
-    creds = _configured_credentials()
-    if not creds or not provided:
+    """Constant-time check of a presented credential against the accepted set.
+
+    The set is the ENV keys PLUS the minted/self-minted keys store (the same
+    union /mcp and /api/admin/* accept via admin_keys.match_presentation):
+    a key the panel minted had better be a first-class write credential on
+    the panel surfaces too — refusing it here dead-ended the self-service
+    story (the mint succeeded, then the key could not save a query).
+    Lazy import keeps saved.py importable without the server initialized.
+    """
+    if not provided:
         return False
-    return any(
-        hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")) for candidate in creds
-    )
+    if any(
+        hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8"))
+        for candidate in _configured_credentials()
+    ):
+        return True
+    try:
+        from . import admin_keys as _admin_keys
+
+        return _admin_keys.match_presentation(provided) is not None
+    except Exception:
+        return False
 
 
 class NotAuthorized(Exception):
@@ -270,14 +314,102 @@ class UnknownSavedQuery(KeyError):
         return self.args[0] if self.args else ""
 
 
+def write_caller_is_admin(request) -> bool:
+    """True when the request RESOLVES to a policy-designated admin.
+
+    The second admission path of the write gate. It asks the admin surface's
+    OWN designation question (:func:`admin_keys.is_admin`), so a caller who
+    may rewrite the policy can also edit a virtual table definition — the
+    incoherence this helper exists to remove. Resolution goes through the
+    full identity ladder (gateway relay attribution → OIDC bearer JWT → the
+    D22 SSO session cookie → the oauth2-proxy browser headers), which is what
+    lets a browser session that presents NO key at all be recognized.
+
+    NOT byte-identical to the admin surface, deliberately.
+    ``_admin_resolve_caller`` additionally treats an EXPLICIT
+    ``X-API-Key``/``X-API-Token`` claim that matches nothing as a hard
+    refusal ("a wrong key is never redeemed as the browser user behind it"),
+    and this helper does not: it never inspects key headers, so a
+    designated-admin session that ALSO carries a stale/rotated explicit key
+    is admitted here while ``/api/admin/*`` would 401 it. Nothing is elevated
+    by the difference — the caller must still resolve to a subject or
+    fingerprint in the policy's ``admins`` list, the same designation the
+    admin surface checks — but the two surfaces disagree for that one request
+    shape. That is a knowing trade rather than an oversight: the alternative
+    is refusing a legitimate admin because a credential they are not required
+    to present happens to be stale.
+
+    Fail-closed by construction:
+
+    * ``None`` (a stdio tool call) and an anonymous resolution are refused —
+      ``caller_from_request_state`` never raises, it degrades to anonymous;
+    * no policy, no ``admins`` list, or an empty one → ``is_admin`` is False;
+    * any exception in resolution → False (this runs inside a REFUSAL path, so
+      an unexpected error must never turn into an admission).
+
+    Scope note — this helper answers ONLY the session-identity question, and
+    that is sufficient by construction. The key middleware records a matched
+    key fingerprint into scope["state"] for /mcp paths only, so on /api/* the
+    ladder cannot see a presented key at all. That is not a gap:
+    assert_write_allowed runs credential_ok FIRST, so a designated admin who
+    writes WITH a key is already admitted by the key path, and this helper
+    exists precisely for the caller who presents none.
+
+    Both imports are LAZY, following the :func:`credential_ok` precedent
+    (which imports ``admin_keys.match_presentation`` the same way). The
+    module-level graph is acyclic today — ``admin_keys`` imports ``policy``
+    lazily too, ``policy`` has no internal imports, and nothing in
+    ``admin_keys``/``identity``/``policy`` reaches back to this module (only
+    ``server`` and ``webui`` import ``saved``) — so this is NOT
+    cycle-breaking. It is kept for two real reasons: the gate runs on the
+    request path, and a lazy import keeps this module cheap to import for
+    callers that never touch the admin path while keeping a future edge from
+    turning the coupling into an actual import cycle.
+    """
+    if request is None:
+        return False
+    try:
+        from . import admin_keys as _admin_keys
+        from . import identity as _identity
+
+        caller = _identity.caller_from_request_state(request)
+        return bool(_admin_keys.is_admin(caller))
+    except Exception:
+        logger.debug("write-gate admin resolution failed; refusing", exc_info=True)
+        return False
+
+
 def assert_write_allowed(request) -> None:
-    """Gate saved-query WRITES (save/delete) on a configured credential.
+    """Gate saved-query WRITES (save/delete) on a credential or an admin identity.
 
     * No credential env configured → single-user-local mode: allowed.
-    * Credential env(s) configured → the request must PRESENT a valid one.
-      An HTTP request that doesn't (or a stdio tool call, which cannot
-      present HTTP credentials) is refused — fail closed against the
-      catalog-poisoning channel.
+    * Credential env(s) configured → allowed when EITHER
+      - the request PRESENTS a valid static or minted key
+        (:func:`credential_ok`, unchanged), OR
+      - the request RESOLVES to a policy-designated admin
+        (:func:`write_caller_is_admin`).
+
+    Everyone else is refused — fail closed against the catalog-poisoning
+    channel. An HTTP request with no credential that is not a designated
+    admin, and a stdio tool call (which cannot present HTTP credentials and
+    resolves anonymous), both get the same refusal.
+
+    Order matters: a valid key is checked FIRST, so a caller holding one is
+    never re-judged by the ladder. The admin path is an ADDITIONAL admission,
+    never a relaxation — it grants nothing to a caller ``require_admin``
+    would refuse.
+
+    One deliberate divergence from ``_admin_resolve_caller``: an UNRECOGNIZED
+    presentation is not a hard refusal here (there it is, so a wrong key is
+    never redeemed as the browser user behind it). It cannot be one, because
+    the dominant presentation on this surface is not a key claim at all —
+    behind oauth2-proxy the browser's SSO access token rides in
+    ``Authorization: Bearer`` on EVERY authenticated request, so refusing on an
+    unmatched value would refuse the very admin session this path exists to
+    admit. Nothing is elevated by the difference: the caller still has to
+    resolve to a subject or fingerprint in the policy's ``admins`` list, so an
+    unmatched presentation buys a caller exactly nothing they did not already
+    have from their session.
     """
     sources = credential_sources()
     if not sources:
@@ -285,12 +417,19 @@ def assert_write_allowed(request) -> None:
     provided = presented_credential(request)
     if credential_ok(provided):
         return
+    if write_caller_is_admin(request):
+        return
     raise NotAuthorized(
-        "saved-query writes require a credential: "
+        "writes require a credential or a designated-admin identity: "
         f"{', '.join(sources)} is configured — present it as Authorization: Bearer, "
-        "X-API-Key or X-API-Token (streamable-http /mcp or /api/saved-queries). "
-        "A stdio MCP call cannot carry credentials; clear the auth envs for "
-        "local single-user mode."
+        "X-API-Key or X-API-Token (streamable-http /mcp or /api/*); a "
+        "policy-designated admin may instead write from their resolved SSO/OIDC "
+        "session with no key at all. An SSO login authenticates you but does NOT "
+        "by itself authorize writes — a signed-in user who is not a designated "
+        "admin still needs a key: mint a key in the Access-control panel "
+        "(self-service) and paste it via the header's Use-an-API-key; minted keys "
+        "are accepted here. A stdio MCP call cannot carry credentials; clear the "
+        "auth envs for local single-user mode."
     )
 
 

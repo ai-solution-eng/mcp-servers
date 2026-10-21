@@ -4,6 +4,8 @@ Two measurement campaigns on the **SE G2** cluster
 (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`, sqlhandler namespace,
 MinIO-backed workload) drove the chart's scaling defaults. Raw results live in
 [`../bench/`](../bench/) — every number below is reproducible from there.
+Full methodology and every head-to-head table (including the S3-vs-NFS
+storage-equalized runs) live in [`../bench/BENCHMARK.md`](../bench/BENCHMARK.md).
 
 ## Campaign 1 — scale-out evidence (2026-09-08)
 
@@ -102,3 +104,26 @@ The 2026-09-08 numbers above are quoted from the raw logs in `bench/`; the
 "0.24 cores / 1.3 GiB fleet peak" observation comes from the cluster metrics
 captured during that run and is recorded in the chart's scaling comments
 (`helm/values.yaml`, `helm/values-examples/values.g2.yaml`).
+
+## Campaign 3 — storage-equalized head-to-heads (2026-09-23)
+
+Three in-cluster comparisons on equal data (parity-gated row counts), full
+tables in [`../bench/BENCHMARK.md`](../bench/BENCHMARK.md):
+
+- **Three-way MCP, storage equalized** — sqlhandler-NFS (nfs backend, same
+  VAST NFS class as ezpresto's mirror) vs sqlhandler-S3 (MinIO) vs ezpresto.
+  With storage equalized, sqlhandler wins 10/10 warm (10x–46x) AND 10/10
+  cold (1.9x–6.1x); the NFS leg proves the nfs backend end-to-end.
+- **Equal-data REST-vs-MCP** — sqlhandler REST twin vs ezpresto MCP:
+  warm 10/10 (1.1x–15.5x), cold 7/10 (ezpresto's local mirror wins the three
+  scan-heaviest shapes).
+- **MCP-to-MCP on equal data** — warm 9/10 (1.1x–14.4x), cold 7/10,
+  concurrency 20.1x.
+
+| Artifact | Contents |
+|---|---|
+| [`../bench/bench_three_way.py`](../bench/bench_three_way.py) / [`bench_three_way_results.json`](../bench/bench_three_way_results.json) | three-way harness + raw data |
+| [`../bench/bench_equal_data_script.py`](../bench/bench_equal_data_script.py) / [`bench_equal_data_results.json`](../bench/bench_equal_data_results.json) | equal-data harness + raw data |
+| [`../bench/bench_mcp_script.py`](../bench/bench_mcp_script.py) / [`bench_mcp_mcp_results.json`](../bench/bench_mcp_mcp_results.json) | MCP-to-MCP harness + raw data |
+| [`../bench/bench_equal_data.yaml`](../bench/bench_equal_data.yaml) / [`../bench/bench_mcp_job.yaml`](../bench/bench_mcp_job.yaml) | in-cluster Job definitions |
+| [`../bench/fill_nfs.py`](../bench/fill_nfs.py) | NFS test-data filler |

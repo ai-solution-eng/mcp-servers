@@ -818,7 +818,25 @@ const $ = (id) => document.getElementById(id);
 const state = { tables: [], selected: null, tab: "query" };
 
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  // Default credential: the page's verified adminCredential rides on EVERY
+  // api() call unless the route is a self-service one. WHY the guard:
+  // the server's identity ladder treats an explicit X-API-Key claim as
+  // AUTHORITATIVE — a recognized key resolves class=key (never the SSO
+  // user behind the browser), and an UNRECOGNIZED one is a hard 401 that
+  // never falls through to SSO (server.py _resolve_presented). Self-mint
+  // requires via=="jwt" — the SSO session — so attaching a static key to
+  // /api/admin/keys/self* would 403 the very flow that mints keys. Every
+  // OTHER write surface (semantic catalog, saved queries, admin) gates on
+  // a presented credential (saved.assert_write_allowed), so the default-on
+  // attachment is what makes the editors work after "Use an API key".
+  // adminCredential is only adopted after a whoami verification, so the
+  // default can never hard-refuse a request that worked without it.
+  const isSelfService = typeof path === "string" && path.startsWith("/api/admin/keys/self");
+  const base = (typeof adminCredential === "string" && adminCredential && !isSelfService)
+    ? { "X-API-Key": adminCredential }
+    : {};
+  const merged = Object.assign({}, base, opts && opts.headers ? opts.headers : {});
+  const res = await fetch(path, Object.assign({}, opts, { headers: merged }));
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
   if (!res.ok) {
@@ -1953,16 +1971,15 @@ async function admPolicySave() {
   if (!text) {
     body = {};
   } else {
-    try {
-      doc = JSON.parse(text);          // JSON round-trips as before
-      body = doc;
-    } catch (e) {
-      // Not JSON — send the text verbatim; the server sniffs YAML
-      // (_parse_text: JSON first, YAML second) and its 400 carries the
-      // verbatim refusal for genuinely-bad input (same contract as the
-      // semantic-catalog upload, which accepts both).
-      body = { policy: text };
-    }
+    // ALWAYS send the editor text verbatim under {policy: text}: the server
+    // writes it byte-for-byte (JSON first, YAML second), so key order and
+    // whitespace survive. The old JSON.parse branch sent a bare object and
+    // the server re-serialised it — lossy, and the pre-fix server even
+    // str()'d it into Python repr (silent null->"None" corruption,
+    // audited 2026-10-20). doc is still parsed for a client-side sanity
+    // check only.
+    try { doc = JSON.parse(text); } catch (e) { doc = null; /* YAML ok */ }
+    body = { policy: text };
   }
   try {
     const res = await api("/api/admin/policy", {
@@ -1975,7 +1992,19 @@ async function admPolicySave() {
     toast("Policy saved — hash " + (res.policy_hash || "?").slice(0, 12));
     accessRefresh();
   } catch (e) {
-    err.textContent = e.message; // the 400's refusal reason, verbatim
+    // A read-only policy mount (ConfigMap mode) surfaces as OSError text;
+    // render the deployment reality instead of a bare errno: writes are
+    // config-blocked, not a bug in the panel — administer via kubectl.
+    if (/read-only/i.test(String(e.message))) {
+      err.textContent =
+        "The policy file is READ-ONLY in this deployment (ConfigMap mode) — " +
+        "panel edits cannot persist. Administer the policy via kubectl " +
+        "(edit the sqlhandler-policy ConfigMap and re-apply), or ask your " +
+        "operator to switch the chart to claim mode (security.policy." +
+        "existingClaim). Raw server error: " + e.message;
+    } else {
+      err.textContent = e.message; // the 400's refusal reason, verbatim
+    }
   }
 }
 

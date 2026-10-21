@@ -128,12 +128,40 @@ class L2ResultCache:
     through :meth:`stats` for ``cache_stats()`` and /metrics.
     """
 
-    def __init__(self, dir_path: str, ttl: float = DEFAULT_TTL):
+    def __init__(self, dir_path: str, ttl: float = DEFAULT_TTL, max_bytes: int = DEFAULT_MAX_BYTES):
         self._dir = dir_path
         self._ttl = ttl
+        # ENFORCED byte cap on the shared directory (0 = unlimited).
+        #
+        # This used to be a dead setting: load_l2_config() read
+        # SQLHANDLER_L2_MAX_BYTES into the config dict and nothing ever
+        # consulted it, so an operator who set a bound got none — the volume
+        # grew until TTL expiry and the only real limit was the PVC size. The
+        # sweep now evicts oldest-first past this cap (see sweep()), which is
+        # what the knob always claimed to do.
+        self._max_bytes = max(int(max_bytes), 0)
         self._lock = threading.Lock()
         self.hits = 0
         self.writes = 0
+        # Stores that OVERWROTE a still-fresh entry for the same key — i.e. a
+        # republish of data the shared dir already held.
+        #
+        # A cross-replica HIT must never contribute here: the artifact it just
+        # read IS the published one, so rewriting it costs a full zstd encode +
+        # a PVC write for nothing (measured on a 2 MB result: the hit was
+        # 8.75 ms with the redundant republish vs 3.21 ms without, and in async
+        # mode every hit also consumed a write-queue slot). The engine's hit
+        # path now stores into memory L1 only (_result_cache_store
+        # publish_l2=False), so this counter stays at 0 on a pure hit while a
+        # genuine recompute-after-miss still counts its (necessary) store.
+        #
+        # It is a REAL measurement, not a placeholder: a refactor that
+        # reintroduces the hit-path republish makes this climb, and the
+        # cross-replica tests assert it stays 0.
+        self.republishes = 0
+        # Entries removed by the SIZE cap (distinct from TTL expiry): the
+        # operator-visible proof that max_bytes is doing something.
+        self.evictions = 0
         self._sweeper: threading.Thread | None = None
         # (key, table, referenced-table ids); ids None = the historical
         # no-tables call shape (see enqueue_write / _write_loop).
@@ -159,6 +187,10 @@ class L2ResultCache:
                 "ttl": self._ttl,
                 "hits": self.hits,
                 "writes": self.writes,
+                "republishes": self.republishes,
+                "max_bytes": self._max_bytes,
+                "bytes": self._cached_bytes(),
+                "evictions": self.evictions,
             }
             if self._write_queue is not None:
                 payload["write_mode"] = "async"
@@ -433,6 +465,11 @@ class L2ResultCache:
                 pass  # no readable existing sidecar — store without tables
         path = self._artifact(key)
         tmp_path: str | None = None
+        # Did a FRESH entry for this key already exist? Then this store is a
+        # republish of data the shared dir already holds (see the
+        # ``republishes`` counter). Counted BEFORE the write so the answer
+        # reflects the state this store found, not what it left behind.
+        overwrote_fresh = self.has_entry(key)
         try:
             Path(self._dir).mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
@@ -455,6 +492,8 @@ class L2ResultCache:
             os.replace(tmp_meta, str(self._sidecar(key)))
             with self._lock:
                 self.writes += 1
+                if overwrote_fresh:
+                    self.republishes += 1
         except Exception:
             logger.debug("L2 result cache store failed for key %s…", key[:16], exc_info=True)
         finally:
@@ -508,12 +547,104 @@ class L2ResultCache:
                 removed += 1
         return removed
 
+    def _cached_bytes(self) -> int:
+        """Bytes currently held by this cache dir (sidecars + parquet).
+
+        A stat walk, not a maintained counter: the directory is shared by
+        several replicas, so any counter a single process kept would drift
+        the moment a peer wrote or swept. The sweep is a periodic backstop,
+        not a hot path — one walk per pass is the honest price of a number
+        that is actually true.
+        """
+        total = 0
+        try:
+            for entry in Path(self._dir).glob("*"):
+                try:
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            return total
+        return total
+
+    def enforce_size_cap(self) -> int:
+        """Evict least-recently-created entries until under ``max_bytes``.
+
+        Returns the number of entries removed. TTL and the size cap are
+        different contracts: TTL bounds AGE (a stale answer), the cap bounds
+        SPACE (a full volume). Before this existed only age was enforced, so
+        a busy deployment filled the volume between expiries and every cache
+        silently degraded to a miss — including the catalog store sharing the
+        same volume.
+
+        Eviction order is oldest-sidecar-first (the sidecar mtime is the
+        entry creation clock, same rule as sweep). Never raises: a cache that
+        cannot be trimmed is still a working cache.
+        """
+        if self._max_bytes <= 0:
+            return 0
+        try:
+            total = self._cached_bytes()
+        except OSError:
+            return 0
+        if total <= self._max_bytes:
+            return 0
+        removed = 0
+        try:
+            sidecars = sorted(
+                Path(self._dir).glob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+            )
+        except OSError:
+            return 0
+        for sidecar in sidecars:
+            if total <= self._max_bytes:
+                break
+            try:
+                size = sidecar.stat().st_size
+                artifact = sidecar.parent / f"{sidecar.stem}.parquet"
+                try:
+                    size += artifact.stat().st_size
+                except OSError:
+                    pass
+                key = self._read_sidecar_key(sidecar)
+                self._remove(key)
+                total -= size
+                removed += 1
+            except Exception:
+                # Corrupt sidecar: drop it and its prefix-mate by name (the
+                # sweep() fallback), counting what we can account for.
+                stem = sidecar.stem
+                try:
+                    sidecar.unlink(missing_ok=True)
+                    (sidecar.parent / f"{stem}.parquet").unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    continue
+        if removed:
+            with self._lock:
+                self.evictions += removed
+            logger.info(
+                "L2 result cache: size cap %d bytes exceeded; evicted %d oldest entr%s",
+                self._max_bytes,
+                removed,
+                "y" if removed == 1 else "ies",
+            )
+        return removed
+
     def _read_sidecar_key(self, sidecar: Path) -> str:
         return str(json.loads(sidecar.read_text(encoding="utf-8"))["key"])
 
     def start_sweeper(self) -> None:
-        """Start the daemon sweep thread (idempotent; no-op when TTL <= 0)."""
-        if self._ttl <= 0 or self._sweeper is not None:
+        """Start the daemon sweep thread (idempotent).
+
+        Runs when EITHER contract is active: a TTL to expire stale entries, or
+        a size cap to enforce. A cache with ttl=0 (never expires) but a real
+        max_bytes still needs the thread — that is exactly the configuration
+        where unbounded growth would otherwise fill the volume.
+        """
+        if (self._ttl <= 0 and self._max_bytes <= 0) or self._sweeper is not None:
             return
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
@@ -523,7 +654,10 @@ class L2ResultCache:
         self._sweeper.start()
 
     def _sweep_loop(self) -> None:
-        interval = max(self._ttl * SWEEP_INTERVAL_FRACTION, 30.0)
+        # When only a size cap is configured (ttl=0) fall back to a fixed
+        # cadence: there is no TTL to derive an interval from, and a cap that
+        # is never checked is the bug this thread exists to prevent.
+        interval = max(self._ttl * SWEEP_INTERVAL_FRACTION, 30.0) if self._ttl > 0 else 60.0
         while True:
             time.sleep(interval)
             try:
@@ -534,6 +668,9 @@ class L2ResultCache:
                         removed,
                         "y" if removed == 1 else "ies",
                     )
+                # Age first, then space: expiring stale entries frees room
+                # before the cap has to evict anything still fresh.
+                self.enforce_size_cap()
             except Exception:
                 logger.debug("L2 result cache sweep skipped", exc_info=True)
 

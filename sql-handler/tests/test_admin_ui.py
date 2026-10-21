@@ -178,3 +178,37 @@ def test_admin_grants_200_with_admin_key(app, monkeypatch):
     for field in ("admins", "datasets", "assignments", "blocked", "policy_hash", "keys"):
         assert field in body, field
     assert isinstance(body["keys"], list)
+
+
+
+# ----------------------------------------------------- api() default credential
+
+
+def _ui_source() -> str:
+    """The packaged UI source (same asset the server serves)."""
+    from importlib import resources
+
+    return resources.files("sqlhandler").joinpath("ui/index.html").read_text(encoding="utf-8")
+
+
+def test_ui_api_attaches_page_credential_by_default():
+    '''The api() helper attaches adminCredential as X-API-Key on every call
+    by default: the catalog/saved write surfaces gate on a presented
+    credential (saved.assert_write_allowed) and the editors previously sent
+    none — a pasted key fixed the header chip but not the saves.'''
+    src = _ui_source()
+    # the default merge exists and names the credential variable
+    assert re.search(r"const base\s*=.*adminCredential", src), "api() must reference adminCredential"
+    assert '"X-API-Key": adminCredential' in src, "the default header must be X-API-Key"
+    # explicit per-call headers still merge OVER the default
+    assert "Object.assign({}, base, opts" in src
+
+
+def test_ui_self_service_paths_never_carry_the_credential():
+    '''Self-mint REQUIRES the SSO identity (via=="jwt"); the server's ladder
+    treats an explicit X-API-Key as authoritative (class=key), so attaching
+    the page credential to /api/admin/keys/self* would 403 the mint. The
+    guard must live inside api() so future self-service calls cannot regress.'''
+    src = _ui_source()
+    assert "/api/admin/keys/self" in src, "self-service path guard missing"
+    assert re.search(r"startsWith\([\"']/api/admin/keys/self", src), "guard must be a path-prefix check"

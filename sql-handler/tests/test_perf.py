@@ -454,6 +454,66 @@ def test_block_cache_sizes_hint_engages_without_stat(cached_env):
     assert n_opens["n"] == cold
 
 
+def test_block_cache_get_file_info_selector_delegates_to_get_file_info(cached_env, tmp_path):
+    """A FileSelector must reach the BASE filesystem's get_file_info.
+
+    pyarrow FileSystem classes (S3FileSystem, LocalFileSystem, ...) do NOT
+    implement the FileSystemHandler-protocol method `get_file_info_selector`;
+    they overload `get_file_info` to accept a FileSelector instead. The
+    handler used to delegate to the absent method, so every dataset open
+    through the block cache raised
+
+        AttributeError: ... has no attribute 'get_file_info_selector'
+
+    Live incident 2026-10-20: with SQLHANDLER_BLOCK_CACHE=true this made the
+    nested tables (sales/orders, sales/employees, b/c) unreadable — surfaced
+    as "Could not open S3 dataset 'sales/orders'" — and every virtual table
+    built on them then failed to bind with DuckDB's "table does not exist".
+    Flat folder tables kept working, which is what made it look like a
+    catalog problem rather than a filesystem one.
+    """
+    (tmp_path / "sales" / "orders").mkdir(parents=True)
+    (tmp_path / "sales" / "orders" / "part.parquet").write_bytes(b"x")
+
+    cfg = {
+        "enabled": True,
+        "include_local": True,
+        "dir": str(cached_env / "blocks"),
+        "block_size": 4096,
+        "max_bytes": 0,
+    }
+    base = pafs.LocalFileSystem()
+    handler = _BlockCacheHandler(base, cfg)
+
+    # pyarrow itself has no such method on a filesystem object — the
+    # delegation must not rely on one.
+    assert not hasattr(base, "get_file_info_selector")
+
+    infos = handler.get_file_info_selector(pafs.FileSelector(str(tmp_path / "sales" / "orders"), recursive=True))
+    assert [Path(i.path).name for i in infos] == ["part.parquet"]
+
+
+def test_block_cache_opens_nested_parquet_dataset(cached_env, tmp_path):
+    """The end-to-end shape of the incident: a nested table opens THROUGH
+    the cache and is readable (the regression was at open, not at read)."""
+    import pyarrow.parquet as pq
+
+    table_dir = tmp_path / "sales" / "orders"
+    table_dir.mkdir(parents=True)
+    pq.write_table(pa.table({"order_id": [1, 2], "qty": [3, 4]}), table_dir / "part.parquet")
+
+    cfg = {
+        "enabled": True,
+        "include_local": True,
+        "dir": str(cached_env / "blocks"),
+        "block_size": 4096,
+        "max_bytes": 0,
+    }
+    fs = pafs.PyFileSystem(_BlockCacheHandler(pafs.LocalFileSystem(), cfg))
+    dset = pad.dataset(str(table_dir), filesystem=fs, format="parquet")
+    assert dset.to_table().column("order_id").to_pylist() == [1, 2]
+
+
 def test_block_cache_handler_scope_is_identity(cached_env):
     """Two handlers over the same base differing only by scope are distinct
     (pyarrow caches datasets by filesystem identity — scopes must not alias)."""

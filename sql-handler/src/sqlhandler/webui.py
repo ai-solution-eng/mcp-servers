@@ -1671,6 +1671,15 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def semantic_catalog_dbt_import_apply(request) -> JSONResponse:
+        # P1-4 symmetry (audit 2026-10-20): /apply WRITES the catalog store
+        # exactly like the plain upload — the same poisoning channel — so it
+        # carries the SAME write gate. It was the one mutation route left
+        # ungated: every sibling (upload, clear, table upsert/delete) gates,
+        # an anonymous apply did not.
+        try:
+            assert_write_allowed(request)
+        except NotAuthorized as exc:
+            return JSONResponse({"error": str(exc)}, status_code=401)
         try:
             raw = await _read_bounded_body(request)
         except _BodyTooLarge:
@@ -1826,10 +1835,22 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         if not isinstance(body, dict):
             return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
+        # POLICY TEXT extraction — NEVER str() a parsed JSON object: str({a: 1})
+        # produces PYTHON REPR (single quotes), which policy._parse_text then
+        # YAML-parses into a silently MUTATED document (None -> the string
+        # "None", backslashes doubled — row_filter LIKE/regex escapes rewritten).
+        # The audited corruption (2026-10-20): PUT with a bare JSON body returned
+        # 200 while writing repr. Accepted bodies: {"policy": "<text>"} (the UI's
+        # shape — YAML/JSON text verbatim) or a bare JSON policy OBJECT, which is
+        # re-serialised as REAL JSON, never repr.
+        if "policy" in body and isinstance(body["policy"], str):
+            policy_text = body["policy"]
+        else:
+            policy_text = _json.dumps(body, indent=2)
         try:
             from .server import _admin_created_by, _admin_write_policy, _audit_admin_event
 
-            result = await asyncio.to_thread(_admin_write_policy, str(body.get("policy", body)))
+            result = await asyncio.to_thread(_admin_write_policy, policy_text)
             _audit_admin_event("admin.policy_set", policy_hash=result["policy_hash"], by=_admin_created_by(caller))
             return JSONResponse(result)
         except _AdminHTTPError as exc:

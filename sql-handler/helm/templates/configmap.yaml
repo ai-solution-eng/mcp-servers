@@ -140,6 +140,39 @@ data:
   {{- with .Values.cache.virtualCacheDir }}
   SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
   {{- end }}
+  {{- /* Rows to warm per table at startup (0 = off). Pairs with
+         prewarmTables: the prewarm thread reads the first N row groups so
+         the first real query is not a cold object-store read. */}}
+  SQLHANDLER_PREWARM_ROWGROUPS: {{ .Values.cache.prewarmRowgroups | quote }}
+  {{- /* Shared L2 result cache (src/sqlhandler/l2cache.py). The memory L1
+         result cache is PER REPLICA, so without this a 4-replica deployment
+         pays every cold query four times — the bench's "per-replica cache
+         physics" (warm p95 1.0-3.2s vs ~105ms p50). Pointing L2 at an RWX
+         volume lets one replica's result be read by the others.
+
+         The dir is deliberately required: silently defaulting to pod-local
+         /tmp would look like sharing while sharing nothing (l2cache.py says
+         the same). Needs an RWX claim — on RWO each pod gets its own volume
+         and the layer is a no-op that still costs a write. */}}
+  {{- if .Values.cache.l2.enabled }}
+  SQLHANDLER_L2_ENABLED: "1"
+  {{- with .Values.cache.l2.dir }}
+  SQLHANDLER_L2_DIR: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cache.l2.ttl }}
+  SQLHANDLER_L2_TTL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cache.l2.minBytes }}
+  SQLHANDLER_L2_MIN_BYTES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cache.l2.maxBytes }}
+  SQLHANDLER_L2_MAX_BYTES: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_L2_WRITE_ASYNC: {{ ternary "1" "0" .Values.cache.l2.writeAsync | quote }}
+  {{- end }}
+  {{- with .Values.savedQueriesPath }}
+  SQLHANDLER_SAVED_QUERIES_PATH: {{ . | quote }}
+  {{- end }}
   # D5: per-query wall-clock timeout (seconds; 0 = no timeout). A runaway
   # query used to hold one of the concurrency-gate slots forever; >10-minute
   # queries must opt in by raising this.

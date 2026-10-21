@@ -19,7 +19,7 @@ podDisruptionBudget:
 terminationGracePeriodSeconds: 90
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.8.0
+  tag: v3.9.2
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3

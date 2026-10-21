@@ -242,3 +242,117 @@ SA tokens for *authentication*, but the OPA policy
 (`ezuadb/main/allow`) denies them *catalog access* — data-plane queries
 require a principal with grants (the operator's UA token, admin group,
 worked).
+
+---
+
+## Three-way MCP head-to-head, storage equalized (2026-09-23)
+
+Legs (all MCP, ClusterIP): **sqlhandler-NFS** (nfs backend on `bench-data-nfs`
+PVC — same `gl4f-filesystem` VAST NFS class as ezpresto's mirror, identical
+bytes from `s3://test-parquet`) · **sqlhandler-S3** (prod, MinIO, 4 replicas)
+· **ezpresto** (its PVC mirror). Parity gate in-pod: employees 50,000 /
+orders 200,000 / customers 150,000 / testdata_50col 3,000,000 — EQUAL on all
+three. All rows 5/5 ok on all legs.
+
+| query | SH-NFS warm | SH-NFS cold | SH-S3 warm | SH-S3 cold | EZ warm | EZ cold | EZ/NFS warm | EZ/NFS cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| count_small | 14.4 | 71.1 | 28.1 | 311.7 | 146.2 | 132.1 | **10x** | **1.9x** |
+| range_filter | 5.0 | 53.4 | 221.6 | 200.4 | 232.3 | 228.3 | **46x** | **4.3x** |
+| filtered_agg | 11.3 | 104.5 | 177.1 | 186.8 | 494.0 | 499.6 | **44x** | **4.8x** |
+| groupby_agg | 12.3 | 118.9 | 145.6 | 209.3 | 393.7 | 398.0 | **32x** | **3.3x** |
+| join_count | 13.1 | 114.4 | 221.4 | 214.9 | 361.8 | 328.3 | **28x** | **2.9x** |
+| join_agg | 14.3 | 128.9 | 276.5 | 296.4 | 456.2 | 468.9 | **32x** | **3.6x** |
+| count_big_3m | 14.5 | 84.4 | 16.9 | 272.0 | 245.4 | 207.8 | **17x** | **2.5x** |
+| col_proj_agg_2cols | 14.5 | 81.2 | 328.5 | 385.0 | 565.9 | 495.4 | **39x** | **6.1x** |
+| filtered_group_3m | 20.9 | 96.4 | 453.9 | 507.5 | 504.6 | 447.5 | **24x** | **4.6x** |
+| wide_agg_4cols | 14.2 | 85.3 | 25.6 | 491.8 | 496.4 | 442.4 | **35x** | **5.2x** |
+| **conc L4** (8 q) | **142.8 qps** (p50 38.9) | — | 27.3 qps | — | 9.0 qps (p50 759) | — | **15.9x** | — |
+
+(all values ms unless noted; ratios = ezpresto ÷ sqlhandler-NFS)
+
+**With storage equalized (same NFS class, same files), sqlhandler wins 10/10
+warm (10x–46x) AND 10/10 cold (1.9x–6.1x).** The NFS leg also proves the nfs
+backend end-to-end (probe, discovery of hive-partitioned + deeply nested
+layouts).
+
+- **SH-NFS warm 5–21 ms is the true single-replica cache floor**; its cold
+  53–129 ms shows DuckDB+local NFS vs Presto on the same storage class:
+  engine beats engine with no storage excuse in either direction.
+- **SH-S3 warm variance this run** (vs its own cold) is the documented
+  4-replica L1 lottery + TTL expiry of the morning's warmth; ezpresto
+  warm≈cold as always (no cache).
+
+Harness: `bench/bench_three_way.py`; raw data:
+`bench/bench_three_way_results.json`. NFS test-data filler:
+`bench/fill_nfs.py` (job defs `bench/bench_equal_data.yaml`,
+`bench/bench_mcp_job.yaml`).
+
+---
+
+## Equal-data in-cluster head-to-head (2026-09-23)
+
+Parity gate at bench time: employees 50,000 / orders 200,000 / customers
+150,000 / testdata_50col 3,000,000 — **EQUAL** on both engines. Mode:
+sqlhandler via REST twin (ClusterIP; /mcp is API-key-gated on v2.3.2
+in-cluster), ezpresto via MCP execute_query (ClusterIP). 5 warm + 5 cold
+reps each, all 5/5 ok.
+
+| query | SH warm | SH cold | EZ warm | EZ cold | warm ratio | cold ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| count_small | 13.5 | 151.4 | 138.6 | 126.0 | 10.27x | 0.83x |
+| range_filter | 98.1 | 132.5 | 219.6 | 210.7 | 2.24x | 1.59x |
+| filtered_agg | 154.3 | 165.6 | 482.5 | 449.7 | 3.13x | 2.72x |
+| groupby_agg | 112.4 | 200.0 | 394.1 | 416.2 | 3.51x | 2.08x |
+| join_count | 189.5 | 196.9 | 372.9 | 327.6 | 1.97x | 1.66x |
+| join_agg | 344.6 | 482.8 | 428.2 | 388.0 | 1.24x | 0.80x |
+| count_big_3m | 15.3 | 350.4 | 237.4 | 215.7 | 15.52x | 0.62x |
+| col_proj_agg_2cols | 296.1 | 375.1 | 575.5 | 545.5 | 1.94x | 1.45x |
+| filtered_group_3m | 470.6 | 493.7 | 539.2 | 548.2 | 1.15x | 1.11x |
+| wide_agg_4cols | 361.0 | 478.6 | 551.2 | 480.6 | 1.53x | 1.00x |
+| conc L4 (8 q) | **37.6 qps** (p50 24 ms) | — | 6.2 qps (p50 782 ms) | — | **6.1x** | — |
+
+- sqlhandler warm wins 10/10 (1.1x–15.5x); cache floor 13–15 ms on counts,
+  ~100–360 ms on aggregations.
+- Cold: sqlhandler wins 7/10 (up to 2.7x); ezpresto's local-disk mirror wins
+  the 3 scan-heaviest counts/joins (its count(*) metadata path is immune to
+  cache-busting comments).
+- ezpresto warm ≈ cold everywhere (no result cache).
+- The warm/cold gap is narrower than the September run because 10 distinct
+  queries sweep the 4-replica L1 cache round-robin (realistic LB behavior;
+  September's sweep hit the same effect).
+
+Harness: `bench/bench_equal_data_script.py`; raw data:
+`bench/bench_equal_data_results.json`.
+
+---
+
+## MCP-to-MCP in-cluster head-to-head on equal data (2026-09-23)
+
+**Both legs speak MCP** (`run_sql` vs `execute_query`), ClusterIP, no
+gateway. In-pod parity gate: employees 50,000 / orders 200,000 / customers
+150,000 / testdata_50col 3,000,000 — **EQUAL**.
+
+| query | SH-MCP warm | SH-MCP cold | EZ-MCP warm | EZ-MCP cold | warm ratio |
+|---|---:|---:|---:|---:|---:|
+| count_small | 36.2 | 269.3 | 117.1 | 122.4 | 3.23x |
+| range_filter | 179.7 | 123.6 | 222.2 | 217.6 | 1.24x |
+| filtered_agg | 116.8 | 169.7 | 477.5 | 473.8 | 4.09x |
+| groupby_agg | 31.9 | 211.9 | 406.8 | 374.7 | 12.75x |
+| join_count | 26.4 | 224.7 | 381.1 | 358.8 | 14.44x |
+| join_agg | 228.3 | 290.4 | 447.4 | 386.8 | 1.96x |
+| count_big_3m | 24.4 | 266.1 | 213.9 | 212.3 | 8.77x |
+| col_proj_agg_2cols | 292.3 | 387.7 | 502.2 | 545.7 | 1.72x |
+| filtered_group_3m | 529.0 | 533.8 | 473.1 | 452.7 | 0.89x |
+| wide_agg_4cols | 470.3 | 479.5 | 529.5 | 514.7 | 1.13x |
+| **conc L4** (8 q) | **157.5 qps** (p50 23.7 ms) | — | 7.8 qps (p50 801.5 ms) | — | **20.1x** |
+
+- Warm: sqlhandler wins 9/10 (1.1x–14.4x); cache floor 24–36 ms.
+- Cold: sqlhandler wins 7/10 (up to 2.8x); ezpresto's local mirror wins the
+  3 scan-heaviest cold shapes.
+- Concurrency: 20.1x qps, p50 23.7 ms vs 801.5 ms.
+- `range_filter` warm (179.7) > cold (123.6): 4-replica L1 LB artifact
+  (first warm rep landed on a cold replica); the pattern averages out across
+  queries.
+
+Harness: `bench/bench_mcp_script.py`; raw data:
+`bench/bench_mcp_mcp_results.json`.

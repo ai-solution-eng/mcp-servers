@@ -529,10 +529,12 @@ def test_minted_key_401s_after_revoke(app, keys_file, policy_file):
     )
 
 
-def test_key_mint_groups_form_refused_503(app, keys_file, policy_file):
-    """The Lead decision: when the policy uses the GROUPS form (no datasets
-    doc), mint REFUSES with 503 "bind via the policy form..." — a datasets
-    doc is never silently created (mutual exclusion would refuse the file)."""
+def test_key_mint_groups_form_binds_key_fps(app, keys_file, policy_file):
+    """Groups-form mint binds the fresh fp into the top-level ``key_fps``
+    map (the direct fp binding that form offers — groups_for() resolves it
+    FIRST), targeting the named assign groups or the policy's
+    default_group. The datasets doc is never silently created (mutual
+    exclusion would refuse the file)."""
     policy_file.write_text(
         json.dumps({"groups": {"g": {"tables": {}}}, "default_group": "g", "admins": [ADMIN_FP]}),
         encoding="utf-8",
@@ -540,9 +542,73 @@ def test_key_mint_groups_form_refused_503(app, keys_file, policy_file):
     _policy.reset_policy_store()
     assert _wait_until(lambda: _policy.policy_store().get().hash != "")
     r = app.post("/api/admin/keys", json={"label": "x"}, headers=_admin_headers())
-    assert r.status_code == 503
-    assert r.json()["error"] == "bind via the policy form when a datasets doc is absent"
-    # compensating action: the key must NOT be stranded in the store
+    assert r.status_code == 201, r.text
+    body = r.json()
+    fp = body["fp"]
+    # the binding landed in key_fps (default-group target), NOT datasets
+    pol = _read_policy(policy_file)
+    assert "datasets" not in pol
+    assert pol["key_fps"][fp] == ["g"]
+    # the response mirrors the binding shape it wrote
+    assert body["binding"]["key_fps"][fp] == ["g"]
+    # and the loaded policy resolves the fp to the default group
+    assert _policy.policy_store().get().groups_for(None, fp) == ("g",)
+
+
+def test_key_mint_groups_form_explicit_assign(app, keys_file, policy_file):
+    """An explicit assign on a groups-form mint names the target groups
+    directly; undefined groups are refused BEFORE any write (the key is
+    removed by the caller's compensating action, and nothing partial
+    lands in the file)."""
+    policy_file.write_text(
+        json.dumps({
+            "groups": {"analysts": {"tables": {}}, "auditors": {"tables": {}}},
+            "default_group": "analysts",
+            "admins": [ADMIN_FP],
+        }),
+        encoding="utf-8",
+    )
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    r = app.post(
+        "/api/admin/keys",
+        json={"label": "x", "assign": ["auditors"]},
+        headers=_admin_headers(),
+    )
+    assert r.status_code == 201, r.text
+    fp = r.json()["fp"]
+    pol = _read_policy(policy_file)
+    assert pol["key_fps"][fp] == ["auditors"]
+    assert _policy.policy_store().get().groups_for(None, fp) == ("auditors",)
+
+    # undefined group -> 400, no binding written
+    r2 = app.post(
+        "/api/admin/keys",
+        json={"label": "y", "assign": ["nonexistent"]},
+        headers=_admin_headers(),
+    )
+    assert r2.status_code == 400
+    assert "undefined group" in r2.json()["error"]
+
+
+def test_key_revoke_drops_key_fps_binding(app, keys_file, policy_file):
+    """Revoking a groups-form mint drops the key_fps binding too — no
+    orphan grant may outlive its key."""
+    policy_file.write_text(
+        json.dumps({"groups": {"g": {"tables": {}}}, "default_group": "g", "admins": [ADMIN_FP]}),
+        encoding="utf-8",
+    )
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    r = app.post("/api/admin/keys", json={"label": "x"}, headers=_admin_headers())
+    fp = r.json()["fp"]
+    assert _read_policy(policy_file)["key_fps"][fp] == ["g"]
+    # revoke: binding AND store entry go together
+    r2 = app.delete(f"/api/admin/keys/{fp}", headers=_admin_headers())
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["assignment_removed"] is True
+    pol = _read_policy(policy_file)
+    assert fp not in pol.get("key_fps", {})
     assert _admin_keys.list_keys() == []
 
 
@@ -615,6 +681,159 @@ def test_key_revoke_normalized_key_spelled_assignment(app, keys_file, policy_fil
     assert r.status_code == 200
     assert r.json()["assignment_removed"] is True
     assert fp not in _read_policy(policy_file)["datasets"]["assignments"]
+
+
+
+# ---------------------------------------------------------------------------
+# F1/F2/F3/F4/T1 — the padded-spelling + binding-shape regression wave
+# (empirically reproduced by lead + independent auditor)
+# ---------------------------------------------------------------------------
+
+
+def _assignment_fp_key(key: str) -> str:
+    # The loader's normalizer, mirrored locally: the test must judge the
+    # FILE the way load_policy will at next restart, not via the code
+    # under test.
+    return key.strip().removeprefix("key:").strip()
+
+
+def _policy_with_padded_fp_assignment(tmp_fp: str) -> dict:
+    """A datasets doc whose fp assignment is stored under the PADDED
+    spelling (" key:sha256:<fp> " — leading/trailing whitespace around the
+    whole key). The loader strips first, so it binds fp fine — but the OLD
+    _assignment_fp (removeprefix-then-strip) never matched it."""
+    doc = json.loads(json.dumps(POLICY_DOC))
+    doc["datasets"]["assignments"][f" key:{tmp_fp} "] = ["a/*"]
+    return doc
+
+
+def test_key_revoke_drops_padded_spelled_assignment(app, keys_file, policy_file):
+    """F1: a revoke must drop an assignment stored under the PADDED
+    spelling. The loader (policy.py) strips-then-removeprefix; the drop
+    matcher normalized removeprefix-then-strip, so " key:sha256:X " never
+    matched and the binding (a live grant) outlived its key."""
+    fp = key_fingerprint("padded-key")
+    policy_file.write_text(json.dumps(_policy_with_padded_fp_assignment(fp)), encoding="utf-8")
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    _admin_keys.add_key("padded-key", label="p", created_by="bootstrap")
+    r = app.delete(f"/api/admin/keys/{fp}", headers=_admin_headers())
+    assert r.status_code == 200, r.text
+    assert r.json()["assignment_removed"] is True
+    assignments = _read_policy(policy_file)["datasets"]["assignments"]
+    # NOTHING bound to this fp survives — either spelling.
+    assert not any(_assignment_fp_key(k) == fp for k in assignments)
+
+
+def test_mint_with_padded_spelled_assignment_loads_afterward(app, keys_file, policy_file):
+    """F2 (worst): a file carrying " key:sha256:X " + a mint binding bare
+    X used to write BOTH spellings — the mint returned 201 while
+    load_policy then refused the whole file ("binds X twice"): the ACL was
+    dead at next restart. The merge now revalidates the MERGED text before
+    writing, so a refused merge → 503 + the compensating remove_key."""
+    fp = key_fingerprint("collide-key")
+    policy_file.write_text(json.dumps(_policy_with_padded_fp_assignment(fp)), encoding="utf-8")
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    _admin_keys.add_key("collide-key", label="c", created_by="bootstrap")
+    r = app.post("/api/admin/keys", json={"label": "x"}, headers=_admin_headers())
+    if r.status_code == 201:
+        # If the merge SUCCEEDS (padded spelling already replaced by the
+        # drop matcher), the written file must LOAD — one fp, one binding.
+        text = policy_file.read_text(encoding="utf-8")
+        _policy.load_policy(str(policy_file))  # raises on the dead-ACL state
+        assert fp not in text or text.count(str(fp)) <= 2  # no duplicated bindings
+    else:
+        # The merge refused the merged document: 503 + the store entry was
+        # removed by the compensating action (no minted-but-never-granted key).
+        assert r.status_code == 503, r.text
+        assert "would not load" in r.json()["error"]
+        assert not any(e["fp"] == r.json().get("fp") for e in _admin_keys.list_keys())
+    # The FILE is loadable either way — the invariant that was broken.
+    _policy.load_policy(str(policy_file))
+
+
+def test_mint_datasets_form_reports_form_and_assignments(app, keys_file, policy_file):
+    """F3: the datasets merge returned {fp: [globs]} (no "assignments"
+    key), so the mint's dispatch fell to the ELSE arm and reported an
+    EMPTY binding. The merge now returns an unambiguous {"form":
+    "datasets", "assignments": ...} and the mint mirrors it."""
+    r = app.post(
+        "/api/admin/keys",
+        json={"label": "ds", "assign": ["reports/*"]},
+        headers=_admin_headers(),
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    fp = body["fp"]
+    assert body["binding"]["form"] == "datasets"
+    assert body["binding"]["assignments"] == {fp: ["reports/*"]}
+    assert body["binding"]["key_fps"] == {}
+    assert body["form"] == "datasets"
+    assert body["assignment"] == {fp: ["reports/*"]}
+    # and the file binding matches what the response claimed
+    assert _read_policy(policy_file)["datasets"]["assignments"][fp] == ["reports/*"]
+
+
+def test_mint_groups_form_assignment_reflects_bound_group(app, keys_file, policy_file):
+    """F4: a groups-form mint with assign ["*"] binds the policy's
+    default_group, but the response's "assignment" echoed ["*"] — a lie
+    in the datasets vocabulary. It now reports the ACTUALLY bound groups
+    plus "form": "groups" so clients cannot misread."""
+    policy_file.write_text(
+        json.dumps({"groups": {"g": {"tables": {}}}, "default_group": "g", "admins": [ADMIN_FP]}),
+        encoding="utf-8",
+    )
+    _policy.reset_policy_store()
+    assert _wait_until(lambda: _policy.policy_store().get().hash != "")
+    r = app.post("/api/admin/keys", json={"label": "x", "assign": ["*"]}, headers=_admin_headers())
+    assert r.status_code == 201, r.text
+    body = r.json()
+    fp = body["fp"]
+    assert body["form"] == "groups"
+    assert body["binding"]["form"] == "groups"
+    assert body["binding"]["key_fps"][fp] == ["g"]
+    # "assignment" reports the BOUND groups (default_group), not ["*"]
+    assert body["assignment"] == {fp: ["g"]}
+    assert _read_policy(policy_file)["key_fps"][fp] == ["g"]
+
+
+def test_mint_merge_refusal_compensates_store(monkeypatch, tmp_path, keys_file):
+    """T1: after a 400 merge refusal the compensating remove_key must have
+    left NO store entry for the fp — the existing refusal test pinned the
+    file and the status but never the store (the auditor's gap)."""
+    import sqlhandler.server as srv
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"groups": {"g": {"tables": {}}}, "default_group": "g", "admins": [ADMIN_FP]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(policy_path))
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    monkeypatch.setenv("SQLHANDLER_ADMIN_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("MCP_API_KEYS", f"{ADMIN_KEY},{USER_KEY}")
+    _policy.reset_policy_store()
+    try:
+        app = server_module._build_http_app()
+        with TestClient(app) as c:
+            captured = {}
+
+            def refusing_merge(fp, globs):
+                # Capture the fp the core minted so the assertion targets
+                # THE key this request created, then refuse exactly the
+                # way an undefined-group merge would (AdminHTTPError 400).
+                captured["fp"] = fp
+                raise srv.AdminHTTPError(400, "assign references undefined group(s) ['x']")
+
+            monkeypatch.setattr(srv, "_admin_merge_assignment_with_fp", refusing_merge)
+            r = c.post("/api/admin/keys", json={"label": "x"}, headers=_admin_headers())
+            assert r.status_code == 400, r.text
+            fp = captured["fp"]
+            assert fp  # the refusal happened after the store write
+            assert not any(e["fp"] == fp for e in _admin_keys.list_keys())
+    finally:
+        _policy.reset_policy_store()
 
 
 # ---------------------------------------------------------------------------
@@ -963,3 +1182,92 @@ def test_sso_bearer_token_in_authorization_resolves_via_ladder(app, monkeypatch,
     _policy.reset_policy_store()
     r = app.get("/api/admin/grants", headers={"Authorization": "Bearer <sso-token-not-a-key>"})
     assert r.status_code == 401, r.text
+
+
+
+# ------------------------------------------- audit 2026-10-20 second-wave fixes
+
+
+def test_dbt_apply_write_gated(app):
+    """1c: import-dbt/apply WRITES the catalog store — the same poisoning
+    channel as the upload — so it carries the SAME write gate. It was the
+    one mutation route left ungated (anonymous POST reached body parsing)."""
+    # the app fixture arms MCP_API_KEYS -> the gate is ON
+    r = app.post("/api/semantic-catalog/import-dbt/apply", json={"manifest": "{}"})
+    assert r.status_code == 401, r.text
+    assert "credential" in r.json()["error"]
+    # parity: the gated sibling behaves identically for an anonymous caller
+    r2 = app.post("/api/semantic-catalog", content="{}", headers={"Content-Type": "text/plain"})
+    assert r2.status_code == 401
+    # NOTE: deliberately NO credentialed "reaches the handler" leg here —
+    # passing the gate builds the engine (_handler() -> load_dotenv()),
+    # which loads the developer's real config/.env into os.environ and
+    # leaks FABRIC_* into later config tests (found 2026-10-20). The gate-
+    # passes side is covered by every admin test that reaches its handler.
+
+
+def test_policy_put_bare_json_object_not_repr(app, policy_file):
+    """2a: a bare JSON policy object PUT to /api/admin/policy must be
+    re-serialised as REAL JSON — the old str(body) produced a Python repr
+    that YAML-parsed into a silently mutated document (None -> "None",
+    backslashes doubled)."""
+    r = app.put(
+        "/api/admin/policy",
+        json={"groups": {"g": {"tables": {}}}, "default_group": "g", "notes": None},
+        headers=_admin_headers(),
+    )
+    assert r.status_code == 200, r.text
+    on_disk = policy_file.read_text()
+    assert "'None'" not in on_disk, on_disk[:200]
+    assert on_disk.lstrip().startswith("{"), "must be real JSON"
+    reloaded = json.loads(on_disk)
+    assert reloaded["notes"] is None, "null must survive as null"
+
+
+
+def test_revoke_refusal_leaves_no_partial_state(app, keys_file, policy_file, monkeypatch):
+    """3a: revoke on an unwritable policy must NOT strand partial state. The
+    old order removed the store key FIRST, then failed the policy write —
+    key gone, grant orphaned, 503 to the operator. The fixed order drops the
+    assignment first, so a policy-write refusal leaves BOTH halves intact;
+    and when the policy IS writable the revoke completes normally."""
+    # 1) happy path: binding dropped, key removed, both true
+    r = app.post("/api/admin/keys", json={"label": "t"}, headers=_admin_headers())
+    fp = r.json()["fp"]
+    # keep the ADMIN_FP designation the fixture policy wrote — without it the
+    # revoke below 403s before exercising anything
+    policy_file.write_text(
+        json.dumps({
+            "groups": {"g": {"tables": {}}},
+            "default_group": "g",
+            "admins": [ADMIN_FP],
+            "key_fps": {fp: ["g"]},
+        }),
+        encoding="utf-8",
+    )
+    _policy.reset_policy_store()
+    r2 = app.delete(f"/api/admin/keys/{fp}", headers=_admin_headers())
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["removed"] == fp and body["assignment_removed"] is True
+    on_disk = policy_file.read_text()
+    assert fp not in on_disk, "binding must be gone from the file"
+    assert _admin_keys.list_keys() == []
+
+    # 2) policy write fails AFTER a successful drop in the past (orphan fp
+    #    with no store entry): the drop succeeds, remove_key 404s — the file
+    #    is CLEANED and the operator still gets a loud 404 for the store half.
+    orphan = "sha256:aaaaaaaaaaaa"
+    policy_file.write_text(
+        json.dumps({
+            "groups": {"g": {"tables": {}}},
+            "default_group": "g",
+            "admins": [ADMIN_FP],
+            "key_fps": {orphan: ["g"]},
+        }),
+        encoding="utf-8",
+    )
+    _policy.reset_policy_store()
+    r3 = app.delete(f"/api/admin/keys/{orphan}", headers=_admin_headers())
+    assert r3.status_code == 404, r3.text
+    assert orphan not in policy_file.read_text(), "the orphan binding must be cleaned even when the store 404s"
