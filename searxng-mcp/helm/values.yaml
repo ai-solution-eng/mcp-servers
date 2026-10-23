@@ -217,3 +217,17 @@ networkPolicy:
     app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
   probeCidrs: []   # node-originated kubelet probes; NEVER 0.0.0.0/0 with empty probeExceptCidrs
   probeExceptCidrs: []
+
+# ============================================================================
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF
+# ============================================================================
+
+# Voluntary-eviction guard for node drains (templates/pdb.yaml, policy/v1).
+# DEFAULT OFF keeps the default helm render byte-identical. Single-replica
+# caveat: with replicaCount 1 (every chart in this fleet), minAvailable: 1
+# blocks ALL voluntary evictions — a drain waits. That is the intended
+# safety trade; operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
