@@ -1,0 +1,24 @@
+{{- if .Values.metrics.enabled }}
+# Prometheus Operator ServiceMonitor — ADDITIVE and OFF by default
+# (values.metrics.enabled, default false): the DEFAULT render is byte-
+# identical to the Wave-0 baseline. Scrapes the SAME service port as /mcp
+# (the server serves /metrics there when APPLYGATE_METRICS_ENABLED is on —
+# wired from this same values key). Requires the prometheus-operator
+# ServiceMonitor CRD in-cluster; metric labels carry tool/outcome only —
+# never namespaces, names, or manifest material.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  endpoints:
+    - port: mcp
+      path: /metrics
+      interval: {{ .Values.metrics.interval | quote }}
+{{- end }}

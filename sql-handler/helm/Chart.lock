@@ -1,0 +1,6 @@
+dependencies:
+- name: pcai-fleet-lib
+  repository: file://../../pcai-helm-lib/chart/pcai-fleet-lib
+  version: 0.1.0
+digest: sha256:c5285f850373fc3ef2865d6882706126c0d7bbf0781917e37d91296652177af7
+generated: "2026-09-14T09:59:09.949209321-04:00"

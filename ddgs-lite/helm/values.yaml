@@ -15,7 +15,7 @@ deployment:
 # -- Image ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/ddgs-mcp
-  tag: v1.0
+  tag: v1.0.1
   pullPolicy: IfNotPresent
 
 # -- Service exposure ------------------------------------------------------------------
@@ -38,16 +38,16 @@ env:
   - name: DDG_REGION
     value: ""
 
-# -- HPE corporate proxy -----------------------------------------------------------------------
-# Route outbound HTTP(S) traffic through the HPE corporate proxy.
-# Default false: open-internet systems must NOT use the proxy (DNS/egress
-# failures). Set true (and configure proxy.*) only behind the HPE proxy.
-hpe_proxies: false
-
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+# -- Egress proxy --------------------------------------------------------------------------------
+# Per-key proxy wiring — each key is wired into the pod only when non-empty,
+# so a corporate-proxy site sets http/https (and usually noProxy), while a
+# direct-egress site leaves proxy: {} (or omits it) and everything renders off.
+# CAUTION: a wrong proxy breaks DNS/egress — only set it behind a real proxy.
+#   proxy:
+#     http: http://proxy.corp.example:8080
+#     https: http://proxy.corp.example:8080
+#     noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,127.0.0.1,localhost"
+proxy: {}
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------
 ezua:

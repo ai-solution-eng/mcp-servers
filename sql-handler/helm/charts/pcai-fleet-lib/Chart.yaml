@@ -1,0 +1,30 @@
+# Shared fleet Helm LIBRARY chart — the templates the eight MCP charts
+# previously byte-copied between them (FLEET-AUDIT-2026-09 §3.5, charts
+# paragraph). type: library → renders no resources of its own; consuming
+# charts include the named templates and keep byte control of their render.
+apiVersion: v2
+name: pcai-fleet-lib
+description: >-
+  Shared Helm library chart for the PCAI MCP fleet: named templates for the
+  repeated boilerplate — probes (liveness/readiness/startup), the hardened
+  securityContext profile (non-root, read-only rootfs, no privilege
+  escalation, dropped caps, seccomp RuntimeDefault), a Prometheus Operator
+  ServiceMonitor, the hpe-ezua vendor-label Kyverno ClusterPolicy, and the
+  oauth2-proxy-ready Istio AuthorizationPolicy (disabled by default).
+type: library
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mcp
+  - pcai
+  - hpe
+  - ezua
+  - helm-library
+  - fleet
+maintainers:
+  - name: HPE AI Solution Engineering
+annotations:
+  # Adoption ledger — one concern at a time per chart, byte-identical render
+  # proof required (see README.md). Kept here so the library itself records
+  # which charts consume it and for which concern.
+  fleet.pcai/adoption: "SQLhandler: probes (Wave-3 C5 pilot)"

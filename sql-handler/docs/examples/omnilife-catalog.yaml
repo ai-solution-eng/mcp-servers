@@ -1,0 +1,287 @@
+# Omnilife semantic catalog — including the VIRTUAL table
+# vw_seguimiento_avance_nivel.
+#
+# Ready to use with SQLhandler: point SQLHANDLER_CATALOG at this file (or paste
+# it into the web UI's Semantic catalog panel / helm semanticCatalog.values).
+# The four physical tables document what the SV described; the last entry is a
+# VIRTUAL table — computed on the fly, at query time, from its `definition`
+# (DuckDB dialect; see docs/semantic-catalog.md "Virtual tables").
+#
+# NOTE: the definition is executed by the SQL engine exactly like any other
+# read-only query — it must stay a single SELECT/WITH statement.
+
+tables:
+  dim_articulos:
+    description: >-
+      Registros de artículos de producto, incluyendo descripciones y
+      clasificaciones categóricas. Cada registro representa un artículo
+      identificado por SKU, organizado en dimensiones como tipo de producto,
+      línea, sublínea y clase, con cobertura en distintos países.
+    aliases:
+      - products
+      - productos
+      - sku catalog
+      - catalogo de productos
+      - articulos
+    columns:
+      BENEFICIOS_PRINCIPALES: "Beneficios principales de marketing del producto, separados por coma; ~51% nulo."
+      CATEGORIA_FUNCIONAL: "Categoría funcional del producto (15 valores, ej. 'Sistema inmunologico', 'Belleza y cuidado personal'); ~51% nulo."
+      CLASE: "Presentación comercial provista por marketing (ej. Hair Styling, Polvo, Tabletas)."
+      CLV_PAIS: "Clave única del país."
+      DESCRIPCION_CONSUMIDOR: "Descripción de producto orientada al consumidor final, párrafo en español; ~51% nulo."
+      DESCRIPCION_SKU: "Descripción detallada del SKU."
+      FAMILIA_PRODUCTO: "Familia de producto (98 valores, ej. ACONDICIONADOR SEYTU, VKIDS); ~51% nulo."
+      FECHA_ACTUALIZACION_BD: "Fecha y hora de la última actualización en la base de datos origen."
+      FORMA_DE_CONSUMO: "Forma de consumo del producto (6 valores: Capsulas, Topico/cosmetico, Polvo, Tabletas, Liquido, Gomitas)."
+      INGREDIENTES_CLAVE: "Ingredientes clave del producto, separados por coma, texto en español; ~51% nulo."
+      LINEA: "Línea de negocio o categoría asignada (ej. BELLEZA, NUTRICION, SERVICIOS, KIT_BIMARCA)."
+      SKU: "Identificador único del artículo."
+      SUBLINEA: "Clasificación secundaria basada en la descripción (ej. DELIVERY, VITAMINAS & SUPLEMENTOS)."
+      TIPO_SKU: "Traducción homologada de la clave de SKU (ej. PRODUCTO, COSMETICOS, LITERATURA, SERVICIOS)."
+      URL_IMAGEN: "Dirección web del recurso gráfico del producto."
+
+  dim_compensacion:
+    description: >-
+      Registros de desempeño del plan de compensación dentro de la estructura
+      de mercadeo en red. Cada registro representa el desempeño de un
+      participante para un periodo específico, incluyendo totales de puntos
+      personales y de red, información de nivel de carrera y de pago, y
+      relaciones de patrocinio dentro de la red jerárquica.
+    aliases:
+      - compensation
+      - compensacion
+      - puntos
+      - points
+      - monthly snapshot
+      - comisiones
+      - plancompmt
+    columns:
+      FECHA_ACTUALIZACION_BD: "Timestamp de la última transacción sincronizada desde el origen Corbiz."
+      LINEA_ACTIVA: "Número de líneas activas asociadas al empresario según reglas de negocio."
+      NUMERO_EMPRESARIO: "Código identificador único del Distribuidor/Empresario."
+      NUMERO_PATROCINADOR: "Código identificador del presentador o patrocinador directo."
+      PERIODO: "Periodo operativo en formato YYYYMM (Año/Mes). Periodos nuevos se agregan como filas; siempre filtrar por PERIODO para análisis punto-en-tiempo."
+      PUNTOS_PERSONALES: "Volumen de puntos generados por compras propias en el periodo, su abreviatura es PP."
+      PUNTOS_RED: "Volumen de puntos generados por la red de primer nivel (línea directa), su abreviatura es PG."
+      PUNTOS_RED_INFERIOR: "Volumen de puntos generados por niveles profundos de la organización, su abreviatura es PLD."
+      TITULO_CARRERA: "Rango máximo histórico o consolidado del empresario según reglas de calificación acumulada."
+      TITULO_PAGO: "Rango alcanzado específicamente en el periodo actual que determina la liquidación de comisiones. Unir a dim_niveles.CLAVE_TITULO para decodificar."
+
+  dim_niveles:
+    description: >-
+      Registros de títulos de pago o tipos de pago asociados a niveles de
+      negocio o tiers de empresarios. Cada registro representa una designación
+      de pago específica y su nivel de jerarquía correspondiente. Escalera:
+      Bronce Inactivo (0), Bronce (3), Bronce Activo (5), Premier/Elite/Supreme
+      de Plata (40-60), Oro (70-90), Diamante (100-120), Doble Diamante
+      (130-150), Triple Diamante Supreme (160).
+    aliases:
+      - titles
+      - ranks
+      - titulos
+      - rank ladder
+      - niveles
+      - dim_titulo_pago
+      - titulo
+    columns:
+      ABREVIATURA_TITULO: "Abreviatura del rango (BI, B, BA, BP, BE, BS, PP, PE, PS, OP, OE, OS, DP, DE, DS, DDP, DDE, DDS, TD)."
+      CLAVE_TITULO: "Código numérico del rango — clave de join para dim_compensacion.TITULO_PAGO (valores: 0, 3, 5, 10, 20...160)."
+      DESCRIPCION_TITULO: "Nivel de negocio o clasificación de tier asignada al empresario (ej. DIAMANTE ELITE, PLATA SUPREME, BRONCE ACTIVO)."
+
+  dim_red:
+    description: >-
+      Genealogía de la red de distribuidores — el árbol de patrocinio
+      materializado como cierre transitivo: una fila por par (distribuidor,
+      ancestro), incluyendo fila de auto-referencia. 20.5M filas cubriendo
+      1.54M distribuidores con profundidades 1-33 (~13 filas por distribuidor).
+      Recetas de consulta: (1) Red completa de X → WHERE LINEA = 'X' (incluye
+      a X en NIVEL_HERENCIA 1; agregar AND NUMERO_EMPRESARIO <> 'X' para
+      excluirlo). (2) Cadena de upline de X → WHERE NUMERO_EMPRESARIO = 'X'
+      ORDER BY NIVEL_HERENCIA (1 = uno mismo, 2 = sponsor directo). (3) Sponsor
+      directo de X → NUMERO_PATROCINADOR_HEREDADO WHERE NUMERO_EMPRESARIO = 'X'
+      AND NIVEL_HERENCIA = 1 (coincide con dim_compensacion.NUMERO_PATROCINADOR).
+      (4) Profundidad de X → MAX(NIVEL_HERENCIA). Siempre restringir por
+      miembro o línea — recorridos sin acotar devuelven millones de filas.
+    aliases:
+      - network
+      - red
+      - genealogy
+      - downline
+      - upline
+      - patrocinio
+      - sponsorship tree
+      - arbol
+      - patrocinadores_heredados
+    columns:
+      FECHA_ACTUALIZACION_BD: "Timestamp de la última recarga completa del snapshot — un solo valor por carga; el árbol completo se reemplaza, no se actualiza incrementalmente."
+      LINEA: "Ancestro por el que pasa esta entrada del camino — self en NIVEL_HERENCIA=1, luego cada sponsor sucesivo hasta la raíz. 'WHERE LINEA = X' = toda la red descendente de X."
+      NIVEL_HERENCIA: "Distancia generacional desde el miembro: 1 = el propio miembro, 2 = sponsor directo, hasta 33 niveles de profundidad."
+      NUMERO_EMPRESARIO: "ID del distribuidor — 1,543,117 distintos; cada uno aparece una vez por cada ancestro por encima de él en el árbol."
+      NUMERO_PATROCINADOR: "Distribuidor patrocinador (upline directo) — mismo valor en cada fila de un miembro; redundante con la fila de NIVEL_HERENCIA=1."
+      NUMERO_PATROCINADOR_HEREDADO: "Sponsor del ancestro LINEA — el siguiente eslabón hacia arriba en la cadena (la LINEA de la fila k+1); en NIVEL_HERENCIA=1 es el sponsor directo del miembro."
+
+  # VIRTUAL table — no storage behind it; SQLhandler constructs it on the fly
+  # as a view over dim_red / dim_compensacion / dim_niveles whenever a query
+  # touches it. Definition ported from the Omnilife SV (Snowflake → DuckDB):
+  # ARRAY_CONSTRUCT_COMPACT → list_filter([...], x -> x IS NOT NULL); `iff`
+  # is provided by SQLhandler as a compat macro. GROUP BY ALL, GREATEST, ::INT
+  # and CTE column lists work in both dialects.
+  vw_seguimiento_avance_nivel:
+    aliases:
+      - seguimiento avance
+      - gap analysis
+      - avance de nivel
+      - que me falta
+      - nivel siguiente
+    description: >-
+      Tabla lógica que calcula el estado de calificación y análisis de brecha
+      para el siguiente nivel de empresarios. Por defecto toma el último
+      periodo disponible en dim_compensacion. Sus salidas principales son
+      REQUISITOS y REQUISITOS_FALTANTES, que consolidan en cadenas
+      concatenadas la meta y la brecha de PP, PG, PLD, LA y la cascada de
+      líneas calificadas (REQ1, REQ2, REQ3) amortiguando excedentes hacia
+      niveles inferiores. Inputs: dim_red (líneas directas de cada empresario
+      via NUMERO_PATROCINADOR_HEREDADO), dim_compensacion (puntos y título de
+      pago del empresario y de sus patrocinados), dim_niveles (abreviaturas de
+      rango para decodificar). Uso: filtrar por NUMERO_EMPRESARIO para obtener
+      su status de avance. Si REQUISITOS_FALTANTES viene vacío, ya cumple
+      todos los requisitos para el siguiente nivel.
+    columns:
+      EO_TP: "Título de pago actual del empresario (código numérico). Unir a dim_niveles.CLAVE_TITULO para obtener el nombre del rango."
+      NUMERO_EMPRESARIO: "ID del empresario evaluado."
+      REQUISITOS: "Cadena concatenada con todos los requisitos del siguiente nivel, separados por coma. Formato: 'N REQ1, N REQ2, N PP, N PG, N PLD, N LA' — donde N es la cantidad requerida y REQ1/REQ2/REQ3 son abreviaturas de rangos de líneas calificadas. Omite requisitos con valor cero."
+      REQUISITOS_FALTANTES: "Cadena concatenada con los requisitos que aún NO cumple el empresario, mismo formato que REQUISITOS. Si está vacío, el empresario ya cumple todos los requisitos para avanzar."
+      TP_SIGUIENTE: "Código del siguiente título/rango al que puede aspirar el empresario. Unir a dim_niveles.CLAVE_TITULO para decodificar."
+    definition: |
+      WITH base AS (
+        SELECT DISTINCT
+          ph.NUMERO_PATROCINADOR_HEREDADO AS NUMERO_EMPRESARIO,
+          COALESCE(pcm1.TITULO_PAGO, 0)::INT          AS EO_TP,
+          COALESCE(pcm1.PUNTOS_PERSONALES, 0)         AS EO_PP,
+          COALESCE(pcm1.PUNTOS_RED, 0)                AS EO_PG,
+          COALESCE(pcm1.PUNTOS_RED_INFERIOR, 0)       AS EO_PLD,
+          COALESCE(pcm1.LINEA_ACTIVA, 0)              AS EO_LA,
+          ph.LINEA,
+          ph.NUMERO_EMPRESARIO                        AS NUMERO_PATROCINADO,
+          COALESCE(pcm2.TITULO_PAGO, 0)::INT          AS TP_PATROCINADOS
+        FROM dim_red AS ph
+        LEFT JOIN dim_compensacion AS pcm1
+          ON  ph.NUMERO_PATROCINADOR_HEREDADO = pcm1.NUMERO_EMPRESARIO
+          AND pcm1.PERIODO = (SELECT MAX(PERIODO) FROM dim_compensacion)
+        LEFT JOIN dim_compensacion AS pcm2
+          ON  ph.NUMERO_EMPRESARIO = pcm2.NUMERO_EMPRESARIO
+          AND pcm2.PERIODO = (SELECT MAX(PERIODO) FROM dim_compensacion)
+      ),
+      lineas_clasificadas AS (
+        SELECT
+          NUMERO_EMPRESARIO, EO_TP, EO_PP, EO_PG, EO_PLD, EO_LA,
+          LINEA,
+          MAX(TP_PATROCINADOS) AS MAX_TP
+        FROM base
+        GROUP BY ALL
+      ),
+      requerimientos (EO_TP, TP_SIGUIENTE,
+        CANT_REQ1, REQ1, CANT_REQ2, REQ2, CANT_REQ3, REQ3,
+        REQ_PP, REQ_PG, REQ_PLD, REQ_LA) AS (
+        SELECT * FROM (VALUES
+          (150, 160, 2, 140, 4, 110, 4,  60, 2500, 10000, 50000000, 10),
+          (140, 150, 2, 130, 3, 100, 4,  60, 2500, 10000, 20000000,  9),
+          (130, 140, 2, 120, 2,  90, 4,  60, 2500, 10000,  8000000,  8),
+          (120, 130, 2, 110, 1,  80, 4,  60, 2500, 10000,  3000000,  7),
+          (110, 120, 2, 100, 4,  60, 0,   0, 2500, 10000,  1200000,  6),
+          (100, 110, 2,  90, 4,  60, 0,   0, 2500, 10000,   500000,  6),
+          ( 90, 100, 2,  80, 3,  60, 0,   0, 2500, 10000,   200000,  5),
+          ( 80,  90, 2,  70, 2,  60, 0,   0, 2500, 10000,    80000,  4),
+          ( 70,  80, 2,  60, 2,  50, 0,   0, 2500, 10000,    34000,  4),
+          ( 60,  70, 2,  40, 2,  30, 0,   0, 2500, 10000,    12000,  4),
+          ( 50,  60, 4,  20, 0,   0, 0,   0, 2500, 10000,        0,  4),
+          ( 40,  50, 2,  20, 2,  10, 0,   0, 2000,  7000,        0,  4),
+          ( 30,  40, 2,  10, 2,   5, 0,   0, 1500,  4000,        0,  4),
+          ( 20,  30, 0,   0, 0,   0, 0,   0, 1000,  2000,        0,  3),
+          ( 10,  20, 0,   0, 0,   0, 0,   0,  500,  1500,        0,  1),
+          (  5,  10, 0,   0, 0,   0, 0,   0,  300,     0,        0,  1),
+          (  3,   5, 0,   0, 0,   0, 0,   0,  300,     0,        0,  0),
+          (  0,   3, 0,   0, 0,   0, 0,   0,  100,     0,        0,  0)
+        )
+      ),
+      titulo AS (
+        SELECT CLAVE_TITULO AS CLV_TP, ABREVIATURA_TITULO AS TP FROM dim_niveles
+      ),
+      contador AS (
+        SELECT
+          lc.NUMERO_EMPRESARIO,
+          r.EO_TP,
+          r.TP_SIGUIENTE,
+          COUNT(IFF(lc.MAX_TP >= r.REQ1 AND r.REQ1 > 0, 1, NULL)) AS EO_REQ1,
+          r.CANT_REQ1, t1.TP AS REQ1,
+          COUNT(IFF(lc.MAX_TP >= r.REQ2
+                 AND lc.MAX_TP < r.REQ1
+                 AND r.REQ2 > 0, 1, NULL)) AS EO_REQ2,
+          r.CANT_REQ2, t2.TP AS REQ2,
+          COUNT(IFF(lc.MAX_TP >= r.REQ3
+                 AND lc.MAX_TP < r.REQ2
+                 AND r.REQ3 > 0, 1, NULL)) AS EO_REQ3,
+          r.CANT_REQ3, t3.TP AS REQ3,
+          lc.EO_PP,  r.REQ_PP,
+          lc.EO_PG,  r.REQ_PG,
+          lc.EO_PLD, r.REQ_PLD,
+          lc.EO_LA,  r.REQ_LA
+        FROM lineas_clasificadas AS lc
+        INNER JOIN requerimientos r ON r.EO_TP = lc.EO_TP
+        LEFT JOIN titulo AS t1 ON t1.CLV_TP = r.REQ1
+        LEFT JOIN titulo AS t2 ON t2.CLV_TP = r.REQ2
+        LEFT JOIN titulo AS t3 ON t3.CLV_TP = r.REQ3
+        GROUP BY ALL
+      ),
+      calculo AS (
+        SELECT
+          NUMERO_EMPRESARIO, EO_TP, TP_SIGUIENTE,
+          CANT_REQ1, EO_REQ1,
+          GREATEST(CANT_REQ1 - EO_REQ1, 0) AS FALTANTE_REQ1,
+          GREATEST(EO_REQ1   - CANT_REQ1, 0) AS EXCEDENTE_REQ1,
+          REQ1,
+          CANT_REQ2, EO_REQ2,
+          GREATEST(CANT_REQ2 - (EO_REQ2 + GREATEST(EO_REQ1 - CANT_REQ1, 0)), 0)
+            AS FALTANTE_REQ2,
+          GREATEST((EO_REQ2 + GREATEST(EO_REQ1 - CANT_REQ1, 0)) - CANT_REQ2, 0)
+            AS EXCEDENTE_REQ2,
+          REQ2,
+          CANT_REQ3, EO_REQ3,
+          GREATEST(CANT_REQ3 - (EO_REQ3
+            + GREATEST((EO_REQ2 + GREATEST(EO_REQ1 - CANT_REQ1, 0))
+                       - CANT_REQ2, 0)), 0)
+            AS FALTANTE_REQ3,
+          GREATEST((EO_REQ3
+            + GREATEST((EO_REQ2 + GREATEST(EO_REQ1 - CANT_REQ1, 0))
+                       - CANT_REQ2, 0)) - CANT_REQ3, 0)
+            AS EXCEDENTE_REQ3,
+          REQ3,
+          REQ_PP,  EO_PP,  GREATEST(REQ_PP  - EO_PP,  0) AS FALTANTE_PP,
+          REQ_PG,  EO_PG,  GREATEST(REQ_PG  - EO_PG,  0) AS FALTANTE_PG,
+          REQ_PLD, EO_PLD, GREATEST(REQ_PLD - EO_PLD, 0) AS FALTANTE_PLD,
+          REQ_LA,  EO_LA,  GREATEST(REQ_LA  - EO_LA,  0) AS FALTANTE_LA
+        FROM contador
+      )
+      SELECT
+        NUMERO_EMPRESARIO,
+        EO_TP,
+        TP_SIGUIENTE,
+        array_to_string(list_filter([
+          iff(CANT_REQ1 > 0, CAST(CANT_REQ1 AS VARCHAR) || ' ' || REQ1, NULL),
+          iff(CANT_REQ2 > 0, CAST(CANT_REQ2 AS VARCHAR) || ' ' || REQ2, NULL),
+          iff(CANT_REQ3 > 0, CAST(CANT_REQ3 AS VARCHAR) || ' ' || REQ3, NULL),
+          iff(REQ_PP  > 0, CAST(REQ_PP  AS VARCHAR) || ' PP',  NULL),
+          iff(REQ_PG  > 0, CAST(REQ_PG  AS VARCHAR) || ' PG',  NULL),
+          iff(REQ_PLD > 0, CAST(REQ_PLD AS VARCHAR) || ' PLD', NULL),
+          iff(REQ_LA  > 0, CAST(REQ_LA  AS VARCHAR) || ' LA',  NULL)
+        ], x -> x IS NOT NULL), ', ') AS REQUISITOS,
+        array_to_string(list_filter([
+          iff(FALTANTE_REQ1 > 0, CAST(FALTANTE_REQ1 AS VARCHAR) || ' ' || REQ1, NULL),
+          iff(FALTANTE_REQ2 > 0, CAST(FALTANTE_REQ2 AS VARCHAR) || ' ' || REQ2, NULL),
+          iff(FALTANTE_REQ3 > 0, CAST(FALTANTE_REQ3 AS VARCHAR) || ' ' || REQ3, NULL),
+          iff(FALTANTE_PP  > 0, CAST(FALTANTE_PP  AS VARCHAR) || ' PP',  NULL),
+          iff(FALTANTE_PG  > 0, CAST(FALTANTE_PG  AS VARCHAR) || ' PG',  NULL),
+          iff(FALTANTE_PLD > 0, CAST(FALTANTE_PLD AS VARCHAR) || ' PLD', NULL),
+          iff(FALTANTE_LA  > 0, CAST(FALTANTE_LA  AS VARCHAR) || ' LA',  NULL)
+        ], x -> x IS NOT NULL), ', ') AS REQUISITOS_FALTANTES
+      FROM calculo

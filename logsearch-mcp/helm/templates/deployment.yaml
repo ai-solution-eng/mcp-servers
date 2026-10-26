@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.rbac.create }}
+      # Dedicated ServiceAccount bound to the read-only Role (rbac.yaml).
+      # With rbac.create=false the pod falls back to the namespace default.
+      serviceAccountName: {{ .Values.deployment.name }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          env:
+            # Namespace policy + caps are rendered HERE from values (Helm
+            # does not template inside values.yaml — the prometheus-mcp
+            # v0.1.0 release shipped a literal "{{ .Values.x }}" string that
+            # way). Empty strings are intentional and meaningful:
+            # allowedNamespaces "" = DENY ALL namespaces (default-deny, fleet
+            # decision D8) unless emptyAllowsAll re-opens it.
+            - name: LOGSEARCH_ALLOWED_NAMESPACES
+              value: {{ .Values.logsearch.allowedNamespaces | quote }}
+            # D8 escape hatch: "true" restores the pre-D8 open default where
+            # an empty allowlist means every namespace is searchable.
+            - name: LOGSEARCH_EMPTY_ALLOWS_ALL
+              value: {{ .Values.logsearch.emptyAllowsAll | quote }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection ON
+            # with the mcp_auth.transport_security_from_env allowlist). The
+            # MCP path is gateway-fronted, so without this pin every gateway
+            # request would 421 "Invalid Host header" (the K8S-MCP lesson).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (ezua endpoint pinned or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
+            # API keys for /mcp — MANDATORY (fleet decision 2026-09). Always
+            # from an operator-created Secret (existingSecret-only, the
+            # K8S-MCP invariant): the pod fails loud
+            # (CreateContainerConfigError) until the Secret exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: LOGSEARCH_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            - name: LOGSEARCH_BLOCKED_NAMESPACES
+              value: {{ .Values.logsearch.blockedNamespaces | quote }}
+            - name: LOGSEARCH_MAX_PODS
+              value: {{ .Values.logsearch.maxPods | quote }}
+            - name: LOGSEARCH_MAX_LINES_PER_POD
+              value: {{ .Values.logsearch.maxLinesPerPod | quote }}
+            - name: LOGSEARCH_MAX_TOTAL_LINES
+              value: {{ .Values.logsearch.maxTotalLines | quote }}
+            # Per-line char cap on search output (truncation marker appended).
+            - name: LOGSEARCH_MAX_LINE_CHARS
+              value: {{ .Values.logsearch.maxLineChars | quote }}
+            # Parallel pod fan-out width (bounded semaphore; 1 = sequential).
+            - name: LOGSEARCH_FETCH_CONCURRENCY
+              value: {{ .Values.logsearch.fetchConcurrency | quote }}
+            # ReDoS screen: user regexes longer than this are refused.
+            - name: LOGSEARCH_MAX_REGEX_CHARS
+              value: {{ .Values.logsearch.maxRegexChars | quote }}
+            {{- if .Values.logsearch.exportRoot }}
+            # export_matches destination (Wave-5 F3, ADDITIVE, DEFAULT OFF):
+            # rendered ONLY when the operator sets exportRoot — the default
+            # render has no LOGSEARCH_EXPORT_ROOT env and the tool refuses
+            # (writes nothing). See values.yaml for the suggested workbench/
+            # shared-PVC convention.
+            - name: LOGSEARCH_EXPORT_ROOT
+              value: {{ .Values.logsearch.exportRoot | quote }}
+            {{- end }}
+            # Web console gate (webui.enabled): the / and /api/* routes in
+            # server._build_http_app. "false" must be passed EXPLICITLY — the
+            # server's own default when the env var is absent is enabled.
+            - name: LOGSEARCH_WEBUI_ENABLED
+              value: {{ .Values.webui.enabled | quote }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics self-metrics (Wave-3 C3, ADDITIVE, DEFAULT OFF): the
+            # server serves per-tool request counters at /metrics only when
+            # this env is set — nothing here renders when metrics.enabled is
+            # false (the default), so the default pod is unchanged. Pairs
+            # with templates/servicemonitor.yaml.
+            - name: LOGSEARCH_METRICS_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.proxy.http }}
+            # Corporate proxy env (fleet convention, searxng-mcp). Wired only
+            # when the corresponding proxy.<key> is non-empty; the k8s API
+            # this server talks to is IN-CLUSTER and stays covered by the
+            # NO_PROXY cluster-local entries below — these vars exist for
+            # fleet consistency and any future egress need, not for the
+            # current tool calls.
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          # /healthz is served by the same Starlette app as /mcp and needs
+          # no MCP handshake — stateless MCP 2.0 keeps every replica
+          # equivalent, so all three probes can share it.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

@@ -19,6 +19,12 @@ Endpoints (all JSON unless noted):
                            util/memory/temp/power/NVLink, grouped into the
                            per-node NVLink domains, plus node + cluster
                            summaries — fails soft on clusters without DCGM
+  GET  /api/nodes       -> per-node CPU & memory capacity view: allocatable
+                           vs requests vs limits vs active usage (cores +
+                           bytes), pods per node. Shown-node selection:
+                           GPU nodes auto-detected, override with the
+                           PROM_UI_NODE_FILTER regex ('all' = every node)
+                           — fails soft per metric family
   GET  /api/alerts      -> {"alerts": [...], "n_total", "n_shown", "counts"}
   GET  /api/rules       -> {"groups": [...], "n_total"} (state/search filters)
   POST /api/query       -> instant query  {"query", "time"?}
@@ -31,6 +37,15 @@ capped and range points downsampled (shape preserved) so a busy cluster
 never floods the browser either. Alerts/rules get their own caps with
 accurate ``n_total`` counts, since those lists are for scanning, not for a
 model's context window.
+
+Wave-4 (D14): the dashboard aggregate ``/api/overview`` — ~14 upstream
+queries per refresh — is served from a short-TTL response cache
+(PROMETHEUS_OVERVIEW_CACHE_TTL, default 20s; 0 disables) keyed by the
+request's actual parameter set. Cached responses are honestly marked
+(``cached: true`` + ``cache_age_seconds``); fresh ones say ``cached:
+false``. Failures are never memoized, and concurrent identical overviews
+share a single computation (single-flight). Range steps are clamped via
+prom_client.resolve_step (D14) with a ``step_notice`` when clamped.
 """
 
 from __future__ import annotations
@@ -46,13 +61,44 @@ from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 from prom_client import (
+    LABEL_NAME_RE,
     PrometheusError,
     _downsample,
     _metric_str,
     format_value,
-    parse_step,
     parse_timestamp,
+    resolve_step,
 )
+
+# Kept as an alias: the audit referenced webui._LABEL_RE; the rule now lives
+# in prom_client (the client enforces it before URL-path interpolation).
+_LABEL_RE = LABEL_NAME_RE
+
+# /api/overview response cache (Wave-4 D14). Default TTL 20s: a browser
+# refresh within the TTL is instant instead of re-running ~14 upstream
+# queries (30-60s payload on a busy cluster). 0 disables the cache entirely
+# (escape hatch — every refresh recomputes, exactly the pre-D14 behavior).
+_OVERVIEW_CACHE_TTL_DEFAULT = 20.0
+
+
+def _overview_cache_ttl(environ: dict[str, str] | None = None) -> float:
+    """PROMETHEUS_OVERVIEW_CACHE_TTL in seconds (default 20; 0 disables).
+
+    Re-read per request (the fleet env pattern). Non-numeric / negative
+    values fall back to the default; fractional values are honored.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("PROMETHEUS_OVERVIEW_CACHE_TTL") or "").strip()
+    if not raw:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    try:
+        ttl = float(raw)
+    except ValueError:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    if ttl < 0:
+        return _OVERVIEW_CACHE_TTL_DEFAULT
+    return ttl
+
 
 _HTML_CANDIDATES = (
     Path(__file__).parent / "ui" / "index.html",  # source tree / editable install
@@ -133,7 +179,7 @@ _GPU_QUERIES = (
 _DEFAULT_GPU_DOMAINS = ((0, 1, 2, 3), (4, 5, 6, 7))
 
 
-def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[int, ...], str]:
+def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[tuple[int, ...], ...], str]:
     """Parse the NVLink domain grouping (env override > default)."""
     env = os.environ if environ is None else environ
     raw = env.get("PROM_UI_GPU_NVLINK_DOMAINS", "").strip()
@@ -154,6 +200,125 @@ def _gpu_domains(environ: dict[str, str] | None = None) -> tuple[tuple[int, ...]
 # the pushgateway. Precedence in /api/gpu: explicit PROM_UI_GPU_NVLINK_DOMAINS
 # (operator escape hatch) > detected islands > built-in default.
 _NVLINK_DOMAIN_QUERY = "nvidia_gpu_nvlink_domain"
+
+# Per-node CPU/memory allocation queries for /api/nodes. Names are the
+# kube-prometheus-stack series present on G2 (verified live):
+#   - kube_node_status_allocatable: one series per (node, resource) —
+#     scheduler-view capacity (what the kubelet admits against)
+#   - kube_pod_container_resource_requests/limits: per-container scheduled
+#     requests/limits — kube-state-metrics >= 2.x carries a `node` label
+#   - container_cpu_usage_seconds_total / container_memory_working_set_bytes:
+#     cAdvisor active usage — this cluster's cAdvisor carries `node`
+#     natively; the node_uname_info join is the fallback for stacks where
+#     it does not (query B renders empty there, and only A is used)
+#   - kube_pod_info: pods scheduled per node (requested-side view)
+# Everything sums per node and fails soft: an absent family is a null
+# column, never a broken tab.
+_NODES_QUERIES = (
+    ("alloc_cpu", 'kube_node_status_allocatable{resource="cpu"}'),
+    ("alloc_mem", 'kube_node_status_allocatable{resource="memory"}'),
+    ("req_cpu", 'sum by (node) (kube_pod_container_resource_requests{resource="cpu", node!=""})'),
+    ("req_mem", 'sum by (node) (kube_pod_container_resource_requests{resource="memory", node!=""})'),
+    ("lim_cpu", 'sum by (node) (kube_pod_container_resource_limits{resource="cpu", node!=""})'),
+    ("lim_mem", 'sum by (node) (kube_pod_container_resource_limits{resource="memory", node!=""})'),
+    (
+        "used_cpu_a",
+        'sum by (node) (rate(container_cpu_usage_seconds_total{container!="",image!=""}[5m]))',
+    ),
+    (
+        "used_cpu_b",
+        (
+            "sum by (node) (rate(container_cpu_usage_seconds_total{container!="
+            '"",image!=""}[5m]) * on(instance) group_left(node) node_uname_info)'
+        ),
+    ),
+    (
+        "used_mem_a",
+        'sum by (node) (container_memory_working_set_bytes{container!="",image!=""})',
+    ),
+    (
+        "used_mem_b",
+        (
+            "sum by (node) (container_memory_working_set_bytes{container!="
+            '"",image!=""} * on(instance) group_left(node) node_uname_info)'
+        ),
+    ),
+    ("pods", 'count by (node) (kube_pod_info{node!=""})'),
+)
+
+# Which nodes the Nodes tab shows by default. The GPU nodes are the ones
+# operators size against (requests near capacity there); detect them from
+# the nvidia GPU allocatable instead of hard-coding hostnames. Precedence:
+# PROM_UI_NODE_FILTER regex > detected GPU nodes > every node.
+_NODES_FILTER_QUERY = 'kube_node_status_allocatable{resource="nvidia_com_gpu"}'
+_DEFAULT_NODE_FILTER = "all"
+
+
+def _node_filter(
+    environ: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Parse the shown-node selection: (kind, value).
+
+    kind is "env" (a regex applied to node names; the literal "all" or an
+    empty value means every node) or "default" (same meaning — the
+    selection itself is computed at request time from the GPU allocatable).
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("PROM_UI_NODE_FILTER") or "").strip()
+    if raw:
+        if raw.lower() == "all":
+            return "env", "all"
+        try:
+            re.compile(raw)
+        except re.error:
+            return "default", _DEFAULT_NODE_FILTER  # invalid regex -> default
+        return "env", raw
+    return "default", _DEFAULT_NODE_FILTER
+
+
+def _gpu_nodes_from_allocatable(data) -> set[str]:
+    """nvidia_com_gpu allocatable series -> set of node names.
+
+    Any node with a GPU allocatable (value >= 0 and the series present) is
+    a GPU node — value 0 with the label present still counts (GPU operator
+    taints don't change the allocatable label's existence).
+    """
+    out: set[str] = set()
+    if not isinstance(data, dict):
+        return out
+    for r in data.get("result", []):
+        node = (r.get("metric") or {}).get("node")
+        if node:
+            try:
+                float(r.get("value", [None, None])[1])
+            except (TypeError, ValueError):
+                continue
+            out.add(str(node))
+    return out
+
+
+def _label_value_rows(data: dict) -> dict[str, float]:
+    """Instant-vector rows -> {label-value: float}, first label wins ties.
+
+    Works for every per-node block (each query sums/groups BY node, so the
+    remaining labels are just the metric name): the value label is `node`
+    for the kube-state-metrics/cAdvisor queries and `nodename` for the
+    node-exporter fallbacks.
+    """
+    out: dict[str, float] = {}
+    if not isinstance(data, dict):
+        return out
+    for r in data.get("result", []):
+        labels = r.get("metric") or {}
+        key = labels.get("node") or labels.get("nodename") or labels.get("instance")
+        if not key:
+            continue
+        try:
+            value = float(r.get("value", [None, None])[1])
+        except (TypeError, ValueError):
+            continue
+        out.setdefault(str(key), value)  # first wins — queries group by node
+    return out
 
 
 def _host_key(host: str) -> str:
@@ -298,10 +463,11 @@ def _gpu_snapshot(
         return series.get(key, (None, None))[0]
 
     keys = sorted({*util_b.get("series", {}), *used_b.get("series", {})}, key=lambda k: (k[0], k[1]))
-    gpus, by_host = [], {}
+    gpus: list[dict] = []
+    by_host: dict[str, list[dict]] = {}
     for key in keys:
         host, idx = key
-        labels = (util_b.get("series", {}).get(key) or used_b.get("series", {}).get(key) or (None, {}))[1]
+        labels: dict = (util_b.get("series", {}).get(key) or used_b.get("series", {}).get(key) or (None, {}))[1]
         used, free = val("fb_used", key), val("fb_free", key)
         total = (used or 0) + (free or 0) if used is not None or free is not None else None
         xid = val("xid", key)
@@ -394,6 +560,135 @@ def _gpu_snapshot(
     }
 
 
+def _nodes_snapshot(
+    blocks: dict,
+    gpu_nodes: set[str],
+    node_filter: tuple[str, str],
+) -> dict:
+    """Assemble the /api/nodes payload from per-metric blocks (fail-soft).
+
+    ``blocks`` maps each _NODES_QUERIES name to an error dict or a
+    ``_label_value_rows`` result keyed by node name. GPU nodes (from the
+    GPU-allocatable block) always rank first; the PROM_UI_NODE_FILTER regex
+    narrows further (a regex that matches nothing falls back to all nodes
+    rather than an empty tab). Every column degrades independently: a block
+    that errored leaves that field null (the UI renders "—"), so a cluster
+    without kube-state-metrics still shows usage, and vice versa.
+    """
+
+    def rows(name: str) -> dict[str, float]:
+        block = blocks.get(name, {})
+        return {} if "error" in block else block.get("rows", {})
+
+    alloc_cpu, alloc_mem = rows("alloc_cpu"), rows("alloc_mem")
+    req_cpu, req_mem = rows("req_cpu"), rows("req_mem")
+    lim_cpu, lim_mem = rows("lim_cpu"), rows("lim_mem")
+    pods = rows("pods")
+    used_cpu_a, used_cpu_b = rows("used_cpu_a"), rows("used_cpu_b")
+    used_mem_a, used_mem_b = rows("used_mem_a"), rows("used_mem_b")
+
+    all_nodes = {
+        *(alloc_cpu or {}),
+        *(alloc_mem or {}),
+        *(req_cpu or {}),
+        *(req_mem or {}),
+        *(lim_cpu or {}),
+        *(lim_mem or {}),
+        *(pods or {}),
+        *(used_cpu_a or {}),
+        *(used_mem_a or {}),
+    }
+
+    # GPU nodes first (they are the sizing targets), then the rest sorted.
+    ranked = sorted(all_nodes, key=lambda n: (n not in gpu_nodes, n))
+
+    kind, raw_filter = node_filter
+    shown = ranked
+    filter_source = {"env": "env", "query": "query"}.get(kind, "default")
+    if kind in ("env", "query") and raw_filter != "all":
+        filter_source = "env" if kind == "env" else "query"
+        try:
+            rx = re.compile(raw_filter, re.IGNORECASE)
+        except re.error:  # defensive — _node_filter already validated
+            rx = None
+        if rx is not None:
+            matched = [n for n in ranked if rx.search(n)]
+            # a filter matching nothing is an operator typo, not an empty tab
+            shown = matched if matched else ranked
+    elif kind == "default" and gpu_nodes:
+        # the default selection IS the GPU nodes (the sizing targets)
+        shown = [n for n in ranked if n in gpu_nodes]
+
+    out = []
+    for node in shown:
+        short = node.split(".", 1)[0]
+        # usage: cAdvisor-with-node-label (A) wins; the node_uname_info join
+        # (B) fills in only where A reported nothing for that node.
+        u_cpu = used_cpu_a.get(node, used_cpu_b.get(node))
+        u_mem = used_mem_a.get(node, used_mem_b.get(node))
+        ac, am = alloc_cpu.get(node), alloc_mem.get(node)
+        rc, rm = req_cpu.get(node), req_mem.get(node)
+        lc, lm = lim_cpu.get(node), lim_mem.get(node)
+        out.append(
+            {
+                "node": node,
+                "hostname": short,
+                "gpu_node": node in gpu_nodes,
+                "alloc_cpu": _r(ac, 2),
+                "alloc_mem": _r(am),
+                "req_cpu": _r(rc, 2),
+                "req_mem": _r(rm),
+                "lim_cpu": _r(lc, 2),
+                "lim_mem": _r(lm),
+                "used_cpu": _r(u_cpu, 2),
+                "used_mem": _r(u_mem),
+                "pods": int(pods[node]) if node in pods else None,
+                "req_cpu_pct": _r(100 * rc / ac, 1) if rc is not None and ac else None,
+                "lim_cpu_pct": _r(100 * lc / ac, 1) if lc is not None and ac else None,
+                "used_cpu_pct": _r(100 * u_cpu / ac, 1) if u_cpu is not None and ac else None,
+                "req_mem_pct": _r(100 * rm / am, 1) if rm is not None and am else None,
+                "lim_mem_pct": _r(100 * lm / am, 1) if lm is not None and am else None,
+                "used_mem_pct": _r(100 * u_mem / am, 1) if u_mem is not None and am else None,
+            }
+        )
+
+    def agg(field: str, scale: float = 1.0) -> float | None:
+        vals = [n[field] for n in out if n[field] is not None]
+        return _r(sum(vals) * scale, 2) if vals else None
+
+    # Cluster row: sums of the shown nodes (not the hidden ones — the tab's
+    # numbers must add up to what the user sees).
+    summary = {
+        "nodes": len(out),
+        "gpu_nodes": sum(1 for n in out if n["gpu_node"]),
+        "alloc_cpu": agg("alloc_cpu"),
+        "alloc_mem": agg("alloc_mem"),
+        "req_cpu": agg("req_cpu"),
+        "req_mem": agg("req_mem"),
+        "lim_cpu": agg("lim_cpu"),
+        "lim_mem": agg("lim_mem"),
+        "used_cpu": agg("used_cpu"),
+        "used_mem": agg("used_mem"),
+        "pods": agg("pods"),
+    }
+    for res in ("cpu", "mem"):
+        total = summary[f"alloc_{res}"]
+        for kind_ in ("req", "lim", "used"):
+            summary[f"{kind_}_{res}_pct"] = (
+                _r(100 * summary[f"{kind_}_{res}"] / total, 1)
+                if total and summary[f"{kind_}_{res}"] is not None
+                else None
+            )
+
+    return {
+        "summary": summary,
+        "nodes": out,
+        "node_filter_source": filter_source,
+        "node_filter": raw_filter if filter_source in ("env", "query") else None,
+        "gpu_nodes_detected": sorted(gpu_nodes) if gpu_nodes else None,
+    }
+
+
 def _load_html() -> str:
     override = os.environ.get("PROM_UI_HTML", "").strip()
     candidates = ([Path(override)] if override else []) + list(_HTML_CANDIDATES)
@@ -458,10 +753,7 @@ def _matrix_rows(data: dict, cap_series: int, cap_points: int) -> tuple[list[dic
     result = data.get("result", [])
     rows = []
     for r in result[:cap_series]:
-        values = [
-            [int(float(t)), format_value(v)]
-            for t, v in _downsample(r.get("values", []), cap_points)
-        ]
+        values = [[int(float(t)), format_value(v)] for t, v in _downsample(r.get("values", []), cap_points)]
         rows.append({"series": _series_id(r.get("metric")), "labels": r.get("metric", {}), "values": values})
     return rows, len(result)
 
@@ -492,8 +784,24 @@ def build_ui_routes(client, config) -> list[Route]:
             }
         )
 
-    async def overview(_request):
-        """Dashboard aggregate. Every block fails soft, independently."""
+    # Per-app-instance cache + single-flight state (closure-scoped: separate
+    # app builds — including tests — never share cache entries).
+    _overview_cache: dict[str, tuple[float, dict]] = {}
+    _overview_inflight: dict[str, asyncio.Future[tuple[dict, bool]]] = {}
+
+    def _mark_overview(base: dict, cached: bool, age: float) -> JSONResponse:
+        """Honest marking (D14): every overview response says whether it came
+        from the cache and how old the payload is (fresh = cached false, 0)."""
+        return JSONResponse({**base, "cached": cached, "cache_age_seconds": round(age, 3)})
+
+    async def _compute_overview() -> tuple[dict, bool]:
+        """Run the dashboard's ~14 upstream queries and build the payload.
+
+        Returns ``(payload, memoizable)``. ``memoizable`` is False when EVERY
+        block failed (upstream down) — failures are never memoized (D14); the
+        normal fail-soft mode (individual cards erroring on a cluster that
+        lacks e.g. DCGM) is a legitimate, cacheable payload.
+        """
         started = time.perf_counter()
 
         async def instant(query: str):
@@ -512,10 +820,7 @@ def build_ui_routes(client, config) -> list[Route]:
             try:
                 rows, _total = _vec_rows(await instant(query), config.max_series)
                 return {
-                    "items": [
-                        {"label": _short_top_label(r["labels"]), "value": r["value"]}
-                        for r in rows
-                    ],
+                    "items": [{"label": _short_top_label(r["labels"]), "value": r["value"]} for r in rows],
                     "query": query,
                 }
             except Exception as exc:
@@ -526,10 +831,13 @@ def build_ui_routes(client, config) -> list[Route]:
             try:
                 s = parse_timestamp(start) or parse_timestamp("now-3h")
                 e = parse_timestamp("now")
-                step = parse_step("", s, e)
+                step, clamp_notice = resolve_step("", s, e)
                 data = await client.range_query(query, s, e, step)
                 rows, _total = _matrix_rows(data, 5, config.max_points)
-                return {"series": rows, "start": s, "end": e, "step": step, "query": query}
+                block = {"series": rows, "start": s, "end": e, "step": step, "query": query}
+                if clamp_notice:
+                    block["step_notice"] = clamp_notice
+                return block
             except Exception as exc:
                 return {"error": str(exc), "query": query}
 
@@ -555,16 +863,49 @@ def build_ui_routes(client, config) -> list[Route]:
             asyncio.gather(*(trend(tw) for tw in _OVERVIEW_TRENDS)),
             alerts_block(),
         )
-        return JSONResponse(
-            {
-                "generated_at": int(time.time()),
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-                "cards": {cq[0]: c for cq, c in zip(_OVERVIEW_CARDS, cards)},
-                "top": {tq[0]: t for tq, t in zip(_OVERVIEW_TOP, tops)},
-                "trends": {tw[0]: t for tw, t in zip(_OVERVIEW_TRENDS, trends)},
-                "alerts": alerts,
-            }
-        )
+        blocks = [*cards, *tops, *trends, alerts]  # gather results, in order
+        memoizable = bool(blocks) and not all("error" in b for b in blocks)
+        payload = {
+            "generated_at": int(time.time()),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "cards": {cq[0]: c for cq, c in zip(_OVERVIEW_CARDS, cards)},
+            "top": {tq[0]: t for tq, t in zip(_OVERVIEW_TOP, tops)},
+            "trends": {tw[0]: t for tw, t in zip(_OVERVIEW_TRENDS, trends)},
+            "alerts": alerts,
+        }
+        return payload, memoizable
+
+    async def overview(request):
+        """Dashboard aggregate, short-TTL cached (D14) and honestly marked.
+
+        Cache key = the request's actual parameter set; entries expire after
+        PROMETHEUS_OVERVIEW_CACHE_TTL seconds (0 disables everything, giving
+        exactly the pre-D14 recompute-every-refresh behavior). Concurrent
+        identical overviews share ONE computation (single-flight) instead of
+        stampeding the upstream. Failures (every block errored) are never
+        memoized.
+        """
+        ttl = _overview_cache_ttl()
+        key = repr(tuple(sorted(request.query_params.items())))
+        if ttl > 0:
+            entry = _overview_cache.get(key)
+            if entry is not None:
+                age = time.monotonic() - entry[0]
+                if age < ttl:
+                    return _mark_overview(entry[1], cached=True, age=age)
+            fut = _overview_inflight.get(key)
+            if fut is None:
+                fut = _overview_inflight[key] = asyncio.ensure_future(_compute_overview())
+        else:
+            fut = asyncio.ensure_future(_compute_overview())
+        try:
+            payload, memoizable = await fut
+        finally:
+            if ttl > 0 and _overview_inflight.get(key) is fut:
+                del _overview_inflight[key]
+        if ttl > 0 and memoizable:
+            _overview_cache[key] = (time.monotonic(), payload)
+        return _mark_overview(payload, cached=False, age=0.0)
 
     async def gpu(_request):
         """NVIDIA GPU (DCGM) aggregate: per-GPU + NVLink-domain + node views.
@@ -606,10 +947,60 @@ def build_ui_routes(client, config) -> list[Route]:
             payload = _gpu_snapshot(blocks, env_domains, {}, env_source)
         payload["generated_at"] = int(time.time())
         payload["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        payload["queries"] = {**{name: query for name, query in _GPU_QUERIES}, "nvlink_domain_info": _NVLINK_DOMAIN_QUERY}
-        payload["domains_detected"] = (
-            {h: [list(g) for g in grps] for h, grps in detected.items()} if detected else None
+        payload["queries"] = {
+            **{name: query for name, query in _GPU_QUERIES},
+            "nvlink_domain_info": _NVLINK_DOMAIN_QUERY,
+        }
+        payload["domains_detected"] = {h: [list(g) for g in grps] for h, grps in detected.items()} if detected else None
+        return JSONResponse(payload)
+
+    async def nodes(_request):
+        """Per-node CPU & memory capacity view (allocation vs usage).
+
+        One instant query per family (+ the GPU-allocatable probe), gathered
+        concurrently, assembled client-agnostically by _nodes_snapshot.
+        Fails soft exactly like /api/gpu: an absent metric family (or an
+        unreachable family) is a null column — the tab only hard-fails when
+        there is no node information at all.
+        """
+        started = time.perf_counter()
+        # ?filter=<regex> (UI input) wins over PROM_UI_NODE_FILTER; the
+        # literal "all" or empty -> the env/default selection.
+        qp = (_request.query_params.get("filter") or "").strip()
+        if qp:
+            node_filter = ("query", "all" if qp.lower() == "all" else qp)
+        else:
+            node_filter = _node_filter()
+
+        async def fetch(name_query):
+            name, query = name_query
+            try:
+                return name, {"query": query, "rows": _label_value_rows(await client.instant_query(query))}
+            except Exception as exc:
+                return name, {"error": str(exc), "query": query}
+
+        results = await asyncio.gather(*(fetch(nq) for nq in _NODES_QUERIES), fetch(("gpu_alloc", _NODES_FILTER_QUERY)))
+        blocks = dict(results[:-1])
+        gpu_alloc = results[-1][1]
+        gpu_nodes = (
+            {}
+            if "error" in gpu_alloc
+            else _gpu_nodes_from_allocatable(
+                {
+                    "result": [
+                        {"metric": {"node": node}, "value": [0, str(value)]}
+                        for node, value in gpu_alloc.get("rows", {}).items()
+                    ]
+                }
+            )
         )
+
+        payload = _nodes_snapshot(blocks, gpu_nodes, node_filter)
+        payload["generated_at"] = int(time.time())
+        payload["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        payload["queries"] = {name: query for name, query in _NODES_QUERIES}
+        payload["queries"]["gpu_alloc"] = _NODES_FILTER_QUERY
+        payload["nodes_total"] = payload["summary"].get("nodes", 0)
         return JSONResponse(payload)
 
     async def alerts(_request):
@@ -708,23 +1099,24 @@ def build_ui_routes(client, config) -> list[Route]:
         try:
             s = parse_timestamp(str(body.get("start") or "") or None) or parse_timestamp("now-1h")
             e = parse_timestamp(str(body.get("end") or "") or None) or parse_timestamp("now")
-            step = parse_step(str(body.get("step") or ""), s, e)
+            step, clamp_notice = resolve_step(str(body.get("step") or ""), s, e)
             started = time.perf_counter()
             data = await client.range_query(q, s, e, step)
             rows, total = _matrix_rows(data, config.max_series, config.max_points)
-            return JSONResponse(
-                {
-                    "resultType": "matrix",
-                    "result": rows,
-                    "n_total": total,
-                    "n_shown": len(rows),
-                    "start": s,
-                    "end": e,
-                    "step": step,
-                    "query": q,
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                }
-            )
+            payload = {
+                "resultType": "matrix",
+                "result": rows,
+                "n_total": total,
+                "n_shown": len(rows),
+                "start": s,
+                "end": e,
+                "step": step,
+                "query": q,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+            if clamp_notice:
+                payload["step_notice"] = clamp_notice
+            return JSONResponse(payload)
         except PrometheusError as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
         except Exception as exc:
@@ -776,6 +1168,7 @@ def build_ui_routes(client, config) -> list[Route]:
         Route("/api/status", status),
         Route("/api/overview", overview),
         Route("/api/gpu", gpu),
+        Route("/api/nodes", nodes),
         Route("/api/alerts", alerts),
         Route("/api/rules", rules),
         Route("/api/query", query, methods=["POST"]),

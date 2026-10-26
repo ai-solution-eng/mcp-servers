@@ -17,6 +17,14 @@ Design points:
 * Resource blocking: images / media / fonts are aborted at the route
   level — 3-5x faster loads and far less memory; text extraction does not
   need them.
+* CDP route filter (SSRF, fleet audit P0-6): the sidecar shares the pod's
+  network namespace, so a navigation to loopback would reach the MCP
+  container and the unauthenticated CDP endpoint itself
+  (``127.0.0.1:9222`` — RCE-as-browser-user). The top-level URL is
+  validated before ``page.goto`` (loopback/pod-local/metadata targets are
+  unreachable in every configuration — the fetch allowlist cannot unlock
+  them here), and the route handler additionally aborts any request
+  (redirects, iframes, subresources) toward such targets mid-render.
 
 Configuration (environment variables):
   BROWSER_CDP_URL           CDP endpoint (default http://127.0.0.1:9222)
@@ -26,6 +34,10 @@ Configuration (environment variables):
   BROWSER_MAX_PAGES         Max concurrent pages (default 3)
   BROWSER_BLOCK_RESOURCES   Block image/media/font requests (default true)
   BROWSER_MAX_HTML_BYTES    Cap on stored serialized DOM (default 5000000)
+  BROWSER_IGNORE_CERT_ERRORS  Skip TLS verification in rendered contexts
+                            (default false) — the browser-side mirror of the
+                            fetch ladder's FETCH_TLS_INSECURE_FALLBACK, for
+                            egress proxies whose CA is not (yet) installed
 """
 
 from __future__ import annotations
@@ -34,6 +46,8 @@ import asyncio
 import base64
 import os
 from dataclasses import dataclass
+
+import url_policy
 
 RENDER_MODES = ("auto", "always", "never")
 
@@ -84,33 +98,25 @@ class BrowserClient:
         max_pages: int | None = None,
         block_resources: bool | None = None,
         max_html_bytes: int | None = None,
+        ignore_cert_errors: bool | None = None,
     ):
         self.cdp_url = cdp_url or os.getenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
         self.connect_timeout_ms = (
-            connect_timeout_ms
-            if connect_timeout_ms is not None
-            else _env_int("BROWSER_CONNECT_TIMEOUT", 5000)
+            connect_timeout_ms if connect_timeout_ms is not None else _env_int("BROWSER_CONNECT_TIMEOUT", 5000)
         )
         self.navigation_timeout_ms = (
-            navigation_timeout_ms
-            if navigation_timeout_ms is not None
-            else _env_int("BROWSER_NAV_TIMEOUT_MS", 30000)
+            navigation_timeout_ms if navigation_timeout_ms is not None else _env_int("BROWSER_NAV_TIMEOUT_MS", 30000)
         )
-        self.extra_wait_ms = (
-            extra_wait_ms
-            if extra_wait_ms is not None
-            else _env_int("BROWSER_EXTRA_WAIT_MS", 1500)
-        )
+        self.extra_wait_ms = extra_wait_ms if extra_wait_ms is not None else _env_int("BROWSER_EXTRA_WAIT_MS", 1500)
         self.max_pages = max_pages if max_pages is not None else _env_int("BROWSER_MAX_PAGES", 3)
         self.block_resources = (
-            block_resources
-            if block_resources is not None
-            else _env_bool("BROWSER_BLOCK_RESOURCES", True)
+            block_resources if block_resources is not None else _env_bool("BROWSER_BLOCK_RESOURCES", True)
         )
         self.max_html_bytes = (
-            max_html_bytes
-            if max_html_bytes is not None
-            else _env_int("BROWSER_MAX_HTML_BYTES", 5_000_000)
+            max_html_bytes if max_html_bytes is not None else _env_int("BROWSER_MAX_HTML_BYTES", 5_000_000)
+        )
+        self.ignore_cert_errors = (
+            ignore_cert_errors if ignore_cert_errors is not None else _env_bool("BROWSER_IGNORE_CERT_ERRORS", False)
         )
         self._pw = None
         self._browser = None
@@ -135,14 +141,11 @@ class BrowserClient:
                 ) from e
             try:
                 self._pw = await async_playwright().start()
-                self._browser = await self._pw.chromium.connect_over_cdp(
-                    self.cdp_url, timeout=self.connect_timeout_ms
-                )
+                self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url, timeout=self.connect_timeout_ms)
             except Exception as e:
                 await self._teardown()
                 raise BrowserUnavailable(
-                    f"headless browser not reachable at {self.cdp_url} "
-                    f"({type(e).__name__}: {e})"
+                    f"headless browser not reachable at {self.cdp_url} ({type(e).__name__}: {e})"
                 ) from e
 
     async def _teardown(self):
@@ -175,18 +178,22 @@ class BrowserClient:
         """Render ``url`` with JS execution and return the serialized DOM
         (plus an optional PNG screenshot). Raises BrowserUnavailable /
         BrowserError; one automatic reconnect is attempted if the CDP
-        connection dropped."""
+        connection dropped.
+
+        SSRF guard: the URL is validated (same policy as the plain fetch
+        path) right before navigation. Loopback/pod-local/metadata targets —
+        the CDP endpoint at 127.0.0.1:9222 above all — are refused in every
+        configuration and never reach ``page.goto``.
+        """
         try:
             return await self._render_once(url, screenshot=screenshot, full_page=full_page)
         except (BrowserUnavailable, BrowserError):
             raise
-        except Exception as e:
+        except Exception:
             # Stale connection (sidecar restarted): drop it and retry once.
             await self._teardown()
             try:
-                return await self._render_once(
-                    url, screenshot=screenshot, full_page=full_page
-                )
+                return await self._render_once(url, screenshot=screenshot, full_page=full_page)
             except BrowserUnavailable:
                 raise
             except Exception as e2:
@@ -194,15 +201,19 @@ class BrowserClient:
 
     async def _render_once(self, url, *, screenshot, full_page):
         await self._ensure_connected()
+        # SSRF gate: after the CDP connect (which is not a navigation), but
+        # strictly before page.goto / any page-level network activity.
+        try:
+            await url_policy.validate_fetch_url_async(url, for_browser=True)
+        except url_policy.UrlPolicyError as e:
+            raise BrowserError(f"SSRF policy blocked navigation to {url}: {e}") from None
         async with self._page_sem:
-            context = await self._browser.new_context()
+            context = await self._browser.new_context(ignore_https_errors=self.ignore_cert_errors)
             page = await context.new_page()
             try:
                 if self.block_resources:
                     await context.route("**/*", self._route_filter)
-                response = await page.goto(
-                    url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms
-                )
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
                 # Give SPA frameworks a moment to hydrate; fixed and bounded
                 # (networkidle hangs on long-polling pages).
                 if self.extra_wait_ms > 0:
@@ -242,7 +253,14 @@ class BrowserClient:
                     pass
 
     async def _route_filter(self, route):
+        """Per-request guard: pod-local/loopback/metadata targets are aborted
+        outright (redirect targets, iframes and subresources included — the
+        pre-goto validation only saw the first URL), then the usual
+        image/media/font blocking applies."""
         try:
+            if url_policy.is_pod_local_url(route.request.url):
+                await route.abort()
+                return
             if route.request.resource_type in ("image", "media", "font"):
                 await route.abort()
             else:

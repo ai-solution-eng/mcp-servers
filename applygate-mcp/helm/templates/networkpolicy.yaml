@@ -1,0 +1,122 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicy — the MCP network zone. ADDITIVE and OFF by default
+# (networkPolicy.enabled, default false): the DEFAULT render is byte-identical
+# to the baseline. Once enabled, this policy DEFAULT-DENIES all ingress to the
+# MCP pods and admits ONLY the listed sources — a real posture, not a no-op.
+#
+# SCOPE (fleet contract, pcai-fleet-lib docs): this policy governs INGRESS —
+# who may call this MCP. Egress is intentionally NOT restricted by default
+# (networkPolicy.egress.enabled, default false): admin MCP servers legitimately
+# reach the Kubernetes API, Prometheus, or the public internet per chart, and a
+# wrong egress baseline would break the relay silently. Restrict egress per
+# site via networkPolicy.egress (DNS is always rendered when enabled).
+#
+# FLEET DOCTRINE (2026-09): the zone exists to stop RANDOM IN-CLUSTER model
+# access — external traffic keeps flowing through the SSO-gated edge gateway
+# exactly as pre-zone, so allowEzafGatewayIngress defaults TRUE and the
+# VirtualService stays rendered for every chart with a browser frontend.
+# Closing a browser path is an explicit, per-chart, per-site decision
+# (e.g. exec/mutation consoles) — never a class default.
+#
+# Kubelet probes / kubectl port-forward originate at the NODE: no
+# pod/namespace selector can match them, so the probe relief is an ipBlock
+# allowance (probeCidrs) with the pod CIDR carved back out
+# (probeExceptCidrs) so cross-namespace pod traffic stays governed by the
+# rules above. A 0.0.0.0/0 probeCidrs value with an empty probeExceptCidrs
+# FAILS the render — that would be an unrestricted app-port allow, the
+# opposite of the zone this policy exists to express.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/type": vendor-service
+    "hpe-ezua/app": {{ .Chart.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # (i) Same-namespace callers (registry scraping / co-deployed ops tooling).
+    {{- if .Values.networkPolicy.sameNamespace }}
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (ii) The MCP network zone: authorized client namespaces — the callers
+    #      listed in networkPolicy.authorizedClients.namespaces (the LLM
+    #      gateway's relay namespace, agentic frontends' namespaces, ...).
+    #      ⚠️ L3 trust: an allowed namespace admits ANY pod in it (workload
+    #      identity requires mesh injection + a workload AuthorizationPolicy —
+    #      see pcai-fleet-lib's documented L7 upgrade path).
+    {{- with .Values.networkPolicy.authorizedClients.namespaces }}
+    - from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (iii) ezaf-gateway pods — the ezua VirtualService path (browser traffic).
+    #       ADMIN class: DISABLED by default (see header). USER-FACING class:
+    #       enabled so frontends keep working unchanged.
+    {{- if .Values.networkPolicy.allowEzafGatewayIngress }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressGatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressGatewayLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+    {{- end }}
+    # (iv) Node-originated kubelet health probes + `kubectl port-forward`.
+    {{- range .Values.networkPolicy.probeCidrs }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | quote }}
+            {{- with $.Values.networkPolicy.probeExceptCidrs }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - port: {{ $.Values.service.port }}
+          protocol: TCP
+    {{- end }}
+  {{- if .Values.networkPolicy.egress.enabled }}
+  egress:
+    # DNS — kube-dns in kube-system, UDP+TCP 53. Without this rule everything
+    # else breaks (every peer is resolved by name first). node-local-dns
+    # sites: append a rule for the 169.254.20.10 injector.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- with .Values.networkPolicy.egress.extraEgress }}
+    # Site-supplied destinations (k8s API, Prometheus, model endpoints...).
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

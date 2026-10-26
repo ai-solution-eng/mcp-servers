@@ -1,132 +1,379 @@
-# Prometheus MCP Server
+# prometheus-mcp
 
-MCP 2.0 server for **read-only** querying of a Prometheus instance — the *time-series* half of cluster observability. A Kubernetes API server sees **state** (pods, events, logs, instantaneous `top`); Prometheus sees **behavior over time** (rates, trends, quantiles, alert state). Together they complete an ops agent: the K8s MCP answers "what happened", this server answers "since when, how fast, and
-why".
+prometheus-mcp is a read-only **Prometheus observation** MCP (Model Context
+Protocol) server: it evaluates instant and range PromQL queries, discovers
+series and label values, lists currently firing/pending alerts, and exposes
+alerting/recording rules with their exact expressions — all against the
+in-cluster Prometheus over plain read-only HTTP, with LLM-safe response
+shaping (shape-preserving downsampling, 4-significant-digit rounding, series
+and label-value caps) so a busy cluster never floods a model's context. It
+serves MCP 2.0 (stateless streamable-HTTP at `/mcp`) behind the PCAI Istio
+gateway, plus an HPE-branded web console (dashboard, GPU/NVLink view, query
+editor, alerts & rules) at `/`.
 
-## Tools (all read-only)
+**What problem(s) it solves**
+
+- Ops agents see state (pods, events, logs) but not **behavior over time**:
+  this server answers "since when, how fast, and why" — the natural pairing
+  with a Kubernetes MCP ("what happened") for evidence-backed triage instead
+  of guesses.
+- Raw Prometheus API responses overwhelm a model context: `prom_query_range`
+  downsamples to a bounded number of evenly-spaced points per series (the
+  shape — ramp/spike/sawtooth — survives), and series/label-value counts are
+  capped with truncation footers.
+- Building queries blind is slow: `prom_series` + `prom_label_values`
+  discover what labels exist before an exact query is written.
+- "Is anything wrong?" needs one call: `prom_alerts` lists firing/pending
+  alerts with severity, labels, and annotations; `prom_rules` shows the exact
+  condition and threshold behind each alert.
+- Humans need the same data without writing PromQL: the web console at `/`
+  provides a dashboard, a per-GPU/NVLink fleet view (DCGM), a per-node CPU
+  & memory capacity view, a query editor with charts, and an alerts & rules
+  browser — over the same client and caps as the tools.
+- GPU fleet visibility: the GPU tab groups each node's GPUs into NVLink
+  islands, detected from the hardware by an optional DaemonSet (or pinned
+  explicitly via `gpuNvlinkDomains`).
+- Capacity planning: the Nodes tab shows each node's CPU cores and memory as
+  three bars — requested / limited / active — against that node's
+  allocatable track, plus per-node 3h trends and a sortable table. The GPU
+  nodes are selected by default (auto-detected from the nvidia GPU
+  allocatable); `nodeFilter` (values) or the browser filter input change
+  the selection (`all` = every node).
+
+## Tools
+
+All tools are read-only and talk to one Prometheus instance.
 
 | Tool | Purpose |
-| --- | --- |
-| `prom_query` | Instant PromQL at a point in time (now / `now-6h` / unix / RFC3339) |
-| `prom_query_range` | Range query — trends, spikes, leaks, sawtooth-vs-plateau |
-| `prom_series` | Which series exist for a selector (label discovery before querying) |
-| `prom_label_values` | Values of one label (list pods/namespaces reporting a metric) |
-| `prom_alerts` | Currently firing/pending alerts, with labels + annotations |
-| `prom_rules` | Alerting/recording rules with their expressions, filterable by state |
+|---|---|
+| `prom_query` | Instant PromQL at a point in time (now / `now-6h` / unix / RFC3339) — current values: rates, error %, memory, queue depth. |
+| `prom_query_range` | Range query — trends, spikes, leaks, sawtooth-vs-plateau; downsampled, series-capped. |
+| `prom_series` | Which series exist for a selector with their label sets — discovery before querying. |
+| `prom_label_values` | Values of one label (e.g. list pods/namespaces reporting a metric), optionally restricted by a selector. |
+| `prom_alerts` | Currently firing/pending alerts with severity, labels, annotations, age. |
+| `prom_rules` | Alerting/recording rules with expressions, filterable by state and name. Capped at `max_rules` (default 50) with a `…[truncated N more rules]` footer — a kube-prometheus-stack ships hundreds of rules and rendering every expr unbounded floods the context; narrow with `state`/`search` instead of paging. |
+| `query_save` | Save a query (+ optional run params) under a name (Wave-5). |
+| `query_list` | List saved queries — name, params, expression; no Prometheus traffic. |
+| `query_delete` | Remove one saved query by name. |
+| `query_saved` | RUN a saved query through the same instant/range paths as `prom_query`/`prom_query_range` (clamps, caps, validation all apply). |
 
-## LLM-safe shaping
+Both query tools take an optional `include_hints` flag (default `true`) —
+see "Query hints" below.
 
-Range queries are downsampled to a bounded number of evenly-spaced points per series (the *shape* — ramp/spike/sawtooth — survives), floats are rounded to 4 significant digits, and the series count is capped per response with a truncation footer naming the count. Caps are env-tunable (`PROM_MAX_SERIES`/`PROM_MAX_POINTS`/`PROM_MAX_LABEL_VALUES`). A busy cluster never floods a model's context.
+## Architecture
 
-## Web UI (HPE-branded)
+A single Python service (Starlette, MCP 2.0 stateless, JSON responses) that
+talks to one backend: the **Prometheus HTTP API** (default: the
+kube-prometheus-stack service in the `prometheus` namespace — set
+`prometheusUrl` if your cluster differs). It needs **no Kubernetes RBAC at
+all** — plain read-only HTTP with the pod's identity. The optional
+NVLink-topology DaemonSet (GPU nodes only) runs `nvidia-smi topo -m` at node
+boot and pushes the detected islands to the pushgateway for the GPU tab; it
+fails soft — a node without a working driver mount never breaks the page.
+HTTP surface: `/mcp` (MCP streamable-HTTP), `/health` + `/healthz`, the web
+console at `/` + `/api/*` (always served — this chart has no webui toggle),
+an optional **API-key gate on `/mcp`** (see "API-key auth" below), and an
+optional gateway-level auth gate (`ezua.authorizationPolicy`, off by
+default).
 
-The streamable-http server also serves a self-contained, no-build web UI — the same HPE branding as the SQLhandler explorer (green element mark, MetricHPE wordmark, light/dark theme with no-flash init and `localStorage` persistence). It is a **read-only** human front-end over the SAME `PrometheusClient` + caps that back the MCP tools, available at `/` (and `/ui`) — through the PCAI gateway too,
-since the VirtualService already routes `/` to the service.
+## API-key auth — OPTIONAL (fleet pattern)
 
-| Tab | What it shows |
-| --- | --- |
-| **Dashboard** | The nice stats: firing/pending alert counts, up targets, node CPU/memory **+ GPU util/memory** %, running pods, top-pods-by-CPU/memory, **top GPU workloads by framebuffer**, cluster CPU + memory trend lines (last 3h), active alerts preview. Optional 30s auto-refresh. |
-| **GPU** | NVIDIA fleet view (DCGM exporter): per-GPU utilization/framebuffer/temp/power/NVLink traffic, grouped into the **per-node NVLink domains**, per-domain workload attribution, GPU trend lines, and the full 16-GPU table. Tables are sortable by any column; rows of one deployment band together (alternating lighter/darker) so workloads read as blocks. |
-| **Query** | PromQL editor with Instant/Range modes (`now-6h`-style relative times, auto step), SVG line chart + table for range results, CSV copy, preset library in the sidebar (incl. a GPU category), saved queries + history (browser-local). |
-| **Alerts & Rules** | Full alert table (state/severity badges, ages, labels, summaries) with filters, plus the rule browser showing each rule's exact expression — searchable, filterable by state. |
-| **MCP Tools** | The tool catalog: what each of the six tools is good for, when an agent reaches for it, arguments, tips, clickable example queries, and the K8s-MCP triage-pairing workflow. |
+`/mcp` requires an API key **only when** `PROMETHEUS_API_KEYS` (or the
+fleet-universal `MCP_API_KEYS` — either var works, key sets are unioned) is
+configured. Default values leave both unset = the server runs **open**, with
+a loud startup warning naming the env vars (optional-by-design fleet
+decision 2026-09: this is a read-only observation surface fronted by the
+SSO-gated edge gateway). The gate scopes to the `/mcp` prefix ONLY:
+`/health`, `/healthz`, the web console, its `/api/*` routes, and the
+opt-in `/metrics` stay key-free — kubelet probes and the ServiceMonitor
+scrape never need a key.
 
-Every dashboard card fails soft: a metric that doesn't exist on a given cluster shows an error inline instead of breaking the page, and the JSON API mirrors the MCP-side caps so a busy cluster can't flood the browser either.
+The chart never inlines a key — pre-deploy the Secret, then point the
+values at it (no pod restart needed; the server re-reads the env per
+request):
 
-### NVLink grouping: detected, not hardcoded
+```bash
+kubectl -n prometheus-mcp create secret generic prometheus-mcp-apikey \
+  --from-literal="api-keys=$(openssl rand -hex 32)"
+helm upgrade prometheus-mcp helm/ -n prometheus-mcp --reuse-values \
+  --set apiKey.existingSecret=prometheus-mcp-apikey
+```
 
-The GPU tab groups each node's GPUs into NVLink islands. Precedence:
+Keys are a comma-separated list (`api-keys=new,old`) — that is the rotation
+mechanism (append → move clients → drop the old, no downtime).
 
-1. **Explicit override** — `gpuNvlinkDomains` (values) / `PROM_UI_GPU_NVLINK_DOMAINS` (env)
-2. **Auto-detected** — the bundled `nvlink-topology` DaemonSet (enabled by default) runs `nvidia-smi topo -m` at **GPU-node boot**, computes the connected components of the NVLink graph, and pushes `nvidia_gpu_nvlink_domain{gpu,domain,peers,hostname}` to the pushgateway. NVLink topology is hardware-fixed, so detection is effectively once per node; the container re-verifies daily as belt-and-braces and otherwise idles at ~0 CPU (one tiny Running pod per GPU node is expected — DaemonSet pods only allow `restartPolicy: Always`, so the container supervises its single-shot script).
-3. **Built-in default** — two 4-GPU islands per 8-GPU H200 NVL node.
+**Migrating from the no-key posture:** nothing to do to keep current
+behavior — with no Secret referenced, the server keeps running open with
+the warning. To tighten a deployment, create + reference the Secret as
+above; in-cluster callers (LLM gateway, DSH) then present the key in
+`Authorization: Bearer …` or `X-API-Key` (update those clients' configs in
+the same change). Saved-query storage itself has no auth layer of its own —
+the gate is transport-level on `/mcp` only.
 
-A node whose `nvlink-topology` pod keeps logging failures (missing driver mount, admission policy) can never break the dashboard — the UI silently keeps the next grouping in the chain.
+## Deploy on PCAI (HPE Private Cloud AI)
 
-### JSON API (all read-only)
+Import the packaged chart once into PCAI, then edit the chart's values in the
+PCAI **Helm Values** editor and apply — you never run `helm install` or
+`kubectl apply` for the deployment itself. Every `helm --set a.b=c`
+corresponds 1:1 to a values key. `${DOMAIN_NAME}` in ezua values is resolved
+by PCAI's deployment pipeline before helm runs — keep the placeholder. Note
+`ezua.domainName` is informational only: the gateway host comes solely from
+`ezua.virtualService.endpoint`.
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/status` | Server status + Prometheus URL + caps |
-| `GET /api/overview` | Dashboard aggregate (cards, top-N, trends, alerts) |
-| `GET /api/gpu` | GPU aggregate (DCGM): per-GPU stats, NVLink domains, node + cluster summaries — fails soft without DCGM |
-| `GET /api/alerts` | Alerts, shaped + counted (`n_total` accurate, items capped) |
-| `GET /api/rules?state=&search=` | Rules with expressions, filtered |
-| `POST /api/query` | Instant query `{"query", "time"?}` |
-| `POST /api/query_range` | Range query `{"query", "start", "end", "step"?}` |
-| `GET /api/series?match=` | Series/label discovery for a selector |
-| `GET /api/label_values?label=&match=` | Values of one label |
+**Required values**:
 
-Prometheus upstream errors map to HTTP 502 with the error text; malformed requests to 400. The UI asset (`ui/index.html`) is copied into `/app/ui` by the Dockerfile; `webui.py` also honors a `PROM_UI_HTML` override.
+```yaml
+prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+#                SITE: the in-cluster Prometheus service — the
+#                kube-prometheus-stack default; adjust the release/namespace
+#                if your cluster names it differently
+ezua:
+  enabled: true                      # SITE: expose through the PCAI Istio gateway
+  domainName: ${DOMAIN_NAME}          # informational — no template reads it
+  virtualService:
+    endpoint: prometheus-mcp.${DOMAIN_NAME}   # SITE: /mcp -> MCP server; / -> web console
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s                    # long: wide range queries can run for minutes
+```
 
-## Configuration (environment variables)
+**Optional values**: `gpuNvlinkDomains` (pin the GPU-tab NVLink grouping),
+`nvlinkAutodetect.*` (the DaemonSet detector — disable if you pin the
+grouping or want no resident pods), `image.*` (this chart pins
+`pullPolicy: Always` for a reason — see `helm/values.yaml`), `resources`,
+`ezua.authorizationPolicy.*` (gateway-level oauth2-proxy enforcement, off by
+default). Complete paste-ready documents:
+[helm/values-examples/values.g2.yaml](helm/values-examples/values.g2.yaml)
+and
+[helm/values-examples/values.hosted-trial.yaml](helm/values-examples/values.hosted-trial.yaml).
 
-| Variable | Default | Meaning |
+### Mandatory endpoint when the gateway is on
+
+`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**
+(this chart's default): `templates/virtualservice.yaml` and — when the
+authorization gate is on — `templates/authorizationpolicy.yaml` call Helm's
+`required` on it, so an empty endpoint aborts the render before anything is
+created — `Valid .Values.ezua.virtualService.endpoint is required !` /
+`… is required when ezua is enabled !`. It must be unique per release on the
+shared ezaf-gateway, and it is the *only* gateway host: `ezua.domainName` is
+informational (no template reads it). With `ezua.enabled: false` nothing is
+rendered from it — in-cluster Service access only.
+
+### Saved-query persistence (`persistence.*` — default OFF)
+
+`query_save`/`query_list`/`query_delete`/`query_saved` keep their JSON store
+in memory unless `persistence.enabled: true` wires `PROMETHEUS_SAVED_QUERIES_PATH`
+to `<mountPath>/<savedQueriesFile>` on a dedicated PVC
+(`<deployment.name>-data`) — every pod update/reschedule otherwise silently
+forgets every saved query. Sub-keys:
+
+| Key | Default | Effect |
 | --- | --- | --- |
-| `PROM_URL` | `http://kubeprom-prometheus.prometheus.svc.cluster.local:9090` | Prometheus base URL (kube-prometheus-stack default on G2) |
-| `PROM_TIMEOUT` | `30` | HTTP timeout seconds |
-| `PROM_MAX_SERIES` | `20` | Max series per response |
-| `PROM_MAX_POINTS` | `60` | Max (downsampled) points per range series |
-| `PROM_MAX_LABEL_VALUES` | `200` | Max label values per response |
-| `PROM_BEARER_TOKEN_ENV` | — | Env-var NAME holding a bearer token (value never in config) |
-| `PROM_UI_GPU_NVLINK_DOMAINS` | `[[0,1,2,3],[4,5,6,7]]` (built-in default) | GPU-tab NVLink island grouping — JSON list of GPU-index groups, applied per node (Helm knob: `gpuNvlinkDomains`). Beats auto-detection; beats the built-in default |
+| `persistence.mountPath` | `/data` | Where the store volume mounts in the container. |
+| `persistence.savedQueriesFile` | `saved-queries.json` | Store file **inside** the mount, pinned explicitly so a moved `mountPath` cannot silently orphan an existing store. |
+| `persistence.size` | `1Gi` | PVC storage request. |
+| `persistence.storageClass` | `""` | Empty = cluster default StorageClass. |
+| `persistence.accessModes` | `[ReadWriteOnce]` | `replicaCount > 1` with a RWO class strands extra replicas Pending — flip to a RWX class (gl4f-filesystem RWX on G2) or keep 1 replica (the fleet default). |
+| `persistence.shared` | `false` | **Per-replica honesty:** the store is per-replica — `replicaCount > 1` fragments stores (each replica keeps its own memory/file) and the server cannot know its own replica count. Set `true` ONLY when the store is genuinely shared across replicas (single replica, or a RWX volume every replica mounts); it renders `PROMETHEUS_SAVED_QUERIES_SHARED=1` and silences the per-replica warning `query_save` otherwise attaches to its result. It is a declaration about the deployment, **not** concurrency control — there is no cross-process locking (a multi-writer JSON store would lose updates silently). |
 
-No RBAC is needed: the in-cluster Prometheus HTTP API is plain read-only HTTP, and the pod needs no Kubernetes permissions at all.
+### Standard Kubernetes knobs
 
-## Local development
+Defaults fit the fleet baseline; overridable per deployment.
 
-```bash
-uv venv --python 3.12 .venv
-UV_CACHE_DIR=$PWD/.uv-cache uv pip install -e . pytest
-.venv/bin/python -m pytest tests/ -v   # 29 unit tests (fully mocked)
+| Key | Default | Effect |
+| --- | --- | --- |
+| `deployment.appName` | `prometheus-mcp` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is, and names the PVC). Leave at the default; mismatched selectors break the Service/VS wiring. |
+| `image.tag` | `v0.7.0` | Kept in lockstep with the pushed image tags / Chart.yaml `appVersion`; the release tooling bumps it. Pin a site override only deliberately — a stale tag is how "old MCP" pods happen. |
+| `resources.requests.cpu` | `100m` | CPU request (limits: memory `512Mi`; requests.memory `128Mi`, no CPU limit). |
 
-# Live check (needs a route to the Prometheus — run in-cluster or port-forward):
-PROM_URL=http://localhost:9090 .venv/bin/python tests/live_check.py
+## Connect an MCP client
 
-# Locally with stdio (inspector):
-PROM_URL=http://localhost:9090 .venv/bin/python server.py --transport stdio
+Any MCP client that speaks streamable-HTTP connects to `/mcp` (stateless —
+no session header needed); humans use the web console at `/`:
 
-# Locally with the web UI:
-PROM_URL=http://localhost:9090 .venv/bin/python server.py \
-    --transport streamable-http --port 9095
-# -> http://localhost:9095/
+```json
+{
+  "mcpServers": {
+    "prometheus-mcp": {
+      "url": "https://prometheus-mcp.<your-domain>/mcp"
+    }
+  }
+}
 ```
 
-## Deployment
+Clients that want the transport spelled out accept `"type": "http"`
+(Claude Code / Claude Desktop) or `"transport": "streamable-http"` (DSH
+profile, opencode). In-cluster consumers can use the service DNS instead:
+`http://prometheus-mcp-service.<namespace>.svc.cluster.local:9095/mcp`. If
+`ezua.authorizationPolicy.enabled=true`, external callers must present a
+valid PCAI token on every call.
 
-Reachable from OUTSIDE the cluster through the PCAI gateway (DSH runs locally on the operator's laptop, so MCP clients hit the ezaf-gateway, not cluster DNS — same topology as searxng-mcp/sqlhandler). The MCP path uses a long VirtualService timeout because wide range queries can run for minutes. The gateway-level oauth2 gate is supported (`ezua.authorizationPolicy`) but **off by default**: the
-rotating 30-min SSO token is a known pain for machine MCP callers — an accepted lab trade (flip it on per environment if the trust posture changes).
+## Self-metrics (GET /metrics — default OFF)
 
-```bash
-docker buildx build -t ghcr.io/ai-solution-eng/prometheus-mcp:v0.1.0 . --push
-helm upgrade --install prometheus-mcp helm/ -n prometheus-mcp \
-    --create-namespace -f helm/local/values.se-g2.yaml
-# verify: https://prometheus-mcp.<cluster-domain>/mcp answers an initialize
-# handshake; in-cluster clients may use the service DNS instead.
-```
+The MCP server exports ITS OWN request counters (not the upstream
+Prometheus's series) at `GET /metrics`: one counter family,
+`prometheus_mcp_tool_requests_total{tool,outcome}` — per-tool call counts
+with outcome ok|error (a tool's "Error: ..." string or exception both count
+as error). No PromQL text, label names, or error strings are exported.
+Chart-gated default-OFF: `metrics.enabled: false` (the default) renders no
+env and no ServiceMonitor and the server serves no `/metrics` route — the
+default pod is unchanged. Set `metrics.enabled: true` (values) to enable;
+`/metrics` rides the same port as `/mcp`, and the ServiceMonitor template
+(templates/servicemonitor.yaml) scrapes it via the Prometheus Operator.
 
-### MCP client registration (in the DSH profile)
+## Performance defaults (Wave-4, decision D14)
 
-Through the gateway (local DSH — primary):
+Two ratified default changes protect the upstream Prometheus (and the
+model's context) from pathological queries — each with an env escape hatch
+that restores today's behavior exactly:
+
+**Range-query step clamp** — `PROMETHEUS_MIN_STEP_SECONDS` (default **15**).
+A caller-supplied `step` below the floor is clamped UP to it before the
+request reaches the upstream server (`step=1s` over a 24h range would
+otherwise pull ~86k points per series). The clamp never lowers a step, and
+it is honest: the `prom_query_range` tool result carries a notice line —
+`step clamped to 15s (requested 1s) — PROMETHEUS_MIN_STEP_SECONDS` — and the
+JSON API (`POST /api/query_range`) returns the same text in a `step_notice`
+field (the effective resolution stays in `step`). Steps at or above the
+floor pass through byte-unchanged. `PROMETHEUS_MIN_STEP_SECONDS=0` disables
+clamping entirely; unset/non-numeric values fall back to the default. The
+clamp applies to every range path: the MCP tool, the query editor, and the
+dashboard trends.
+
+**`/api/overview` payload cache** — `PROMETHEUS_OVERVIEW_CACHE_TTL`
+(default **20** seconds; `0` disables). The dashboard aggregate runs ~14
+upstream queries per refresh (30-60s payload on a busy cluster); a refresh
+within the TTL is served instantly from the previous computation and is
+marked honestly — `cached: true` + `cache_age_seconds` (fresh responses say
+`cached: false`, age `0`). The cache key is the request's actual parameter
+set, failures are never memoized (an overview whose every block errored is
+recomputed next refresh), and concurrent identical overviews share a single
+computation (single-flight) instead of stampeding Prometheus. The cache is
+per-process (each replica computes its own); `0` restores the pre-D14
+recompute-every-refresh behavior exactly.
+
+**Label-name validation** — no env. The client validates the label NAME
+against the same rule the web console always applied
+(`[a-zA-Z_][a-zA-Z0-9_]*`) before interpolating it into the
+`/api/v1/label/<name>/values` URL path; invalid names are rejected
+client-side with a clear error (`Error: invalid label name 'a/b': …`)
+instead of reaching the server. Valid label names are unaffected.
+
+`PROMETHEUS_METRICS_ENABLED` (Wave 3) remains chart-gated default-off — see
+the self-metrics section above.
+
+## Saved queries, query hints, dashboard deep links (Wave-5, additive)
+
+Three additive features; the default experience is unchanged when they are
+unused.
+
+### Saved queries (`query_save` / `query_list` / `query_delete` / `query_saved`)
+
+A small name→{query, params} store:
+
+- **Where it lives** — `PROMETHEUS_SAVED_QUERIES_PATH` (server env). Unset
+  (default) → the store is **in-memory only for the session** and every
+  tool result says so ("in-memory only for this session — set
+  PROMETHEUS_SAVED_QUERIES_PATH to persist"). Set → a **durable JSON file**
+  at that path. The store is per-process (each replica keeps its own; the
+  file is per-replica state, not a shared multi-writer database). A
+  multi-replica deployment therefore fragments stores — the server says so
+  honestly: every `query_save` result carries a `Storage:` line
+  (`shared=false` + the store path) plus a warning naming
+  `PROMETHEUS_SAVED_QUERIES_SHARED` (see the chart's `persistence.shared`
+  above) until the deployment declares the store genuinely shared.
+- **Writes are atomic** — every mutation writes a temp file in the same
+  directory, fsyncs, then `os.replace`s it over the target. A failed write
+  (disk full, …) rolls the store back and leaves the previous file
+  byte-intact; no partial file can ever appear at the path.
+- **Names are sanitized** — whitespace collapses, anything outside
+  letters/digits/space/`.`/`_`/`-` becomes `_`, length caps at 64. The
+  stored (sanitized) name is reported back, and the original spelling is
+  kept as an alias so `query_saved`/`query_delete` accept either.
+- **Saving over an existing name overwrites** it (an update, not a
+  duplicate); the store caps at 100 entries with a clear error instead of
+  silent eviction.
+- **`params`** — optional run defaults recorded with the query, using the
+  exact arguments the query tools already take: `mode`
+  (`instant`|`range`), `time` (instant) or `start`/`end`/`step` (range).
+  `query_saved(name, params?)` merges per-call overrides over the saved
+  defaults and runs the query through the **same code path** as
+  `prom_query`/`prom_query_range` — the D14 step clamp, the series/point
+  caps and all validation apply unchanged. Queries are validated when they
+  RUN, not when saved.
+
+### Query hints (advisory, capped, suppressible)
+
+`prom_query` and `prom_query_range` append a short `Hints (advisory)` block
+when the query text matches an obvious pattern — static analysis of the
+expression only, no extra HTTP, no result inspection:
+
+- `[cardinality]` — a label matcher whose regex matches every value
+  (`{pod=~".*"}`): narrow the selector to bound the series count.
+- `[counter]` — a `_total`/`_count` metric used without `rate()`/`increase()`
+  or any over-time function: raw counters only ever rise.
+- `[regex]` — a matcher starting with an unbounded wildcard
+  (`{pod=~".*myapp.*"}`): anchoring keeps matching cheap on
+  high-cardinality labels.
+- `[range-vector]` — a bare `metric[5m]` selector with no over-time
+  function: an instant query wants `rate(metric[5m])` (or the selector
+  without the bracket).
+
+At most **3 hints** are returned per result, quoted label values can never
+trip them (`errors{kind="user_total"}` is not a counter), and queries that
+match nothing are byte-identical with hints on or off. Pass
+`include_hints=false` to suppress the block entirely.
+
+### Dashboard deep links (web console)
+
+The query editor's state is shareable: the expression + time range ride in
+the URL **fragment** (`#q=…&range=…`) — never the query string — so a
+shared link re-sends nothing to the server and never lands in access logs:
+
+- `#q=up&range=now` — instant at `now`
+- `#q=<urlencoded PromQL>&range=now-6h..now/2m` — range from `now-6h` to
+  `now` with step `2m` (omit the `/step` for auto resolution)
+
+The fragment is decoded on page load (switching to the Query tab and
+running the query), refreshed after every successful run
+(`history.replaceState` — no reload), and copied by the **🔗 Link** button
+next to 💾 Save. Decoded values only ever land in input `.value`
+assignments (never `innerHTML`) — the console's escape-clean rendering
+rule applies to the fragment too.
+
+These browser features are independent of the MCP-side saved queries (the
+console's "Saved queries" panel remains per-browser localStorage; the MCP
+store above is per-server).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), Prometheus target, GPU/NVLink detector, ezua/Istio + oauth2-proxy auth gate, upgrading |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | MCP handshake + first tool test, optional operator kubectl checks, troubleshooting |
+| [helm/values-examples/README.md](helm/values-examples/README.md) | What the example values files are, how to use them (PCAI editor or `helm -f`) |
+
+## Enabling the network zone (MCP NetworkPolicy — ADDITIVE, DEFAULT OFF)
+
+The chart can default-deny all ingress to the MCP pods and admit ONLY the
+listed client namespaces ("the zone"). Default OFF — the default render is
+byte-identical to the baseline; nothing changes until you enable it:
 
 ```yaml
-- id: mcp-prometheus
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    transport: streamable-http
-    serverName: prometheus
-    url: https://prometheus-mcp.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp
+networkPolicy:
+  enabled: true
+  authorizedClients:
+    namespaces: [pcai-llm, monitoring]   # the LLM gateway relay + Prometheus scrape
+  allowEzafGatewayIngress: true          # browser path stays OPEN (fleet doctrine)
+  probeCidrs: [172.28.1.61/32, 172.28.1.62/32, 172.28.1.63/32,
+               172.28.1.161/32, 172.28.1.162/32]   # node IPs (kubelet probes)
+  probeExceptCidrs: []                   # MUST stay empty with /32 allows (strict-subset rule)
 ```
 
-In-cluster consumers (bypasses the gateway entirely):
-
-```yaml
-    url: http://prometheus-mcp-service.prometheus-mcp.svc.cluster.local:9095/mcp
-```
-
-## Triage pairing (why this + the K8s MCP)
-
-1. K8s MCP: `describe pod` → `lastState: OOMKilled`, restart count
-2. K8s MCP: `logs --previous` → what it was doing
-3. **Prometheus MCP**: `prom_query_range` on `container_memory_working_set_bytes{pod=…}[6h]` → sawtooth = leak, plateau-at-limit = undersized
-4. Evidence-backed verdict instead of a guess
+Enable one namespace at a time (add the ns name under
+`authorizedClients.namespaces`, apply, verify — see the fleet RUNBOOK in the
+`mcp-netzone` workbench workspace). Ready-made hardened profile:
+`helm/values-examples/values-hardened-g2.yaml`. `monitoring` MUST stay
+listed or Prometheus scraping dies silently. Fleet doctrine (2026-09): the
+zone restricts IN-CLUSTER model access only — the browser path stays open
+through the SSO-gated edge gateway (closing a console is an explicit
+per-chart, per-site decision, never a default).

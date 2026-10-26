@@ -1,0 +1,41 @@
+# prometheus-mcp — HARDENED-G2 overlay: the MCP network zone ON, browser console
+# KEPT (merge onto the base/g2 values document; nothing here is standalone).
+
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+
+# Authorized callers from the LIVE gateway netpol (+ the ServiceMonitor scrape ns).
+# Enable only once the LLM gateway's relay namespace is listed — unlisted callers time out.
+networkPolicy:
+  enabled: true
+  sameNamespace: true
+  authorizedClients:
+    namespaces:
+      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
+      - dsh-web-helm        # DSH web (live gateway allowlist)
+      - owebui0-11-0        # OWUI instance on the live gateway allowlist
+      - opencode-web-helm   # OpenCode web
+      - prometheus          # the ACTUAL Prometheus scraper (kubeprom stack, ns `prometheus`)
+      - monitoring          # ServiceMonitor scrape ns; omit and scraping dies SILENTLY
+  allowEzafGatewayIngress: true   # browser path ON for this chart (per-chart choice)
+  ingressGatewayNamespace: istio-system
+
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  # Per-node /32 kubelet-probe allows (masters .61-.63, workers .161-.162).
+  probeCidrs:
+    - 172.28.1.61/32
+    - 172.28.1.62/32
+    - 172.28.1.63/32
+    - 172.28.1.161/32
+    - 172.28.1.162/32
+  # Stays EMPTY: ipBlock.except must be a STRICT SUBSET of the cidr — pod IPs
+  # are not inside a node /32, nothing to carve out.
+  probeExceptCidrs: []
+
+  egress:
+    enabled: false          # admin MCP egress intentionally unrestricted
+    extraEgress: []
+
+# The VirtualService STAYS rendered: external/browser traffic keeps flowing
+# through the SSO-gated edge gateway exactly as pre-zone.

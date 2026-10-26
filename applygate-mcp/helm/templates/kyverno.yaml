@@ -1,0 +1,42 @@
+{{- if .Values.kyverno.enabled }}
+# Ported from the fleet charts (identical body to searxng-mcp's and
+# prometheus-mcp's templates/kyverno.yaml): a pre-install ClusterPolicy that
+# stamps the PCAI vendor-service labels onto this chart's workloads, so the
+# EZUA console/tooling can recognize them. Same hook annotations — pre-install
+# with before-hook-creation deletion — so re-installs are idempotent.
+#
+# Gated by .Values.kyverno.enabled (default false): a ClusterPolicy is
+# cluster-scoped, and this chart's DEFAULT render must stay unchanged. It
+# fits applygate as-is — the server already runs readOnlyRootFilesystem,
+# dropped ALL capabilities and non-root uid 10001, so no security-context
+# mutation is (or should be) applied.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ printf "add-vendor-app-labels-%s-%s" .Release.Name .Chart.Name }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  background: false
+  rules:
+  - name: add-vendor-app-labels
+    match:
+      any:
+      - resources:
+          # list all namespaces defined by the chart here
+          # if there are no namespace resource defined leave only .Release.Namespace
+          namespaces:
+          - {{ .Release.Namespace }}
+          kinds:
+          - Pod
+          - Deployment
+          - Service
+    mutate:
+      patchStrategicMerge:
+        metadata:
+            labels:
+              "hpe-ezua/type": vendor-service
+              "hpe-ezua/app": {{ .Chart.Name }}
+{{- end }}

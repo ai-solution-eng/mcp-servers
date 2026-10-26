@@ -1,0 +1,54 @@
+# applygate-mcp — HARDENED-G2 overlay: the MCP network zone ON (merge onto the
+# base/G2 values document; browser path open).
+
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+
+# Confirm the LLM gateway's relay namespace is listed first — unlisted callers
+# time out.
+networkPolicy:
+  enabled: true
+  sameNamespace: true
+  authorizedClients:
+    namespaces:
+      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
+      - dsh-web-helm        # DSH web (live gateway allowlist, inventory §6)
+      - owebui0-11-0        # OWUI instance on the live gateway allowlist
+      - opencode-web-helm   # OpenCode web
+      - prometheus         # the ACTUAL scraper (kubeprom stack) — omit and up=0
+      - monitoring          # ServiceMonitor scrape — omit and scraping dies SILENTLY
+  # Browser path stays OPEN: the zone restricts IN-CLUSTER callers only;
+  # external traffic rides the SSO-gated edge gateway.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  # Kubelet probes originate at the NODE: per-node /32 allows only (G2:
+  # .61-.63 masters, .161-.162 workers); pod traffic stays zone-governed.
+  probeCidrs:
+    - 172.28.1.61/32
+    - 172.28.1.62/32
+    - 172.28.1.63/32
+    - 172.28.1.161/32
+    - 172.28.1.162/32
+  # Stays EMPTY with per-node /32s: ipBlock.except must be a STRICT SUBSET and
+  # pod IPs are not inside a node /32 — only a BROAD probe allow pairs with it.
+  probeExceptCidrs: []
+
+  egress:
+    enabled: false          # admin MCP egress intentionally unrestricted
+    extraEgress: []
+
+# ============================================================================
+# Transport Security (DNS-rebinding protection)
+# ============================================================================
+
+# Zone-hardened: list the EXTRA svc-DNS names in-cluster callers use (verbatim
+# or host:*; own-svc DNS auto-prepended). mcpHostname = the VS host (421 else).
+mcpHostname: applygate-mcp.${DOMAIN_NAME}
+
+extraAllowedHosts: [applygate-mcp.*.svc.cluster.local]
+
+# The VirtualService STAYS rendered: external/browser traffic keeps flowing
+# through the SSO-gated edge gateway exactly as pre-zone.

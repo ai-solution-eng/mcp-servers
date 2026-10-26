@@ -1,0 +1,23 @@
+{{- if .Values.routing.affinity.enabled }}
+{{- $host := .Values.routing.affinity.host }}
+{{- if not $host }}
+{{- $host = printf "%s.%s.svc.cluster.local" (include "sqlhandler.fullname" .) .Release.Namespace }}
+{{- end }}
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-dr
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+    {{- include "sqlhandler.ezua.labels" . | nindent 4 }}
+spec:
+  # Destination host: the in-cluster service FQDN by default (the same host
+  # the VirtualService routes to) — consistent-hash applies at the
+  # service → pod hop. Override with a full host when needed (used verbatim).
+  host: {{ $host | quote }}
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpHeaderName: {{ .Values.routing.affinity.headerKey | required "\nValid .Values.routing.affinity.headerKey is required when routing.affinity is enabled !" | quote }}
+{{- end }}

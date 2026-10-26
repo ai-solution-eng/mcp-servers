@@ -5,22 +5,24 @@ then exercises: static shell, traversal guard, console toggle, and the MCP
 endpoint in both modern (2026-07-28 envelope) and legacy eras, with and
 without API-key auth.
 """
-import asyncio
+
 import json
 import os
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
+from collections.abc import Callable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 # kubernetes stubs (same approach as test_namespace_policy.py)
+_install_kubernetes_stubs: Callable[[], None]  # bound by the exec below (shared k8s stub installer)
 _src = open(os.path.join(HERE, "test_namespace_policy.py")).read()
-exec(_src.split("def main()")[0])
-_install_kubernetes_stubs()
+exec(_src.split("def main()")[0])  # noqa: S102 — deliberate: reuse the kubernetes stubs without importing pytest
+_install_kubernetes_stubs()  # noqa: F821 — bound by the exec above
 
 import server  # noqa: E402
 
@@ -38,6 +40,7 @@ def start_server(api_key=None, console=True):
     mcp_asgi = server._ApiKeyAuthMiddleware(server.mcp.streamable_http_app(stateless_http=True))
     router = server._ConsoleRouterApp(mcp_asgi, server._ConsoleApp(server._UI_DIR))
     import uvicorn
+
     cfg = uvicorn.Config(router, host="127.0.0.1", port=PORT, log_level="error")
     srv = uvicorn.Server(cfg)
     t = threading.Thread(target=srv.run, daemon=True)
@@ -55,9 +58,11 @@ def get(path, key=None, no_redirect=False):
     req = urllib.request.Request(BASE + path)
     if key:
         req.add_header("Authorization", f"Bearer {key}")
+
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **k):
             return None
+
     opener = urllib.request.build_opener(NoRedirect) if no_redirect else urllib.request.build_opener()
     try:
         r = opener.open(req, timeout=5)
@@ -67,8 +72,7 @@ def get(path, key=None, no_redirect=False):
 
 
 def post_mcp(body, key=None, modern=True, method_name=None, named=None):
-    headers = {"Content-Type": "application/json",
-               "Accept": "application/json, text/event-stream"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     if modern and method_name:
@@ -76,8 +80,7 @@ def post_mcp(body, key=None, modern=True, method_name=None, named=None):
         headers["Mcp-Method"] = method_name
         if named:
             headers["Mcp-Name"] = named
-    req = urllib.request.Request(BASE + "/mcp", data=json.dumps(body).encode(),
-                                 headers=headers, method="POST")
+    req = urllib.request.Request(BASE + "/mcp", data=json.dumps(body).encode(), headers=headers, method="POST")
     try:
         r = urllib.request.urlopen(req, timeout=10)
         return r.status, r.headers.get("content-type", ""), r.read()
@@ -85,7 +88,7 @@ def post_mcp(body, key=None, modern=True, method_name=None, named=None):
         return e.code, e.headers.get("content-type", ""), e.read()
 
 
-results = []
+results: list[tuple[bool, str]] = []
 
 
 def check(cond, label):
@@ -102,44 +105,60 @@ def run(api_key=None, console=True):
             return
         # ── static shell ──
         st, hdrs, body = get("/", no_redirect=True)
-        check(st == 302 and hdrs.get("Location", hdrs.get("location")) == "/ui/",
-              "GET / -> 302 /ui/")
+        check(st == 302 and hdrs.get("Location", hdrs.get("location")) == "/ui/", "GET / -> 302 /ui/")
         st, hdrs, body = get("/ui/")
         html = body.decode()
         check(st == 200 and "HPE Kubernetes Ops Console" in html, "GET /ui/ serves the shell")
         check("content-security-policy" in {k.lower() for k in hdrs}, "shell carries CSP headers")
         st, hdrs, body = get("/ui/style.css")
-        check(st == 200 and "text/css" in hdrs.get("Content-Type", hdrs.get("content-type", "")),
-              "style.css served with text/css")
+        check(
+            st == 200 and "text/css" in hdrs.get("Content-Type", hdrs.get("content-type", "")),
+            "style.css served with text/css",
+        )
         st, hdrs, body = get("/ui/app.js")
-        check(st == 200 and "javascript" in hdrs.get("Content-Type", hdrs.get("content-type", "")),
-              "app.js served with javascript content type")
+        check(
+            st == 200 and "javascript" in hdrs.get("Content-Type", hdrs.get("content-type", "")),
+            "app.js served with javascript content type",
+        )
         st, _, _ = get("/ui/../server.py")
         check(st == 404, "path traversal /ui/../server.py -> 404")
         st, _, _ = get("/ui/%2e%2e/server.py")
         check(st == 404, "encoded traversal /ui/%2e%2e/server.py -> 404")
 
         # ── MCP: modern envelope ──
-        meta = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                          "io.modelcontextprotocol/clientCapabilities": {"tools": {}}}}
-        st, ct, body = post_mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": dict(meta)},
-                                key=api_key, modern=True, method_name="tools/list")
+        meta = {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {"tools": {}},
+            }
+        }
+        st, ct, body = post_mcp(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": dict(meta)},
+            key=api_key,
+            modern=True,
+            method_name="tools/list",
+        )
         tools = None
         try:
             tools = json.loads(body)["result"]["tools"]
         except Exception:
             pass
-        check(st == 200 and tools and len(tools) >= 18,
-              f"modern tools/list over HTTP ({len(tools) if tools else 0} tools)")
+        check(
+            st == 200 and tools and len(tools) >= 18,
+            f"modern tools/list over HTTP ({len(tools) if tools else 0} tools)",
+        )
         names = {t["name"] for t in tools} if tools else set()
         check("list_virtual_services" in names, "list_virtual_services served over HTTP")
 
         call_params = {"name": "list_namespaces", "arguments": {}}
         call_params.update(meta)
-        st, ct, body = post_mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                                 "params": call_params},
-                                key=api_key, modern=True, method_name="tools/call",
-                                named="list_namespaces")
+        st, ct, body = post_mcp(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": call_params},
+            key=api_key,
+            modern=True,
+            method_name="tools/call",
+            named="list_namespaces",
+        )
         ok = st == 200
         text = None
         try:
@@ -149,8 +168,9 @@ def run(api_key=None, console=True):
         check(ok and text and "NAMESPACES" in text, f"modern tools/call list_namespaces -> {str(text)[:40]!r}")
 
         # ── MCP: legacy (no envelope) — the legacy stateless path answers SSE ──
-        st, ct, body = post_mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
-                                key=api_key, modern=False)
+        st, ct, body = post_mcp(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}, key=api_key, modern=False
+        )
         ok = False
         try:
             if "event-stream" in ct:
@@ -168,11 +188,13 @@ def run(api_key=None, console=True):
         if api_key:
             st, _, _ = get("/ui/")
             check(st == 200, "console shell reachable WITHOUT key (inert, no data)")
-            st, _, _ = post_mcp({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}},
-                                key=None, modern=False)
+            st, _, _ = post_mcp(
+                {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}, key=None, modern=False
+            )
             check(st == 401, "/mcp without key -> 401 (shell exemption did not weaken auth)")
-            st, _, _ = post_mcp({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}},
-                                key="wrong", modern=False)
+            st, _, _ = post_mcp(
+                {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, key="wrong", modern=False
+            )
             check(st == 401, "/mcp with wrong key -> 401")
     finally:
         srv.should_exit = True

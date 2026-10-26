@@ -1,0 +1,23 @@
+{{- if .Values.persistence.enabled }}
+# THE point: user-saved queries (query_save / query_list / query_delete /
+# query_saved, Wave-5 F4) must survive pod updates and reschedules. The chart
+# renders PROMETHEUS_SAVED_QUERIES_PATH onto this volume (deployment.yaml);
+# with persistence off the server default applies — an in-memory store that
+# every pod update silently wipes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.deployment.name }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

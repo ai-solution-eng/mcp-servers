@@ -22,6 +22,22 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "sqlhandler.labels" . | nindent 4 }}
+  annotations:
+    {{- /* KEEP THE VOLUME ACROSS UPGRADES (live incident 2026-10-21).
+
+           Without this annotation Helm DELETES a PVC it owns whenever the
+           resource drops out of the rendered set — and the volume goes with
+           it. On 2026-10-21 a redeploy recreated this claim (new UID, empty
+           filesystem) and silently destroyed every MINTED API KEY in
+           admin-keys/admin-keys.json, plus the uploaded catalog and saved
+           queries. Callers saw it as "my key stopped working" with nothing
+           in any log to explain why.
+
+           This claim holds OPERATOR CONTENT (the keys store, the catalog
+           upload, saved queries), not re-derivable cache. Deletion must be
+           a deliberate `kubectl delete pvc`, never a side effect of a
+           values change or a helm uninstall. */}}
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     {{- toYaml ($store.accessModes | default (list "ReadWriteMany")) | nindent 4 }}
@@ -32,4 +48,74 @@ spec:
     requests:
       storage: {{ $store.size | default "1Gi" }}
 {{- end }}
+{{- end }}
+{{- /* DOCUMENT SEPARATOR (live bug 2026-10-21): the catalog claim above and
+       the policy claim below are two separate Kubernetes objects. Without an
+       explicit "---" between them they rendered as ONE YAML document with
+       duplicate apiVersion/kind/metadata keys — YAML parsers accept that
+       silently (last key wins), so `helm template` looked fine while only
+       the SECOND PVC ever reached the cluster. On a fresh install the
+       catalog claim was simply never created. `helm lint` and a plain
+       render both miss this; the regression test asserts on the PARSED
+       document count, not the raw text. */}}
+---
+{{- /* An explicit existingClaim WINS over the default claim.create, so a
+       site that manages its own claim keeps working unchanged and an
+       upgrade never tries to adopt a claim it did not create. Only the
+       case where BOTH are deliberately set to conflicting values is a
+       mistake — and even then, honouring existingClaim (the operator's
+       explicit statement) is the safer reading than failing the install. */}}
+{{- if and .Values.security.policy.enabled .Values.security.policy.claim.create (not .Values.security.policy.existingClaim) }}
+{{- /* Chart-owned WRITABLE policy volume (claim mode).
+
+       WHY this exists: claim mode (security.policy.existingClaim) is the ONLY
+       way the admin panel can persist a policy edit — the ConfigMap mode is a
+       read-only mount by construction, so every admin write dies on
+       "[Errno 30] Read-only file system". But existingClaim is, by definition,
+       a claim that ALREADY EXISTS: the chart never created one, so enabling
+       claim mode required a hand-applied PVC (helm/local/policy-pvc.g2.yaml)
+       BEFORE the helm upgrade. Skip that step and the pods sit Pending on an
+       unbound claim with no actionable message — the same class of silent
+       deploy-time failure the mount-overlap guard exists to prevent.
+
+       policy.claim.create makes the chart own it: render the claim here and
+       leave existingClaim empty. The claim name is then derived
+       (<release>-policy), exactly like the catalog store's <release>-catalog.
+
+       Render-time guard (mirrors the catalog store's): ReadWriteMany is
+       REQUIRED whenever replicas can exceed 1. The policy is a live shared
+       file that every replica hot-reloads by mtime; a ReadWriteOnce claim
+       attaches on one node only, stranding the other replicas Pending AND
+       letting replicas disagree about the ACL. Operator values that cannot
+       work should not render. */}}
+{{- $polClaim := .Values.security.policy.claim }}
+{{- $polMulti := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) }}
+{{- if and $polMulti (not (has "ReadWriteMany" ($polClaim.accessModes | default list))) }}
+{{- fail "security.policy.claim: ReadWriteMany access is required when replicas can exceed 1 (autoscaling.enabled or replicaCount > 1) — a ReadWriteOnce policy claim strands the extra pods Pending and lets replicas disagree about the ACL. Use an RWX StorageClass." }}
+{{- end }}
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+  annotations:
+    {{- /* KEEP THE VOLUME ACROSS UPGRADES — same reason as the catalog
+           claim above, and more sharply here: this volume holds the LIVE
+           policy, the file the admin panel writes. Losing it does not just
+           lose data, it silently REVERTS the deployment to the permissive
+           default (a missing policy file means "no restrictions"). A
+           values change must never be able to loosen an ACL. */}}
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml ($polClaim.accessModes | default (list "ReadWriteMany")) | nindent 4 }}
+  {{- if $polClaim.storageClass }}
+  storageClassName: {{ $polClaim.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $polClaim.size | default "1Gi" }}
 {{- end }}

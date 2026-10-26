@@ -121,18 +121,13 @@ def build_body(host: str, dom: dict[int, int], peers: dict[int, list[int]]) -> s
     """Exposition-format push body (empty string clears a previous push)."""
     lines = []
     for g in sorted(dom):
-        labels = (
-            f'gpu="{g}",domain="{dom[g]}",'
-            f'peers="{",".join(str(p) for p in peers[g])}",hostname="{host}"'
-        )
+        labels = f'gpu="{g}",domain="{dom[g]}",peers="{",".join(str(p) for p in peers[g])}",hostname="{host}"'
         lines.append(f"{_METRIC}{{{labels}}} 1")
     return ("\n".join(lines) + "\n") if lines else ""
 
 
 def push(url: str, body: str) -> None:
-    req = urllib.request.Request(
-        url, data=body.encode(), method="PUT", headers={"Content-Type": "text/plain"}
-    )
+    req = urllib.request.Request(url, data=body.encode(), method="PUT", headers={"Content-Type": "text/plain"})
     with urllib.request.urlopen(req, timeout=_PUSH_TIMEOUT) as resp:
         if resp.status < 200 or resp.status >= 300:
             raise URLError(f"pushgateway returned HTTP {resp.status}")

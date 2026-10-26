@@ -21,11 +21,12 @@ import pyarrow as pa
 import pytest
 
 # pgserver resolves its runtime/lock dir via platformdirs at import time —
-# point XDG_RUNTIME_DIR at a writable location BEFORE the (lazy) import.
-os.environ.setdefault(
-    "XDG_RUNTIME_DIR", os.path.join(tempfile.gettempdir(), "sqlhandler-pg-runtime")
-)
-os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
+# point XDG_RUNTIME_DIR at a WRITABLE location BEFORE the (lazy) import.
+# Unconditional assignment (not setdefault): a host-exported XDG_RUNTIME_DIR
+# can be unwritable (e.g. a read-only /run/user mount), and setdefault would
+# keep it — the later makedirs then aborted COLLECTION of the whole pytest
+# run. A fresh mkdtemp per run also avoids parallel-run collisions.
+os.environ["XDG_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="sqlhandler-pg-runtime-")
 
 from sqlhandler.engine import SqlEngine  # noqa: E402
 from sqlhandler.external import (  # noqa: E402

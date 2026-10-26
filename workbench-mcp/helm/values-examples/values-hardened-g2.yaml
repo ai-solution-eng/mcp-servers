@@ -1,0 +1,51 @@
+# workbench-mcp — HARDENED-G2 example: the MCP network zone ON.
+# Admin-surface MCP: the zone locks IN-CLUSTER access to the allowlisted
+# namespaces; the browser/console path stays OPEN through the SSO-gated edge
+# gateway (the browser is behind admin sign-ins).
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+#
+# OVERLAY: merge onto the base/g2 values document — nothing here is standalone
+# (keys absent here inherit the base document/chart defaults).
+# Pointer: documentation/DEPLOYMENT.md + helm/values.yaml (networkPolicy block).
+#
+# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
+# with the zone on, every unlisted caller times out (deny by absence).
+#
+# Zone list: least-privilege — the namespaces the gateway netpol names as
+# authorized MCP callers, plus monitoring for the ServiceMonitor scrape.
+networkPolicy:
+  enabled: true
+  sameNamespace: true
+  authorizedClients:
+    namespaces:
+      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
+      - dsh-web-helm        # DSH web (gateway allowlist)
+      - owebui0-11-0        # OWUI instance on the gateway allowlist
+      - opencode-web-helm   # OpenCode web
+      - prometheus          # the ACTUAL Prometheus scraper — the monitoring ns
+                            # holds otel/UA, NOT the scraper; omit and up=0
+      - monitoring          # ServiceMonitor scrape ns — omit and it dies SILENTLY
+  allowEzafGatewayIngress: true   # browser path stays OPEN — IN-CLUSTER callers only
+  ingressGatewayNamespace: istio-system
+
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  # Kubelet probes originate at the NODE (.61-.63 masters, .161-.162 workers).
+  probeCidrs:
+    - 172.28.1.61/32
+    - 172.28.1.62/32
+    - 172.28.1.63/32
+    - 172.28.1.161/32
+    - 172.28.1.162/32
+  probeExceptCidrs: []   # only a BROAD probe allow (0.0.0.0/0) pairs with a carve-out
+
+  egress:
+    enabled: false          # admin MCP egress intentionally unrestricted
+    extraEgress: []
+
+# The VirtualService stays rendered — external/browser traffic rides the
+# SSO-gated edge gateway exactly as without the zone.
+
+# Add-on: to run the sandbox executor pool on a zoned deploy, paste the
+# executors block + workbench.sandboxExec keys from values.g2.yaml onto this doc.

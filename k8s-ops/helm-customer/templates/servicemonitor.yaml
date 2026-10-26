@@ -1,0 +1,23 @@
+{{- /* Opt-in Prometheus Operator ServiceMonitor for the server's /metrics
+      endpoint. Gated by metrics.enabled (default false): the DEFAULT render
+      emits nothing, so the default chart output stays byte-identical to the
+      pre-metrics baseline. /metrics itself must also be switched on —
+      this chart sets K8S_MCP_METRICS_ENABLED=true when metrics.enabled=true.
+      The Service's scrape port is named `mcp`. */ -}}
+{{- if .Values.metrics.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  endpoints:
+    - port: mcp
+      path: /metrics
+      interval: {{ .Values.metrics.interval | quote }}
+{{- end }}

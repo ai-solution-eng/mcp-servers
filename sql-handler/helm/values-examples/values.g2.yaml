@@ -1,0 +1,230 @@
+replicaCount: 4
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 80
+  extraMetrics: []
+  behavior:
+    scaleUpStabilizationSeconds: 30
+    scaleDownStabilizationSeconds: 300
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+  whenUnsatisfiable: ScheduleAnyway
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+terminationGracePeriodSeconds: 90
+image:
+  repository: ghcr.io/ai-solution-eng/sqlhandler
+  tag: v3.9.2
+  digest: ''
+  pullPolicy: IfNotPresent
+backend: s3
+sources: []
+databases: []
+nameOverride: ''
+fullnameOverride: ''
+serviceAccount:
+  create: false
+  name: ''
+  annotations: {}
+service:
+  type: ClusterIP
+  port: 9097
+  targetPort: 9097
+mcp:
+  transport: streamable-http
+  path: /mcp
+  port: 9097
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    cpu: 800m
+    memory: 16Gi
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 20
+startupProbe:
+  enabled: true
+  periodSeconds: 5
+  failureThreshold: 24
+security:
+  hardened: true
+  networkPolicy:
+    enabled: false
+    gatewayNamespace: istio-system
+    allowedNamespaces: []
+    additionalIngress: []
+  authorizationPolicy:
+    enabled: false
+    principals: []
+    namespaces: []
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  automountServiceAccountToken: false
+  apiKey:
+    existingSecret: mcp-fleet-apikeys
+    existingSecretKey: api-keys
+fabric:
+  credentialsSecret:
+    name: fabric-credentials
+    tenantIdKey: tenant-id
+    clientIdKey: client-id
+    clientSecretKey: client-secret
+    create: false
+    values:
+      tenantId: ''
+      clientId: ''
+      clientSecret: ''
+  lakehouseAbfssUrl: ''
+  workspaceId: ''
+  lakehouseId: ''
+  authority: onelake.dfs.fabric.microsoft.com
+s3:
+  credentialsSecret:
+    name: s3-credentials
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    create: true
+    values:
+      accessKey: <S3_ACCESS_KEY>
+      secretKey: <S3_SECRET_KEY>
+  endpointUrl: http://minio.minio.svc.cluster.local:9000
+  region: us-east-1
+  bucket: test-parquet
+  prefix: ''
+  anonymous: false
+  useSsl: false
+iceberg:
+  catalogType: rest
+  catalogUri: ''
+  catalogName: sqlhandler
+  warehouse: ''
+  namespace: ''
+  credentialsSecret:
+    name: iceberg-credentials
+    tokenKey: token
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    create: false
+    values:
+      token: ''
+      accessKey: ''
+      secretKey: ''
+  storage:
+    endpointUrl: ''
+    region: us-east-1
+    anonymous: false
+nfs:
+  rootDir: /data
+  mount:
+    enabled: false
+    pvcName: ''
+    mountPath: /data
+    readOnly: true
+cache:
+  ttl: 3600
+  versionCheckInterval: 10
+  prewarmTables: ''
+  listAsyncRefresh: true
+  duckdbMemoryFraction: '0.6'
+  spillDir: /tmp/sqlhandler-duckdb-spill
+  cacheDir: /tmp/sqlhandler-cache
+  virtualCacheDir: /var/lib/sqlhandler-catalog
+  blockCache:
+    enabled: true
+    maxBytes: '1073741824'
+semanticCatalog:
+  enabled: true
+  mountPath: /etc/sqlhandler
+  tables:
+    orders:
+      description: Orders fact table used by the G2 benchmark workload
+      columns:
+        order_id: Order identifier (bench range-filters on it)
+        region: Sales region — bench groups/aggregates by it
+        product: Product key — bench groups by it
+        unit_price: Unit price — bench filters > 250 / averages it
+        qty: Quantity sold — bench sums it
+    employees:
+      description: Employee dimension table used by the G2 benchmark workload
+    orders_eu:
+      definition: SELECT order_id, region, product, unit_price, qty FROM orders WHERE
+        region = 'EU'
+      description: 'EU orders slice — the simplest virtual table: a filtered view
+        over the physical scan (user filters push down into it).'
+    orders_line_totals:
+      definition: SELECT *, unit_price * qty AS line_total FROM orders WHERE unit_price
+        > 250
+      description: Premium orders with a computed line_total — expressions in definitions;
+        also the composition base for orders_eu_premium.
+    orders_eu_premium:
+      definition: SELECT order_id, product, unit_price * qty AS line_total FROM orders_line_totals
+        WHERE region = 'EU'
+      description: 'Composed virtual table: builds on orders_line_totals (which builds
+        on orders) — definitions compose, nothing is stored.'
+    revenue_by_region:
+      definition: SELECT region, count(*) AS orders, sum(unit_price * qty) AS revenue,
+        round(avg(unit_price), 2) AS avg_unit_price FROM orders GROUP BY region ORDER
+        BY revenue DESC
+      description: Region revenue rollup — an aggregate virtual table; the materialized
+        cache (TTL 3600s, auto-sorted) serves repeat queries.
+  json: ''
+  yaml: ''
+  existingConfigMap: ''
+  store:
+    enabled: true
+    existingClaim: ''
+    size: 1Gi
+    storageClass: ''
+    accessModes:
+    - ReadWriteMany
+    mountPath: /var/lib/sqlhandler-catalog
+  __comment: null
+containerArgs:
+- --transport
+- streamable-http
+- --host
+- 0.0.0.0
+- --port
+- '9097'
+ingress:
+  enabled: false
+  className: ''
+  annotations: {}
+  hosts:
+  - host: sqlhandler.local
+    paths:
+    - path: /
+      pathType: Prefix
+  tls: []
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+ezua:
+  enabled: true
+  domainName: ${DOMAIN_NAME}
+  kyverno:
+    enabled: true
+  virtualService:
+    endpoint: sqlhandler.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 60s
+    longTimeout: 3600s
+  authorizationPolicy:
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

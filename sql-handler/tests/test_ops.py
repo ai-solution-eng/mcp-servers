@@ -11,7 +11,7 @@ import pytest
 from sqlhandler import observability
 from sqlhandler.engine import LakehouseError, QueryJob, SqlEngine
 from sqlhandler.observability import Metrics, audit_query, token_matches
-from sqlhandler.provider import TableInfo
+from sqlhandler.provider import DataProvider, TableInfo
 from sqlhandler.server import _ApiTokenMiddleware
 
 
@@ -20,7 +20,7 @@ def _make_engine(tmp_path, **kw):
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"id": [1, 2, 3, 4, 5], "kind": ["a", "b", "a", "b", "a"]}), d / "part.parquet")
 
-    class P:
+    class P(DataProvider):
         kind = "fake"
 
         def list_tables(self):
@@ -132,7 +132,7 @@ def test_audit_bad_path_never_raises(tmp_path):
 def _patch_register(monkeypatch, sleep=None):
     import sqlhandler.engine as eng_mod
 
-    def register(self, con, sql, version=None):
+    def register(self, con, sql, version=None, **kw):
         if sleep is not None:
             time.sleep(sleep)
         con.register("work_order", pa.table({"id": [1, 2, 3, 4, 5]}))
@@ -176,6 +176,118 @@ def test_gate_disabled_by_default(monkeypatch, tmp_path):
     for j in jobs:
         j.wait(10)
     assert all(j.state == "done" for j in jobs)
+
+
+# ------------------------------------------------- gate-leak regressions
+#
+# The gate has a SMALL fixed number of slots (default 8). A slot acquired but
+# never released is therefore not a transient inefficiency — it is permanent
+# capacity loss: after 8 such events every query queues out until the pod
+# restarts. TWO failure paths used to leak exactly that way, because the sole
+# release site is the finally inside QueryJob._run:
+#
+#   1. threading.Thread.start() raising (fd/PID exhaustion) — the thread never
+#      ran, so _run never executed and the finally never fired;
+#   2. duckdb.connect() raising (OOM / fd exhaustion) — it sat OUTSIDE the try
+#      whose finally releases, so the exception escaped before the release.
+#
+# Both are tested by counting FREE slots before and after: the assertion is on
+# the semaphore's value, not on log output, so it fails for any future leak
+# regardless of how the release is implemented.
+
+
+def _free_gate_slots():
+    """Free slots on the engine's process-wide gate (None = gate disabled).
+
+    The gate is PROCESS-WIDE and its size is fixed at first use, so a test must
+    read the live semaphore rather than assume its own env var took effect (an
+    earlier test in the same process may have sized it already). The non-blocking
+    drain counts free slots without disturbing the gate.
+    """
+    from sqlhandler.engine import _query_gate
+
+    # _semaphore() sizes the gate from the CURRENT env on first use (and
+    # rebuilds it when the env changes), so call it rather than reading _sem:
+    # in a fresh process _sem is still None and a raw read would report the
+    # gate as disabled.
+    sem = _query_gate._semaphore()
+    if sem is None:
+        return None
+    taken = 0
+    while sem.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        sem.release()
+    return taken
+
+
+def test_gate_slot_released_when_thread_start_fails(monkeypatch, tmp_path):
+    """Thread.start() raising must NOT consume a gate slot (leak path 1)."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0, "gate must be enabled with free slots"
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("threading.Thread.start", boom)
+    with pytest.raises(RuntimeError, match="can.t start new thread"):
+        QueryJob(eng, "SELECT * FROM work_order")
+
+    # Measure BEFORE undoing the env: _semaphore() REBUILDS the gate when the
+    # configured size changes, so a post-undo read would measure a FRESH
+    # semaphore and silently mask the leak. Same env = same semaphore.
+    assert _free_gate_slots() == before, "a failed thread start leaked a gate slot"
+
+
+def test_gate_slot_released_when_duckdb_connect_fails(monkeypatch, tmp_path):
+    """duckdb.connect() raising must NOT consume a gate slot (leak path 2)."""
+    import duckdb
+
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0
+
+    def boom(*a, **k):
+        raise RuntimeError("out of file descriptors")
+
+    monkeypatch.setattr(duckdb, "connect", boom)
+    job = QueryJob(eng, "SELECT * FROM work_order")
+    job.wait(10)
+
+    # The job reports the failure honestly AND the slot came back. Measured
+    # BEFORE undo for the same reason as the thread-start test above.
+    assert job.state == "error"
+    assert "DuckDB connection" in (job.error or "")
+    assert _free_gate_slots() == before, "a failed duckdb.connect() leaked a gate slot"
+
+
+def test_gate_survives_repeated_start_failures(monkeypatch, tmp_path):
+    """The pathological case the leak made permanent: fail MORE times than the
+    gate has slots, then prove a real query still runs (all slots intact)."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "2")
+    eng = _make_engine(tmp_path)
+    before = _free_gate_slots()
+    assert before is not None and before > 0
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr("threading.Thread.start", boom)
+    for _ in range(before + 3):  # MORE failures than the gate has slots
+        with pytest.raises(RuntimeError):
+            QueryJob(eng, "SELECT * FROM work_order")
+
+    # All slots still free — with the leak, `before` failures would have
+    # exhausted the gate entirely.
+    assert _free_gate_slots() == before
+    monkeypatch.undo()
+    # A genuine query still completes — the gate was not exhausted.
+    job = QueryJob(eng, "SELECT * FROM work_order")
+    job.wait(10)
+    assert job.state == "done"
 
 
 # ---------------------------------------------------------------- api token
@@ -222,3 +334,40 @@ def test_token_middleware_blocks_and_allows():
     assert _run_middleware(None, "/ui", {}) == 200
     assert _run_middleware(None, "/mcp", {}) == 200
     assert _run_middleware(None, "/health", {}) == 200
+
+
+# --------------------------------------------------- readiness drift rollup
+
+# The 2026-09 HA-review fix: one failing backend check used to report 503
+# immediately, draining EVERY replica of a scaled-out deployment on one
+# storage blip. A failing check now reports degraded (still HTTP 200 to the
+# kubelet) until SQLHANDLER_READY_DEGRADED_GRACE of CONTINUOUS failure has
+# elapsed; the /metrics gauge rolls the state up as 1 / 0.5 / 0.
+
+
+def test_readiness_drift_rollup(monkeypatch):
+    from sqlhandler.observability import ReadinessDrift, _ready_degraded_grace
+
+    monkeypatch.setenv("SQLHANDLER_READY_DEGRADED_GRACE", "60")
+    assert _ready_degraded_grace() == 60.0
+    d = ReadinessDrift()
+    assert d.rollup() == 1.0  # never failed
+    d.note_backend(False)
+    assert d.rollup() == 0.5  # failing, inside the grace
+    assert 0 <= d.failed_seconds() < 5
+    d.note_backend(True)
+    assert d.rollup() == 1.0  # a healthy check resets the clock
+    monkeypatch.setenv("SQLHANDLER_READY_DEGRADED_GRACE", "0")
+    d.note_backend(False)
+    assert d.rollup() == 0.0  # grace 0 = the historical binary behavior
+
+
+def test_readiness_gauge_renders_without_engine(monkeypatch):
+    # The gauge renders ALWAYS (most informative exactly when the backend is
+    # down, i.e. when the engine block may be skipped).
+    from sqlhandler.observability import metrics
+
+    text = metrics.render(None)
+    line = [l for l in text.splitlines() if l.startswith("sqlhandler_readiness_state ")]
+    assert len(line) == 1
+    assert line[0].split()[-1] in ("1.0", "0.5", "0.0")

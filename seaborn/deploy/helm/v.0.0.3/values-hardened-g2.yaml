@@ -1,0 +1,43 @@
+# mcp-seaborn-server — HARDENED-G2 example: the MCP network zone ON.
+# USER-FACING class (fleet contract): the browser path stays ON (gateway rule
+# true, VirtualService still rendered) — the seaborn UI must keep working
+# unchanged. Zone list = the live gateway-caller namespaces (inventory §6)
+# + monitoring for any ServiceMonitor scrape.
+#
+# ⚠️ Enable AFTER confirming the LLM gateway's relay namespace is listed —
+# with the zone on, every unlisted caller times out (deny by absence).
+networkPolicy:
+  enabled: true
+  sameNamespace: true
+  authorizedClients:
+    namespaces:
+      - pcai-llm            # LLM Gateway relay (in-cluster MCP relay)
+      - dsh-web-helm        # DSH web — calls mcp-seaborn directly (profile seed)
+      - owebui0-11-0        # OWUI instance on the live gateway allowlist
+      - opencode-web-helm   # OpenCode web
+      - prometheus         # the ACTUAL Prometheus scraper (kubeprom stack,
+                            # ns `prometheus`) — the monitoring ns holds otel/UA,
+                            # NOT the scraper; omit and up=0 within one interval
+      - monitoring          # Prometheus scraping (ServiceMonitor) — omit and
+                            # metrics scraping dies SILENTLY
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  # Node-originated kubelet probes: node IPs only (G2 live: .61-.63 masters,
+  # .161-.162 workers), pod CIDR carved out.
+  probeCidrs:
+    - 172.28.1.61/32
+    - 172.28.1.62/32
+    - 172.28.1.63/32
+    - 172.28.1.161/32
+    - 172.28.1.162/32
+  # probeExceptCidrs stays EMPTY with per-node /32 allows: ipBlock.except must
+  # be a STRICT SUBSET of the cidr — pod IPs (10.224.x) are not inside a node
+  # /32 (172.28.1.x), so there is nothing to carve out. Only a BROAD probe
+  # allow (e.g. 0.0.0.0/0) pairs with a carve-out.
+  probeExceptCidrs: []
+  egress:
+    enabled: false          # egress intentionally unrestricted (SQLhandler peer)
+
+# USER-FACING: VS stays rendered — nothing to flip here.

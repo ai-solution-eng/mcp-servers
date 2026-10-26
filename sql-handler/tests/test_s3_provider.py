@@ -28,7 +28,16 @@ def test_endpoint_override_keeps_scheme():
 
 
 def test_endpoint_override_adds_scheme_when_missing():
+    # use_ssl now defaults to TRUE (audit P3: cleartext S3 creds) — a
+    # scheme-less endpoint dials https unless S3_USE_SSL=false opts out.
     p = _provider(endpoint_url="127.0.0.1:9000")
+    assert p._endpoint_override() == "https://127.0.0.1:9000"
+
+
+def test_endpoint_override_http_when_use_ssl_opt_out():
+    # the documented plain-http MinIO opt-out: S3_USE_SSL=false (or the
+    # config field) restores the old behavior.
+    p = _provider(endpoint_url="127.0.0.1:9000", use_ssl=False)
     assert p._endpoint_override() == "http://127.0.0.1:9000"
 
 

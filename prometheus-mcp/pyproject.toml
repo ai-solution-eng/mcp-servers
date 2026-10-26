@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prometheus-mcp"
-version = "0.4.0"
+version = "0.7.0"
 description = "Prometheus MCP Server — read-only PromQL queries, series/label discovery, alerts and rules over MCP"
 requires-python = ">=3.10"
 keywords = ["mcp", "prometheus", "monitoring", "model-context-protocol"]
 
 dependencies = [
+    "httpx2>=2.12.0",
     "mcp>=2.0.0",
-    "httpx>=0.27.0",
     "starlette>=0.37.0",
     "uvicorn>=0.27.0",
 ]
@@ -20,4 +20,4 @@ dependencies = [
 prometheus-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "prom_client", "webui"]
+py-modules = ["server", "prom_client", "webui", "saved_queries", "mcp_metrics", "mcp_auth"]

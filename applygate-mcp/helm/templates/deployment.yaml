@@ -1,0 +1,226 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  # RWO-safe rollout: the audit PVC is single-attacher (ReadWriteOnce). The
+  # default RollingUpdate maxSurge=1 DEADLOCKS: the surge pod waits for the
+  # volume the old pod holds, the old pod waits for the surge pod to go
+  # Ready — the upgrade stalls in FailedAttachVolume until timeout/abort
+  # (observed 2026-09-15). Recreate = kill-then-start: the volume frees
+  # before the replacement attaches. Brief downtime per rollout is correct
+  # for a single-replica writer; the audit trail persists on the PVC (the
+  # hash chain is append-only and survives pod replacement).
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+              name: mcp
+          env:
+            # Rendered in the TEMPLATE from the namespaces.* knobs (Helm does
+            # not template inside values.yaml). Default-deny on purpose: an
+            # empty APPLYGATE_ALLOWED_NAMESPACES means the server refuses
+            # EVERY write loudly — enabling namespaces is an explicit,
+            # auditable values-file act, never an accident.
+            - name: APPLYGATE_ALLOWED_NAMESPACES
+              value: {{ .Values.namespaces.allowed | quote }}
+            - name: APPLYGATE_BLOCKED_NAMESPACES
+              value: {{ .Values.namespaces.blocked | quote }}
+            - name: APPLYGATE_ALLOWED_KINDS
+              value: {{ .Values.kinds.allowed | quote }}
+            - name: APPLYGATE_AUDIT_FILE
+              value: {{ .Values.audit.file | quote }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            {{- if .Values.mcpHostname }}
+            # Public FQDN — pins the Host header (DNS-rebinding protection,
+            # fleet-shared helper mcp_auth.transport_security_from_env).
+            # Without it, every gateway-fronted request gets 421 "Invalid
+            # Host header" — set it whenever ezua fronts this server (usually
+            # the same value as ezua.virtualService.endpoint).
+            - name: MCP_HOSTNAME
+              value: {{ .Values.mcpHostname | quote }}
+            {{- end }}
+            {{- if or .Values.mcpHostname .Values.extraAllowedHosts }}
+            # In-cluster callers (svc DNS) — DNS-rebinding allowlist. When
+            # transport security is active (pinned mcpHostname or any
+            # extraAllowedHosts), the chart ALWAYS includes this release's
+            # own service DNS FIRST — the same name the Service resource
+            # renders — because the LLM-gateway relay hop arrives with
+            # Host: <deployment.name>-service.<ns>.svc.cluster.local:<port>
+            # (the fleet 421 Misdirected Request class). Site
+            # extraAllowedHosts append after it; entries are matched
+            # verbatim or as `host:*` by the SDK's transport security.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.planBinding.unplannedApply }}
+            # D11 plan-binding transition knob (values: planBinding.unplannedApply).
+            # Only rendered when set — the server's built-in default is deny
+            # (the strictest mode applies out of the box); warn = documented
+            # migration path (applies + logs loudly); allow = pre-D11 behavior;
+            # anything else fails closed to deny.
+            - name: APPLYGATE_UNPLANNED_APPLY
+              value: {{ .Values.planBinding.unplannedApply | quote }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # /metrics gate (chart values: metrics.enabled — additive, OFF by
+            # default so the default render stays byte-identical to the Wave-0
+            # baseline). The server serves /metrics on this same container
+            # port; prometheus-client is import-guarded inside the image.
+            - name: APPLYGATE_METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+            {{- end }}
+            # Read-only web console gate (chart values: webui.enabled). The
+            # console exposes NO apply/delete endpoints — mutations stay
+            # behind the MCP tools' confirm flags.
+            - name: APPLYGATE_WEBUI_ENABLED
+              value: {{ .Values.webui.enabled | quote }}
+            # API keys for /mcp — always from an operator-created Secret
+            # (existingSecret-only, the K8S-MCP invariant): the chart never
+            # creates or inlines a key, and the pod fails loud
+            # (CreateContainerConfigError) until the Secret exists.
+            # Comma-separated keys all authenticate → zero-downtime rotation.
+            - name: APPLYGATE_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            {{- if .Values.clients.existingSecret }}
+            # Caller-name registry (values: clients.existingSecret →
+            # APPLYGATE_CLIENTS, "name:key;name:key;..."). Only rendered when
+            # set — the default render stays byte-identical and the audit
+            # stays fp-only. The registry NAMES keys the API-key middleware
+            # already matched; it can never authenticate anything.
+            - name: APPLYGATE_CLIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clients.existingSecret }}
+                  key: {{ .Values.clients.existingSecretKey }}
+            {{- end }}
+            {{- if .Values.callerPassthrough.trustedCidrs }}
+            # X-MCP-Caller trusted peers (values: callerPassthrough.trustedCidrs
+            # → MCP_CALLER_TRUSTED_CIDRS). Only rendered when set — UNSET =
+            # fail-closed: the header is ignored from every peer and the
+            # default render stays byte-identical (fp-only attribution).
+            - name: MCP_CALLER_TRUSTED_CIDRS
+              value: {{ .Values.callerPassthrough.trustedCidrs | quote }}
+            {{- end }}
+            {{- if .Values.proxy.http }}
+            # Corporate proxy env — wired only when the corresponding
+            # proxy.<key> is non-empty. The Kubernetes API is in-cluster and
+            # covered by the NO_PROXY cluster-local entries, so this is fleet
+            # consistency with searxng-mcp, and the empty proxy: {} default
+            # keeps proxy-less sites proxy-free.
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # Audit trail volume: PVC (or emptyDir when persistence is off).
+            - name: audit
+              mountPath: /data
+            # readOnlyRootFilesystem: temp churn (kubernetes client scratch)
+            # needs a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: audit
+          persistentVolumeClaim:
+            claimName: {{ .Values.deployment.name }}-audit
+        {{- else }}
+        - name: audit
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+{{- if .Values.persistence.enabled }}
+# The audit trail must survive restarts to be worth anything — dedicated PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.deployment.name }}-audit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+  annotations:
+    # The audit trail is the product: never let a release lifecycle destroy it.
+    # helm uninstall keeps this PVC; delete it explicitly when truly intended.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

@@ -120,6 +120,52 @@
     color: var(--text);
   }
   header .spacer { flex: 1; }
+  /* ---- header identity widget (D-UI: chip + use-key + sign out) ---- */
+  /* Same visual language as header .meta (12px muted row), RAG's chip
+     logic — NOT RAG's markup/classes: this page has its own stylesheet. */
+  #id-chip {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #id-chip.show { display: inline-flex; }
+  #id-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); flex-shrink: 0; }
+  #id-dot.session { background: var(--green); }
+  #id-dot.keycred { background: var(--yellow); }
+  #id-src {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text);
+  }
+  #id-key-link {
+    display: none;
+    color: var(--muted);
+    font-size: 12px;
+    text-decoration: none;
+  }
+  #id-key-link:hover { color: var(--accent); }
+  #id-signout { display: none; padding: 4px 12px; font-size: 12px; font-weight: 500; }
+  /* The use-key dialog: same overlay shape as the sv-modal pair above. */
+  #id-key-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
+  #id-key-modal.hidden { display: none; }
+  #id-key-dialog {
+    position: relative;
+    width: min(440px, 92vw);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px var(--shadow);
+    padding: 16px 18px;
+  }
+  #id-key-dialog h3 { margin: 0 0 6px; font-size: 14px; color: var(--text); }
+  #id-key-dialog .insp-field { margin: 10px 0; }
+  #id-status { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
   #status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; margin-right: 6px; }
   #status-dot.ok { background: var(--green); }
   #status-dot.err { background: var(--red); }
@@ -170,6 +216,8 @@
     padding: 0 5px;
     text-transform: uppercase;
   }
+  .table-item .fmt.virtual { color: var(--accent); border-color: var(--accent); }
+  .table-item .fmt.raw { color: var(--yellow); border-color: var(--yellow); }
   .table-item .tname { flex: 1; font-family: var(--mono); font-size: 13px; word-break: break-all; }
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .tabs {
@@ -360,6 +408,17 @@
     outline: none;
   }
   .sv-editor textarea::selection { background: rgba(1, 169, 130, 0.30); }
+  /* ---- client-side tokenizer token classes (both themes) ----
+     Colors mirror the pygments themes' feel; defined via CSS vars so the
+     theme switch needs no re-highlight. Escaped text gets no span at all —
+     building innerHTML from escaped chunks only around matched spans. */
+  .sv-editor .tok-key { color: var(--accent-2); }        /* YAML/JSON keys */
+  .sv-editor .tok-str { color: var(--green); }           /* strings */
+  .sv-editor .tok-num { color: var(--yellow); }          /* numbers */
+  .sv-editor .tok-bool { color: var(--red); font-style: italic; }  /* bools/null */
+  .sv-editor .tok-cmt { color: var(--muted); font-style: italic; } /* comments */
+  .sv-editor .tok-pct { color: var(--muted); }           /* punctuation : , { } [ ] */
+  .sv-editor .tok-err { color: var(--red); }             /* unterminated quote */
 
   /* ---- global SV editor modal ---- */
   .sv-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; }
@@ -395,6 +454,54 @@
   .sv-dialog-foot { display: flex; align-items: center; gap: 10px; }
   .sv-dialog-foot .spacer { flex: 1; }
   .sv-err { color: var(--red); font-size: 12px; font-family: var(--mono); white-space: pre-wrap; }
+
+  /* ---- Inspector tab (MCP tool bridge) ---- */
+  #insp-error {
+    display: none;
+    background: var(--err-bg);
+    border: 1px solid var(--err-border);
+    color: var(--err-text);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  #insp-error.show { display: block; }
+  .insp-field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
+  .insp-field label { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .insp-field label b { color: var(--text); font-weight: 600; }
+  .insp-field .req { color: var(--yellow); font-weight: 700; margin-left: 4px; }
+  .insp-field input, .insp-field select {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+  }
+  .insp-field input:focus, .insp-field select:focus { border-color: var(--accent); }
+  .insp-field input[type="checkbox"] { width: auto; align-self: flex-start; }
+  .insp-out {
+    background: var(--editor-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    max-height: 60vh;
+  }
+  .insp-out.is-error { background: var(--err-bg); border-color: var(--err-border); color: var(--err-text); }
+  .insp-out table { border-collapse: collapse; margin: 6px 0; }
+  .insp-out th, .insp-out td { border: 1px solid var(--border); padding: 2px 8px; text-align: left; }
 </style>
 </head>
 <body>
@@ -412,8 +519,36 @@
     <span class="dot" style="color:var(--yellow)">read-only</span>
   </div>
   <div class="spacer"></div>
+  <div id="id-chip">
+    <span id="id-dot"></span>
+    <span id="id-name">…</span>
+    <span id="id-src" title="Which credential resolved this session (the identity ladder's rung)"></span>
+  </div>
+  <a href="#" id="id-key-link" title="Paste a key for this page session — the same credential the Access-control panel uses">Use an API key</a>
+  <a href="/oauth/login?next=%2Fui" id="id-sso-link" style="display:none;color:var(--muted);font-size:12px;text-decoration:none" title="Start the SSO round trip (the verified session carries your username, not the IdP sub UUID)">Sign in with SSO</a>
+  <button id="id-signout" class="ghost" title="Clear this page's credential (and end an edge SSO session when deployed behind the gateway)">Sign out</button>
   <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
 </header>
+
+<!-- Use-an-API-key dialog: the pasted key becomes adminCredential — the SAME
+     page-memory variable the Access-control panel reads. Never persisted
+     (the panel's contract: the raw key must not live anywhere an XSS could
+     silently read back); Sign out clears it. -->
+<div id="id-key-modal" class="hidden" role="dialog" aria-modal="true" aria-label="Use an API key">
+  <div class="sv-backdrop" id="id-key-backdrop"></div>
+  <div id="id-key-dialog">
+    <h3>Use an API key</h3>
+    <div class="hint" style="margin-bottom:4px">The pasted key governs this page's Access-control calls — held in memory only, never stored. An SSO session (signed in above) needs no key here.</div>
+    <div class="insp-field">
+      <input type="password" id="id-key-input" placeholder="paste the admin key" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="query-actions" style="margin-top:10px">
+      <button id="id-key-use">Use key</button>
+      <button id="id-key-cancel" class="ghost">Cancel</button>
+      <span class="hint" id="id-key-msg" style="margin-left:4px"></span>
+    </div>
+  </div>
+</div>
 
 <div class="layout">
   <aside>
@@ -433,6 +568,10 @@
       <div style="display:flex;gap:8px;margin-top:8px">
         <button id="catalog-upload" class="ghost" style="flex:1" title="Upload a catalog file — JSON or YAML are both accepted">Upload JSON/YAML…</button>
       </div>
+      <input type="file" id="catalog-dbt-file" accept=".json,.txt" style="display:none" />
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="catalog-dbt" class="ghost" style="flex:1" title="Import dbt's target/manifest.json into the catalog: model + column descriptions become docs; virtual tables only for nodes meta-tagged sqlhandler.virtual AND when you tick the preview option">Import dbt…</button>
+      </div>
       <div class="hint" style="margin-top:8px">Per-dataset docs: select a table → <b>Semantic</b> tab.</div>
     </div>
   </aside>
@@ -442,6 +581,8 @@
       <button class="tab active" data-tab="query">Query</button>
       <button class="tab" data-tab="schema">Schema</button>
       <button class="tab" data-tab="semantic">Semantic</button>
+      <button class="tab" data-tab="inspector">Inspector</button>
+      <button class="tab" data-tab="access">Access control</button>
     </div>
 
     <div id="pane-query" class="pane">
@@ -505,6 +646,109 @@
         </div>
       </div>
     </div>
+
+    <div id="pane-inspector" class="pane hidden">
+      <div class="hint" style="margin-bottom:10px">MCP inspector — the same tools an MCP client sees (documentation/MCP.md). Calls ride the web API auth.</div>
+      <div class="panel">
+        <h2>MCP tool</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="insp-tool" style="flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 10px;font-family:var(--mono);font-size:12px;outline:none"></select>
+          <button id="insp-run" title="Call the tool (Ctrl+Enter)">Run</button>
+          <button id="insp-raw" class="ghost" title="Show the exact {content, isError} JSON the bridge returned">Raw</button>
+        </div>
+        <div class="hint" id="insp-tool-desc" style="margin-top:8px"></div>
+        <div id="insp-form" style="margin-top:10px"></div>
+      </div>
+      <div id="insp-error"></div>
+      <div id="insp-result"></div>
+    </div>
+
+    <div id="pane-access" class="pane hidden">
+      <div class="hint" style="margin-bottom:10px">Access control — the admin frontend over <code style="font-family:var(--mono)">/api/admin/*</code> (README: Administering from the frontend). The credential is held in this page's memory ONLY — never persisted.</div>
+      <div class="panel" id="sso-mint-card">
+        <h2>Your API key <span class="hint" id="sso-mint-status"></span></h2>
+        <div class="hint" style="margin-bottom:8px">Signed in via SSO? Mint a long-lived <b>X-API-KEY</b> for MCP clients (bound to your account — it acts as you, with exactly your grants). The raw key is shown once.</div>
+        <div class="query-actions">
+          <button id="sso-mint">Mint my key</button>
+          <button id="sso-keys-list" class="ghost">My keys</button>
+          <span class="hint">Minting again rotates: the oldest key is retired (server default: one active key).</span>
+        </div>
+        <div id="sso-minted" style="display:none;margin-top:10px">
+          <div style="color:var(--yellow);font-size:12px;margin-bottom:4px">⚠ Store it now — shown once, never recoverable:</div>
+          <div class="insp-out" style="max-height:none;word-break:break-all" id="sso-minted-key"></div>
+          <div class="query-actions"><button class="copy-btn ghost" id="sso-minted-copy">copy</button></div>
+        </div>
+        <div id="sso-keys" style="display:none;margin-top:10px"></div>
+      </div>
+      <div class="panel">
+        <h2>Admin credential</h2>
+        <div class="insp-field">
+          <label><b>Admin key (X-API-Key)</b><span class="hint"> — sent with every Access-control call. LEAVE EMPTY when signed in via SSO (the browser session is the credential — your Keycloak subject must be in the policy's admins list)</span></label>
+          <input type="password" id="adm-key" placeholder="paste the admin key — kept in memory only" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="query-actions">
+          <button id="adm-connect">Connect</button>
+          <button id="adm-forget" class="ghost" title="Clear the credential from this page's memory">Forget</button>
+          <span class="hint">Wrong credential → the server's 401/403 message renders verbatim below; fix the key and reconnect.</span>
+        </div>
+      </div>
+      <div id="adm-error" class="panel" style="display:none;background:var(--err-bg);border-color:var(--err-border);color:var(--err-text)"></div>
+      <div id="adm-body">
+        <div class="panel">
+          <h2>Grants <span class="hint" id="adm-grants-meta"></span></h2>
+          <div class="insp-field">
+            <label><b>Designated admins</b> — subjects / key fingerprints from the policy document's <code style="font-family:var(--mono)">admins:</code> list</label>
+            <div id="adm-admins" class="insp-out" style="max-height:none"></div>
+          </div>
+          <div class="insp-field">
+            <label><b>Assignments</b> — identity → dataset globs (added to <code style="font-family:var(--mono)">global</code>; <code style="font-family:var(--mono)">blocked</code> wins)</label>
+            <div id="adm-assignments" class="insp-out" style="max-height:none"></div>
+          </div>
+          <div class="insp-field">
+            <label><b>Blocked</b> — hidden for everyone, wins over any grant</label>
+            <div id="adm-blocked" class="insp-out" style="max-height:none"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Keys <span class="hint">secret-source keys are read-only — revoke via kubectl (the Secret's lifecycle)</span></h2>
+          <div id="adm-keys"></div>
+        </div>
+        <div class="panel">
+          <h2>Users <span class="hint" id="adm-users-meta"></span></h2>
+          <div class="hint" style="margin-bottom:8px">Every subject the system knows — from policy grants, self-minted keys, and recent activity (audit tail). Grant BY NAME: writes the subject's row into the policy document (hot-reloads immediately). Users sign in via SSO and mint their own key bound to their subject — no admin action needed after the grant.</div>
+          <div id="adm-users"></div>
+        </div>
+        <div class="panel">
+          <h2>Mint a key</h2>
+          <div class="insp-field">
+            <label><b>Label</b></label>
+            <input type="text" id="adm-mint-label" placeholder="e.g. reports-bot" autocomplete="off" />
+          </div>
+          <div class="insp-field">
+            <label><b>Assign globs</b> — comma-separated; empty = global only</label>
+            <input type="text" id="adm-mint-assign" placeholder="workorder/*, reports/*" autocomplete="off" />
+          </div>
+          <div class="query-actions">
+            <button id="adm-mint">Mint</button>
+            <span class="hint">The raw key is shown once, below — it is not recoverable.</span>
+          </div>
+          <div id="adm-minted" style="display:none;margin-top:10px">
+            <div style="color:var(--yellow);font-size:12px;margin-bottom:4px">⚠ Store it now — shown once, never recoverable:</div>
+            <div class="insp-out" style="max-height:none;word-break:break-all" id="adm-minted-key"></div>
+            <div class="query-actions"><button class="copy-btn ghost" id="adm-minted-copy">copy</button></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Policy document <span class="hint" id="adm-policy-hash"></span><span class="hint"> — the whole authored file (YAML; JSON accepted too)</span></h2>
+          <textarea id="adm-policy" spellcheck="false" style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:12px;padding:10px;min-height:220px;resize:vertical;line-height:1.5"></textarea>
+          <div class="query-actions">
+            <button id="adm-policy-save">Save policy</button>
+            <button id="adm-policy-reload" class="ghost" title="Discard edits and reload the served policy document">Reload</button>
+            <span id="adm-policy-err" class="sv-err"></span>
+          </div>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 
@@ -537,6 +781,34 @@
   </div>
 </div>
 
+<!-- dbt manifest import: preview → explicit Apply. Same .sv-modal styling. -->
+<div id="dbt-modal" class="sv-modal hidden" role="dialog" aria-modal="true" aria-label="dbt manifest import">
+  <div class="sv-backdrop" id="dbt-modal-backdrop"></div>
+  <div class="sv-dialog">
+    <div class="sv-dialog-head">
+      <div>
+        <h2>Import dbt manifest</h2>
+        <div class="hint" id="dbt-modal-info">target/manifest.json → semantic catalog</div>
+      </div>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Only nodes meta-tagged sqlhandler.virtual AND this checkbox produce virtual tables — both gates are required">
+        <input type="checkbox" id="dbt-allow-virtual" /> allow virtual tables
+      </label>
+      <button type="button" class="sv-close" id="dbt-modal-close" title="Close (Esc)">✕</button>
+    </div>
+    <div style="flex:1;min-height:0;overflow:auto;padding:4px 2px">
+      <div id="dbt-modal-summary" class="empty" style="margin:4px 0 10px">Pick a target/manifest.json and click Preview.</div>
+      <div id="dbt-modal-warnings"></div>
+      <pre id="dbt-modal-catalog" style="display:none;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto;border:1px solid var(--border,#333);border-radius:6px;padding:8px;margin:8px 0 0"></pre>
+    </div>
+    <div class="sv-dialog-foot">
+      <span class="hint">Preview writes nothing. Apply merges: hand-written entries are kept; previous dbt imports are refreshed.</span>
+      <span class="spacer"></span>
+      <span id="dbt-modal-err" class="sv-err"></span>
+      <button id="dbt-modal-apply" disabled>Apply</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -546,7 +818,25 @@ const $ = (id) => document.getElementById(id);
 const state = { tables: [], selected: null, tab: "query" };
 
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  // Default credential: the page's verified adminCredential rides on EVERY
+  // api() call unless the route is a self-service one. WHY the guard:
+  // the server's identity ladder treats an explicit X-API-Key claim as
+  // AUTHORITATIVE — a recognized key resolves class=key (never the SSO
+  // user behind the browser), and an UNRECOGNIZED one is a hard 401 that
+  // never falls through to SSO (server.py _resolve_presented). Self-mint
+  // requires via=="jwt" — the SSO session — so attaching a static key to
+  // /api/admin/keys/self* would 403 the very flow that mints keys. Every
+  // OTHER write surface (semantic catalog, saved queries, admin) gates on
+  // a presented credential (saved.assert_write_allowed), so the default-on
+  // attachment is what makes the editors work after "Use an API key".
+  // adminCredential is only adopted after a whoami verification, so the
+  // default can never hard-refuse a request that worked without it.
+  const isSelfService = typeof path === "string" && path.startsWith("/api/admin/keys/self");
+  const base = (typeof adminCredential === "string" && adminCredential && !isSelfService)
+    ? { "X-API-Key": adminCredential }
+    : {};
+  const merged = Object.assign({}, base, opts && opts.headers ? opts.headers : {});
+  const res = await fetch(path, Object.assign({}, opts, { headers: merged }));
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
   if (!res.ok) {
@@ -563,6 +853,153 @@ function toast(msg, isErr) {
   el._t = setTimeout(() => { el.className = "toast"; }, 2600);
 }
 
+// ---- header identity widget (chip + use-an-API-key + sign out) ------------
+// Ported from the MultimodalRAG header (renderIdentityChip / openKeyModal /
+// signOut) onto SQLhandler's contract — one credential, page memory only:
+//
+// * The probe is GET /api/whoami (the REST twin of the MCP whoami tool): it
+//   previews the identity THIS request resolves to. A presented X-API-Key is
+//   authenticated by the endpoint itself (a wrong key stays anonymous — a
+//   wrong key is never redeemed as the browser user behind it); a keyless
+//   request resolves through the ladder (SSO bearer JWT → browser headers).
+// * The chip shows the resolved identity + the rung tag (oidc / browser /
+//   key / sso) — including via="anonymous" with require_identity on, which
+//   is exactly the "why can't I mint?" answer rendered in place.
+// * Use an API key: sets `adminCredential` — the SAME variable the
+//   Access-control panel reads (single credential per page; no second
+//   storage location to forget). The key is NOT persisted (the panel's
+//   no-storage contract, pinned by test_admin_ui).
+// * Sign out: clears that credential and — when deployed behind the
+//   gateway's oauth2-proxy — ends the edge SSO session too (best-effort:
+//   a 404 from a non-gated deployment falls back to a plain reload).
+const ID_SRC_LABELS = {
+  jwt: "oidc",
+  browser: "browser",
+  key: "key",
+  relay: "relay",
+  "sso-cookie": "SSO",
+};
+
+function idCredentialName(caller) {
+  // What to CALL the identity: a subject (SSO/relay/subject-bound key) by
+  // name; a pseudonymous key by its middle-truncated fingerprint.
+  const s = (caller && caller.subject) || "";
+  if (s) return s;
+  const fp = (caller && caller.key_fp) || "";
+  if (!fp) return "";
+  return fp.length <= 18 ? fp : fp.slice(0, 11) + "…" + fp.slice(-6);
+}
+
+function renderIdentityChip(sess) {
+  const chip = $("id-chip"), dot = $("id-dot"), name = $("id-name"),
+    src = $("id-src"), keylink = $("id-key-link"), signout = $("id-signout"),
+    ssolink = $("id-sso-link");
+  if (!chip) return;
+  if (!sess || !sess.authenticated) {
+    // Anonymous: on a requireIdentity deployment show WHY the gated pages
+    // refuse (the exact question the SSO mint card gets); on an open one
+    // stay quiet — the historical no-chip look. When the D22 flow is
+    // served, offer the SSO round trip (the RAG parity: sign-in link).
+    chip.classList.remove("show");
+    signout.style.display = "none";
+    keylink.style.display = sess && sess.require_identity ? "inline" : "none";
+    if (ssolink) ssolink.style.display = sess && sess.sso_login_available ? "inline" : "none";
+    return;
+  }
+  const cls = (sess.caller && sess.caller.class) || "";
+  dot.className = cls === "user" || cls === "browser" ? "session" : "keycred";
+  name.textContent = "Signed in as " + (idCredentialName(sess.caller) || "unknown");
+  src.textContent = ID_SRC_LABELS[sess.via] || sess.via || "?";
+  src.title = "resolved via: " + (sess.via || "?") + (cls ? " (" + cls + ")" : "");
+  chip.classList.add("show");
+  keylink.style.display = sess.via === "jwt" || sess.via === "browser" ? "inline" : "none";
+  if (ssolink) ssolink.style.display = "none";
+  signout.style.display = "inline-flex";
+}
+
+async function probeIdentity() {
+  // ONE probe, with the page's current credential riding along so the
+  // response reflects the credential the workspace actually uses (an
+  // explicit key outranks the browser session server-side).
+  const headers = adminCredential ? { "X-API-Key": adminCredential } : {};
+  try {
+    const r = await fetch("/api/whoami", { credentials: "same-origin", headers });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function openIdKeyModal(event) {
+  if (event) event.preventDefault();
+  $("id-key-input").value = "";
+  $("id-key-msg").textContent = "";
+  $("id-key-modal").classList.remove("hidden");
+  $("id-key-input").focus();
+}
+
+function closeIdKeyModal() {
+  $("id-key-modal").classList.add("hidden");
+}
+
+async function applyIdKey() {
+  const key = ($("id-key-input").value || "").trim();
+  if (!key) { $("id-key-msg").textContent = "paste a key first"; return; }
+  // Verify BEFORE adopting: the probe with the candidate key must resolve
+  // authenticated — otherwise the panel would just render the 401 verbatim
+  // on the next click (fine) but the header would keep saying anonymous
+  // (confusing). A non-authenticating key is refused here with the same
+  // message the panel would show.
+  try {
+    const r = await fetch("/api/whoami", {
+      credentials: "same-origin",
+      headers: { "X-API-Key": key },
+    });
+    const sess = r.ok ? await r.json() : null;
+    if (!sess || !sess.authenticated) {
+      $("id-key-msg").textContent = "the server did not accept that key";
+      return;
+    }
+  } catch (e) {
+    $("id-key-msg").textContent = "server unreachable — try again";
+    return;
+  }
+  adminCredential = key;       // the panel's variable — the single credential
+  $("adm-key").value = key;    // keep the panel field in step
+  closeIdKeyModal();
+  toast("Key set for this page session");
+  await renderIdentityFromServer();
+}
+
+function idSignOut() {
+  // Clear the page credential (adminCredential + the panel field), then end
+  // the server-side sessions: the app's own D22 SSO cookie (/oauth/logout)
+  // and — when deployed behind the gateway's oauth2-proxy — the edge
+  // session (/oauth2/sign_out, which chains the IdP end_session on the G2
+  // platform). /oauth2/sign_out redirects back to /ui either way; on a
+  // deployment without the edge proxy it 404s into the same visible reload.
+  adminCredential = "";
+  $("adm-key").value = "";
+  location.href = "/oauth2/sign_out?rd=" + encodeURIComponent("/oauth/logout");
+}
+
+function wireIdentityWidget() {
+  $("id-key-link").onclick = openIdKeyModal;
+  $("id-key-cancel").onclick = closeIdKeyModal;
+  $("id-key-backdrop").onclick = closeIdKeyModal;
+  $("id-key-use").onclick = applyIdKey;
+  $("id-key-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); applyIdKey(); }
+    if (e.key === "Escape") closeIdKeyModal();
+  });
+  $("id-signout").onclick = idSignOut;
+}
+
+async function renderIdentityFromServer() {
+  renderIdentityChip(await probeIdentity());
+}
+
 function setError(msg) {
   const el = $("error");
   if (msg) { el.textContent = msg; el.className = "show"; }
@@ -573,6 +1010,14 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
+}
+
+// Raw landing-zone formats (csv/tsv/json/ndjson/jsonl, + .gz) — mirrors
+// sqlhandler.rawfiles.RAW_FORMATS. The badge reads "raw csv" etc. so an
+// agent/user can see at a glance that the table has no statistics.
+function isRawFormat(fmt) {
+  return ["csv", "tsv", "json", "ndjson", "jsonl",
+          "csv.gz", "tsv.gz", "json.gz", "ndjson.gz", "jsonl.gz"].includes(fmt);
 }
 
 // ---- header status -------------------------------------------------------
@@ -616,8 +1061,10 @@ function renderTables() {
     const el = document.createElement("div");
     el.className = "table-item" + (state.selected && state.selected.path === t.path ? " active" : "");
     const fmt = document.createElement("span");
-    fmt.className = "fmt";
-    fmt.textContent = t.format || "?";
+    // RAW badge: same mechanism as VIRTUAL — raw landing-zone tables
+    // (csv/tsv/json, scanned whole) deserve a visible kind marker.
+    fmt.className = "fmt" + (t.format === "virtual" ? " virtual" : isRawFormat(t.format) ? " raw" : "");
+    fmt.textContent = t.format === "virtual" ? "virtual" : isRawFormat(t.format) ? "raw " + t.format : t.format || "?";
     const name = document.createElement("span");
     name.className = "tname";
     // show `<source>/schema/name`, e.g. sales/orders or warehouse/sales/orders
@@ -633,6 +1080,7 @@ function selectTable(t) {
   state.selected = t;
   renderTables();
   $("sql").value = "SELECT * FROM " + (t.qualified_name || t.path) + " LIMIT 100";
+  inspRefillTable(t); // Inspector pane: keep the `table` argument on the selected table
   showSchema(t);
   switchTab("schema");
 }
@@ -647,7 +1095,10 @@ async function showSchema(t) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ table: t.path }),
     });
-    $("schema-desc").textContent = "uri: " + (d.uri || "");
+    // RAW tables announce themselves (landing zone: whole-file scans, no
+    // statistics) — same posture as the /api/describe `raw` marker.
+    $("schema-desc").textContent =
+      "uri: " + (d.uri || "") + (d.raw ? " — RAW " + (d.format || "") + " (landing zone; no row-group statistics)" : "");
     const cols = d.columns || [];
     let html = '<table class="grid"><thead><tr><th>#</th><th>column</th><th>type</th></tr></thead><tbody>';
     cols.forEach((c, i) => {
@@ -676,6 +1127,7 @@ function renderResult(payload) {
     '<button class="copy" id="copy-csv">copy CSV</button>' +
     '<button class="copy" id="export-csv">export CSV</button>' +
     '<button class="copy" id="export-parquet">export Parquet</button>' +
+    '<button class="copy" id="export-arrow">export Arrow</button>' +
     (numericColIndex(cols, rows) >= 0 ? '<button class="copy" id="toggle-chart">📊 chart</button>' : "") +
     '</div><div id="chart"></div>';
   html += '<div style="overflow:auto;max-height:60vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr>';
@@ -700,6 +1152,8 @@ function renderResult(payload) {
   if (ec) ec.onclick = () => exportResult("csv");
   const ep = $("export-parquet");
   if (ep) ep.onclick = () => exportResult("parquet");
+  const ea = $("export-arrow");
+  if (ea) ea.onclick = () => exportResult("arrow");
   const tc = $("toggle-chart");
   if (tc) tc.onclick = () => drawChart(cols, rows, tc);
 }
@@ -895,7 +1349,8 @@ async function loadColumnStats() {
     });
     const fmt = (v) => esc(v === null || v === undefined ? "" : String(v));
     let html = '<div class="hint" style="margin-bottom:8px">rows: ' + fmt(p.n_rows) +
-      " · profiled: " + fmt(p.profiled_rows) + "</div>";
+      " · profiled: " + fmt(p.profiled_rows) +
+      (p.duration_ms === undefined || p.duration_ms === null ? "" : " · took: " + p.duration_ms + " ms") + "</div>";
     html += '<div style="overflow:auto"><table class="grid"><thead><tr><th>column</th><th>min</th><th>max</th><th>distinct≈</th><th>null %</th><th>q25</th><th>q50</th><th>q75</th></tr></thead><tbody>';
     (p.columns || []).forEach((c) => {
       html += "<tr><td>" + esc(c.name) + "</td><td>" + fmt(c.min) + "</td><td>" + fmt(c.max) + "</td><td>" +
@@ -916,7 +1371,11 @@ function switchTab(tab) {
   $("pane-query").classList.toggle("hidden", tab !== "query");
   $("pane-schema").classList.toggle("hidden", tab !== "schema");
   $("pane-semantic").classList.toggle("hidden", tab !== "semantic");
+  $("pane-inspector").classList.toggle("hidden", tab !== "inspector");
+  $("pane-access").classList.toggle("hidden", tab !== "access");
   if (tab === "semantic") loadSemanticPane();
+  if (tab === "inspector") loadInspector();
+  if (tab === "access") accessRefresh();
 }
 
 // ---- theme toggle ---------------------------------------------------------
@@ -963,6 +1422,210 @@ $("sql").addEventListener("keydown", (e) => {
 });
 $("save-query").onclick = saveCurrentQuery;
 $("load-stats").onclick = loadColumnStats;
+
+// ---- Inspector tab (MCP tool bridge) ---------------------------------------
+// A thin MCP-inspector: the SAME tools/schemas an MCP client's tools/list sees
+// (GET /api/inspector/tools), one auto-generated arguments form per tool, and
+// POST /api/inspector/call dispatching through the server's own tools/call
+// path — so identity, policy, caching, audit and the saved-query write gate
+// behave exactly as over /mcp. Tool errors come back MCP-shaped
+// ({content, isError:true}); only bridge validation is an HTTP 4xx.
+const INSP_GROUPS = [
+  ["Discovery & schema", ["list_tables", "search_tables", "describe_table", "profile_table", "column_stats", "sample_rows"]],
+  ["Querying", ["run_sql", "scan_table", "explain_query", "ask_data"]],
+  ["Async jobs", ["query_submit", "query_status", "query_result", "query_cancel"]],
+  ["Saved queries", ["query_save", "query_list", "query_delete", "query_saved"]],
+];
+const insp = { tools: [], byName: {}, loaded: false };
+
+async function loadInspector() {
+  if (insp.loaded) return;
+  const sel = $("insp-tool");
+  sel.innerHTML = '<option value="">loading tools…</option>';
+  try {
+    const data = await api("/api/inspector/tools");
+    insp.tools = data.tools || [];
+    insp.byName = {};
+    insp.tools.forEach((t) => { insp.byName[t.name] = t; });
+    // Grouped picker (documentation/MCP.md groupings); unlisted tools land in
+    // a trailing "Other" group so a future tool is still callable.
+    const grouped = new Set(INSP_GROUPS.flatMap((g) => g[1]));
+    let html = "";
+    for (const [label, names] of INSP_GROUPS) {
+      const present = names.filter((n) => insp.byName[n]);
+      if (!present.length) continue;
+      html += '<optgroup label="' + esc(label) + '">';
+      for (const n of present) html += '<option value="' + esc(n) + '">' + esc(n + " — " + inspFirstSentence(insp.byName[n])) + "</option>";
+      html += "</optgroup>";
+    }
+    const others = insp.tools.filter((t) => !grouped.has(t.name));
+    if (others.length) {
+      html += '<optgroup label="Other">';
+      for (const t of others) html += '<option value="' + esc(t.name) + '">' + esc(t.name + " — " + inspFirstSentence(t)) + "</option>";
+      html += "</optgroup>";
+    }
+    sel.innerHTML = html || '<option value="">(no tools returned)</option>';
+    sel.onchange = inspRenderForm;
+    insp.loaded = true;
+    inspRenderForm();
+  } catch (e) {
+    sel.innerHTML = "";
+    inspShowError("Cannot load the tool list: " + e.message);
+  }
+}
+
+function inspFirstSentence(t) {
+  const d = (t.description || "").trim();
+  const m = d.match(/^[^\n.]+[.\n]?/); // first sentence; falls back to the whole thing
+  return (m ? m[0] : d).replace(/\s+/g, " ").trim().slice(0, 90);
+}
+
+// The schema is the contract: type-driven form. string→text, integer→number,
+// boolean→checkbox, enum→select, array-of-string→comma-separated text,
+// object/other→JSON textarea. `table` (and `column` when it names a column of
+// the selected table — NOT attempted) auto-fills from the left list; only the
+// table autofill is wired (the task's explicit scope).
+function inspRenderForm() {
+  const sel = $("insp-tool");
+  const name = sel.value;
+  const form = $("insp-form");
+  $("insp-error").className = "";
+  $("insp-error").textContent = "";
+  if (!name || !insp.byName[name]) { form.innerHTML = ""; $("insp-tool-desc").textContent = ""; return; }
+  const tool = insp.byName[name];
+  const schema = tool.inputSchema || {};
+  const props = schema.properties || {};
+  const required = new Set(schema.required || []);
+  $("insp-tool-desc").textContent = tool.description || "";
+  if (!Object.keys(props).length) {
+    form.innerHTML = '<div class="hint">No arguments — the tool takes none.</div>';
+    return;
+  }
+  let html = "";
+  for (const [key, spec] of Object.entries(props)) {
+    const label = spec && spec.title ? spec.title : key;
+    const desc = spec && spec.description ? " — " + spec.description : "";
+    const req = required.has(key) ? '<span class="req" title="required">✱</span>' : "";
+    html += '<div class="insp-field" data-key="' + esc(key) + '">';
+    html += "<label><b>" + esc(label) + "</b>" + req + esc(desc) + "</label>";
+    const type = (spec && spec.type) || "string";
+    const auto = key === "table" && state.selected
+      ? ' value="' + esc(state.selected.path) + '" title="auto-filled from the selected table"'
+      : "";
+    if (Array.isArray(spec && spec.enum)) {
+      html += '<select data-arg="' + esc(key) + '">';
+      html += '<option value=""></option>';
+      for (const v of spec.enum) {
+        const cur = required.has(key) && v === (spec.default !== undefined ? spec.default : spec.enum[0]);
+        html += '<option value="' + esc(v) + '"' + (cur ? " selected" : "") + ">" + esc(String(v)) + "</option>";
+      }
+      html += "</select>";
+    } else if (type === "boolean") {
+      html += '<input type="checkbox" data-arg="' + esc(key) + '"' + (spec && spec.default === true ? " checked" : "") + " />";
+    } else if (type === "integer" || type === "number") {
+      html += '<input type="number" data-arg="' + esc(key) + '" step="any"' + auto + (spec && spec.default !== undefined ? ' value="' + esc(spec.default) + '"' : "") + " />";
+    } else if (type === "array") {
+      html += '<input type="text" data-arg="' + esc(key) + '" placeholder="comma-separated values"' + auto + " />";
+    } else if (type === "object") {
+      html += '<textarea data-arg="' + esc(key) + '" rows="2" placeholder=\'{"param": "value"} or ["p1", "p2"]\' style="width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:12px;padding:7px 10px;resize:vertical"></textarea>';
+    } else {
+      html += '<input type="text" data-arg="' + esc(key) + '"' + auto + " />";
+    }
+    html += "</div>";
+  }
+  form.innerHTML = html;
+  // Ctrl+Enter inside the form runs the call — the Query tab's muscle memory.
+  form.onkeydown = (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); inspRun(); }
+  };
+}
+
+// Live table autofill: re-fill (don't overwrite user-edited non-table fields)
+// the `table` argument whenever the selection changes — same event showSchema uses.
+function inspRefillTable(t) {
+  const field = document.querySelector("#insp-form .insp-field[data-key='table'] [data-arg='table']");
+  if (field && t && t.path) field.value = t.path;
+}
+
+function inspCollect() {
+  const args = {};
+  document.querySelectorAll("#insp-form [data-arg]").forEach((el) => {
+    const key = el.dataset.arg;
+    let val;
+    if (el.type === "checkbox") val = el.checked;
+    else if (el.type === "number") val = el.value === "" ? null : Number(el.value);
+    else val = el.value;
+    if (val === null || val === undefined || val === "" || val === false) return; // optional: omit
+    args[key] = val;
+  });
+  return args;
+}
+
+function inspSetOut(payload) {
+  const out = $("insp-result");
+  const isError = !!payload.isError;
+  const text = payload.content && payload.content[0] && payload.content[0].text ? payload.content[0].text : "(empty content)";
+  // Time-to-result (perf review 2026-09): the bridge reports the tool call's
+  // wall time — the slow-vs-cached story is the point of this tab (first
+  // profile/preview pays the scan, cached and cross-replica L2 hits drop
+  // to ms scale).
+  const took = payload.duration_ms === undefined || payload.duration_ms === null ? "" :
+    '<span class="hint">took: ' + payload.duration_ms + " ms</span>";
+  out.innerHTML =
+    '<div class="result-meta"><span class="' + (isError ? "bad" : "ok") + '">' +
+    (isError ? "⚠ isError — the tool reported an error" : "✓ ok") +
+    '</span><span>tool: ' + esc($("insp-tool").value || "?") + "</span>" + took +
+    '<button class="copy" id="insp-copy">copy text</button></div>' +
+    '<div class="insp-out' + (isError ? " is-error" : "") + '">' + esc(text) + "</div>";
+  const btn = $("insp-copy");
+  if (btn) btn.onclick = () => navigator.clipboard.writeText(text).then(() => toast("Copied"));
+}
+
+function inspShowError(msg) {
+  const el = $("insp-error");
+  el.textContent = msg;
+  el.className = "show";
+}
+
+async function inspRun() {
+  const name = $("insp-tool").value;
+  if (!name) { inspShowError("Pick a tool first."); return; }
+  const args = inspCollect();
+  $("insp-run").disabled = true;
+  $("insp-result").innerHTML = '<div class="loading">calling ' + esc(name) + "…</div>";
+  $("insp-error").className = "";
+  try {
+    const res = await fetch("/api/inspector/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, arguments: args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+    inspSetOut(data);
+  } catch (e) {
+    $("insp-result").innerHTML = "";
+    inspShowError(e.message); // bridge errors only (HTTP 4xx); tool errors render above
+  } finally {
+    $("insp-run").disabled = false;
+  }
+}
+
+$("insp-run").onclick = inspRun;
+$("insp-raw").onclick = () => {
+  const out = $("insp-result");
+  const box = out.querySelector(".insp-out");
+  if (!box) { toast("Run a tool first", true); return; }
+  // Toggle: re-render the SAME payload the bridge returned, JSON-formatted.
+  const payload = { content: [{ type: "text", text: box.textContent }], isError: out.querySelector(".bad") !== null };
+  const raw = out.dataset.raw === "1";
+  out.dataset.raw = raw ? "0" : "1";
+  if (raw) inspSetOut(payload);
+  else {
+    out.innerHTML = '<div class="result-meta"><span class="hint">raw bridge response ({content, isError} — inspector fidelity)</span></div>' +
+      '<div class="insp-out">' + esc(JSON.stringify(payload, null, 2)) + "</div>";
+  }
+};
 
 // ---- semantic catalog ------------------------------------------------------
 async function refreshCatalog() {
@@ -1018,6 +1681,461 @@ $("catalog-clear").onclick = async () => {
   } catch (e) { toast(e.message, true); }
 };
 
+// ---- dbt manifest import (preview → explicit Apply) -------------------------
+// Reads target/manifest.json client-side, POSTs it to the preview route
+// (parse-only — nothing is written), shows imported/virtuals/skipped counts
+// plus the first warnings, and only the Apply button writes — through the
+// same validated upload store as a manual upload. Virtual tables need BOTH
+// the node's meta.sqlhandler.virtual AND the allow-virtual checkbox.
+const dbtImport = { manifest: null, preview: null };
+
+function dbtModalClose() {
+  $("dbt-modal").classList.add("hidden");
+  dbtImport.manifest = null;
+  dbtImport.preview = null;
+  $("dbt-modal-apply").disabled = true;
+  $("dbt-modal-catalog").style.display = "none";
+  $("dbt-modal-catalog").textContent = "";
+  $("dbt-modal-warnings").textContent = "";
+  $("dbt-modal-err").textContent = "";
+  $("dbt-modal-summary").textContent = "Pick a target/manifest.json and click Preview.";
+  $("dbt-modal-summary").className = "empty";
+}
+
+function dbtDbtBody() {
+  const body = { manifest: dbtImport.manifest };
+  if ($("dbt-allow-virtual").checked) body.allow_virtual = true;
+  return body;
+}
+
+function dbtShowPreview(res) {
+  dbtImport.preview = res;
+  const summary = $("dbt-modal-summary");
+  summary.className = "";
+  summary.innerHTML =
+    "<b>" + res.imported + "</b> table" + (res.imported === 1 ? "" : "s") + " would be imported" +
+    " · <b>" + res.virtuals + "</b> virtual" +
+    " · <b>" + res.skipped + "</b> skipped" +
+    (res.warnings && res.warnings.length
+      ? " · " + res.warnings.length + " warning" + (res.warnings.length === 1 ? "" : "s")
+      : "");
+  const warns = $("dbt-modal-warnings");
+  warns.textContent = "";
+  (res.warnings || []).slice(0, 8).forEach((w) => {
+    const line = document.createElement("div");
+    line.className = "hint";
+    line.style.marginTop = "4px";
+    line.textContent = "⚠ " + w;
+    warns.appendChild(line);
+  });
+  if ((res.warnings || []).length > 8) {
+    const more = document.createElement("div");
+    more.className = "hint";
+    more.style.marginTop = "4px";
+    more.textContent = "… and " + (res.warnings.length - 8) + " more";
+    warns.appendChild(more);
+  }
+  const pre = $("dbt-modal-catalog");
+  pre.style.display = "block";
+  pre.textContent = JSON.stringify(res.catalog, null, 2);
+  $("dbt-modal-apply").disabled = !res.imported || !dbtImport.manifest;
+}
+
+async function dbtPreview() {
+  if (!dbtImport.manifest) { $("dbt-modal-err").textContent = "Pick a manifest.json first."; return; }
+  const err = $("dbt-modal-err");
+  err.textContent = "";
+  $("dbt-modal-apply").disabled = true;
+  $("dbt-modal-summary").textContent = "parsing manifest…";
+  $("dbt-modal-summary").className = "empty";
+  try {
+    dbtShowPreview(await api("/api/semantic-catalog/import-dbt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dbtDbtBody()),
+    }));
+  } catch (e) {
+    $("dbt-modal-summary").textContent = "Pick a target/manifest.json and click Preview.";
+    $("dbt-modal-summary").className = "empty";
+    err.textContent = e.message;
+  }
+}
+
+async function dbtApply() {
+  if (!dbtImport.manifest) return;
+  const err = $("dbt-modal-err");
+  err.textContent = "";
+  $("dbt-modal-apply").disabled = true;
+  try {
+    const res = await api("/api/semantic-catalog/import-dbt/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dbtDbtBody()),
+    });
+    dbtModalClose();
+    toast("dbt import applied: " + res.tables + " table" + (res.tables === 1 ? "" : "s") +
+      " (" + res.overwritten + " refreshed)");
+    refreshCatalog();
+  } catch (e) {
+    err.textContent = e.message;
+    $("dbt-modal-apply").disabled = false;
+  }
+}
+
+$("catalog-dbt").onclick = () => $("catalog-dbt-file").click();
+$("catalog-dbt-file").onchange = async () => {
+  const f = $("catalog-dbt-file").files[0];
+  if (!f) return;
+  $("catalog-dbt-file").value = "";
+  let parsed;
+  try {
+    parsed = JSON.parse(await f.text());
+  } catch (e) {
+    toast(f.name + " is not valid JSON (need dbt's target/manifest.json)", true);
+    return;
+  }
+  dbtImport.manifest = parsed;
+  $("dbt-modal-info").textContent = f.name + " → semantic catalog";
+  $("dbt-modal").classList.remove("hidden");
+  await dbtPreview();
+};
+$("dbt-modal-close").onclick = dbtModalClose;
+$("dbt-modal-backdrop").onclick = dbtModalClose;
+$("dbt-allow-virtual").onchange = () => { if (dbtImport.manifest) dbtPreview(); };
+$("dbt-modal-apply").onclick = dbtApply;
+
+// ---- Access control (admin frontend over /api/admin/*) ----------------------
+// The grants/mint/revoke/policy panel. The credential is typed per session and
+// held in a JS variable ONLY — never localStorage/sessionStorage (same posture
+// as the panel's server contract: the raw minted key is shown once, so the
+// admin key must not live in a place a stray XSS could silently read back).
+// Every fetch carries the credential header; the admin-api contract renders
+// server error messages verbatim (401 identity-required, 403 non-admin).
+let adminCredential = "";
+
+function admHeaders(extra) {
+  // Both header spellings are accepted by the admin routes; X-API-Key is the
+  // canonical one for a static admin key (SSO tokens ride Authorization).
+  const h = Object.assign({ "X-API-Key": adminCredential }, extra || {});
+  return h;
+}
+
+function admShowError(msg) {
+  const el = $("adm-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+// Render an "empty" line into one of the detail boxes; rows otherwise.
+function admKV(rows) {
+  return rows.map((r) =>
+    '<div style="padding:2px 0">' + r + "</div>").join("");
+}
+
+function admFp(fp) {
+  // Monospace, middle-truncated: sha256:<6hex>…<4hex> keeps it readable in a
+  // table cell while staying unambiguous (full fp is in the title tooltip).
+  const s = String(fp || "");
+  if (s.length <= 18) return s;
+  return s.slice(0, 11) + "…" + s.slice(-6);
+}
+
+async function accessRefresh() {
+  if (!adminCredential) {
+    $("adm-body").style.display = "none";
+    admShowError("");
+    $("adm-grants-meta").textContent = "";
+    return;
+  }
+  admShowError("");
+  $("adm-body").style.display = "";
+  try {
+    const g = await api("/api/admin/grants", { headers: admHeaders() });
+    admRenderGrants(g);
+    // The same payload carries policy_text — the WHOLE authored policy
+    // document (datasets doc + top-level admins, or the groups form) as
+    // YAML, so the editor shows what is actually enforcing. Older servers
+    // without the field fall back to the datasets-only JSON mirror (the
+    // historic prefill). Unsaved edits (dirty flag) are never overwritten.
+    if (!$("adm-policy")._dirty) {
+      $("adm-policy").value = (g.policy_text !== undefined && g.policy_text !== null)
+        ? g.policy_text
+        : (g.datasets === null || g.datasets === undefined ? "" : JSON.stringify(g.datasets, null, 2));
+      $("adm-policy")._dirty = false;
+    }
+    $("adm-policy-hash").textContent = g.policy_hash ? ("policy_hash: " + g.policy_hash) : "";
+  } catch (e) {
+    // Non-admin / anonymous: the server's message renders verbatim (the
+    // contract — never paraphrased client-side).
+    $("adm-body").style.display = "none";
+    admShowError(e.message);
+  }
+}
+
+function admRenderGrants(g) {
+  $("adm-grants-meta").textContent = g.groups && g.groups.length
+    ? (g.groups.length + " group(s) defined") : "";
+  const admins = (g.admins && g.admins.length) ? g.admins : ["(none — bootstrap: add the admin's subject or key:<fp> to the policy document's \"admins\" list)"];
+  $("adm-admins").innerHTML = admins.map((a) => "<div>" + esc(String(a)) + "</div>").join("");
+  const asg = g.assignments || {};
+  const asgKeys = Object.keys(asg);
+  $("adm-assignments").innerHTML = asgKeys.length
+    ? admKV(asgKeys.map((k) =>
+        "<b>" + esc(k) + "</b> → " + esc((asg[k] || []).join(", "))))
+    : "<div class='hint' style='padding:2px 0'>(no assignments)</div>";
+  const blocked = g.blocked || [];
+  $("adm-blocked").innerHTML = blocked.length
+    ? admKV(blocked.map((b) => "<span style='color:var(--red)'>" + esc(String(b)) + "</span>"))
+    : "<div class='hint' style='padding:2px 0'>(none)</div>";
+  const keys = g.keys || [];
+  if (!keys.length) {
+    $("adm-keys").innerHTML = '<div class="empty">no keys minted yet — the Secret-sourced admin keys do not appear here until the store reports them</div>';
+    return;
+  }
+  let html = '<table class="grid"><thead><tr><th>label</th><th>fingerprint</th><th>source</th><th>created</th><th>created by</th><th></th></tr></thead><tbody>';
+  for (const k of keys) {
+    const secret = k.source === "secret";
+    html += "<tr>" +
+      "<td title='fp " + esc(k.fp || "") + "'>" + esc(k.label || "?") + "</td>" +
+      "<td title='" + esc(k.fp || "") + "'>" + esc(admFp(k.fp)) + "</td>" +
+      "<td>" + esc(k.source || "?") + (secret ? " (read-only)" : "") + "</td>" +
+      "<td>" + esc(k.created_at || "") + "</td>" +
+      "<td>" + esc(k.created_by || "") + "</td>" +
+      "<td>" + (secret
+        ? "<span class='hint'>via kubectl</span>"
+        : "<button class='mini-del' data-fp='" + esc(k.fp || "") + "' title='Revoke this key (removes it and its assignment from the store)'>✕ revoke</button>") +
+      "</td></tr>";
+  }
+  html += "</tbody></table>";
+  $("adm-keys").innerHTML = html;
+  $("adm-keys").querySelectorAll(".mini-del").forEach((btn) => {
+    btn.onclick = async () => {
+      const fp = btn.dataset.fp;
+      if (!confirm("Revoke key " + (fp || "?") + "? Its assignment is removed with it.")) return;
+      try {
+        const res = await api("/api/admin/keys/" + encodeURIComponent(fp), { method: "DELETE", headers: admHeaders() });
+        toast("Key revoked" + (res && res.assignment_removed ? " (assignment removed too)" : ""));
+        accessRefresh();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    };
+  });
+}
+
+async function admConnect() {
+  adminCredential = ($("adm-key").value || "").trim();
+  if (!adminCredential) { admShowError("Enter the admin key first."); return; }
+  await accessRefresh();
+  await renderIdentityFromServer(); // the header chip follows the credential
+}
+
+function admForget() {
+  adminCredential = "";
+  $("adm-key").value = "";
+  $("adm-body").style.display = "none";
+  admShowError("");
+  $("adm-grants-meta").textContent = "";
+  renderIdentityChip(null); // the credential is gone — the chip must not claim it
+}
+
+async function admMint() {
+  const label = ($("adm-mint-label").value || "").trim();
+  if (!label) { toast("Label required to mint a key", true); return; }
+  const globs = ($("adm-mint-assign").value || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const body = { label };
+  if (globs.length) body.assign = globs;
+  try {
+    const res = await api("/api/admin/keys", {
+      method: "POST",
+      headers: admHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    $("adm-minted").style.display = "";
+    $("adm-minted-key").textContent = res.key || "";
+    $("adm-mint-label").value = "";
+    $("adm-mint-assign").value = "";
+    accessRefresh();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function admPolicySave() {
+  const err = $("adm-policy-err");
+  err.textContent = "";
+  const text = $("adm-policy").value.trim();
+  let body;
+  let doc = null;
+  if (!text) {
+    body = {};
+  } else {
+    // ALWAYS send the editor text verbatim under {policy: text}: the server
+    // writes it byte-for-byte (JSON first, YAML second), so key order and
+    // whitespace survive. The old JSON.parse branch sent a bare object and
+    // the server re-serialised it — lossy, and the pre-fix server even
+    // str()'d it into Python repr (silent null->"None" corruption,
+    // audited 2026-10-20). doc is still parsed for a client-side sanity
+    // check only.
+    try { doc = JSON.parse(text); } catch (e) { doc = null; /* YAML ok */ }
+    body = { policy: text };
+  }
+  try {
+    const res = await api("/api/admin/policy", {
+      method: "PUT",
+      headers: admHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    $("adm-policy")._dirty = false;
+    $("adm-policy-hash").textContent = "policy_hash: " + (res.policy_hash || "?");
+    toast("Policy saved — hash " + (res.policy_hash || "?").slice(0, 12));
+    accessRefresh();
+  } catch (e) {
+    // A read-only policy mount (ConfigMap mode) surfaces as OSError text;
+    // render the deployment reality instead of a bare errno: writes are
+    // config-blocked, not a bug in the panel — administer via kubectl.
+    if (/read-only/i.test(String(e.message))) {
+      err.textContent =
+        "The policy file is READ-ONLY in this deployment (ConfigMap mode) — " +
+        "panel edits cannot persist. Administer the policy via kubectl " +
+        "(edit the sqlhandler-policy ConfigMap and re-apply), or ask your " +
+        "operator to switch the chart to claim mode (security.policy." +
+        "existingClaim). Raw server error: " + e.message;
+    } else {
+      err.textContent = e.message; // the 400's refusal reason, verbatim
+    }
+  }
+}
+
+$("adm-connect").onclick = admConnect;
+$("adm-forget").onclick = admForget;
+$("adm-mint").onclick = admMint;
+$("adm-minted-copy").onclick = () =>
+  navigator.clipboard.writeText($("adm-minted-key").textContent).then(() => toast("Raw key copied — store it now"));
+$("adm-policy-save").onclick = admPolicySave;
+$("adm-policy-reload").onclick = async () => {
+  $("adm-policy")._dirty = false;
+  await accessRefresh();
+};
+$("adm-policy").addEventListener("input", () => { $("adm-policy")._dirty = true; });
+$("adm-key").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); admConnect(); }
+});
+
+// ---- Self-service SSO key minting (the user's own long-lived X-API-KEY) ----
+// The browser's SSO session (Keycloak bearer, already held by the page's
+// fetches) is the credential: POST /api/admin/keys/self with NO X-API-Key —
+// the server verifies the JWT and binds the key to the VERIFIED subject.
+// The card is visible to everyone; the server's 403 ("SSO only") renders in
+// the toast for key-class visitors — same verbatim-error contract as admin.
+
+async function ssoMint() {
+  $("sso-mint-status").textContent = "";
+  try {
+    const res = await api("/api/admin/keys/self", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    $("sso-minted").style.display = "";
+    $("sso-minted-key").textContent = res.key || "";
+    $("sso-mint-status").textContent = "bound to " + (res.subject || "your account");
+    toast("Key minted for " + (res.subject || "your account"));
+  } catch (e) {
+    $("sso-minted").style.display = "none";
+    toast(e.message, true); // the server's 403/503 verbatim
+  }
+}
+
+async function ssoKeysList() {
+  try {
+    const res = await api("/api/admin/keys/self");
+    const keys = res.keys || [];
+    const box = $("sso-keys");
+    box.style.display = "";
+    box.innerHTML = keys.length
+      ? '<table class="grid"><thead><tr><th>label</th><th>fingerprint</th><th>created</th><th></th></tr></thead><tbody>' +
+        keys.map((k) =>
+          "<tr><td>" + esc(k.label || "?") + "</td>" +
+          "<td title='" + esc(k.fp || "") + "'>" + esc(admFp(k.fp)) + "</td>" +
+          "<td>" + esc(k.created_at || "") + "</td>" +
+          "<td><button class='mini-del' data-fp='" + esc(k.fp || "") + "'>✕ revoke</button></td></tr>").join("") +
+        "</tbody></table>"
+      : '<div class="hint">no active self-minted keys</div>';
+    box.querySelectorAll(".mini-del").forEach((btn) => {
+      btn.onclick = async () => {
+        if (!confirm("Revoke this key? MCP clients using it will stop working.")) return;
+        try {
+          await api("/api/admin/keys/self/" + encodeURIComponent(btn.dataset.fp), { method: "DELETE" });
+          toast("Key revoked");
+          ssoKeysList();
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("sso-mint").onclick = ssoMint;
+$("sso-keys-list").onclick = ssoKeysList;
+$("sso-minted-copy").onclick = () =>
+  navigator.clipboard.writeText($("sso-minted-key").textContent).then(() => toast("Raw key copied — store it now"));
+
+// ---- Users (admin): every known subject, grant BY NAME ---------------------
+
+async function admLoadUsers() {
+  const box = $("adm-users");
+  if (!adminCredential) { box.innerHTML = ""; return; }
+  try {
+    const res = await api("/api/admin/users", { headers: admHeaders() });
+    const users = res.users || [];
+    $("adm-users-meta").textContent = users.length + " subject(s)";
+    if (!users.length) {
+      box.innerHTML = '<div class="empty">no subjects yet — users appear here after an operator grant or their first SSO key mint</div>';
+      return;
+    }
+    const admins = new Set(res.admins || []);
+    let html = '<table class="grid"><thead><tr><th>subject</th><th>grants (dataset globs)</th><th>keys</th><th>last seen</th><th></th></tr></thead><tbody>';
+    for (const u of users) {
+      html += "<tr>" +
+        "<td><b>" + esc(u.subject) + "</b>" + (admins.has(u.subject) || admins.has("subject:" + u.subject) ? " <span style='color:var(--yellow)' title='designated admin'>★</span>" : "") + "</td>" +
+        "<td><input type='text' class='adm-grants-in' data-subject='" + esc(u.subject) + "' value=\"" + esc((u.grants || []).join(", ")) + "\" style='width:100%;background:var(--editor-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:11px;padding:4px 6px' placeholder='workorder/*, reports/*' /></td>" +
+        "<td>" + (u.keys && u.keys.length ? u.keys.length + " <span class='hint'>active</span>" : "<span class='hint'>none</span>") + "</td>" +
+        "<td>" + esc(u.last_seen || "—") + "</td>" +
+        "<td><button class='adm-grants-save mini-del' data-subject='" + esc(u.subject) + "' style='color:var(--text)'>save</button></td>" +
+        "</tr>";
+    }
+    html += "</tbody></table>";
+    box.innerHTML = html;
+    box.querySelectorAll(".adm-grants-save").forEach((btn) => {
+      btn.onclick = async () => {
+        const subject = btn.dataset.subject;
+        const input = box.querySelector(".adm-grants-in[data-subject='" + CSS.escape(subject) + "']");
+        const globs = (input.value || "").split(",").map((s) => s.trim()).filter(Boolean);
+        try {
+          await api("/api/admin/users/" + encodeURIComponent(subject) + "/grants", {
+            method: "PUT",
+            headers: admHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ globs }),
+          });
+          toast("Grants saved for " + subject + (globs.length ? "" : " (revoked all)"));
+          accessRefresh(); // the assignments panel reflects the same write
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+  } catch (e) {
+    box.innerHTML = "";
+  }
+}
+
+const _accessRefreshWithUsers = accessRefresh;
+accessRefresh = async function () {
+  await _accessRefreshWithUsers();
+  if (adminCredential) await admLoadUsers();
+};
+
 // ---- SV editor component ----------------------------------------------------
 // A transparent-text textarea layered over a <pre> the SERVER highlights with
 // pygments (lexer guessed from the content — the same `pygmentize -g`
@@ -1042,9 +2160,7 @@ function makeSVEditor(mount, sizing) {
   mount.appendChild(ed);
 
   let clean = "";
-  let timer = null;
-  let seq = 0; // ignore stale highlight responses after newer keystrokes
-  let fmt = "yaml"; // seeds the server's -g-style lexer guess (virtual filename)
+  let fmt = "yaml"; // YAML or JSON — picks the client-side tokenizer
 
   const syncScroll = () => { pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; };
   ta.addEventListener("scroll", syncScroll);
@@ -1058,36 +2174,116 @@ function makeSVEditor(mount, sizing) {
     }
   });
 
-  async function highlightNow() {
-    const text = ta.value;
-    const mine = ++seq;
-    try {
-      const r = await api("/api/highlight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          format: fmt,
-          theme: document.documentElement.dataset.theme === "light" ? "light" : "dark",
-        }),
-      });
-      if (mine !== seq) return;                 // a newer edit already won
-      if (r && r.html) code.innerHTML = r.html; // pygments escapes token text
-      else code.textContent = text;             // no pygments / over cap: plain
-    } catch (err) {
-      if (mine !== seq) return;
-      code.textContent = text;
+  // ---- client-side highlighting (replaces the server /api/highlight round-trip) ----
+  // The old design POSTed the text to the server for pygments on every keystroke
+  // (300ms debounce + RTT): a delete left the colored layer showing STALE text for
+  // seconds, and since clicks land on the textarea (caret layer) while the user aims
+  // at the stale colored layer, clicks appeared to "not align". Highlighting now runs
+  // synchronously in the same frame as the edit — both layers are always in register.
+  // Catalog panes are only ever YAML or JSON, so one small tokenizer covers both;
+  // unknown formats degrade to escaped plain text (the editor always works).
+  const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const span = (cls, t) => '<span class="' + cls + '">' + esc(t) + "</span>";
+
+  function highlightYAML(text) {
+    // Line-based: a line is [indent]key: value | comment | scalar | block indicator.
+    // Values may be quoted strings, numbers, bools/null, or block indicators
+    // (| > with optional chomping/indent markers). Multi-line flow scalars are
+    // out of scope for a highlighter (they render as plain text — harmless).
+    let out = "";
+    for (const line of text.split("\n")) {
+      let i = 0;
+      // full-line comment
+      const c = line.indexOf("#");
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith("#")) { out += span("tok-cmt", line); out += "\n"; continue; }
+      // key (either "key:" or "key: value"); keys may be quoted
+      const m = /^(\s*(- )?)(?:"([^"]*)"|'([^']*)'|([^:#\n]+?))(\s*:)(\s+|$)/.exec(line);
+      if (m) {
+        const [full, indent, dash, dq, sq, bare, colon, ws] = m;
+        out += esc(indent);
+        out += dq !== undefined ? span("tok-key", '"' + dq + '"')
+             : sq !== undefined ? span("tok-key", "'" + sq + "'")
+             : span("tok-key", bare);
+        out += span("tok-pct", colon) + esc(ws ?? "");
+        i = full.length;
+        const rest = line.slice(i);
+        out += highlightScalar(rest);
+      } else {
+        out += highlightScalar(line);
+      }
+      out += "\n";
     }
+    // trailing newline split artifact: text.split adds an empty last element only
+    // when text ends with \n — the extra "\n" above already reproduces it, so
+    // drop one if the original text ended without a newline... (handled by caller join)
+    return out;
+  }
+
+  function highlightScalar(rest) {
+    if (!rest) return "";
+    const t = rest.trim();
+    // trailing / inline comment (space-# to avoid coloring URIs etc.)
+    let body = rest, comment = "";
+    const h = rest.search(/(^|\s)#/);
+    if (h >= 0 && !/^['"]/.test(t)) { body = rest.slice(0, h); comment = rest.slice(h); }
+    const tv = body.trim();
+    if (/^["']/.test(tv)) {
+      const q = tv[0];
+      const closed = tv.length > 1 && tv.lastIndexOf(q) > 0;
+      const cls = closed ? "tok-str" : "tok-err";
+      // keep surrounding whitespace outside the span for exact metrics
+      const lead = body.slice(0, body.indexOf(q));
+      const tail = closed ? body.slice(body.lastIndexOf(q) + 1) : "";
+      const core = closed ? body.slice(body.indexOf(q), body.lastIndexOf(q) + 1) : body.slice(body.indexOf(q));
+      return esc(lead) + span(cls, core) + esc(tail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^-?(\d[\d_]*(\.\d+)?([eE][+-]?\d+)?)$/.test(tv)) {
+      const lead = body.slice(0, body.indexOf(tv));
+      const trail = body.slice(body.indexOf(tv) + tv.length);
+      return esc(lead) + span("tok-num", tv) + esc(trail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^(true|false|null|~|yes|no|on|off)$/i.test(tv)) {
+      const lead = body.slice(0, body.indexOf(tv));
+      const trail = body.slice(body.indexOf(tv) + tv.length);
+      return esc(lead) + span("tok-bool", tv) + esc(trail) + (comment ? span("tok-cmt", comment) : "");
+    }
+    if (/^[|>][+-]?\d*$/.test(tv)) { // block scalar indicator
+      const lead = body.slice(0, body.indexOf(tv));
+      return esc(lead) + span("tok-pct", tv) + (comment ? span("tok-cmt", comment) : "");
+    }
+    return esc(body) + (comment ? span("tok-cmt", comment) : "");
+  }
+
+  function highlightJSON(text) {
+    // One regex pass: strings (incl. key context), numbers, bools/null, punctuation.
+    const re = /("(?:[^"\\]|\\.)*")(\s*:)?|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false|null)\b|([{},\[\]])/g;
+    let out = "", last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      out += esc(text.slice(last, m.index));
+      if (m[1] !== undefined) out += span(m[2] ? "tok-key" : "tok-str", m[1]);
+      else if (m[2] !== undefined) out += span("tok-pct", m[2]);
+      else if (m[3] !== undefined) out += span("tok-num", m[3]);
+      else if (m[4] !== undefined) out += span("tok-bool", m[4]);
+      else if (m[5] !== undefined) out += span("tok-pct", m[5]);
+      last = re.lastIndex;
+    }
+    out += esc(text.slice(last));
+    return out;
+  }
+
+  function highlightNow() {
+    const text = ta.value;
+    code.innerHTML = fmt === "json" ? highlightJSON(text) : highlightYAML(text);
     syncScroll();
   }
-  const schedule = (ms) => { clearTimeout(timer); timer = setTimeout(highlightNow, ms); };
-  ta.addEventListener("input", () => { schedule(300); if (ed._onchange) ed._onchange(); });
-  document.addEventListener("sv-theme-change", () => schedule(60)); // restyle for the theme
+  ta.addEventListener("input", () => { highlightNow(); if (ed._onchange) ed._onchange(); });
+  document.addEventListener("sv-theme-change", () => highlightNow()); // colors come from CSS vars, but re-run keeps parity
 
   return {
     el: ed,
     get text() { return ta.value; },
-    set text(v) { ta.value = v; code.textContent = v; clean = v; highlightNow(); },
+    set text(v) { ta.value = v; clean = v; highlightNow(); },
     get format() { return fmt; },
     set format(f) { fmt = f; },
     get dirty() { return ta.value !== clean; },
@@ -1297,7 +2493,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 initThemeToggle();
+wireIdentityWidget();
 refreshStatus();
+renderIdentityFromServer();
 refreshTables();
 refreshCatalog();
 renderSaved();

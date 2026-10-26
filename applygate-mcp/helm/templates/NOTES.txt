@@ -1,0 +1,55 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret -}}
+
+applygate-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+════════════════════════════════════════════════════════════════════
+1. API key — REQUIRED BEFORE THE POD WILL START.
+   This chart NEVER creates the key Secret (an envsubst apply once
+   emptied a live key Secret — the K8S-MCP lesson). Until the Secret
+   below exists in this namespace, the pod sits in
+   CreateContainerConfigError:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+   Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-keys}' | base64 -d
+
+   ROTATION (zero downtime): the value is a COMMA-SEPARATED list of
+   valid keys — append the new one, move clients over, drop the old:
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-keys=new-key,old-key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+   The server re-reads the env per request — no restart needed. The
+   fleet-universal MCP_API_KEYS env is honored too (either var works).
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints — /mcp REQUIRES the key (X-API-Key or Authorization:
+   Bearer); the read-only console and /health probes do not.
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} {{ .Values.service.port }}:{{ .Values.service.targetPort }}
+  Console : http://localhost:{{ .Values.service.port }}/   (plan previews — ALWAYS dry-run)
+  MCP     : http://localhost:{{ .Values.service.port }}/mcp   (X-API-Key: <api-key>)
+
+  MCP client config:
+  { "mcpServers": { "applygate": { "type": "remote", "url": "http://localhost:{{ .Values.service.port }}/mcp", "headers": { "X-API-Key": "<api-key>" } } } }
+
+════════════════════════════════════════════════════════════════════
+3. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | head -8
+  # → no "APPLYGATE_API_KEYS is unset" banner; unauthenticated /mcp → 401.
+
+════════════════════════════════════════════════════════════════════
+4. Plan binding (D11) + audit trail — what changed since 0.1.4:
+   apply_manifest is sha256-bound to the EXACT bytes plan_apply recorded
+   (default: refuse without a plan). Automation that skips plan_apply now
+   FAILS BY DESIGN — the migration path is values planBinding.unplannedApply:
+   warn (applies + logs loudly) or allow (pre-D11 behavior).
+   The audit JSONL is now HASH-CHAINED (prev_sha256 per entry) and
+   caller-attributed (non-secret key fingerprint + client) — tamper-evident;
+   verify with the README procedure. Fleet convention: the audit.path is
+   documented for ops mount/expose — mount this release's audit PVC into
+   the logsearch pod to make the trail searchable.

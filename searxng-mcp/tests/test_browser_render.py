@@ -57,19 +57,16 @@ WEAK_BUT_PRESENT_HTML = """
 # challenge markers, and under RENDER_MIN_CHARS of visible text: nothing in
 # the document says "JavaScript required", it just stays empty until rendered.
 def _bare_shell() -> str:
-    pagination = "".join(
-        f'\n        <li class="page-item"><a href="/js/page/{n}/">{n}</a></li>'
-        for n in range(1, 21)
-    )
+    pagination = "".join(f'\n        <li class="page-item"><a href="/js/page/{n}/">{n}</a></li>' for n in range(1, 21))
     structure = "".join(
         '\n    <div class="quote" itemscope itemtype="http://schema.org/Quotation">'
-        '<span class="placeholder" data-key="q%d"></span></div>' % n
+        f'<span class="placeholder" data-key="q{n}"></span></div>'
         for n in range(1, 21)
     )
     head = (
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         '<meta charset="UTF-8">\n'
-        '<title>Quotes to Scrape</title>\n'
+        "<title>Quotes to Scrape</title>\n"
         '<link href="/static/bootstrap.min.css" rel="stylesheet">\n'
         '<link href="/static/docs.min.css" rel="stylesheet">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
@@ -84,8 +81,7 @@ def _bare_shell() -> str:
         "</head>\n"
     )
     return (
-        head
-        + "<body>\n"
+        head + "<body>\n"
         '<div class="container">\n'
         '  <nav class="navbar"><a href="/">Quotes to Scrape</a>'
         '<a href="/login">Login</a></nav>\n'
@@ -359,11 +355,7 @@ def test_include_screenshot_forces_browser_and_appends_data_url(monkeypatch):
     fetcher = make_fetcher(monkeypatch, plain_html=RICH_HTML)
     stub = StubBrowserClient(page=rich_page(), shot="QUJD")  # base64("ABC")
     fetcher._browser = stub
-    out = run(
-        fetcher.fetch_and_parse(
-            "https://spa.example/", DummyCtx(), include_screenshot=True
-        )
-    )
+    out = run(fetcher.fetch_and_parse("https://spa.example/", DummyCtx(), include_screenshot=True))
     assert len(stub.calls) == 1 and stub.calls[0]["screenshot"] is True
     assert "data:image/png;base64,QUJD" in out
     assert "PNG data URL" in out
@@ -373,11 +365,7 @@ def test_screenshot_requested_but_browser_down_still_returns_content(monkeypatch
     fetcher = make_fetcher(monkeypatch, plain_html=RICH_HTML)
     stub = StubBrowserClient(error=BrowserUnavailable("down"))
     fetcher._browser = stub
-    out = run(
-        fetcher.fetch_and_parse(
-            "https://spa.example/", DummyCtx(), include_screenshot=True
-        )
-    )
+    out = run(fetcher.fetch_and_parse("https://spa.example/", DummyCtx(), include_screenshot=True))
     assert "Headless Browser Rendering" in out
     assert "data:image/png" not in out
 
@@ -396,9 +384,7 @@ def test_wikipedia_url_skips_browser_and_uses_api(monkeypatch):
         return "Wikipedia API prose."
 
     monkeypatch.setattr(fetcher, "_try_wikipedia_api", fake_wiki_api)
-    out = run(
-        fetcher.fetch_and_parse("https://en.wikipedia.org/wiki/Search_engine", DummyCtx())
-    )
+    out = run(fetcher.fetch_and_parse("https://en.wikipedia.org/wiki/Search_engine", DummyCtx()))
     assert stub.calls == []
     assert "Wikipedia API prose." in out
     assert "(via Wikipedia API)" in out
@@ -428,13 +414,12 @@ def test_fetch_content_rejects_unknown_render_over_wire():
     import server
 
     async def run_wire():
-        async with InMemoryTransport(server.mcp) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                return await session.call_tool(
-                    "fetch_content",
-                    {"url": "https://example.com/", "render": "bogus"},
-                )
+        async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            return await session.call_tool(
+                "fetch_content",
+                {"url": "https://example.com/", "render": "bogus"},
+            )
 
     result = asyncio.run(run_wire())
     assert not result.is_error  # validation errors are returned as text

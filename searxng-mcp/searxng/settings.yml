@@ -50,7 +50,8 @@ outgoing:
   enable_http2: true
   max_request_timeout: 10
   request_timeout: 5
-  # Uncomment when the cluster has no direct internet egress (HPE sites):
+  # Uncomment when the cluster has no direct internet egress (behind a
+  # corporate proxy — use the site's real proxy address):
   # proxies:
   #   all://:
-  #     - http://hpeproxy.its.hpecorp.net:8080
+  #     - http://proxy.corp.example:8080

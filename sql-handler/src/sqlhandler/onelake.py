@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -50,7 +51,12 @@ _TOKEN_ATTEMPTS = 3
 _TOKEN_RETRY_BASE_SLEEP = 0.5
 
 # Upper bound on DFS list continuation pages per directory (safety guard).
-_DFS_LIST_MAX_PAGES = 5
+# Raised from 5 (audit P2): a 5-page cap silently truncated any schema with
+# >~5000 entries — list_tables returned a SHORT list and callers could not
+# tell. The bound is now large enough to be unreachable in practice, and if
+# it IS hit the truncation is LOUD: a warning is logged and the
+# sqlhandler_onelake_listing_truncated_total metric is incremented.
+_DFS_LIST_MAX_PAGES = 5000
 
 
 class OneLakeProvider(DataProvider):
@@ -181,13 +187,17 @@ class OneLakeProvider(DataProvider):
             entries = self._dfs_list(f"{self._lh_root}/Tables/{info.path}/_delta_log")
         except Exception:
             return None
-        versions = [0]
+        # No numeric log file seen -> None, NOT 0 (audit P2): seeding
+        # versions=[0] made "no _delta_log listing" indistinguishable from
+        # "table at version 0", so a stale cache token could pin a table that
+        # has no log at all. None tells the engine to fall back to TTL.
+        versions: list[int] = []
         for entry in entries:
             name = entry.get("name", "").rstrip("/").split("/")[-1]
             stem = name.split(".", 1)[0]
             if stem.isdigit():
                 versions.append(int(stem))
-        return max(versions)
+        return max(versions) if versions else None
 
     def check_connection(self) -> str | None:
         """Cheap readiness check: acquire token and list the Tables root."""
@@ -231,7 +241,25 @@ class OneLakeProvider(DataProvider):
             continuation = payload.get("continuation")
             if not continuation:
                 return paths
-        raise LakehouseError(f"DFS list of {path} failed: too many continuation pages")
+        # The page bound was hit: NEVER return a silently truncated list.
+        # Log a warning and bump the truncation counter, then raise — callers
+        # must see the failure, not a short table list that looks complete.
+        logger.warning(
+            "DFS list of %s hit the %d-page continuation bound — listing TRUNCATED; "
+            "raising instead of returning a partial result",
+            path,
+            _DFS_LIST_MAX_PAGES,
+        )
+        try:
+            from .observability import metrics as _metrics
+
+            _metrics.onelake_listing_truncated.inc(path)
+        except Exception:  # metrics must never break the error path
+            pass
+        raise LakehouseError(
+            f"DFS list of {path} failed: exceeded {_DFS_LIST_MAX_PAGES} continuation pages "
+            "(listing truncated — widen the prefix or raise _DFS_LIST_MAX_PAGES)"
+        )
 
     def list_tables(self) -> list[TableInfo]:
         """List the Delta tables under the lake Tables dir.
@@ -291,8 +319,15 @@ class OneLakeProvider(DataProvider):
             raise LakehouseError(f"Could not open Delta table {info.path!r}: {exc}") from exc
 
     def _storage_options(self) -> dict:
-        """Storage options for deltalake (OneLake account + SP creds)."""
-        return {
+        """Storage options for deltalake (OneLake account + SP creds).
+
+        ``SQLHANDLER_ONELAKE_STORAGE_OPTIONS`` (a JSON object) is merged on
+        top, so operators can tune the delta-rs object-client (retries,
+        timeouts, connection behavior) without code changes. Malformed JSON
+        is an operator config error and fails loudly (same philosophy as
+        ATTACH).
+        """
+        options = {
             "account_name": "onelake",
             "azure_tenant_id": self.config.tenant_id,
             "azure_client_id": self.config.client_id,
@@ -300,11 +335,26 @@ class OneLakeProvider(DataProvider):
             "dfs_endpoint": self.config.fabric_authority,
             "blob_endpoint": self.config.fabric_authority.replace("dfs", "blob"),
         }
+        raw = os.environ.get("SQLHANDLER_ONELAKE_STORAGE_OPTIONS", "").strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+                if not isinstance(extra, dict):
+                    raise ValueError("must be a JSON object")  # noqa: TRY004
+                options.update(extra)
+            except Exception as exc:
+                raise LakehouseError(f"SQLHANDLER_ONELAKE_STORAGE_OPTIONS is not valid JSON options: {exc}") from exc
+        return options
 
     def open_dataset(self, info: TableInfo, version: int | None = None):
         """Open the Delta table as a pyarrow Dataset (cached by the engine).
 
         ``version`` pins a historical Delta snapshot for time travel.
+
+        When the disk block cache is enabled (``SQLHANDLER_BLOCK_CACHE=1``)
+        the delta DATA-file reads are routed through it (see
+        :meth:`_delta_data_fs`); with the cache off the dataset is built
+        exactly as before, entirely inside delta-rs.
         """
         if version is not None:
             _validate_snapshot_version(version, "Delta")
@@ -312,6 +362,75 @@ class OneLakeProvider(DataProvider):
         else:
             dt = self._open_delta(info)
         try:
-            return dt.to_pyarrow_dataset()
+            fs = self._delta_data_fs(dt, info, version)
+            if fs is None:
+                return dt.to_pyarrow_dataset()
+            return dt.to_pyarrow_dataset(filesystem=fs)
         except Exception as exc:
             raise LakehouseError(f"Could not open Delta dataset {info.path!r}: {exc}") from exc
+
+    def _delta_data_fs(self, dt, info: TableInfo, version: int | None):
+        """The block-cache-wrapped filesystem for Delta data-file reads, or None.
+
+        ``DeltaTable.to_pyarrow_dataset()`` does its data IO inside delta-rs's
+        own object-store client, which bypassed ``maybe_block_cache``
+        entirely — OneLake scans never cached bytes (audit finding). When the
+        block cache is ON this rebuilds the SAME handler delta-rs would build
+        internally (``DeltaStorageHandler`` over the table URI with this
+        provider's storage options, seeded with the snapshot's file sizes
+        from the delta log), wraps it in the disk block cache, and hands it
+        back so parquet footers/column chunks are fetched once and re-served
+        from pod-local disk. Delta-log/checkpoint IO stays inside delta-rs
+        either way (small, and already cached by the engine's dataset
+        handles). Returns None — leaving delta-rs's built-in path in place —
+        when the cache is disabled or anything fails: the cache is an
+        accelerator, never a dependency.
+
+        Snapshot consistency: block keys are scoped by the Delta snapshot
+        version, mirroring the engine result cache's base-snapshot keying.
+        Delta data files are immutable per the protocol (so path+size alone
+        is already snapshot-safe), and the engine re-opens the dataset when
+        ``check_version`` sees a new ETL commit; the scope additionally
+        guarantees that a re-open at a different snapshot — a new commit or
+        a time-travel read — can never be served another snapshot's cached
+        bytes even if a backend rewrote a path in place.
+        """
+        from .blockcache import block_cache_enabled, maybe_block_cache
+
+        if not block_cache_enabled():
+            return None
+        try:
+            import pyarrow.fs as pafs
+            from deltalake.fs import DeltaStorageHandler
+
+            handler = DeltaStorageHandler(
+                self.table_uri(info),
+                options=self._storage_options(),
+                known_sizes=self._delta_file_sizes(dt),
+            )
+            snapshot = int(version) if version is not None else int(dt.version())
+            return maybe_block_cache(
+                pafs.PyFileSystem(handler),
+                purpose=f"onelake:{info.path}",
+                scope=f"delta-v{snapshot}",
+            )
+        except Exception:
+            logger.warning("OneLake block-cache wrap failed; reading uncached", exc_info=True)
+            return None
+
+    @staticmethod
+    def _delta_file_sizes(dt) -> dict[str, int] | None:
+        """Relative data-file path -> size, from the snapshot's add actions.
+
+        The delta log already carries every file's size, so seeding the
+        handler with it (exactly what delta-rs does internally) saves one
+        HEAD request per file per open. Returns None when the stats cannot
+        be read and the cache falls back to stat()-per-file behavior.
+        """
+        try:
+            import pyarrow as pa
+
+            adds = pa.table(dt.get_add_actions(flatten=True))
+            return dict(zip(adds.column("path").to_pylist(), adds.column("size_bytes").to_pylist()))
+        except Exception:
+            return None

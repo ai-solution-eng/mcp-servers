@@ -1,0 +1,188 @@
+# ============================================================================
+# applygate-mcp — the governed Kubernetes WRITE-path MCP server (PCAI Helm values)
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: applygate-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — comma-separated keys all authenticate (/mcp 401s without).
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Write surface (default-deny): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+#   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
+#   Audit trail + persistence (hash-chained; logsearch-searchable) — README 'Audit trail'
+#   Caller attribution: clients.existingSecret + callerPassthrough.trustedCidrs — README
+#   Cross-namespace writes: per-namespace RBAC bootstrap — documentation/DEPLOYMENT.md
+
+deployment:
+  name: applygate-mcp
+  appName: applygate-mcp
+  replicaCount: 1
+
+image:
+  repository: ghcr.io/ai-solution-eng/applygate-mcp
+  tag: v0.5.0
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# ============================================================================
+# Transport Security (DNS-rebinding protection)
+# ============================================================================
+
+# Public FQDN pin — set in lockstep with ezua.virtualService.endpoint, or
+# every gateway-fronted request 421s.
+mcpHostname: ''
+# EXTRA in-cluster svc-DNS hosts (verbatim or host:*; own-svc DNS auto-prepended).
+extraAllowedHosts: []
+
+# Operator-created Secret (never inline a key in values); the Deployment
+# fails loud until it exists. Comma-separated keys all authenticate (rotation).
+apiKey:
+  existingSecret: applygate-mcp-apikey
+  existingSecretKey: api-keys
+
+clients:
+  # Caller-name registry "name:key;name:key;..." — NAMES only (already-matched
+  # keys); NEVER authenticates. Omitted (default) → fp-only caller audit.
+  existingSecret: ''
+  existingSecretKey: clients
+
+callerPassthrough:
+  # X-MCP-Caller honored ONLY from peers in these CIDRs; empty = fail-closed.
+  # Attribution-never-authorization: via/name NEVER unlock anything.
+  trustedCidrs: ''
+
+webui:
+  enabled: true
+
+namespaces:
+  allowed: ''
+  blocked: ''
+
+kinds:
+  allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
+
+audit:
+  # Hash-chained, tamper-evident JSONL trail (README "Audit trail") — mount
+  # the SAME path/PVC into the logsearch pod to make "who did what" searchable.
+  file: /data/audit.jsonl
+
+planBinding:
+  # apply_manifest is sha256-bound to the planned bytes; missing/tampered plan
+  # refuses BY DEFAULT. ''=deny (default) | warn=logged | allow=legacy.
+  unplannedApply: ''
+
+metrics:
+  # /metrics + ServiceMonitor — additive, OFF by default; true serves /metrics
+  # on the SAME container port and ships the ServiceMonitor (prom-op CRD needed).
+  enabled: false
+  interval: 30s
+
+persistence:
+  enabled: true
+  size: 1Gi
+  accessModes: [ReadWriteOnce]
+
+service:
+  type: ClusterIP
+  port: 9102
+  targetPort: 9102
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 512Mi}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  create: true
+  name: applygate-mcp
+
+rbac:
+  create: true
+
+# Per-key proxy wiring — each key wired only when non-empty; proxy: {} = off
+# (the in-cluster k8s API is covered by the standard NO_PROXY entries).
+proxy: {}
+
+kyverno:
+  enabled: false
+
+ezua:
+  enabled: false
+  domainName: ${DOMAIN_NAME}
+  virtualService:
+    # false unrenders the VS (no browser path) while ezua.enabled keeps driving
+    # every other gate. Gate DIRECTLY on this key — Sprig `default` flips it.
+    enabled: true
+    endpoint: applygate-mcp.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 120s
+
+# ============================================================================
+# MCP Network Zone (ADDITIVE, DEFAULT OFF)
+# ============================================================================
+
+# Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
+# egress stays unrestricted (policyTypes: [Ingress] only).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # In-cluster caller namespaces (relay ns first; + `monitoring` when a
+  # ServiceMonitor ships — an unlisted scrape ns dies silently).
+  authorizedClients:
+    namespaces: []
+  # Browser/console path stays OPEN — the zone stops RANDOM IN-CLUSTER access
+  # only; flip to false only as an explicit per-site decision.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # Live-verified edge-pod label — `ezaf-gateway` is the Gateway CR NAME;
+  # do not "fix" this back to app=ezaf-gateway.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes / kubectl port-forward. NEVER 0.0.0.0/0
+  # with an empty probeExceptCidrs (the template fails the render).
+  probeCidrs: []
+  probeExceptCidrs: []
+
+  egress:
+    # Egress intentionally unrestricted (fleet contract: admin MCPs reach the
+    # k8s API / Prometheus / internet legitimately per site).
+    enabled: false
+    extraEgress: []
+
+# ============================================================================
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF
+# ============================================================================
+
+# Voluntary-eviction guard for node drains (templates/pdb.yaml, policy/v1).
+# DEFAULT OFF keeps the default helm render byte-identical. Single-replica
+# caveat: with replicaCount 1 (every chart in this fleet), minAvailable: 1
+# blocks ALL voluntary evictions — a drain waits. That is the intended
+# safety trade; operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1

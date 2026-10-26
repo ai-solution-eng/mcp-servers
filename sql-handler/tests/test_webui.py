@@ -418,6 +418,124 @@ def test_semantic_catalog_http_routes(tmp_path, monkeypatch):
     assert client.delete("/api/semantic-catalog", headers=auth).json()["removed"] is True
     assert "description" not in client.post("/api/describe", json={"table": "orders"}, headers=auth).json()
 
+def test_semantic_catalog_upload_admits_a_designated_admin_without_a_key(tmp_path, monkeypatch):
+    """POST /api/semantic-catalog: the write gate admits an SSO admin with no key.
+
+    The catalog upload is the strongest poisoning channel of the four write
+    routes, so it carries the same saved.assert_write_allowed gate. The bug
+    this pins shut: the panel could administer (PUT /api/admin/policy reached
+    the route) while the very same admin was refused 401 here, because the
+    gate read only key headers and an SSO session presents none.
+
+    Three cases on one app, differing only in who is calling:
+      * anonymous -> 401 (the gate still refuses; no general opening);
+      * trusted SSO session of a NON-admin -> 401 (authenticated is not
+        authorized);
+      * trusted SSO session of a DESIGNATED admin -> 200, catalog written.
+    """
+    import json
+
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.policy import reset_policy_store
+    from sqlhandler.server import _transport_security
+    from sqlhandler.server import mcp as mcp_server
+
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    # MCP keys (not the /api token) so /api has NO middleware of its own and
+    # the write gate is the ONE layer deciding these requests — otherwise a
+    # valid SQLHANDLER_API_TOKEN would itself satisfy credential_ok and the
+    # non-admin case could never be observed refusing.
+    monkeypatch.setenv("MCP_API_KEYS", "key-9")
+    # the deployment posture: the gateway's identity headers are trusted, and
+    # the policy designates one admin by SUBJECT (an SSO username).
+    monkeypatch.setenv("SQLHANDLER_TRUST_BROWSER_HEADERS", "1")
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps({"admins": ["andrew"], "datasets": {"global": ["*"]}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    monkeypatch.setenv("SQLHANDLER_POLICY_FILE", str(policy_file))
+    reset_policy_store()
+
+    pq.write_table(pa.table({"id": [1, 2], "amount": [1.0, 2.0]}), str(tmp_path / "orders.parquet"))
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    register_ui(app, lambda: eng)
+    client = TestClient(app)
+
+    catalog = b"tables:\n  orders:\n    description: by the admin\n"
+    try:
+        # 1) anonymous, no key, no session: refused — the gate did not open
+        r = client.post("/api/semantic-catalog", content=catalog)
+        assert r.status_code == 401, r.text
+        assert "MCP_API_KEYS" in r.json()["error"]
+
+        # 2) a signed-in SSO user who is NOT designated: refused, and told to
+        #    mint a key (their session is not the problem, their designation
+        #    is) — authenticated is not authorized.
+        non_admin = {"X-Auth-Request-User": "mallory"}
+        r = client.post("/api/semantic-catalog", content=catalog, headers=non_admin)
+        assert r.status_code == 401, r.text
+        assert "designated admin" in r.json()["error"]
+        assert "mint a key" in r.json()["error"]
+        assert not (tmp_path / "store.json").exists(), "nothing was written"
+
+        # 3) the designated admin, same session shape, NO api key -> allowed
+        admin = {"X-Auth-Request-User": "andrew"}
+        r = client.post("/api/semantic-catalog", content=catalog, headers=admin)
+        assert r.status_code == 200, r.text
+        assert r.json()["tables"] == 1
+        assert eng.catalog_status()["active_source"] == "upload"
+
+        # ...and the DELETE (the strongest of the four) admits the admin too
+        r = client.delete("/api/semantic-catalog", headers=admin)
+        assert r.status_code == 200, r.text
+        assert r.json()["removed"] is True
+
+        # a non-admin still cannot DELETE either
+        assert client.delete("/api/semantic-catalog", headers=non_admin).status_code == 401
+    finally:
+        reset_policy_store()
+
+
+def test_semantic_catalog_upload_static_key_still_works(tmp_path, monkeypatch):
+    """Unchanged path: a valid static key writes with no identity involved.
+
+    Regression guard for the fix itself — adding the admin branch must not
+    disturb the credential branch, and it must not require a policy at all
+    (most deployments have no admins list).
+    """
+    TestClient = pytest.importorskip("starlette.testclient", reason="httpx").TestClient
+    from sqlhandler.server import _transport_security
+    from sqlhandler.server import mcp as mcp_server
+
+    monkeypatch.setenv("SQLHANDLER_CATALOG_STORE", str(tmp_path / "store.json"))
+    monkeypatch.setenv("MCP_API_KEYS", "key-9")
+    monkeypatch.delenv("SQLHANDLER_POLICY_ENABLED", raising=False)
+
+    pq.write_table(pa.table({"id": [1], "amount": [1.0]}), str(tmp_path / "orders.parquet"))
+    eng = SqlEngine(FileProvider(FileConfig(root_dir=str(tmp_path))), cache_ttl=0)
+    app = mcp_server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        transport_security=_transport_security,
+    )
+    register_ui(app, lambda: eng)
+    client = TestClient(app)
+
+    catalog = b"tables:\n  orders:\n    description: with a key\n"
+    assert client.post("/api/semantic-catalog", content=catalog).status_code == 401
+    r = client.post("/api/semantic-catalog", content=catalog, headers={"X-API-Key": "key-9"})
+    assert r.status_code == 200, r.text
+    assert r.json()["tables"] == 1
+
 
 # ---------------------------------------------------------------------------
 # semantic catalog editor: content / per-table upsert + remove / highlight

@@ -48,9 +48,12 @@ def test_unconfigured_onelake_raises():
         make_provider(FabricConfig())
 
 
-def test_env_not_polluted_by_dotenv(tmp_path):
+def test_env_not_polluted_by_dotenv(tmp_path, monkeypatch):
     # load_dotenv should not clobber existing variables.
-    os.environ["SQLHANDLER_ENV_FILE"] = str(tmp_path / "missing.env")
+    # (monkeypatch, not a bare os.environ write: a leaked SQLHANDLER_ENV_FILE
+    # disables the conventional config/.env fallback for EVERY later test in
+    # the same session — the 2026-10-16 wave's last ordering failure.)
+    monkeypatch.setenv("SQLHANDLER_ENV_FILE", str(tmp_path / "missing.env"))
     from sqlhandler.config import load_dotenv
 
     load_dotenv()  # no crash when file absent

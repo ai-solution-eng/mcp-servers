@@ -1,0 +1,20 @@
+# sqlhandler — hardened MCP-network-zone overlay: paste AFTER values.g2.yaml.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ⚠️ CRITICAL: list the gateway's relay namespace first — with the zone on,
+# every unlisted caller times out (deny by absence).
+security:
+  networkPolicy:
+    enabled: true
+    gatewayNamespace: istio-system
+    allowedNamespaces: []          # empty: the zone list below is the allowlist
+    additionalIngress: []
+    # Appends in-cluster caller namespaces (kubernetes.io/metadata.name) to the rules above.
+    authorizedClients:
+      - pcai-llm            # LLM Gateway relay
+      - dsh-web-helm        # DSH web
+      - owebui0-11-0        # OWUI
+      - opencode-web-helm   # OpenCode web
+      - monitoring          # Prometheus scrape ns — omit and /metrics scraping dies SILENTLY
+
+    # OPTIONAL: sqlLocalAccess — CIDRs allowed direct to the service port (bypassing the gateway).

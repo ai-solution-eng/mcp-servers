@@ -46,6 +46,7 @@ tables:
 | `description` | table | One to three sentences: what one row is, grain, refresh cadence, gotchas |
 | `aliases` | table | List of alternative names people/agents might search for |
 | `columns` | table | Map of column name → one-line description. Only documented columns are annotated; undated columns stay untouched |
+| `definition` | table | SQL (a single `SELECT`/`WITH` statement) that makes the entry a **virtual table** — see below |
 
 ### Table keys — three forms that all work
 
@@ -56,6 +57,50 @@ tables:
 | Bare name | `work_order` | Quick start; matches whatever path the table actually has |
 
 The engine tries **path → qualified → bare name**, so a bare name keeps working even if the table moves. Start with bare names; promote to paths if two tables share a name.
+
+### Virtual tables — entries with a `definition`
+
+An entry whose key is a clean bare identifier (`^[A-Za-z_][A-Za-z0-9_]*$`) and that carries a non-empty
+`definition` becomes a **virtual table**: it shows up in `list_tables` (marked `VIRTUAL`), `describe_table`,
+`search_tables` and the Data Explorer like any other table, but nothing is stored behind it — SQLhandler
+constructs it **on the fly, at query time**, as a view over the base tables the definition names. Filters and
+projections from the user's query push down through it into the physical scans, and it composes with joins,
+CTEs and other virtual tables like any real table.
+
+```yaml
+tables:
+  vw_big_sales:
+    description: Sales over threshold, with the store name resolved
+    aliases: [big sales]
+    definition: |
+      SELECT s.id, s.amount, store.name
+      FROM sales s JOIN dim_store store USING (store_id)
+      WHERE s.amount > 100
+```
+
+Rules of the road:
+
+- **Dialect**: definitions run on the engine's DuckDB. `GROUP BY ALL`, `GREATEST`, `::INT` casts and CTE column
+  lists work as in Snowflake, and the engine bridges the two constructs DuckDB lacks: an `iff(c, t, e)` compat
+  macro, and `ARRAY_CONSTRUCT_COMPACT(...)` rewritten to `list_filter([...], x -> x IS NOT NULL)` at
+  registration time (string-literal-safe, any arity). Snowflake-style definitions using those two run verbatim;
+  anything more exotic needs porting (see [`examples/omnilife-catalog.yaml`](examples/omnilife-catalog.yaml)
+  for a worked example).
+- **Validation**: a definition must be exactly one read-only statement and must parse; anything else is dropped
+  with a warning (a broken entry must never break the catalog). Definitions execute on the same locked-down,
+  read-only connections as every other query — they add no new capability, only curated, reusable query shapes.
+- **Storage wins**: a virtual entry whose name collides with a physical table is ignored — the catalog can
+  never shadow real data.
+- **Base-table scope**: definitions resolve base tables among the lake's tables and other virtual tables;
+  attached-database tables (SQLHANDLER_ATTACH) are not pulled in automatically.
+- **Costs are query-time costs — paid once**: the first query touching a virtual table materializes its full
+  result to parquet; every later query (UI previews, filtered reads, aggregates) reads that file — milliseconds
+  instead of re-running the pipeline — until the definition, any base table's snapshot version, or
+  `SQLHANDLER_VIRTUAL_CACHE_TTL` (default 3600; `0` disables) changes. Unfiltered previews cannot short-circuit
+  a definition with blocking aggregates, which is exactly why the materialization exists. Profiling and its row
+  count run the definition (bounded by `SQLHANDLER_PROFILE_MAX_ROWS` for the sample); `scan_table` works via the
+  SQL path but its pyarrow `filters` argument is refused (use `run_sql`). Time-travel queries bypass the cache.
+- `virtual: true` **without** a `definition` is just a documentation marker — no table appears.
 
 ### Authoring tips
 

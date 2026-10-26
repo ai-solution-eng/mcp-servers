@@ -1,0 +1,122 @@
+# ============================================================================
+# k8s-mcp-customer — PCAI hosted-trial values (values-examples, secret-free);
+# target: an HPE-hosted PCAI trial cluster. STRUCTURALLY LOCKED twin of helm/.
+# Full guide: documentation/DEPLOYMENT.md
+# Owners: Andrew Bydlon <andrew.bydlon@hpe.com>, Francesco Caliva <francesco.caliva@hpe.com>
+# ============================================================================
+
+# STRUCTURALLY LOCKED — the security knobs (exec, namespace policy, per-user keys,
+# RBAC scope, extra groups) DO NOT EXIST here and the templates never read them:
+# pasting them is inert; Day-2 security changes are a platform action (NOTES.txt).
+
+# FULL VALUES — complete copy of helm-customer/values.yaml with the site edits inline.
+# ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the placeholders verbatim.
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+#   1. apiKey.existingSecret — the API-key Secret, created OUT OF BAND (the chart
+#      never creates or inlines it); CreateContainerConfigError until it exists.
+#   2. ezua.virtualService.endpoint WHEN ezua.enabled — render FAILS without it;
+#      doubles as MCP_HOSTNAME and must be unique per release.
+
+# ### OPTIONAL ###
+# The LOCKED chart tunes only benign wiring (copy the shape from the pointer):
+#   Exposure endpoint: ezua.virtualService.endpoint — documentation/DEPLOYMENT.md
+#   Console shell: console.enabled — documentation/DEPLOYMENT.md
+#   In-cluster callers: extraAllowedHosts (svc-DNS; never bypasses the key gate) — documentation/DEPLOYMENT.md
+#   Listing caps / metrics: listing.* / metrics.enabled — documentation/DEPLOYMENT.md
+#   Gateway SSO gate: ezua.authorizationPolicy.enabled (tokens ON TOP of the key) — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment / Image / Service / Resources
+# ============================================================================
+
+deployment:
+  name: k8s-mcp-customer
+  appName: k8s-mcp-customer
+  replicaCount: 1
+
+image:
+  repository: ghcr.io/ai-solution-eng/k8s-mcp
+  tag: v1.2.0   # same image as the internal chart — the locking lives in this chart
+  pullPolicy: IfNotPresent
+
+# Only for a PRIVATE GHCR package (public pulls are anonymous):
+#   kubectl create secret docker-registry ghcr-pull -n <ns> --docker-server=ghcr.io ...
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 9090        # MCP (streamable-http at /mcp) + ops console (/ui/)
+  targetPort: 9090
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 2Gi}
+
+serviceAccount:
+  create: true
+  name: ""                   # empty = deployment.name (it is the RBAC subject)
+
+# ============================================================================
+# MCP Server App Config (benign keys only)
+# ============================================================================
+
+apiKey:
+  # The pre-created API-key Secret (kubectl create secret generic …).
+  existingSecret: ""
+  existingSecretKey: api-key
+
+console:
+  enabled: true              # HPE ops console at /ui/ (inert shell; /mcp keeps auth)
+
+# Extra Host headers for in-cluster svc-DNS callers (never bypasses the
+# API-key gate). Kept at the chart default.
+extraAllowedHosts: []
+
+# Performance guardrails only — NOT security knobs; "" = the server's own default.
+listing:
+  maxItems: ""
+  concurrency: ""
+  maxEvents: ""              # K8S_MCP_MAX_EVENTS — get_events/triage items (server default 100)
+  maxNsRewrite: ""           # K8S_MCP_MAX_NS_REWRITE — per-namespace rewrite limit (server default 20)
+
+# RBAC is BAKED, NOT VALUES-DRIVEN: templates/rbac-readonly.yaml carries a
+# $scope chart constant; clamping a tenant = switch it + repackage (platform action).
+
+# ============================================================================
+# Pod Annotations / Node Placement
+# ============================================================================
+
+# Container hardening (non-root, read-only rootfs, dropped caps, seccomp) is NOT values-overridable.
+podAnnotations:
+  sidecar.istio.io/inject: "false"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# ${DOMAIN_NAME} is resolved by PCAI before rendering — keep the placeholders verbatim.
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"   # informational only — no template reads it
+
+  virtualService:
+    # Unique per release on the shared gateway; doubles as MCP_HOSTNAME.
+    endpoint: "k8s-mcp-customer.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+
+  # Gateway auth gate (oauth2-proxy) — on = PCAI tokens on TOP of the API key.
+  authorizationPolicy:
+    enabled: false
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
+
+# Observability: per-tool counters + ServiceMonitor.
+metrics:
+  enabled: true
+  interval: 30s

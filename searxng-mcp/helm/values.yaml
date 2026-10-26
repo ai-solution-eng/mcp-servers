@@ -1,151 +1,233 @@
+# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
+# SearXNG sidecar, for PCAI. The VirtualService root serves the SearXNG web
+# UI; /mcp routes to the MCP server (streamable-http + SSE).
 # Owner: Andrew Bydlon
 # Email: andrew.bydlon@hpe.com
-# Prefer: Slack
+#
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. searxng.secretKey OR searxng.existingSecret — seeds SEARXNG_SECRET; the
+#      render FAILS when both are empty (templates/deployment.yaml gate). Never
+#      put a real secret in values: prefer existingSecret at a pre-created
+#      Secret [key: secret]
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart
+#      default true); templates/virtualservice.yaml calls `required` on it
+# ### OPTIONAL ### — major tuning setups (copy the shape from the pointer, don't improvise)
+#   Corporate egress: proxy.{http,https,noProxy}, caCert.*, fetch.*, browser.* (+ browser.caCert)
+#     — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
+#   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth" | values-examples/values.g2.yaml
+#   Engine tuning: searxng.disabledEngines — documentation/DEPLOYMENT.md (chart default: corporate dead-engine list)
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — README "Prometheus self-metrics"
+#   DNS-rebinding hosts: extraAllowedHosts — documentation/DEPLOYMENT.md
 
-# searxng-mcp — MCP 2.0 metasearch + content fetcher backed by a bundled
-# SearXNG sidecar, for PCAI (HPE Ezmeral Unified Analytics). The
-# VirtualService root serves the SearXNG web UI; /mcp routes to the MCP
-# server (streamable-http + SSE) through the PCAI Istio gateway.
+# ============================================================================
+# Deployment / Images
+# ============================================================================
 
-# -- Deployment ----------------------------------------------------------------
 deployment:
   name: searxng-mcp
   appName: searxng-mcp
   replicaCount: 1
 
-# -- Images ------------------------------------------------------------------------
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  # Keep in lockstep with Chart.yaml appVersion (and the pushed image tags):
-  # this default is what a deploy WITHOUT a site values file uses, and a
-  # stale default is how a "v1.0.0 MCP + browser sidecar" pod happens —
-  # an MCP too old to know the sidecar exists.
-  tag: v1.2.1
+  tag: v1.7.0   # keep in lockstep with Chart.yaml appVersion
   pullPolicy: IfNotPresent
 
-# Only needed if the GHCR package stays PRIVATE. Public packages (the
-# ddgs-mcp convention) pull anonymously. Create with:
-#   kubectl create secret docker-registry ghcr-pull -n searxng-mcp \
-#     --docker-server=ghcr.io --docker-username=<gh-user> \
-#     --docker-password=<gh-PAT-with-read:packages>
+# GHCR-pull Secret, only if the package stays PRIVATE (public pulls are anonymous):
+#   kubectl create secret docker-registry ghcr-pull -n searxng-mcp --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<gh-PAT-with-read:packages>
 imagePullSecrets: []
 
 # Bundled SearXNG sidecar.
 searxng:
   image:
     repository: docker.io/searxng/searxng
-    # Pinned to the dated tag that Docker Hub 'latest' resolved to when the
-    # chart was updated (2026-09-08) — a mutable 'latest' tag would give
-    # different images per node/restart. To re-pin later:
-    #   curl -s https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=5 | jq -r '.results[].name' | head -3
-    # For a fully immutable reference, switch to the digest form:
-    #   image: docker.io/searxng/searxng@sha256:3547509b419cd6a67333d6d68bd1ffad8d46d3669d82e7a7bd538f7b45827432
-    tag: "2026.9.8-3fdc6d753"
+    tag: "2026.9.8-3fdc6d753"   # dated pin, not mutable 'latest'; digest form = fully immutable
     pullPolicy: IfNotPresent
-  # Secret key used by SearXNG for session/crypto. CHANGE THIS for any real
-  # deployment (kubectl create secret is an alternative — wire envFrom then).
+  # SEARXNG_SECRET: prefer existingSecret (rotation = update Secret + restart);
+  #   kubectl create secret generic <name> --from-literal=secret=$(openssl rand -hex 32)
   secretKey: "change-me-searxng-secret"
-  # Public base URL of the SearXNG UI (rendered into settings.yml
-  # server.base_url). Leave "" to omit — the JSON API works without it; set
-  # the literal https://<endpoint>/ in site values for correct UI links.
-  baseUrl: ""
-  # Default language/region passed to the MCP server (SEARXNG_LANGUAGE).
-  language: "en-US"
-  # Engines to disable via settings.yml (top-level engines key). Default: []
-  # — every default SearXNG engine stays enabled, including ddg/brave/
-  # startpage. SearXNG auto-suspends engines that fail repeatedly and the
-  # search tool reports per-query which engines did not respond, so leaving
-  # them on is cheap. If one proves consistently dead on a given network
-  # (startpage showed a hard CAPTCHA wall on the HPE proxy), add its name
-  # here and re-deploy.
-  disabledEngines: []
-  resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-    limits:
-      cpu: "1"
-      memory: 1Gi
+  existingSecret: ""
+  existingSecretKey: secret
+  baseUrl: ""   # rendered into settings.yml server.base_url; "" omits it
+  language: "en-US"   # SEARXNG_LANGUAGE
+  # Corporate-egress casualties; [] only on open-internet installs. Names MUST
+  # match SearXNG engine names exactly (dots for brave, spaces for ddg/startpage).
+  disabledEngines:
+    - brave
+    - brave.images
+    - brave.news
+    - brave.videos
+    - duckduckgo
+    - duckduckgo images
+    - duckduckgo news
+    - duckduckgo videos
+    - startpage
+    - startpage images
+    - startpage news
+    - wikidata
 
-# -- Service exposure -------------------------------------------------------------------
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+# ============================================================================
+# Resources / Service Exposure
+# ============================================================================
+
 service:
   type: ClusterIP
   port: 9090        # MCP server (streamable-http + SSE at /mcp)
   targetPort: 9090
   searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
 
-# -- Resources (MCP container) ----------------------------------------------------------------
 resources:
-  requests:
-    cpu: 200m
-    memory: 200Mi
-  limits:
-    cpu: "1"
-    memory: 512Mi
+  requests: {cpu: 200m, memory: 200Mi}
+  limits: {cpu: "1", memory: 512Mi}
 
-# -- Headless-browser sidecar (optional) ----------------------------------------------------------
-# Lets fetch_content render JavaScript pages (auto-escalation when plain HTTP
-# fails or returns a JS-stub shell, render="always", and include_screenshot).
-# The image is built from ./browser/Dockerfile (Playwright Chromium headless
-# shell). Disabled by default: adds ~512Mi memory and a second image to
-# maintain, while plain HTTP + curl_cffi already covers most sites. The MCP
-# container reaches the browser on http://127.0.0.1:9222 (pod-localhost,
-# loopback-only binding) — no service, port, or policy changes needed.
+# ============================================================================
+# Headless-browser Sidecar (optional)
+# ============================================================================
+
+# Lets fetch_content render JavaScript pages; off by default (adds ~512Mi +
+# a second image). Reached on pod-localhost http://127.0.0.1:9222.
 browser:
   enabled: false
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.2.1
+    tag: v1.6.1
     pullPolicy: IfNotPresent
+
   resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
-    limits:
-      memory: 1Gi
-  # Corporate MITM CA: the entrypoint installs *.crt files from this
-  # ConfigMap into the container trust store at startup (Chromium does not
-  # honor SSL_CERT_FILE / NODE_EXTRA_CA_CERTS). The ConfigMap must exist in
-  # the release namespace, e.g. copy the cluster-wide one:
-  #   kubectl get cm ezaf-root-ca -n <existing-ns> -o yaml | \
-  #     yq 'del(.metadata.namespace,.metadata.uid,.metadata.resourceVersion,
-  #            .metadata.creationTimestamp)' | \
-  #     kubectl apply -n <release-ns> -f -
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 1Gi}
+  # Corporate MITM CA for Chromium — the ConfigMap must exist in the release namespace:
+  #   kubectl get cm ezaf-root-ca -n <ns> -o yaml | yq 'del(.metadata.namespace,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp)' | kubectl apply -n <ns> -f -
   caCert:
     enabled: false
     configMap: "ezaf-root-ca"
-  # Extra Chromium command-line flags (string), e.g. "--disable-features=x".
-  extraArgs: ""
+  extraArgs: ""   # extra Chromium command-line flags, e.g. "--disable-features=x"
+  ignoreCertErrors: false   # escape hatch when the proxy CA cannot be distributed
 
-# -- Environment ------------------------------------------------------------------------------------
+# ============================================================================
+# Environment
+# ============================================================================
+
 env:
   - name: SEARXNG_URL
     value: "http://localhost:8080"
 
-# -- HPE corporate proxy -------------------------------------------------------------------------------
-# Route outbound HTTP(S) traffic through the HPE corporate proxy.
-# Default false: open-internet systems must NOT use the proxy (DNS/egress
-# failures). Set true (and configure proxy.*) only behind the HPE proxy.
-# When true this configures BOTH: env proxies for the MCP container
-# (fetch_content) and SearXNG's outgoing.proxies (engine requests).
-hpe_proxies: false
+# ============================================================================
+# Metrics
+# ============================================================================
 
-proxy:
-  http: http://hpeproxy.its.hpecorp.net:8080
-  https: http://hpeproxy.its.hpecorp.net:8080
-  noProxy: ".cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.0.0.0/8,localhost"
+# ONE counter family on the MCP container (searxng_mcp_tool_requests_total);
+# true serves /metrics key-free on the MCP port for the ServiceMonitor scrape.
+metrics:
+  enabled: false
+  serviceMonitor: true
+  interval: 30s
 
-# -- PCAI (HPE Ezmeral Unified Analytics) integration ------------------------------------------------------
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# /mcp requires a key ONLY when existingSecret is set (SEARXNG_API_KEYS; the
+# MCP_API_KEYS env is honored too). Empty = open with a loud startup warning.
+apiKey:
+  existingSecret: ""
+  existingSecretKey: api-keys
+
+# ============================================================================
+# Networking
+# ============================================================================
+
+# EXTRA Host values the SDK's DNS-rebinding protection accepts for in-cluster
+# callers (joined into MCP_EXTRA_ALLOWED_HOSTS); own-service DNS + loopback are auto-included.
+extraAllowedHosts: []
+
+# ============================================================================
+# Fetch Content SSRF Policy
+# ============================================================================
+
+# Escapes/caps for the fetch SSRF guard; empty strings keep the built-in
+# defaults. Loopback/pod-local/metadata targets are NEVER fetchable.
+fetch:
+  allowHosts: ""   # SEARXNG_FETCH_ALLOW_HOSTS — hosts/CIDRs that may resolve internal
+  denyExtra: ""    # SEARXNG_FETCH_DENY_EXTRA — deny wins over the allowlist
+  cacheTtl: ""     # SEARXNG_FETCH_CACHE_TTL ("" = built-in 300; "0" off)
+  maxBodyBytes: "" # SEARXNG_FETCH_MAX_BODY_BYTES ("" = built-in 5000000)
+  maxScreenshotKb: ""   # SEARXNG_FETCH_MAX_SCREENSHOT_KB ("" = 512)
+  maxRedirects: ""      # SEARXNG_FETCH_MAX_REDIRECTS ("" = 5)
+  # FETCH_TLS_INSECURE_FALLBACK — one unverified retry on a certificate error
+  # ("" = off); the caCert bundle below is the proper fix.
+  tlsInsecureFallback: ""
+
+# ============================================================================
+# Corporate Egress CA / Egress Proxy
+# ============================================================================
+
+# Point caCert at a release-namespace ConfigMap of the proxy's PEM certs
+# (verification stays ON): openssl s_client -proxy <proxy-host>:<port> -connect example.com:443 -showcerts
+caCert:
+  enabled: false
+  configMap: "zscaler-root-ca"
+
+# Non-empty keys configure BOTH the MCP container env proxies (fetch_content)
+# and SearXNG outgoing.proxies; a wrong proxy breaks DNS/egress.
+proxy: {}
+
+# ============================================================================
+# PCAI (HPE Ezmeral Unified Analytics) Integration
+# ============================================================================
+
 ezua:
   enabled: true
   domainName: "${DOMAIN_NAME}"
   virtualService:
-    # Root of this host serves the normal SearXNG web page; /mcp is routed
-    # to the MCP server (streamable-http + SSE).
+    # Gate DIRECTLY on this key — Sprig's `default` treats an explicit false
+    # as empty; false unrenders the VS while ezua.enabled drives the other gates.
+    enabled: true
+    # Doubles as MCP_HOSTNAME (the DNS-rebinding Host pin); must be unique
+    # per release on the shared gateway.
     endpoint: "searxng-mcp.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
     timeout: 660s
+
   authorizationPolicy:
     enabled: true
     namespace: "istio-system"
     providerName: "oauth2-proxy"
+
+# ============================================================================
+# MCP Network Zone
+# ============================================================================
+
+# Ingress allowlist (ns selectors): once enabled anything not matched is DENIED;
+# include the scrape ns whenever a ServiceMonitor ships, or it dies SILENTLY.
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []   # LLM-gateway relay ns goes here first
+  allowEzafGatewayIngress: true   # browser path stays ON (user-facing chart)
+  ingressGatewayNamespace: istio-system
+
+  ingressGatewayLabels:
+    app: istio-ingressgateway   # live edge-pod label (NOT app=ezaf-gateway)
+  probeCidrs: []   # node-originated kubelet probes; NEVER 0.0.0.0/0 with empty probeExceptCidrs
+  probeExceptCidrs: []
+
+# ============================================================================
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF
+# ============================================================================
+
+# Voluntary-eviction guard for node drains (templates/pdb.yaml, policy/v1).
+# DEFAULT OFF keeps the default helm render byte-identical. Single-replica
+# caveat: with replicaCount 1 (every chart in this fleet), minAvailable: 1
+# blocks ALL voluntary evictions — a drain waits. That is the intended
+# safety trade; operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1

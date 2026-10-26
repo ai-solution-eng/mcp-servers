@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlhandler"
-version = "1.4.3"
+version = "3.9.2"
 description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -55,3 +55,16 @@ target-version = "py311"
 # BLE001: broad `except Exception` is intentional at MCP tool boundaries
 # (errors are returned to the agent as strings, never crash the server).
 ignore = ["BLE001"]
+
+# Wave 2026-10-16: put the repo root on sys.path so tests can import
+# the tests package (tests/test_perf.py imports tests.test_virtual).
+# No tests/__init__.py exists in either tree; pythonpath is the least invasive fix.
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv]
+# duckdb is pinned to the version the vendored scanner extensions are built for
+# (duckdb-ext/v1.5.5 — DuckDB requires an EXACT version match for extensions;
+# 1.5.6 refuses to LOAD them, breaking every external-catalog ATTACH type).
+# Bump BOTH together: re-bake duckdb-ext for a new DuckDB, then release this pin.
+constraint-dependencies = ["duckdb==1.5.5"]

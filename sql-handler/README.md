@@ -387,29 +387,45 @@ sqlhandler --transport streamable-http --host 0.0.0.0 --port 9097
 | `NFS_ROOT` | Mounted directory with tables (nfs backend; required) |
 | `SQLHANDLER_TRANSPORT` | Default MCP transport for the CLI (`stdio` default; `streamable-http`) |
 | `SQLHANDLER_ENV_FILE` | Path to a `.env` file (default: auto-discovered `config/.env`) |
-| `SQLHANDLER_CORS_ORIGINS` | Comma-separated browser origins allowed on `/api/*` + `/ui` (default `*`) |
+| `SQLHANDLER_ALLOWED_ORIGINS` | Comma-separated extra browser origins allowed on `/api/*`, `/ui` and `/mcp` (CORS + `/mcp` Origin validation). **Default: none — same-origin only** (decision D3; the old `*` default let any web page read the API). The legacy `SQLHANDLER_CORS_ORIGINS` is still honored when explicitly set. |
+| `SQLHANDLER_ALLOWED_HOSTS` | Optional strict `Host`-header allowlist for `/mcp` (DNS-rebinding defense; mismatch → 421). Comma-separated; `host:*` allows any port. Unset = no Host pinning (a pod can't know its externally-visible hostnames); `/mcp` Origin validation is on regardless. Chart: `mcp.allowedHosts`. |
+| `SQLHANDLER_MCP_READONLY` | **`1` (default): MCP `run_sql` is SELECT-only** — the same DuckDB-parser guard as the web API rejects multi-statement DDL, INSERT/UPDATE/DELETE, ATTACH, COPY, PRAGMA/SET (decision D2). `0` restores multi-statement/DDL execution for trusted callers. Attached external catalogs stay read-only in BOTH modes (engine-enforced). Env re-read per call — flips need no restart. Chart: `mcp.readonly`. |
+| `SQLHANDLER_METRICS_AUTH` | `1` gates `/metrics` + `/ready` behind the API token / MCP API keys (`X-API-Key`, `X-API-Token` or `Bearer`). Default off = unauthenticated (today's behavior). Gate-on with no credential configured → 401 for everyone (fail closed). Chart: `security.metricsAuth`. |
 | `SQLHANDLER_DUCKDB_FILE_ACCESS` | `1` re-enables DuckDB file/table functions (`read_csv`, `COPY ... TO`, URL reads) that are locked down by default — see [Security notes](#security-notes) |
 | `SQLHANDLER_CACHE_TTL` | Seconds to keep `list_tables`/`describe_table` results in memory (default `3600`, `0` disables) |
 | `SQLHANDLER_LIST_ASYNC_REFRESH` | Serve `list_tables` from cache immediately and refresh in the background (plus automatically every `SQLHANDLER_CACHE_TTL`); default `true`, `false` = synchronous every call |
 | `SQLHANDLER_DATASET_CACHE_TTL` | Seconds to reuse an open Dataset handle (default `3600`, `0` disables) |
 | `SQLHANDLER_DATASET_CACHE_TABLES` | Max tables held in the dataset LRU (default `8`) |
 | `SQLHANDLER_VERSION_CHECK_INTERVAL` | How often a Delta table's snapshot version is re-checked (default `10`s; `0` = every query) |
-| `SQLHANDLER_MAX_ROWS` | Server-side row cap for `run_sql` results (default `1000`; `0` = unlimited) |
+| `SQLHANDLER_MAX_ROWS` | Server-side row cap for `run_sql` results (default `1000`; `0` = unlimited). Also clamps `scan_table` when its `limit` is missing/negative — decision D4: `scan_table(limit=-1)` no longer materializes whole tables; pass an explicit positive limit for more rows |
 | `SQLHANDLER_MAX_OUTPUT_ROWS` | Max rows rendered as markdown to a client (default `1000`) |
 | `SQLHANDLER_READINESS_CHECK` | `0` to disable the backend-aware `/ready` connectivity probe |
 | `SQLHANDLER_PREWARM_TABLES` | Comma-separated tables whose schemas are warmed at first request, e.g. `work_order_header,work_order_note_recent` (when unset, the busiest tables from the previous run are warmed automatically) |
 | `SQLHANDLER_CATALOG` | Path to a semantic-catalog JSON/YAML file (table/column descriptions merged into list/describe; hot-reloaded) |
 | `SQLHANDLER_CATALOG_STORE` | Writable path for UI/API catalog uploads (default: `<cache-dir>/semantic-catalog.json`); overrides `SQLHANDLER_CATALOG` while present |
 | `SQLHANDLER_CATALOG_UPLOAD` | `0` disables the catalog mutation endpoints (upload/clear **and** the browser editor's apply/remove — reading/editing text still works, applying is refused) (default on) |
+| `SQLHANDLER_VIRTUAL_CACHE_TTL` | Seconds a virtual table's materialized result is reused (keyed by definition + base-snapshot versions, so new ETL commits invalidate immediately). `0` disables (default 3600) |
+| `SQLHANDLER_VIRTUAL_CACHE_DIR` | Where virtual-table results are materialized (default: the disk-warm cache dir); point at an RWX PVC shared by the replicas to materialize once per deployment |
+| `SQLHANDLER_VIRTUAL_CACHE_MAX_BYTES` | Skip caching virtual results larger than this — they are served live instead (default 2GiB; `0` = unlimited) |
+| `SQLHANDLER_RESULT_CACHE_TTL` | Seconds an identical query's result is served from memory (keyed by sql/params/limits + base-snapshot versions; repeated agent queries become ~0 ms). `0` disables (default 3600) |
+| `SQLHANDLER_RESULT_CACHE_MAX_BYTES` | In-memory cap for cached query results, LRU-evicted (default 256MiB) |
+| `SQLHANDLER_VIRTUAL_CACHE_SORT` | `0` disables clustering (auto-sorting) of materialized virtual results by their lowest-cardinality columns (default on) |
+| `SQLHANDLER_BLOCK_CACHE` | `1` enables the disk block cache for object-store reads (parquet footers/column chunks cached pod-local; opt-in — cold big sequential scans pay a small Python-layer cost, repeated/filtered reads win big) (default off). Backends: S3/Iceberg filesystems and the OneLake/Delta **data files** (delta-log IO stays inside delta-rs; cached bytes are scoped by Delta snapshot version, so a new ETL commit or a time-travel read never serves another snapshot's blocks) |
+| `SQLHANDLER_BLOCK_CACHE_DIR` / `_BLOCK_SIZE` / `_MAX_BYTES` / `_INCLUDE_LOCAL` | Cache location (default `<tmp>/sqlhandler-block-cache`), block size (default 8MiB), total-size cap (reset on overflow, default 4GiB), and `1` to also cache `LocalFileSystem` paths (NFS mounts — real-local disk is already covered by the page cache) |
+| `SQLHANDLER_S3_OPTIONS` | JSON object merged into pyarrow's `S3FileSystem` kwargs — timeouts, retry limits, connection tuning (S3 + Iceberg backends) |
+| `SQLHANDLER_ONELAKE_STORAGE_OPTIONS` | JSON object merged into delta-rs storage options (OneLake backend) |
 | `SQLHANDLER_QUERY_MEMORY_SIZE` | Recent query outcomes kept for the query-memory resource (default 50; 0 disables) |
 | `SQLHANDLER_PROFILE_MAX_ROWS` | Row sample cap for `profile_table` (default 1000000; 0 = full table) |
-| `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (default 0 = no timeout) |
+| `SQLHANDLER_QUERY_TIMEOUT` | Per-query wall-clock timeout in seconds (**default 600** — decision D5; a runaway query used to hold a concurrency slot forever; `0` = no timeout) |
 | `SQLHANDLER_MAX_CONCURRENT_QUERIES` | Max simultaneous DuckDB queries (default 8; 0 = unlimited); excess queue |
 | `SQLHANDLER_QUEUE_TIMEOUT` | Seconds a query may wait for a concurrency slot (default 30) |
-| `SQLHANDLER_ASYNC_JOB_TTL` | Seconds a finished async-query job stays fetchable (default 900) |
+| `SQLHANDLER_ASYNC_JOB_TTL` | Seconds a finished async-query job stays fetchable (default 900; shared by the web `/api/query/async` registry and the MCP jobs registry) |
+| `SQLHANDLER_MAX_JOBS` | Max jobs tracked by the MCP/`/api/jobs` async-query registry (default **8**; garbage/non-positive values fall back to the default — the registry is bounded by design). Beyond the cap a submit is refused with a clear message until jobs are cancelled/fetched; the registry is in-memory and a restart clears it |
+| `SQLHANDLER_SAVED_QUERIES_PATH` | JSON file for the saved-parameterized-queries store (default: next to the disk-warm cache / platform temp dir, like the catalog store). Each entry maps a name to a SQL template + default bind params; writes are atomic (temp+rename, chmod 600) and the store degrades to empty on a corrupt file rather than erroring |
 | `SQLHANDLER_EXPORT_MAX_ROWS` | Row cap for CSV/Parquet exports (default 100000; 0 = hard 1M ceiling) |
 | `SQLHANDLER_AUDIT_LOG` | Path to a JSONL audit file — one line per query outcome (unset = off) |
 | `SQLHANDLER_API_TOKEN` | Require this bearer token on `/api/*` (unset = no token check) |
+| `SQLHANDLER_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | OPTIONAL `/mcp` API-key gate: comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). Unset → `/mcp` runs open exactly as before (loud startup warning; gateway remains the outer layer). Rotation: append the new key, move clients, drop the old — env re-read per request, no restart. Chart wiring: `security.apiKey.existingSecret` (empty default = not wired). | unset → `/mcp` open |
 | `S3_FORMAT` | `auto` (detect Delta by `_delta_log`), `parquet`, or `delta` |
 
 ## Performance & caching
@@ -650,6 +666,12 @@ It is served by the same server process, so it needs **no extra deployment**:
 | `POST /api/query` | run read-only SQL, returns columns+rows JSON |
 | `POST /api/query/async` | start an async query, returns a `query_id` |
 | `GET  /api/query/{id}` / `/{id}/rows` / `DELETE /api/query/{id}` | async status / paginated rows / cancel |
+| `POST /api/jobs` | start an async query **job** (the MCP `query_submit` twin: `SQLHANDLER_MAX_JOBS` cap, submit-time read-only guard, watchdog-enforced timeout) |
+| `GET  /api/jobs/{id}` / `/{id}/result` / `DELETE /api/jobs/{id}` | job status / result handed over **once** then freed (second fetch → 409) / cancel |
+| `GET    /api/saved-queries` | saved parameterized queries |
+| `POST   /api/saved-queries` | save one — `{name, sql, params, description}` (**auth-gated write**: refused 401 when a credential env is configured but the request presents none) |
+| `DELETE /api/saved-queries/{name}` | delete one (auth-gated write; unknown name → 404) |
+| `POST   /api/saved-queries/{name}/run` | run one — call-time `params` override stored ones as **bind params** (never string-interpolated) |
 | `POST /api/preview` | first N rows of a table |
 | `POST /api/profile` | column statistics (min/max, null %, distinct, quartiles) |
 | `POST /api/export` | download a query or table as CSV / Parquet |
@@ -662,9 +684,12 @@ In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is 
 
 ## Security notes
 
-- **The read-only filter guards the web API only.** The MCP `run_sql` tool is for trusted agent callers and accepts arbitrary SQL (it is the point of the tool).
+- **Read-only by default everywhere SQL runs.** The web API has always enforced SELECT-only; MCP `run_sql` now runs the **same DuckDB-parser guard by default** (decision D2): multi-statement scripts, DDL/DML, `ATTACH`, `COPY` and `PRAGMA`/`SET` are refused with an error naming `SQLHANDLER_MCP_READONLY`. Set `SQLHANDLER_MCP_READONLY=0` to restore the old arbitrary-SQL capability for trusted callers — lake data only: **attached external catalogs are SELECT-only unconditionally** (enforced on the query connection itself, before any scanner extension loads), so `INSERT INTO <sink>.t SELECT * FROM <attached>.…` cannot exfiltrate in either mode. The env is re-read per call, so a flip needs no restart. Chart: `mcp.readonly`.
+- **`/mcp` transport guard is on** (DNS-rebinding defense): requests that present a browser `Origin` header are refused unless the origin is listed in `SQLHANDLER_ALLOWED_ORIGINS` (MCP clients send no Origin and are unaffected). A strict `Host`-header pin is available via `SQLHANDLER_ALLOWED_HOSTS` (mismatch → 421) — opt-in because a pod cannot know its externally-visible hostnames.
+- **CORS is same-origin only by default** (decision D3): responses carry no `Access-Control-Allow-Origin` until `SQLHANDLER_ALLOWED_ORIGINS` lists origins. The legacy `SQLHANDLER_CORS_ORIGINS` env is still honored when set, but its old `*` default is gone.
 - **DuckDB file access is locked down by default** on every query connection (MCP and web): `read_csv`/`read_parquet`/`COPY ... TO` of local files and extension-based URL fetches fail closed, while the registered pyarrow datasets scan normally — all object-store IO (S3/ABFS/NFS) is done by pyarrow outside DuckDB, so nothing legitimate is lost. Set `SQLHANDLER_DUCKDB_FILE_ACCESS=1` if a query
   genuinely needs DuckDB's own file/table functions.
+- **Saved-query writes are credential-gated** (the semantic-catalog poisoning lesson, applied to the saved-query store): a saved query is a template other agents run, so `query_save`/`query_delete` — and their REST twins — require a valid credential whenever one is configured (`SQLHANDLER_API_TOKEN`, or `MCP_API_KEYS`/`SQLHANDLER_API_KEYS`; checked per request on REST and per call on the MCP path). With no credential configured the deployment is in the known single-user-local mode: writes work and a loud startup line says so. Saved SQL is validated at save time (parsed; SELECT-only while the read-only mode is on) and the guard is re-applied at run time, so a hand-edited store file cannot smuggle DDL past the read-only mode. Parameters are always **bind** parameters — values never enter the SQL text.
 - **Table names are traversal-guarded**: `schema/name` values containing `..` or absolute paths are rejected, and the NFS backend verifies every table path stays inside `NFS_ROOT` (symlinks included).
 - **Network posture** (helm chart, `security.hardened: true` default): non-root read-only container, no ServiceAccount token, and an optional pod-level AuthorizationPolicy. The ingress NetworkPolicy is **off by default** so in-cluster callers work with zero friction; the ClusterIP Service exposes nothing outside the cluster. Enable it for production / real-data deployments
   (`security.networkPolicy.enabled: true`) and allowlist direct callers via `allowedNamespaces`. External access is authenticated at the gateway by the oauth2-proxy AuthorizationPolicy — keep `ezua.authorizationPolicy.enabled: true`.
@@ -675,7 +700,7 @@ In a PCAI deployment the UI is behind the same oauth2-proxy as `/mcp`, so it is 
 
 ### Prometheus metrics
 
-`GET /metrics` renders the Prometheus text exposition (no extra dependency): query counters by outcome (`ok`/`error`/`cancelled`), a query-duration histogram, rows returned, cache hit/miss counters per cache type, and gauges for the table count, process RSS and the container memory limit.
+`GET /metrics` renders the Prometheus text exposition (no extra dependency): query counters by outcome (`ok`/`error`/`cancelled`), a query-duration histogram, rows returned, cache hit/miss counters per cache type, and gauges for the table count, process RSS and the container memory limit. Set `SQLHANDLER_METRICS_AUTH=1` to require a token on `/metrics` + `/ready` (see the env table; default off = open, today's behavior).
 
 ### Audit log
 
@@ -683,17 +708,20 @@ Set `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` and every query outcome is appended
 
 ### API token (non-gateway deployments)
 
-When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it (`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time compared) — for deployments where the JSON API is not already behind the PCAI oauth2-proxy gateway. `/mcp`, `/ui`, `/health` and `/ready` are unaffected; note the in-browser UI does not send the token, so leave it unset when the UI must work without
+When `SQLHANDLER_API_TOKEN` is set, every `/api/*` request must present it (`Authorization: Bearer <token>` or `X-API-Token: <token>`, constant-time compared) — for deployments where the JSON API is not already behind the PCAI oauth2-proxy gateway. `/mcp`, `/ui` and `/health` are unaffected (and `/metrics` + `/ready` too, unless `SQLHANDLER_METRICS_AUTH=1`); note the in-browser UI does not send the token, so leave it unset when the UI must work without
 gateway auth.
 
 ## MCP tools
 
 - `list_tables`       — enumerate tables in the configured source (any backend); annotated with catalog descriptions when configured
-- `search_tables`     — keyword search over table/column names + catalog docs
+- `search_tables`     — keyword search over table/column names + catalog docs, ranked best-first (exact/substring terms, then fuzzy near-miss names for typos); each hit carries `matched_on` reasons
 - `describe_table`    — columns/types/URI for a table (+ catalog docs)
 - `profile_table`     — column statistics: min/max, distinct≈, null %, avg/std, q25/q50/q75, row count (cached like describe)
-- `run_sql`           — run SQL via DuckDB (aggregations/joins); markdown (default), JSON or CSV output; optional bind `params` and time travel
+- `column_stats`      — statistics for ONE column: distinct count, null count/%, min/max, q25/q50/q75 and the top-5 values with counts, over the same bounded sample profile_table uses (`SQLHANDLER_PROFILE_MAX_ROWS`)
+- `run_sql`           — run SELECT-only SQL via DuckDB (aggregations/joins); markdown (default), JSON or CSV output; optional bind `params` and time travel. DDL/DML is refused by default (`SQLHANDLER_MCP_READONLY`, decision D2)
 - `scan_table`        — pull columns/rows via pyarrow with a row limit; same output formats and time travel
+- `query_submit` / `query_status` / `query_result` / `query_cancel` — **async query jobs**: start a long query and get a `job_id` immediately, poll its status, fetch the result once (then it is freed from memory), cancel mid-flight. Same engine path as `run_sql`: the read-only guard applies at **submit** time, the `SQLHANDLER_QUERY_TIMEOUT` (600s default) is watchdog-enforced even when nobody polls, `SQLHANDLER_MAX_ROWS` bounds results. The registry is in-memory (a restart clears it — resubmit) and capped at `SQLHANDLER_MAX_JOBS` (default 8; beyond that the submit is refused with a clear message). REST twins under `/api/jobs/*`
+- `query_save` / `query_list` / `query_delete` / `query_saved` — **saved parameterized queries**: name → SQL + default bind params (`$name` / `?` placeholders — never string-interpolated), stored in a JSON file (`SQLHANDLER_SAVED_QUERIES_PATH`). Save-time validation parses the SQL and applies the read-only guard (re-applied at run time, so a hand-edited store cannot smuggle DDL). **Writes are auth-gated**: when `SQLHANDLER_API_TOKEN` or `MCP_API_KEYS`/`SQLHANDLER_API_KEYS` is configured, an unauthenticated `query_save`/`query_delete` is refused; with no credential configured (single-user-local mode) writes are allowed and the posture is logged at startup. REST twins under `/api/saved-queries/*`
 
 In federated multi-source mode, tables are source-qualified: `list_tables` returns all sources, and `describe_table` / `run_sql` take names like `sales_orders` or `inventory_raw_customers` (bare names only when unique).
 
@@ -740,6 +768,10 @@ tables:
 ```
 
 Keys match the logical `schema/name` path (a bare name or the source-qualified name also work). The file is hot-reloaded on change (cached describes are invalidated so new wording appears immediately); a missing/broken file never breaks queries.
+
+#### Virtual tables — catalog entries with a SQL `definition`
+
+A catalog entry keyed by a clean bare identifier that carries a `definition` (a single `SELECT`/`WITH` query) becomes a **virtual table**: listed with a `VIRTUAL` badge in `list_tables` and the Data Explorer, describable (schema derived from the definition itself, docs merged on top), searchable by its aliases, and queryable like any other table — constructed on the fly, at query time, as a view over the base tables its definition names. Nothing is stored; user filters still push down into the physical scans, and definitions compose (a virtual table may build on another). Definitions must be a single read-only statement in the engine's DuckDB dialect (`iff(...)` is provided as a compat macro; see [`docs/semantic-catalog.md`](docs/semantic-catalog.md), including a full Snowflake→DuckDB port from Omnilife in [`docs/examples/omnilife-catalog.yaml`](docs/examples/omnilife-catalog.yaml)). Storage wins on name collisions; invalid definitions are dropped with a warning, never breaking the catalog.
 
 #### Upload through the UI / API (no file access needed)
 
@@ -806,7 +838,7 @@ Prompts: `explore-data` (list → catalog → profile → SQL workflow) and `ana
 
 ### Query timeout
 
-`SQLHANDLER_QUERY_TIMEOUT` (seconds; 0 = off, the default) interrupts a query inside DuckDB when it runs too long — no leaked threads, a clean error to the caller. Applies to MCP `run_sql` and the web API alike.
+`SQLHANDLER_QUERY_TIMEOUT` (seconds; **600 by default** — decision D5, `0` = off) interrupts a query inside DuckDB when it runs too long — no leaked threads, a clean error to the caller. Applies to MCP `run_sql` and the web API alike.
 
 ### Async queries (web API)
 

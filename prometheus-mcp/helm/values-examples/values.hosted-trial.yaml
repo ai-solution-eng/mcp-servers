@@ -1,0 +1,132 @@
+# ============================================================================
+# prometheus-mcp — sanitized HOSTED-TRIAL EXAMPLE values (full copy of
+# helm/values.yaml; paste-ready for the PCAI Helm Values editor).
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# Secret-free; PCAI resolves ${DOMAIN_NAME} before rendering — keep the placeholders
+# as-is, substituting the literal domain only for a local `helm template`.
+
+# ### REQUIRED ### — set before ANY apply (render fails or containers refuse to start)
+#   1. prometheusUrl — the in-cluster Prometheus this deployment queries; no render
+#      guard (the default targets the kube-prometheus-stack service).
+#   2. ezua.virtualService.endpoint — required whenever ezua.enabled (chart default
+#      true); templates call `required` on it — the render aborts without it.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   GPU/NVLink tab: gpuNvlinkDomains, nvlinkAutodetect.* — documentation/DEPLOYMENT.md "Optional values" | values-examples/values.g2.yaml
+#   Gateway auth (oauth2-proxy/SSO): ezua.authorizationPolicy.* — documentation/DEPLOYMENT.md "Gateway exposure"
+#   Saved-query persistence: persistence.* — documentation/DEPLOYMENT.md | values-examples/values.hosted-trial.yaml
+#   Network zone (ingress allowlist): networkPolicy.* — values-examples/values-hardened-g2.yaml (OVERLAY)
+#   Self-metrics + ServiceMonitor: metrics.* — documentation/DEPLOYMENT.md
+#   API-key gate on /mcp: apiKey.existingSecret — README "API-key auth"
+#   Nodes-tab default filter: nodeFilter — documentation/DEPLOYMENT.md "Optional values"
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
+deployment:
+  name: prometheus-mcp
+  appName: prometheus-mcp
+  replicaCount: 1
+
+# pullPolicy stays Always on purpose (see helm/values.yaml).
+image:
+  repository: ghcr.io/ai-solution-eng/prometheus-mcp
+  tag: v0.7.0
+  pullPolicy: Always
+
+imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
+
+# ============================================================================
+# Prometheus Target
+# ============================================================================
+
+# Included, not a placeholder: the kube-prometheus-stack service DNS is the
+# same across PCAI deployments (verified on G2).
+prometheusUrl: http://kubeprom-prometheus.prometheus.svc.cluster.local:9090
+
+# ============================================================================
+# GPU Tab
+# ============================================================================
+
+# Leave "" to defer to detection/default (precedence in helm/values.yaml).
+gpuNvlinkDomains: ""
+
+# DaemonSet on GPU nodes that detects real NVLink islands at node boot.
+nvlinkAutodetect:
+  enabled: false   # false on CPU-only trial clusters; true where GPU nodes exist
+  image: python:3.12-slim
+  privileged: true
+  driverInstallDir: /run/nvidia/driver
+  # Must stay well under the pushgateway's --metric.timetolive=30s.
+  pushInterval: 20
+  pushgatewayUrl: http://pushgateway-prometheus-pushgateway.prometheus.svc.cluster.local:9091   # adjust to your cluster
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# Flip to true where the trial wants per-tool counters (requires the
+# ServiceMonitor CRD); off = no /metrics route.
+metrics:
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s             # ServiceMonitor scrape interval
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+# ============================================================================
+# Networking
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9095
+  targetPort: 9095
+
+# ============================================================================
+# Saved-Query Persistence
+# ============================================================================
+
+# Chart default OFF — flip to true so user-saved queries survive pod updates.
+persistence:
+  enabled: false
+  mountPath: /data
+  size: 1Gi
+  storageClass: ""   # "" = cluster default StorageClass
+  accessModes:
+    - ReadWriteOnce
+  savedQueriesFile: saved-queries.json
+  shared: false   # keep false for non-shared multi-replica stores
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# No site fill needed — PCAI substitutes ${DOMAIN_NAME} in both values below.
+ezua:
+  enabled: true   # deploy the VirtualService
+  domainName: ${DOMAIN_NAME}   # informational only — no template reads it
+  virtualService:
+    endpoint: prometheus-mcp.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 660s
+  # Gateway-level auth gate. Default off — flip on if the trial's trust
+  # posture requires token-enforced access.
+  authorizationPolicy:
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy

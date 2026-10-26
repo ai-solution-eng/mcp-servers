@@ -17,6 +17,7 @@ from typing import ClassVar
 
 SCRIPT = Path(__file__).resolve().parent.parent / "helm" / "files" / "detect_nvlink.py"
 _spec = importlib.util.spec_from_file_location("detect_nvlink", SCRIPT)
+assert _spec is not None and _spec.loader is not None, f"cannot load detect_nvlink spec from {SCRIPT}"
 detect = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(detect)
 

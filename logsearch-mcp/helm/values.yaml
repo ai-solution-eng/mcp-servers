@@ -1,0 +1,175 @@
+# ============================================================================
+# logsearch-mcp — read-only, namespace-scoped Kubernetes pod-log search over
+# MCP (/mcp, through the PCAI Istio gateway when ezua is enabled); the same
+# port serves the HPE log-search console (/ and /api/*) when webui.enabled.
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: logsearch-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — /mcp must never trust network position; pod logs are sensitive.
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Namespace policy (THE access control; default-deny): logsearch.allowedNamespaces /
+#     blockedNamespaces, or the emptyAllowsAll lab escape hatch — documentation/DEPLOYMENT.md
+#   RBAC scope: rbac.clusterWide (release-ns default; cluster-wide = lab only) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/serviceMonitor — documentation/DEPLOYMENT.md
+#   export_matches destination: logsearch.exportRoot (workbench-shared) — documentation/DEPLOYMENT.md
+#   Blast-radius caps: logsearch.maxPods/maxLinesPerPod/maxTotalLines/maxLineChars — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment / Image
+# ============================================================================
+
+deployment:
+  name: logsearch-mcp
+  appName: logsearch-mcp
+  replicaCount: 1
+
+image:
+  repository: ghcr.io/ai-solution-eng/logsearch-mcp
+  tag: v0.4.0
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE
+
+# ============================================================================
+# API Keys
+# ============================================================================
+
+# /mcp requires a key; the chart NEVER creates or inlines one — reference an
+# operator-created Secret (fails loud until it exists):
+apiKey:
+  existingSecret: logsearch-mcp-apikey
+  existingSecretKey: api-keys
+
+# ============================================================================
+# Namespace Policy
+# ============================================================================
+
+# THE server's only access control: pod logs routinely carry sensitive
+# strings, and an EMPTY allowedNamespaces DENIES ALL namespaces (default-deny).
+logsearch:
+  allowedNamespaces: ""     # "" = DENY ALL — set globs, or emptyAllowsAll: true
+  blockedNamespaces: ""     # e.g. "kube-system,kube-public,kube-node-lease"
+  emptyAllowsAll: false     # true = open default (trusted lab clusters only)
+  # Blast-radius caps: fetch width/budget/line + regex-size limits per fan-out.
+  maxPods: 50
+  maxLinesPerPod: 1000
+  maxTotalLines: 300
+  maxLineChars: 2000
+  fetchConcurrency: 8
+  maxRegexChars: 512
+  # export_matches destination: "" = no env, tool refuses with setup
+  # instructions; set an ABSOLUTE dir agents can read back (workbench-shared).
+  exportRoot: ""
+
+extraAllowedHosts: []   # EXTRA Host headers for in-cluster svc-DNS callers (`host:*` form)
+
+# ============================================================================
+# Metrics
+# ============================================================================
+
+# ONE counter family (tool/outcome only — no namespace, pod, or log content);
+# false renders nothing at all, true serves /metrics key-free.
+metrics:
+  enabled: false
+  serviceMonitor: true      # render the monitoring.coreos.com/v1 ServiceMonitor (requires enabled)
+  interval: 30s
+
+webui:
+  enabled: true   # false = MCP-only surface (/health, /healthz, /mcp only)
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 512Mi}
+
+securityContext:
+  runAsNonRoot: true   # the image runs as USER 10001 (non-root, no shell needed)
+  runAsUser: 10001
+
+# ============================================================================
+# RBAC
+# ============================================================================
+
+# READ-ONLY, minimal: pods get/list + pods/log get. clusterWide keeps the
+# blast radius to one namespace; true renders a ClusterRole(+Binding) — lab only.
+rbac:
+  create: true
+  clusterWide: false
+
+# ============================================================================
+# Networking
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9101
+  targetPort: 9101
+
+# Per-key proxy wiring (fleet convention: searxng-mcp); this server's only
+# peer is the in-cluster API, so the block is fleet consistency only.
+proxy: {}
+
+# ============================================================================
+# PCAI Networking
+# ============================================================================
+
+# Deploys the Istio VirtualService through the ezaf-gateway. OFF by default.
+ezua:
+  enabled: false
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    enabled: true   # false unrenders the VS while ezua.enabled keeps driving other gates
+    endpoint: "logsearch-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s
+
+# ============================================================================
+# Network Zone
+# ============================================================================
+
+# MCP network zone — ADDITIVE, DEFAULT OFF. Ingress allowlist (ns selectors):
+# once on, anything not matched is DENIED; egress stays unrestricted.
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # In-cluster caller namespaces; the LLM gateway's relay namespace goes first.
+  authorizedClients:
+    namespaces: []
+  allowEzafGatewayIngress: true   # browser path stays on the SSO-gated edge gateway
+  ingressGatewayNamespace: istio-system
+  # Edge pods carry app=istio-ingressgateway; `ezaf-gateway` is the Gateway CR NAME.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes; NEVER 0.0.0.0/0 with an empty probeExceptCidrs.
+  probeCidrs: []
+  probeExceptCidrs: []
+
+  egress:
+    enabled: false   # admin MCPs reach the k8s API / Prometheus / internet legitimately
+    extraEgress: []
+
+# ============================================================================
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF
+# ============================================================================
+
+# Voluntary-eviction guard for node drains (templates/pdb.yaml, policy/v1).
+# DEFAULT OFF keeps the default helm render byte-identical. Single-replica
+# caveat: with replicaCount 1 (every chart in this fleet), minAvailable: 1
+# blocks ALL voluntary evictions — a drain waits. That is the intended
+# safety trade; operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1

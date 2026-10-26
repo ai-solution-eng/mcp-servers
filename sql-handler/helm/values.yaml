@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v1.4.3
+  tag: v3.9.2
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -150,6 +150,39 @@ mcp:
   transport: streamable-http   # MCP 2.0 transport
   path: /mcp                   # FastMCP default; VirtualService routes on it
   port: 9097                   # container + service port
+  # Fleet decision D2: MCP run_sql is SELECT-only by default (the same
+  # DuckDB-parser guard the web API uses — multi-statement DDL, INSERT/
+  # UPDATE/DELETE, ATTACH, COPY, PRAGMA are refused with an error that names
+  # SQLHANDLER_MCP_READONLY). Set false ONLY for trusted-caller deployments
+  # that need DDL/script execution; attached external databases stay
+  # read-only either way (enforced in the engine, not the flag).
+  readonly: true
+  # Strict /mcp Host-header allowlist (DNS-rebinding protection, 421 on
+  # mismatch). Comma-separated exact hostnames; "host:*" allows any port,
+  # e.g. "sqlhandler.pcai.svc.cluster.local:*,sqlhandler.example.com".
+  # Origin validation is ALWAYS on for /mcp (browser-originated requests
+  # are refused unless listed under allowedOrigins), so this stays optional:
+  # a pod cannot know which externally-visible hostname callers use, and a
+  # wrong pin 421s every request. Set it when your hostnames are fixed.
+  allowedHosts: ""
+  # Fleet decision D3: extra browser origins allowed on /api/*, /ui and
+  # /mcp (comma-separated, e.g. "https://sql-ui.example.com"). Empty
+  # (default) = same-origin only: cross-origin browser reads are refused,
+  # MCP clients (which send no Origin header) are unaffected. The legacy
+  # SQLHANDLER_CORS_ORIGINS env is still honored when set explicitly, but
+  # its old "*" default is gone.
+  allowedOrigins: ""
+
+# -- Query execution ------------------------------------------------------------
+# Applies to the DuckDB SQL path — MCP run_sql and the web API alike.
+query:
+  # Fleet decision D5: per-query wall-clock timeout in seconds (0 = no
+  # timeout, the pre-D5 behavior). On expiry the query is interrupted inside
+  # DuckDB (no leaked threads/connections) and the caller gets a clean error.
+  # The default 600s stops a runaway query from holding one of the
+  # concurrency-gate slots forever; genuine >10-minute queries must raise
+  # this deliberately (the gateway itself caps calls at 3600s).
+  timeoutSeconds: "600"
 
 # -- Resources ----------------------------------------------------------------
 # Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
@@ -211,6 +244,27 @@ security:
   # auto-mounted ServiceAccount token, plus an optional ingress
   # NetworkPolicy (security.networkPolicy.enabled below, default false).
   hardened: true
+  # OPTIONAL API-key auth on /mcp (fleet decision 2026-09 — SQL is optional
+  # until per-user keys/roles land). When apiKey.existingSecret is set, the
+  # chart wires SQLHANDLER_API_KEYS from that Secret's key and every /mcp
+  # request needs a valid key (X-API-Key or Bearer). Leave empty for
+  # gateway-fronted deployments — the server then runs open (with a loud
+  # startup warning). Comma-separated keys all authenticate: that is the
+  # rotation mechanism — append the new key, move clients over, drop the old
+  # one, no downtime. The fleet-universal MCP_API_KEYS env is honored too
+  # (either var authenticates).
+  apiKey:
+    existingSecret: ""
+    existingSecretKey: api-keys
+  # Optional auth gate on /metrics + /ready (audit: both leak table counts,
+  # RSS and error strings unauthenticated). Default false = today's
+  # behavior (open). When true, a scrape/read must present SQLHANDLER_API_TOKEN
+  # or an /mcp API key (MCP_API_KEYS / SQLHANDLER_API_KEYS) as
+  # X-API-Key / X-API-Token / Bearer — wire the matching header into the
+  # Prometheus scrape config; liveness probes keep using /health (open).
+  # With the gate on but NO credential source configured, both endpoints
+  # 401 for everyone (fail closed, loud startup warning).
+  metricsAuth: false
   # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
   # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
   # Egress is NOT restricted (the server must reach AAD/OneLake/S3).
@@ -243,6 +297,136 @@ security:
     principals: []
     # Allowed caller namespaces (Istio identity namespaces).
     namespaces: []
+  # Policy-as-code: per-caller row filters, column masks and hidden tables
+  # from an operator-authored JSON/YAML file (documentation/MCP.md). The
+  # server reads the file named by SQLHANDLER_POLICY_FILE (policy.py) and
+  # hot-reloads it on mtime; a PRESENT but INVALID file fails closed with
+  # E_POLICY rather than degrading — operator-authored config must never
+  # half-apply. This block is what makes `security.policy.enabled` real:
+  # without the mount + env wiring below the flag was a silent no-op (the
+  # server never saw a policy file, the admin panel 403'd for everyone).
+  policy:
+    # Master switch — renders the policy mount and sets SQLHANDLER_POLICY_
+    # ENABLED=1 (policy.py's truthy set: 1/true/yes/on). Default false:
+    # policy-as-code is opt-in per site.
+    enabled: false
+    # Name of an EXISTING ConfigMap carrying the policy document (key:
+    # existingConfigMapKey) — manage it out-of-band like the credential
+    # Secrets. REQUIRED unless existingClaim is set; the render fails
+    # otherwise (an enabled policy with no source locks every gated
+    # surface for every caller). The engine hot-reloads ConfigMap edits
+    # (kubelet syncs the mount, mtime changes) — no rollout needed.
+    existingConfigMap: ""
+    existingConfigMapKey: policy.json
+    # Where the policy volume is mounted; SQLHANDLER_POLICY_FILE points at
+    # <mountPath>/<fileName>. The seed ConfigMap mounts at <mountPath>-seed.
+    #
+    # MUST NOT sit under semanticCatalog.mountPath (default /etc/sqlhandler):
+    # that directory is the read-only catalog ConfigMap mount, and nesting
+    # the policy volumes inside it left the kubelet stuck in
+    # ContainerCreating with the volume attached and NO mount error (live
+    # 2026-10-20, 8+ minutes, zero ready replicas). The template fails the
+    # render on any overlap so this cannot regress silently.
+    mountPath: /etc/sqlhandler-policy
+    # Writable alternative to the read-only ConfigMap: mount this PVC at
+    # mountPath so the live policy file is editable through the admin
+    # panel (the mount is read-write — the panel writes <fileName>).
+    # The ConfigMap above (required while seedFromConfigMap is on) stays
+    # mounted — read-only, at <mountPath>-seed — purely as the seed source.
+    #
+    # Prefer `claim.create` below over pointing this at an existing claim.
+    # Do NOT reuse the catalog claim (semanticCatalog.store,
+    # <release>-catalog): mounting ONE claim twice (catalog store + policy)
+    # hung every pod in ContainerCreating for 8+ minutes on 2026-10-20 with
+    # the volume attached and NO mount error in the events. Use a DEDICATED
+    # claim so every claim is mounted exactly once.
+    # Leave empty to let the chart create <release>-policy (the DEFAULT).
+    # Set this ONLY when you manage the claim yourself — and note the chart
+    # cannot verify it exists: a typo or a skipped `kubectl apply` surfaces
+    # as pods stuck Pending on "persistentvolumeclaim ... not found", with
+    # no actionable message at install time. Prefer claim.create.
+    existingClaim: ""
+    # CHART-OWNED writable policy volume — THE DEFAULT.
+    #
+    # WHY the chart owns it: ConfigMap mode is a read-only mount by
+    # construction, so EVERY admin write fails with "[Errno 30] Read-only
+    # file system" — the panel looks broken while enforcement (reads) still
+    # works. Claim mode is the only way panel edits persist, and requiring a
+    # hand-applied PVC before the upgrade was a silent deploy-time trap
+    # (live 2026-10-21: pods sat Pending on "persistentvolumeclaim
+    # \"sqlhandler-policy-rw\" not found" because the manual apply step was
+    # missed). Creating the claim here makes a correct deployment the
+    # DEFAULT one — no out-of-band step to forget.
+    #
+    # ReadWriteMany is REQUIRED whenever replicas can exceed 1 (the render
+    # fails otherwise): the policy is one live file every replica hot-reloads
+    # by mtime, so an RWO claim would strand the extra pods Pending AND let
+    # replicas disagree about the ACL.
+    claim:
+      # true = render <release>-policy and mount it read-write. Set false ONLY
+      # together with existingClaim, or to run the read-only ConfigMap mode.
+      create: true
+      accessModes: [ReadWriteMany]
+      storageClass: ""      # "" = cluster default
+      size: 1Gi             # policy documents are KBs
+    # Policy file name inside the mount (both modes).
+    fileName: policy.json
+    # One-time seed (claim mode only): on first boot the server copies the
+    # ConfigMap document to the live file when the live file does not
+    # exist yet (server.py _seed_policy_from_configmap). After that the
+    # live file is the truth FOREVER — ConfigMap edits stop applying (the
+    # documented trade of the writable-policy mode).
+    #
+    # A missing policy file is a PERMISSIVE default, not an error: the server
+    # serves with no row filters, no masks and nothing hidden, and logs a loud
+    # "POLICY IS NOT RESTRICTING ANYTHING" warning at startup. That is the
+    # intended bootstrap state — the pod must be reachable so an operator can
+    # author the policy. (A PRESENT-but-INVALID file is different: it fails
+    # closed, hiding every covered table, while still serving.)
+    #
+    # Seeding is what carries an EXISTING policy across the ConfigMap→claim
+    # switch. Leave it true on an upgrade so current ACLs survive; set it
+    # false on a genuinely fresh install to start from the permissive default.
+    seedFromConfigMap: true
+
+  # -- OIDC identity rung (self-mint) ---------------------------------------
+  # Verifies Bearer JWTs AND the SSO session cookie (oidc_identity.py).
+  # A verified token resolves Caller(via="jwt", subject=<identityClaim>) —
+  # the ONLY rung the self-mint accepts. Left empty/undocumented by
+  # default: OFF unless enabled is true with a real issuer.
+  oidc:
+    enabled: false
+    issuer: ""          # e.g. https://keycloak.<domain>/realms/UA
+    audience: ""        # e.g. ua
+    identityClaim: preferred_username
+    # In-cluster JWKS endpoint (http://...svc); the https issuer URL is
+    # only reachable when platformCa below supplies the private CA.
+    jwksUrl: ""
+    jwksRefreshSeconds: "3600"
+    fetchTimeoutSeconds: "3"
+    clockSkewSeconds: "60"
+    # Platform CA bundle for the private-CA issuer (PCAI): mounted
+    # read-only and handed to the JWKS fetcher via REMOTE_CA_BUNDLE.
+    platformCa:
+      enabled: false
+      configMapName: ezaf-root-ca
+      configMapKey: ezaf-root-ca.crt
+      mountPath: /etc/platform-ca
+      bundleFile: ca-certificates.crt
+
+  # -- Self-mint keys store (admin_keys.py) ---------------------------------
+  # JSON file the self-mint writes minted keys to. mountPath must be a
+  # WRITABLE directory — a subpath of an RWX claim is the usual choice.
+  # Without it self-mint answers 503 "the keys store is not configured".
+  adminKeys:
+    mountPath: ""       # e.g. /var/lib/sqlhandler-catalog/admin-keys
+    existingClaim: ""   # optional dedicated claim; usually a subpath of
+                        # the semanticCatalog.store claim (already mounted)
+
+  # Self-mint rotate cap: minting beyond this revokes the OLDEST
+  # self-minted key for the subject (server.py _self_mint_enforce_cap).
+  selfMintMaxKeys: 1
+
   runAsUser: 1000
   readOnlyRootFilesystem: true
   # The app never calls the Kubernetes API; don't hand it a token.
@@ -278,6 +462,9 @@ fabric:
   workspaceId: ""                # fallback (if no full URL)
   lakehouseId: ""                # fallback (if no full URL)
   authority: onelake.dfs.fabric.microsoft.com
+  # Extra delta-rs storage options (JSON-merged into the env): object-client
+  # retries, timeouts, connection behavior for the OneLake backend.
+  storageOptions: {}
 
 # -- S3 / MinIO backend (used when backend: s3) ------------------------------------
 # Non-secret values (endpoint/bucket/prefix) go in the ConfigMap; the access
@@ -313,6 +500,9 @@ s3:
   prefix: ""                  # optional sub-tree within the bucket
   anonymous: false            # read public buckets without keys
   useSsl: false               # force https when endpointUrl has no scheme
+  # Extra pyarrow S3FileSystem kwargs (JSON-merged into the env): timeouts,
+  # retry limits, connection behavior. e.g. {request_timeout: 120}
+  options: {}
 
 # -- Iceberg backend (used when backend: iceberg) ---------------------------------
 # Tables are discovered through an Iceberg catalog; the Parquet data files
@@ -367,6 +557,12 @@ cache:
   # Comma-separated table names whose data should be warmed at startup,
   # e.g. "work_order_header,work_order_note_recent".
   prewarmTables: ""
+  # Row groups read per prewarmed table (0 = off, default 1). The prewarm
+  # thread reads the first N row groups of each prewarmTables entry, so the
+  # first real query over them is not a cold object-store read. Costs a
+  # bounded amount of startup IO — raise it only for tables whose FIRST
+  # rows are what queries touch (range-filtered scans on a sorted column).
+  prewarmRowgroups: 1
   # Serve list_tables from the cache immediately and refresh it in the
   # background (plus automatically once per `ttl` seconds), so callers never
   # block on the slow S3/DFS listing. Set false for fully synchronous calls.
@@ -383,6 +579,70 @@ cache:
   # so the first describe after an OOMKill is not cold). Point at a PVC
   # mount path to also survive pod rescheduling.
   cacheDir: /tmp/sqlhandler-cache
+  # -- Virtual-table performance (README: "Virtual tables") -----------------
+  # Seconds a virtual table's materialized result is reused. The cache key
+  # covers the definition (and everything it builds on) plus every base
+  # table's Delta/Iceberg snapshot version, so new ETL commits invalidate
+  # immediately; the TTL is only a backstop. 0 disables materialization.
+  virtualCacheTtl: 3600
+  # Where materialized results are written. Default: cacheDir above. Point
+  # at an RWX PVC shared by all replicas to materialize once per deployment
+  # instead of once per pod.
+  virtualCacheDir: ""
+  # Cluster (sort) materialized virtual results by their lowest-cardinality
+  # columns so row-group statistics prune filtered reads. 0 disables.
+  virtualCacheSort: true
+  # Seconds an identical query's result is served from memory (keyed by
+  # sql/params/limits + base-snapshot versions). 0 disables.
+  resultCacheTtl: 3600
+  # In-memory byte cap for cached query results (LRU-evicted).
+  resultCacheMaxBytes: "268435456"
+  # -- Shared L2 result cache (cross-replica) -------------------------------
+  # The memory cache above is PER REPLICA: with N replicas behind one Service,
+  # a repeated query lands on a different pod ~(N-1)/N of the time and pays
+  # the cold path again. That is the whole "cached results are still slow"
+  # experience on a scaled-out deployment — the cache is warm, just not on
+  # the pod that answered. L2 writes each result to a shared directory so
+  # every replica can read it back (src/sqlhandler/l2cache.py).
+  #
+  # REQUIRES an RWX volume (e.g. the catalog PVC, ReadWriteMany). On an RWO
+  # claim each pod mounts its own volume, so the cache looks shared while
+  # sharing nothing — leave `dir` empty rather than point it at pod-local
+  # /tmp, which the engine deliberately refuses to default for that reason.
+  l2:
+    enabled: false
+    # Directory all replicas share. Must be an RWX mount path.
+    dir: ""
+    # Seconds a shared entry stays valid (mirrors resultCacheTtl).
+    ttl: "3600"
+    # Results below this many bytes are not shared. The engine default is
+    # 256 KiB (a tiny result can cost more to round-trip the volume than to
+    # recompute), but the MCP row cap is 1000 rows, so an interactive result
+    # is typically tens of KB — at 256 KiB the layer is enabled and shares
+    # nothing. 1 KiB keeps small-but-real results shared; raise it toward
+    # 256 KiB if the volume is slow and recompute is cheap for your data.
+    minBytes: "1024"
+    # Byte cap on the shared volume; expired entries are swept lazily.
+    maxBytes: "2147483648"
+    # Publish off the query path (a dropped write is just a cache miss).
+    writeAsync: true
+  # -- Disk block cache (object-store reads) --------------------------------
+  # Opt-in disk cache for parquet footers/column chunks read through pyarrow
+  # filesystems (s3 + iceberg backends; delta-rs IO on onelake is not
+  # wrappable). Off by default: cold big sequential scans pay a small
+  # Python-layer cost, repeated/filtered/preview reads win big.
+  blockCache:
+    enabled: false
+    # Cache location. Default: <tmp>/sqlhandler-block-cache.
+    dir: ""
+    # Bytes per cached block (bigger = fewer remote round-trips).
+    blockSize: "8388608"
+    # Total cache size; the cache resets itself when exceeded.
+    maxBytes: "4294967296"
+    # 1 also caches LocalFileSystem paths — NFS mounts ARE LocalFileSystem
+    # to pyarrow while being network; real-local disk is already covered by
+    # the OS page cache.
+    includeLocal: false
 
 # -- Semantic catalog ----------------------------------------------------------
 # The "semantic view": human-written table/column descriptions merged into
@@ -414,6 +674,8 @@ semanticCatalog:
   #       description: ...
   #       aliases: [...]
   #       columns: {col: doc}
+  #       definition: |          # optional — makes the entry a VIRTUAL table
+  #         SELECT ...           # (single read-only SELECT/WITH, DuckDB dialect)
   # Rendered to canonical JSON into the ConfigMap. Entry shapes are validated
   # at render time (each table entry must be a mapping) — operator-authored
   # config must not fail silently (same philosophy as SQLHANDLER_ATTACH).
@@ -460,6 +722,18 @@ semanticCatalog:
     # <mountPath>/semantic-catalog.json. The upload API writes here, so the
     # mount is read-write (unlike the values-catalog ConfigMap mount).
     mountPath: /var/lib/sqlhandler-catalog
+    # Saved parameterized queries (SQLHANDLER_SAVED_QUERIES_PATH) ride the
+    # SAME claim as the catalog store by default, for the same reason: they
+    # are operator content, not cache.
+    #
+    # WHY this needs to be explicit: with no SQLHANDLER_SAVED_QUERIES_PATH,
+    # saved.py falls back to SQLHANDLER_CACHE_DIR — which the chart points at
+    # /tmp/sqlhandler-cache, an emptyDir. Saved queries then die with the pod
+    # AND diverge per replica (a query saved through one replica is invisible
+    # to the other). The catalog store got a PVC path; saved queries did not,
+    # which was an inconsistency in the chart's env wiring rather than a
+    # deliberate choice. Set to "" to restore the old pod-local behaviour.
+    savedQueriesPath: ""
 
 # -- Runtime arguments for the sqlhandler entrypoint --------------------------
 containerArgs:
@@ -518,3 +792,47 @@ ezua:
     enabled: true
     namespace: "istio-system"
     providerName: "oauth2-proxy"
+
+# ==== Wave 2026-10-16 helm-side port (routing / podMonitor / scratch writes) ====
+
+metrics:
+  podMonitor:
+    enabled: true
+    # Set the podMonitorSelector match label here or the target never appears.
+    additionalLabels: {}
+    # {name: <secret>, key: <key>} — omit for open scraping.
+    bearerTokenSecret: {}
+
+
+routing:
+  affinity:
+    # Renders the DestinationRule when true; behavior changes only for callers that SEND headerKey.
+    enabled: false
+    # Header Istio hashes on (e.g. an agent session id); Istio does not create it.
+    headerKey: "x-sqlhandler-session"
+    # Destination host the rule applies to (empty = the in-cluster service FQDN).
+    host: ""
+
+# Agent-facing scratch writes (CTAS/INSERT/COPY INTO) under subject-scoped
+# namespaces; every target must resolve under <scratch-root>/<subject-slug>/...
+writes:
+  enabled: false
+
+  scratch:
+    # Allowlisted scratch roots: comma-separated [name=]<path> entries; an iceberg://
+    # prefix marks a pyiceberg root. Empty = nothing classifies (fail closed).
+    roots: ""
+    # Advisory single-writer lease TTL in seconds
+    leaseTtl: "300"
+    # pyiceberg scratch catalog (backend iceberg only): SQL-catalog DB URI
+    icebergCatalogUri: ""
+    icebergWarehouse: ""
+    # RWX: with replicaCount > 1 the scratch root MUST be ReadWriteMany.
+    pvc:
+      # Dedicated RWX PVC for scratch — enable with writes.enabled
+      enabled: false
+      size: 10Gi
+      storageClass: ""
+      accessModes: []        # default [ReadWriteMany], guarded at render
+      mountPath: /scratch
+      existingClaim: ""      # mount an existing claim instead of creating one

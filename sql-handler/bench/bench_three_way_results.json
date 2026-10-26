@@ -1,0 +1,163 @@
+{
+ "run": "three-way MCP head-to-head: sqlhandler-NFS vs sqlhandler-S3 vs ezpresto-PVC-mirror",
+ "date": "2026-09-23T20:48Z",
+ "mode": "all MCP streamable-HTTP ClusterIP: sqlhandler-nfs run_sql (NFS backend, bench-data PVC = same gl4f VAST NFS class as ezpresto's mirror, same bytes from s3://test-parquet) | sqlhandler run_sql (S3/MinIO, 4-replica prod) | ezpresto execute_query (PVC mirror)",
+ "parity_in_pod": {
+  "employees": [
+   50000,
+   50000,
+   50000
+  ],
+  "orders": [
+   200000,
+   200000,
+   200000
+  ],
+  "customers": [
+   150000,
+   150000,
+   150000
+  ],
+  "testdata_50col": [
+   3000000,
+   3000000,
+   3000000
+  ],
+  "verdict": "EQUAL x3"
+ },
+ "reps": "5 warm + 5 cold per query per leg; all 5/5 ok, zero errors on all three legs",
+ "concurrency_L4": {
+  "sqlhandler-nfs": {
+   "qps": 142.75,
+   "p50": 38.9,
+   "p95": 44.6
+  },
+  "sqlhandler-s3": {
+   "qps": 27.34,
+   "p50": 22.9,
+   "p95": 31.8
+  },
+  "ezpresto": {
+   "qps": 8.97,
+   "p50": 759.1,
+   "p95": 870.2
+  }
+ },
+ "notes": [
+  "sqlhandler-nfs is 1 replica -> warm sweep = true single-pod cache floor (no LB lottery); the 4-replica S3 leg pays the per-replica L1 lottery this run (TTL 3600s had expired the morning's warmth)",
+  "storage equalized: SH-NFS vs EZ both read the same-class NFS; result: sqlhandler wins 10/10 warm AND 10/10 cold",
+  "first live validation of the sqlhandler NFS backend (readiness probe + discovery incl. hive-partitioned sales/employees and nested finance/b/c)"
+ ],
+ "rows": [
+  {
+   "q": "count_small",
+   "nfs_warm": 14.4,
+   "nfs_cold": 71.1,
+   "s3_warm": 28.1,
+   "s3_cold": 311.7,
+   "ez_warm": 146.2,
+   "ez_cold": 132.1,
+   "ez_vs_nfs_warm": 10.2,
+   "ez_vs_nfs_cold": 1.9
+  },
+  {
+   "q": "range_filter",
+   "nfs_warm": 5.0,
+   "nfs_cold": 53.4,
+   "s3_warm": 221.6,
+   "s3_cold": 200.4,
+   "ez_warm": 232.3,
+   "ez_cold": 228.3,
+   "ez_vs_nfs_warm": 46.5,
+   "ez_vs_nfs_cold": 4.3
+  },
+  {
+   "q": "filtered_agg",
+   "nfs_warm": 11.3,
+   "nfs_cold": 104.5,
+   "s3_warm": 177.1,
+   "s3_cold": 186.8,
+   "ez_warm": 494.0,
+   "ez_cold": 499.6,
+   "ez_vs_nfs_warm": 43.7,
+   "ez_vs_nfs_cold": 4.8
+  },
+  {
+   "q": "groupby_agg",
+   "nfs_warm": 12.3,
+   "nfs_cold": 118.9,
+   "s3_warm": 145.6,
+   "s3_cold": 209.3,
+   "ez_warm": 393.7,
+   "ez_cold": 398.0,
+   "ez_vs_nfs_warm": 32.0,
+   "ez_vs_nfs_cold": 3.3
+  },
+  {
+   "q": "join_count",
+   "nfs_warm": 13.1,
+   "nfs_cold": 114.4,
+   "s3_warm": 221.4,
+   "s3_cold": 214.9,
+   "ez_warm": 361.8,
+   "ez_cold": 328.3,
+   "ez_vs_nfs_warm": 27.6,
+   "ez_vs_nfs_cold": 2.9
+  },
+  {
+   "q": "join_agg",
+   "nfs_warm": 14.3,
+   "nfs_cold": 128.9,
+   "s3_warm": 276.5,
+   "s3_cold": 296.4,
+   "ez_warm": 456.2,
+   "ez_cold": 468.9,
+   "ez_vs_nfs_warm": 31.9,
+   "ez_vs_nfs_cold": 3.6
+  },
+  {
+   "q": "count_big_3m",
+   "nfs_warm": 14.5,
+   "nfs_cold": 84.4,
+   "s3_warm": 16.9,
+   "s3_cold": 272.0,
+   "ez_warm": 245.4,
+   "ez_cold": 207.8,
+   "ez_vs_nfs_warm": 16.9,
+   "ez_vs_nfs_cold": 2.5
+  },
+  {
+   "q": "col_proj_agg_2cols",
+   "nfs_warm": 14.5,
+   "nfs_cold": 81.2,
+   "s3_warm": 328.5,
+   "s3_cold": 385.0,
+   "ez_warm": 565.9,
+   "ez_cold": 495.4,
+   "ez_vs_nfs_warm": 39.0,
+   "ez_vs_nfs_cold": 6.1
+  },
+  {
+   "q": "filtered_group_3m",
+   "nfs_warm": 20.9,
+   "nfs_cold": 96.4,
+   "s3_warm": 453.9,
+   "s3_cold": 507.5,
+   "ez_warm": 504.6,
+   "ez_cold": 447.5,
+   "ez_vs_nfs_warm": 24.1,
+   "ez_vs_nfs_cold": 4.6
+  },
+  {
+   "q": "wide_agg_4cols",
+   "nfs_warm": 14.2,
+   "nfs_cold": 85.3,
+   "s3_warm": 25.6,
+   "s3_cold": 491.8,
+   "ez_warm": 496.4,
+   "ez_cold": 442.4,
+   "ez_vs_nfs_warm": 35.0,
+   "ez_vs_nfs_cold": 5.2
+  }
+ ]
+}

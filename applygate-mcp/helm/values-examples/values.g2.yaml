@@ -1,0 +1,238 @@
+# ============================================================================
+# applygate-mcp — sanitized SE-G2 EXAMPLE values (full copy of helm/values.yaml;
+# paste-ready: this file alone is the complete values document).
+# Full guide: documentation/DEPLOYMENT.md.
+# Owner: Andrew Bydlon
+# Email: andrew.bydlon@hpe.com
+# ============================================================================
+
+# Secret-free; real site values live in helm/local/ (never committed, never packaged).
+
+# ### REQUIRED ### — key material lives in Secrets you own, NOT in values
+# (create the API-key Secret out of band; the pod sits in CreateContainerConfigError
+# until it exists — default ref: applygate-mcp-apikey, key api-keys).
+#   1. apiKey.existingSecret — comma-separated keys all authenticate (/mcp 401s without).
+#   2. ezua.virtualService.endpoint — render guard while ezua.enabled; unique per release.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Write surface (default-deny): namespaces.allowed/blocked + kinds.allowed — documentation/DEPLOYMENT.md
+#   Gateway exposure + mcpHostname lockstep (421s otherwise) — documentation/DEPLOYMENT.md
+#   Network zone (default off) — values-examples/values-hardened-g2.yaml (overlay)
+#   Metrics + ServiceMonitor: metrics.enabled/interval — documentation/DEPLOYMENT.md
+#   Audit trail + persistence (hash-chained; logsearch-searchable) — README 'Audit trail'
+#   Caller attribution: clients.existingSecret + callerPassthrough.trustedCidrs — README
+#   Cross-namespace writes: per-namespace RBAC bootstrap — documentation/DEPLOYMENT.md
+
+# ============================================================================
+# Deployment
+# ============================================================================
+
+deployment:
+  name: applygate-mcp
+  appName: applygate-mcp
+  replicaCount: 1
+
+# ============================================================================
+# Image
+# ============================================================================
+
+# repository/tag/pullPolicy are release-managed (lockstep with Chart.yaml) —
+# leave at the chart default.
+image:
+  repository: ghcr.io/ai-solution-eng/applygate-mcp
+  tag: v0.5.0
+  pullPolicy: IfNotPresent
+
+# Only needed if the GHCR package stays PRIVATE (public packages pull
+# anonymously).
+imagePullSecrets: []
+
+# ============================================================================
+# Transport Security (DNS-rebinding protection)
+# ============================================================================
+
+# mcpHostname = public FQDN, in lockstep with the endpoint below (every
+# gateway request 421s without it). extraAllowedHosts = EXTRA svc-DNS hosts.
+mcpHostname: applygate-mcp.your-cluster.example
+extraAllowedHosts: [applygate-mcp.mcp-demo.svc.cluster.local]
+
+# ============================================================================
+# Web Console
+# ============================================================================
+
+# Strictly READ-ONLY console (no apply/delete endpoints); false strips / and
+# /api/* while /mcp and health keep working.
+webui:
+  enabled: true
+
+# ============================================================================
+# Namespace Policy
+# ============================================================================
+
+# THE guardrail — chart default '' = default-deny: every write refused.
+namespaces:
+  # Namespaces this server may write in (globs like team-* are OK)
+  allowed: team-alpha,team-beta,mcp-demo
+  # ALWAYS wins over allowed
+  blocked: kube-system,kube-public,kube-node-lease
+
+# ============================================================================
+# Write Surface
+# ============================================================================
+
+kinds:
+  # Narrow per site if desired — Secret and cluster-scoped kinds are refused
+  # regardless.
+  allowed: ConfigMap,Service,Deployment,StatefulSet,Job,CronJob,Ingress,ServiceAccount,PodDisruptionBudget,HorizontalPodAutoscaler
+
+# ============================================================================
+# Audit Trail
+# ============================================================================
+
+audit:
+  # Hash-chained JSONL trail (README "Audit trail") — mount the SAME path/PVC
+  # into the logsearch pod so the write path's "who did what" is searchable.
+  file: /data/audit.jsonl
+
+planBinding:
+  # Missing/tampered plan refuses BY DEFAULT (server default deny).
+  unplannedApply: ''          # deny (default) | warn (logged) | allow (legacy)
+
+metrics:
+  # Additive, OFF by default (byte-identical render); needs the
+  # prometheus-operator CRDs.
+  enabled: false
+  interval: 30s
+
+# ============================================================================
+# Persistence
+# ============================================================================
+
+# Audit-trail PVC — the trail must survive restarts.
+persistence:
+  enabled: true
+  size: 1Gi
+  accessModes: [ReadWriteOnce]
+
+# ============================================================================
+# Service Exposure
+# ============================================================================
+
+service:
+  type: ClusterIP
+  port: 9102
+  targetPort: 9102
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: '1', memory: 512Mi}
+
+# ============================================================================
+# Security Contexts
+# ============================================================================
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+# ============================================================================
+# Service Account / RBAC
+# ============================================================================
+
+serviceAccount:
+  create: true
+  name: applygate-mcp
+
+rbac:
+  create: true
+
+# ============================================================================
+# Per-Key Proxy Wiring
+# ============================================================================
+
+# Fleet-consistency block — each key wired only when non-empty; the in-cluster
+# k8s API is covered by the standard NO_PROXY cluster-local entries.
+proxy:
+  http: http://proxy.corp.example:8080
+  https: http://proxy.corp.example:8080
+  noProxy: .cluster.local,.svc,.svc.cluster,.svc.cluster.local,10.0.0.0/8,10.96.0.1,127.0.0.1,172.16.0.0/12,localhost
+
+# ============================================================================
+# Kyverno Vendor-Label Policy
+# ============================================================================
+
+# Cluster-scoped; off by default — enable where EZUA vendor labeling is enforced.
+kyverno:
+  enabled: true
+
+# ============================================================================
+# PCAI (HPE Ezmeral Unified Analytics) Integration
+# ============================================================================
+
+# Gateway exposure on — a WRITE-path MCP relies on ezaf-gateway authn
+# in front.
+ezua:
+  enabled: true   # deploy the VirtualService on this cluster
+  # Literal domain (this file must not rely on ${DOMAIN_NAME} resolution)
+  domainName: your-cluster.example   # informational only — no template reads it
+  virtualService:
+    # Literal host — /mcp -> MCP server (9102); / -> read-only console
+    endpoint: applygate-mcp.your-cluster.example
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 120s
+
+# Fleet API-key auth: the shared fleet key Secret (key: api-keys).
+apiKey:
+  existingSecret: "mcp-fleet-apikeys"
+  existingSecretKey: "api-keys"
+
+# Caller attribution — unset = fp-only audit; enable when a trusted relay
+# emits X-MCP-Caller (set trustedCidrs to its CIDRs) or a registry is wanted:
+clients:
+  existingSecret: ''
+  existingSecretKey: clients
+
+callerPassthrough:
+  trustedCidrs: ''
+
+# ============================================================================
+# MCP Network Zone (ADDITIVE, DEFAULT OFF)
+# ============================================================================
+
+# Ingress allowlist (ns selectors): once enabled anything unmatched is DENIED;
+# egress unrestricted. Zone OFF in this plain G2 profile (hardened: overlay).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  authorizedClients:
+    namespaces: []
+
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+
+  probeCidrs: []
+  probeExceptCidrs: []
+
+  egress:
+    enabled: false
+    extraEgress: []

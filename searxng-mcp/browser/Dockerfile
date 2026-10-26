@@ -42,7 +42,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 # gosu: drop from root (needed to install the mounted CA at start) to the
 # unprivileged 'browser' user before exec'ing Chromium.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gosu \
+    && apt-get install -y --no-install-recommends ca-certificates gosu libnss3-tools \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 browser \
     && mkdir -p /ms-playwright /certs-src /certs-installed \

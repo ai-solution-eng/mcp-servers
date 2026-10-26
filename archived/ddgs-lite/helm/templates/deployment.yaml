@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+            {{- if and .Values.hpe_proxies .Values.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if and .Values.hpe_proxies .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}

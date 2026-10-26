@@ -1,0 +1,21 @@
+{{- if .Values.persistence.enabled }}
+# THE point of the workbench: workspaces must survive pod restarts. RWX so
+# every replica sees the same workspaces (MCP is stateless — any replica
+# serves any request).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.deployment.name }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

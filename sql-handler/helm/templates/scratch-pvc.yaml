@@ -1,0 +1,44 @@
+{{- if and .Values.writes.enabled .Values.writes.scratch.pvc.enabled (not .Values.writes.scratch.pvc.existingClaim) }}
+{{- /* Persistent volume backing the write tier's scratch roots
+       (SQLHANDLER_WRITE_SCRATCH_ROOTS) — implementation review §4. Every
+       caller writes under <mountPath>/<subject-slug>/...; the engine's
+       dataset/result caches treat the written tables as ordinary Delta
+       tables, so a shared RWX volume makes writes + read-backs work across
+       replicas (and the single-writer lease file lives on the same
+       volume, which is what makes it cross-replica).
+
+       Render-time guard (semanticCatalog.store's precedent, byte-for-byte
+       the same discipline): ReadWriteMany is REQUIRED whenever replicas
+       can exceed 1 (autoscaling or replicaCount > 1). RWO claims attach on
+       one node only — the other replicas would see neither the written
+       tables nor the lease, which is exactly the failure this chart
+       refuses to ship. Operator-authored values that cannot work should
+       not render. */}}
+{{- $store := .Values.writes.scratch.pvc }}
+{{- $multi := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) }}
+{{- if and $multi (not (has "ReadWriteMany" ($store.accessModes | default list))) }}
+{{- fail "writes.scratch.pvc: ReadWriteMany access is required when replicas can exceed 1 (autoscaling.enabled or replicaCount > 1) — a ReadWriteOnce claim hides the scratch tables AND the single-writer lease from the other replicas. Use an RWX StorageClass, or set accessModes: [ReadWriteOnce] ONLY for single-replica deployments." }}
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-scratch
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+  annotations:
+    # Scratch DATA is re-derivable (it is a materialized query result), but
+    # the volume must SURVIVE a rolling upgrade so in-flight agent workflows
+    # keep reading what an earlier step wrote. Deletion stays an explicit
+    # `kubectl delete pvc` decision (same posture as the catalog store).
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml ($store.accessModes | default (list "ReadWriteMany")) | nindent 4 }}
+  {{- if $store.storageClass }}
+  storageClassName: {{ $store.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $store.size | default "10Gi" }}
+{{- end }}

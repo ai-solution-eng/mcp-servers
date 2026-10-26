@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import traceback
+import warnings
 from dataclasses import dataclass
 
 import httpx
@@ -24,6 +25,30 @@ from ddgs.exceptions import DDGSException
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
+
+# ---------------------------------------------------------------------------
+# Deprecation (fleet decision D17, stage 1 — warn only, NO other change)
+# ---------------------------------------------------------------------------
+# ddgs_lite is retired in favor of searxng_mcp, which is a drop-in replacement
+# (the same two tools — search + fetch_content — backed by a real SearXNG
+# metasearch engine instead of client-side ddgs scraping, with the fleet SSRF
+# guard, auth middleware, and TTL caching). Stage 1 (Wave-3 C3): every tool
+# call emits a one-per-process DeprecationWarning; behavior is otherwise
+# unchanged. Stage 2 (Wave 7, only on D17 approval): archive this server.
+
+_DEPRECATION_MESSAGE = (
+    "ddgs_lite is deprecated — use searxng_mcp (drop-in: same two tools); archive pending (fleet decision D17)"
+)
+_deprecation_warned = False
+
+
+def _warn_deprecated_once() -> None:
+    """Emit the D17 deprecation warning at tool-call time, ONCE per process."""
+    global _deprecation_warned
+    if _deprecation_warned:
+        return
+    _deprecation_warned = True
+    warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
 
 
 @dataclass
@@ -70,7 +95,11 @@ class Metasearcher:
         self._ddgs = DDGS(proxy=proxy, timeout=10)
 
     async def search(
-        self, query: str, ctx: Context, max_results: int = 10, region: str = "",
+        self,
+        query: str,
+        ctx: Context,
+        max_results: int = 10,
+        region: str = "",
         backend: str = "auto",
     ) -> tuple[list[SearchResult], str]:
         await self.rate_limiter.acquire()
@@ -265,10 +294,7 @@ class WebContentFetcher:
         text = text[start_index : start_index + max_length]
         truncated = start_index + max_length < total
 
-        meta = (
-            f"\n\n---\n[Content info: Showing characters {start_index}-"
-            f"{start_index + len(text)} of {total} total"
-        )
+        meta = f"\n\n---\n[Content info: Showing characters {start_index}-{start_index + len(text)} of {total} total"
         if truncated:
             meta += f". Use start_index={start_index + max_length} to see more"
         meta += f" (via {source})]"
@@ -328,14 +354,13 @@ async def search(
                  yandex, yahoo, mojeek, wikipedia, grokipedia.
         ctx: MCP context for logging.
     """
+    _warn_deprecated_once()  # D17 stage 1 (once per process)
     try:
-        results, error_info = await searcher.search(
-            query, ctx, max_results, region, backend
-        )
+        results, error_info = await searcher.search(query, ctx, max_results, region, backend)
         return searcher.format_results(results, error_info)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
-        return f"An error occurred while searching: {str(e)}"
+        return f"An error occurred while searching: {e!s}"
 
 
 @mcp.tool()
@@ -373,14 +398,15 @@ async def fetch_content(
             follows redirects).
         ctx: MCP context for logging.
     """
+    _warn_deprecated_once()  # D17 stage 1 (once per process)
     return await fetcher.fetch_and_parse(url, ctx, start_index, max_length, backend)
 
 
 def main():
+    import uvicorn
     from starlette.applications import Starlette
     from starlette.middleware.cors import CORSMiddleware
     from starlette.routing import BaseRoute, Route
-    import uvicorn
 
     parser = argparse.ArgumentParser(description="DuckDuckGo MCP Server")
     parser.add_argument(
@@ -408,9 +434,7 @@ def main():
     if "stdio" in transports and len(transports) > 1:
         parser.error("Cannot mix stdio with HTTP transports")
     if transports == {"stdio"} and (args.host is not None or args.port is not None):
-        parser.error(
-            "--host / --port are only valid with --transport sse or streamable-http"
-        )
+        parser.error("--host / --port are only valid with --transport sse or streamable-http")
 
     if transports == {"stdio"}:
         mcp.run(transport="stdio")
@@ -419,11 +443,7 @@ def main():
     host = args.host or "127.0.0.1"
     port = args.port or 8000
 
-    sse_app = (
-        mcp.sse_app(sse_path="/mcp", transport_security=_mcp_transport_security)
-        if "sse" in transports
-        else None
-    )
+    sse_app = mcp.sse_app(sse_path="/mcp", transport_security=_mcp_transport_security) if "sse" in transports else None
     http_app = (
         mcp.streamable_http_app(
             streamable_http_path="/mcp",
@@ -462,9 +482,8 @@ def main():
 
         @asynccontextmanager
         async def combined_lifespan(app):
-            async with sse_lifespan(app):
-                async with http_lifespan(app):
-                    yield
+            async with sse_lifespan(app), http_lifespan(app):
+                yield
 
         lifespan = combined_lifespan
     elif "streamable-http" in transports:

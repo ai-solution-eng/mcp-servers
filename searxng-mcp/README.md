@@ -64,7 +64,7 @@ fetch_content(
     max_length: int = 8000,    # characters per call
     backend: str = "auto",     # auto|trafilatura|bs4 ('httpx' alias)|curl|wikipedia
     render: str = "auto",      # auto|always|never — headless-browser usage
-    include_screenshot: bool = False,  # append a PNG data URL of the page
+    include_screenshot: bool = False,  # PNG data URL, first page only, size-capped
 ) -> str
 ```
 
@@ -85,13 +85,118 @@ so. `render="always"` skips plain HTTP entirely; `render="never"` keeps the old 
 | `SEARXNG_TIMEOUT` | `10` | Search request timeout (s) |
 | `SEARXNG_VERIFY_TLS` | `true` | TLS verification for https:// SearXNG URLs |
 | `SEARXNG_REQUESTS_PER_MINUTE` | `30` | Search rate limit |
+| `SEARXNG_SEARCH_CACHE_TTL` | `120` | Search result cache TTL seconds (`0` disables) |
 | `FETCH_REQUESTS_PER_MINUTE` | `20` | Fetch rate limit |
 | `FETCH_VERIFY_TLS` | `true` | TLS verification for fetched pages |
+| `FETCH_CA_BUNDLE` | — | Combined CA bundle (public roots + the egress proxy's CA) for TLS-intercepting egress (Zscaler et al.); passed as `verify=` to both fetch rungs. The chart's `caCert:` block builds it |
+| `FETCH_TLS_INSECURE_FALLBACK` | `false` | Retry a certificate-verification failure ONCE unverified, output marked — last-resort for CA-rotation gaps, never for HTTP/DNS/policy failures |
 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | — | Corporate proxy for `fetch_content` |
+| `SEARXNG_FETCH_ALLOW_HOSTS` | — | SSRF-guard escape (D6): hosts/CIDRs allowed despite resolving internally |
+| `SEARXNG_FETCH_DENY_EXTRA` | — | SSRF-guard: extra denied hosts/CIDRs (deny wins over allow) |
+| `SEARXNG_FETCH_CACHE_TTL` | `300` | Fetch result cache TTL seconds (`0` disables) |
+| `SEARXNG_FETCH_MAX_BODY_BYTES` | `5000000` | Response-body cap on the plain path |
+| `SEARXNG_FETCH_MAX_SCREENSHOT_KB` | `512` | Screenshot data-URL cap (KB) |
+| `SEARXNG_FETCH_MAX_REDIRECTS` | `5` | Redirect-hop cap (each hop re-validated) |
 | `BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Headless-browser sidecar CDP endpoint |
 | `BROWSER_NAV_TIMEOUT_MS` etc. | see `browser_client.py` | Nav timeout, settle wait, max pages, resource blocking |
+| `MCP_HOSTNAME` | — | Public FQDN clients use to reach `/mcp` (DNS-rebinding Host pin; set ⇒ protection explicitly ON). Read at startup — changing it requires a restart |
+| `MCP_EXTRA_ALLOWED_HOSTS` | — | Comma-separated in-cluster Host allowlist additions (verbatim or `host:*`). When transport security is active, the chart AUTO-prepends the release's own service DNS (`searxng-mcp-service.<ns>.svc.cluster.local:*`) — the LLM-gateway relay hop's Host header (421 Misdirected Request without it); chart key `extraAllowedHosts` lists only EXTRA hosts. Empty ⇒ unset ⇒ behavior unchanged |
+
+**Config freeze — which envs are read when.** The connection block is read
+**once at import/startup**: `SEARXNG_URL`, `SEARXNG_LANGUAGE`,
+`SEARXNG_TIMEOUT`, `SEARXNG_VERIFY_TLS`, `SEARXNG_REQUESTS_PER_MINUTE`,
+`FETCH_REQUESTS_PER_MINUTE`, and `FETCH_VERIFY_TLS` configure the long-lived
+`SearXNGClient` / `WebContentFetcher` objects and module-level constants —
+changing any of them requires a pod (or process) restart, and so do
+`MCP_HOSTNAME` / `MCP_EXTRA_ALLOWED_HOSTS` (the transport-security helper
+resolves them once at startup). **Re-read live (no restart needed):** the
+API-key envs (`SEARXNG_API_KEYS` / `MCP_API_KEYS` — key rotation via the
+Secret is live). Everything else is read once: the connection block, the
+transport-security pair, AND the cache/cap knobs (`SEARXNG_SEARCH_CACHE_TTL`,
+`SEARXNG_FETCH_CACHE_TTL`, `SEARXNG_FETCH_MAX_BODY_BYTES`,
+`SEARXNG_FETCH_MAX_SCREENSHOT_KB`, `SEARXNG_FETCH_MAX_REDIRECTS`,
+`FETCH_CA_BUNDLE`, `FETCH_TLS_INSECURE_FALLBACK`) are read when the
+client/fetcher objects are CONSTRUCTED (or at import) — changing any of
+them requires a pod (or process) restart. Aligning the connection block
+with the per-request re-read pattern is deferred — a later work item; do
+not assume a changed `SEARXNG_URL` in a running pod does anything.
 
 The search client deliberately ignores environment proxies (`trust_env=False`): the sidecar is reached over `localhost`, and nothing must intercept that.
+
+## fetch_content SSRF guard (default-ON — fleet decision D6)
+
+`fetch_content` and the headless-browser rung sit behind a shared URL policy
+(`url_policy.py`, adapted from the fleet reference implementation in
+`MultimodalRAG/src/multimodal_rag/utils/url_policy.py`):
+
+- **Scheme allowlist** — only `http://` and `https://`.
+- **Resolved-IP denylist** — checked on the addresses a host resolves to,
+  not just its name: loopback (`127/8`, `::1`), unspecified (`0.0.0.0/8`, `::`),
+  RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16` —
+  including the cloud-metadata endpoint `169.254.169.254` — and `fe80::/10`),
+  unique-local (`fc00::/7`), CGNAT/benchmark/TEST-NET/multicast/reserved, and
+  IPv4-mapped IPv6 after unwrapping. Name forms of the same targets are
+  blocked too: `localhost`, cloud-metadata hostnames (`metadata.google.internal`,
+  `metadata`, …) and cluster-local suffixes (`*.svc`, `*.cluster.local`).
+- **Unconditional core** — loopback, pod-local and metadata targets are
+  refused in every configuration. The allowlist below cannot unlock them;
+  the browser sidecar shares the pod's network namespace, so navigating it
+  at loopback would reach the MCP container and the unauthenticated CDP
+  endpoint itself.
+- **Per-hop redirect re-validation** — redirects are never followed blindly:
+  the fetcher runs a manual hop loop (cap `SEARXNG_FETCH_MAX_REDIRECTS`) and
+  re-runs the full policy on every `Location` before requesting it.
+- **DNS-rebinding pin** — with no proxy env set, each hop connects to the
+  IP address that was validated (original hostname preserved via `Host` +
+  TLS SNI), so check-time ≠ fetch-time rebinding cannot reroute the request.
+  When `HTTP(S)_PROXY` is configured the request keeps the original hostname
+  (the corporate proxy performs egress DNS; the denylist still ran on the
+  check-time resolution) — that residual is documented and bounded to
+  proxied deployments.
+- **CDP route filter** — the browser validates its top-level URL before
+  `page.goto`, and its route handler aborts any in-render request
+  (redirects, iframes, subresources) toward loopback/pod-local/metadata/
+  cluster-internal targets.
+- **Escapes** — `SEARXNG_FETCH_ALLOW_HOSTS` (comma-separated hostnames,
+  `.suffix` forms, IP literals, CIDRs) adds legitimate internal targets;
+  additive, never authoritative (public fetching keeps working).
+  `SEARXNG_FETCH_DENY_EXTRA` denies on top; deny wins over allow.
+  Errors name the governing env var.
+
+**Before → after for agents:** public-web search/fetch behaves exactly as
+before; fetching internal/loopback/metadata URLs used to succeed and now
+returns a policy error naming `SEARXNG_FETCH_ALLOW_HOSTS`.
+
+Quick wins in the same area: successful fetches are memoized for
+`SEARXNG_FETCH_CACHE_TTL` seconds with single-flight coalescing (concurrent
+identical requests share one upstream run); **searches are memoized for
+`SEARXNG_SEARCH_CACHE_TTL` seconds (default 120, `0` disables) with the
+same single-flight semantics** — on a shared multi-tenant instance this
+dedupes the duplicate queries several agent sessions produce, which is a
+direct saving of the upstream per-IP engine budget; the plain-path response body is
+capped (`SEARXNG_FETCH_MAX_BODY_BYTES`) with a truncation notice in the
+output; the screenshot data URL is size-capped
+(`SEARXNG_FETCH_MAX_SCREENSHOT_KB`) and ships with the first page
+(`start_index=0`) only — it used to be appended, uncapped, after every
+`max_length` slice (a response-size bypass); bs4 extraction prefers the
+`lxml` parser when it is importable.
+
+In-cluster operators set these via the chart's `fetch:` values (wired to the
+env names above; empty = built-in defaults) or the generic `env:` list.
+
+## Prometheus self-metrics (GET /metrics — default OFF)
+
+The MCP server exports its own request counters at `GET /metrics`: one
+counter family, `searxng_mcp_tool_requests_total{tool,outcome}` — per-tool
+call counts with outcome ok|error for `search` and `fetch_content` (SSRF
+policy refusals and engine failures surface as fetch/search errors). No
+queries, URLs, or error text are exported. Chart-gated default-OFF:
+`metrics.enabled: false` (the default) renders no env and no ServiceMonitor
+and the server serves no `/metrics` route — the default pod is unchanged.
+Set `metrics.enabled: true` (values) to enable; `/metrics` rides the MCP
+container's port, is key-free (the auth gate protects only `/mcp`), and the
+ServiceMonitor template (templates/servicemonitor.yaml) scrapes it via the
+Prometheus Operator.
 
 ## Headless browser rendering (optional sidecar)
 
@@ -102,7 +207,7 @@ Build & push (separate image; the MCP image stays slim — only the ~40 MB playw
 
 ```bash
 docker buildx build \
-  -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+  -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.6.1 \
   mcp_servers/searxng_mcp/browser --push
 ```
 
@@ -114,7 +219,9 @@ nor `NODE_EXTRA_CA_CERTS`). Without the sidecar the server behaves exactly as be
 ```bash
 uv venv --python 3.12 .venv          # or any python ≥3.10
 uv pip install -e . pytest           # or: uv pip install -r <(sed ...) — see pyproject
-.venv/bin/python -m pytest tests/ -v # 58 unit tests (fully mocked, no network)
+.venv/bin/python -m pytest tests/ -v # unit tests (fully mocked, no network; the
+                                     # optional 'browser' extra — playwright — is
+                                     # needed only for the browser-rung tests)
 
 # Live check against any real SearXNG:
 SEARXNG_URL=https://searxng.example.com SEARXNG_VERIFY_TLS=false \
@@ -137,12 +244,52 @@ docker run --rm -p 8080:8080 \
 
 ## Deployment
 
+Deployment on PCAI (HPE Private Cloud AI / Ezmeral Unified Analytics) is values-driven: users never run `helm install` or `kubectl apply` — the packaged chart is imported into the PCAI catalog once, the deployment is created from it, and every knob below is set in the chart's **Helm Values** editor (or via the PCAI API). PCAI resolves `${DOMAIN_NAME}` in the `ezua` values before rendering. The paste-ready full-values examples in [`helm/values-examples/`](helm/values-examples/README.md) are written for that editor.
+
+### Required values
+
+The chart **fails to render** unless these are set:
+
+| Key | Why it is required |
+|---|---|
+| `searxng.secretKey` | **REQUIRED** — the deployment template errors (`searxng.secretKey is required (SEARXNG_SECRET) — or set searxng.existingSecret`) when it is empty. It seeds SearXNG's `SEARXNG_SECRET` (session/crypto); the chart default is a placeholder, so change it for any real deployment. |
+| `searxng.existingSecret` (+ `existingSecretKey`, default `secret`) | **Alternative wiring, preferred**: point at a pre-created Secret and `SEARXNG_SECRET` comes from `secretKeyRef` instead — when set, the literal `secretKey` above is ignored and the empty-value render failure cannot happen. `kubectl create secret generic <name> --from-literal=secret=$(openssl rand -hex 32)`. |
+| `ezua.virtualService.endpoint` | **REQUIRED when `ezua.enabled`** (default `true`): the VirtualService host — e.g. `searxng-mcp.${DOMAIN_NAME}` (PCAI resolves `${DOMAIN_NAME}`). Empty endpoint aborts the render. Doubles as `MCP_HOSTNAME` (DNS-rebinding Host pin, read at startup). |
+
+```yaml
+searxng:
+  # Preferred — the secret never passes through values files or git:
+  existingSecret: "searxng-secret"
+  # … or a literal (lab only): secretKey: "<SECRET_KEY>"   # openssl rand -hex 32
+ezua:
+  virtualService:
+    endpoint: "searxng-mcp.${DOMAIN_NAME}"
+```
+
+### Standard Kubernetes knobs
+
+Boilerplate sizing/identity/probe values — every path is settable in the PCAI **Helm Values** editor; defaults are sensible, so none normally need touching:
+
+| Key | Default | Effect |
+|---|---|---|
+| `deployment.appName` | `searxng-mcp` | Kubernetes object + pod label for the MCP container. |
+| `deployment.replicaCount` | `1` | Pod replicas (stateless MCP server — scale freely). |
+| `image.pullPolicy` | `IfNotPresent` | Pull policy of the MCP container image. |
+| `resources.requests.cpu` / `resources.limits.cpu` | `200m` / `1` | MCP container CPU requests/limits. |
+| `searxng.image.pullPolicy` | `IfNotPresent` | Pull policy of the SearXNG sidecar image. |
+| `searxng.resources.requests.cpu` / `searxng.resources.limits.cpu` | `100m` / `1` | SearXNG sidecar CPU requests/limits. |
+| `browser.image.tag` / `browser.image.pullPolicy` | `v1.6.1` / `IfNotPresent` | Optional headless-browser sidecar image pin and pull policy (used when `browser.enabled`). |
+| `browser.resources.requests.cpu` | `250m` | Headless-browser sidecar CPU request (memory limit 1Gi). |
+| `service.targetPort` | `9090` | Container port the Service's `mcp` port forwards to (also the `/mcp` VirtualService backend). |
+| `metrics.serviceMonitor` | `true` | Render the ServiceMonitor when `metrics.enabled: true`. |
+| `metrics.interval` | `30s` | ServiceMonitor scrape interval. |
+
 ```bash
 # Build & push the MCP image (playwright client included via the browser extra)
-docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v1.1.0 -f Dockerfile . --push
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp:v1.7.0 -f Dockerfile . --push
 
 # Optional: build & push the headless-browser sidecar (see the section above)
-docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.1.0 \
+docker buildx build -t ghcr.io/ai-solution-eng/searxng-mcp-browser:v1.6.1 \
     mcp_servers/searxng_mcp/browser --push
 
 # Render & inspect, then install (per-site values from helm/local/)
@@ -150,6 +297,36 @@ helm template searxng-mcp helm/ -f helm/local/values.<site>.yaml
 helm upgrade --install searxng-mcp helm/ -n searxng-mcp --create-namespace \
     -f helm/local/values.<site>.yaml
 ```
+
+**Rebuild safety (W7 fixes, 2026-10):** the images neutralize two
+crash-loop classes at build time — (1) a **permission neutralizer**
+(`chmod -R a+rX /app` after the code COPY; `/ms-playwright` in the browser
+image), because agents' files land `0600` on the ops box, COPY preserves
+modes, and a non-root container dies on the first unreadable module; and
+(2) a **build-time import gate** that imports every declared loose
+py-module (`mcp_auth`, `mcp_metrics`, `url_policy`, …) from the installed
+wheel — the non-editable install silently omits a declared module whose
+file is not COPYed, which otherwise surfaces as a first-query
+`ModuleNotFoundError` in a pod instead of in the build log.
+
+### API-key auth — OPTIONAL (fleet pattern)
+
+By default `/mcp` runs open (the chart wires no key env) and relies on the
+gateway / network position. Because the `fetch_content` tools can reach
+in-cluster URLs, enabling the key gate is **recommended** beyond a lab. The
+chart never inlines a key — pre-deploy the Secret, then point the values at
+it (no pod restart needed; the server re-reads the env per request):
+
+```bash
+kubectl -n searxng-mcp create secret generic searxng-mcp-apikey \
+  --from-literal="api-keys=$(openssl rand -hex 32)"
+helm upgrade searxng-mcp helm/ -n searxng-mcp --reuse-values \
+  --set apiKey.existingSecret=searxng-mcp-apikey
+```
+
+Keys are a comma-separated list (`api-keys=new,old`) — that is the rotation
+mechanism (append → move clients → drop the old). The fleet-universal
+`MCP_API_KEYS` env is honored too (either var works).
 
 Chart contents:
 
@@ -159,7 +336,11 @@ Chart contents:
 - `virtualservice.yaml` — `/mcp` → 9090 (MCP), `/` → 8080 (**the normal SearXNG web page**), behind the EZAF gateway.
 - `kyverno.yaml` — vendor label policy (same as ddgs-lite).
 
-On HPE-network clusters set `hpe_proxies: true` — this wires the corporate proxy into both SearXNG's engine requests (settings.yml) and the MCP container's `fetch_content` egress (env), matching the ddgs-lite convention.
+On corporate-proxy clusters (no direct internet egress) set `proxy.http`/`proxy.https` (and usually `proxy.noProxy`) — each key is wired into the pod only when non-empty, configuring both SearXNG's engine requests (settings.yml `outgoing.proxies`) and the MCP container's `fetch_content` egress (env). `proxy: {}` (the default) renders everything off.
+
+### Migrating from hpe_proxies
+
+The `hpe_proxies` flag was removed (chart ≥ 1.5.0) in favor of the per-key `proxy:` dict. Set `proxy.http` / `proxy.https` / `proxy.noProxy` directly — each key is active only when non-empty, so `proxy: {}` (or omitting the block) is fully off; there is no separate flag to flip. Old `hpe_proxies: true` + chart-default-proxy sites should copy their site's real proxy addresses into an explicit `proxy:` block (see the example in `helm/values.yaml`).
 
 ### MCP client registration
 
@@ -195,18 +376,28 @@ Or through the gateway (oauth2-proxy protected):
 - **Sidecar image pinning.** The chart pins SearXNG to the dated tag that Docker Hub's `latest` resolved to when the chart was last touched (never the mutable `latest` tag itself — pods rescheduled later would silently get different engines/settings). To refresh the pin: look up the newest dated tag on Docker Hub, bump `searxng.image.tag` in values, and upgrade. For a fully immutable reference,
   use the digest form (`image: searxng/searxng@sha256:…`). The MCP server side is decoupled from SearXNG releases — it speaks the JSON API, whose schema has been stable for years — so sidecar upgrades are low-risk; validate with `GET /config` and one search call after upgrading.
 - `server.limiter: false` keeps the limiter off for internal API use — no valkey/redis required. Add valkey only if you ever expose this publicly.
-- **Default: no engines are disabled.** All default SearXNG engines stay on, including ddg/brave/startpage. SearXNG auto-suspends engines that fail repeatedly (transient, self-recovers) and the search tool reports `some engines did not respond: …` per query — so an engine being flaky costs a little latency, never correctness. If one proves *consistently* dead on a given network (startpage showed a
-  hard CAPTCHA wall on the HPE proxy during testing), add it to `searxng.disabledEngines` in values and `helm upgrade`; verify with `GET /config` afterwards.
+- **The default disable-list targets engines that die behind corporate egress proxies** (ddg/brave/startpage variants + `wikidata`; SE-G2 evidence: CAPTCHA walls for datacenter IPs, SPARQL timeouts through the proxy). On a *shared* egress IP this is not a latency nicety — every search pays the dead engines' request/timeout budget, the cluster's instances share one upstream rate-limit budget, and SearXNG auto-suspension merely reports `some engines did not respond: …` per query without conserving quota. Set `searxng.disabledEngines: []` only on open-internet (non-proxied) installs. Names must match engine names exactly (see the `engines:` array in `GET /config`); a wrong name is silently ignored.
 
 ## Files
+
+| Document | Contents |
+|---|---|
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), ezua/Istio wiring, upgrading |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | Two-path liveness, MCP handshake check, one-tool test, optional operator kubectl, troubleshooting |
+| [helm/values-examples/](helm/values-examples/README.md) | Paste-ready, secret-free full-values examples (G2 lab, hosted trial) |
+| [helm/values.yaml](helm/values.yaml) | Chart defaults — the authoritative list of every knob |
 
 ```
 searxng_mcp/
 ├── server.py               # MCP 2.0 MCPServer + tools (search, fetch_content)
 ├── searxng_client.py       # SearXNG JSON API client + formatting
 ├── fetcher.py              # trafilatura → bs4/html2text → Wikipedia fetcher
-│                           #   (+ headless-browser escalation rung)
+│                           #   (+ headless-browser escalation rung, redirect
+│                           #   hop loop, TTL cache/single-flight, body caps)
+├── url_policy.py           # SSRF guard: scheme allowlist, resolved-IP
+│                           #   denylist, DNS pin, allowlist/deny escapes
 ├── browser_client.py       # Playwright-over-CDP client for the browser sidecar
+│                           #   (+ CDP route filter)
 ├── browser/                # headless-browser sidecar image (Chromium headless
 │   ├── Dockerfile          #   shell, loopback CDP, CA/proxy entrypoint)
 │   └── entrypoint.sh
@@ -216,7 +407,28 @@ searxng_mcp/
 ├── helm/                   # chart: configmap, sidecar deployment, service, VS
 │   └── local/              # per-site values (never committed)
 └── tests/
-    ├── test_searxng_mcp.py # 32 unit tests (mocked transport, in-memory MCP)
-    ├── test_browser_render.py # 26 escalation tests (stubbed browser client)
+    ├── test_searxng_mcp.py # unit tests (mocked transport, in-memory MCP)
+    ├── test_browser_render.py # escalation tests (stubbed browser client)
+    ├── test_url_policy.py  # SSRF guard tests (denylist, hops, pin, cache, caps)
     └── live_check.py       # end-to-end check vs a real instance (+ sidecar)
 ```
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the service: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and the edge-gateway pods — the browser path stays open by default via
+`allowEzafGatewayIngress: true`, so the VirtualService keeps working).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) leave `ezua.virtualService.enabled: true` — the browser path is a feature
+here, not a break-glass; (5) apply via the PCAI values editor (`helm upgrade`
+for operators); (6) verify — an allowed namespace gets HTTP 200 from
+`service:port/mcp`, any other namespace times out (browsers keep working via
+the gateway). See `values-examples/values-hardened-g2.yaml` for the full
+hardened profile.
