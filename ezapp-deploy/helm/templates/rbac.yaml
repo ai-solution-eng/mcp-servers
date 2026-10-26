@@ -1,0 +1,67 @@
+{{- if .Values.rbac.create }}
+{{- /* Least privilege: this server DEPLOYS applications, so its cluster
+      power is the EzAppConfig verbs below. No `list`/`watch` — the server
+      (tools, UI) addresses CRs only by name from its ownership ledger, and
+      the RBAC keeps it structurally unable to enumerate anyone else's
+      EzAppConfigs. */ -}}
+{{- if eq .Values.rbac.apiGroup "*" }}
+{{- fail "rbac.apiGroup must be the EzAppConfig CRD group (e.g. ezconfig.hpe.ezaf.com), never '*'" }}
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.deployment.name }}-ezappconfig-writer
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+- apiGroups: [{{ .Values.rbac.apiGroup | quote }}]
+  resources: [{{ .Values.ezappconfig.plural | quote }}]
+  verbs: [get, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-ezappconfig-writer
+  labels:
+    app: {{ .Values.deployment.appName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.deployment.name }}-ezappconfig-writer
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.serviceAccount.name | default .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+---
+{{/* The ownership ledger is name-pinned via resourceNames: the server may
+      read/patch ONLY its own ledger ConfigMap in its own namespace — never
+      any other ConfigMap. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.deployment.name }}-ledger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [{{ .Values.deployment.name }}-ledger]
+  verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.deployment.name }}-ledger
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.deployment.name }}-ledger
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.serviceAccount.name | default .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

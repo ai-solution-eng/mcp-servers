@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ezapp-deploy — managed applications</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>ezapp-deploy <span class="dim">— applications managed by this MCP server</span></h1>
+  <div id="auth">
+    <input id="keybox" type="password" placeholder="API key" autocomplete="off" spellcheck="false">
+    <button id="savekey" type="button">Save key</button>
+    <button id="refresh" type="button">Refresh</button>
+    <label><input id="autorefresh" type="checkbox" checked> auto-refresh (15s)</label>
+  </div>
+  <p id="statusbar" class="dim"></p>
+</header>
+<main>
+  <section>
+    <h2>EzAppConfigs <span class="dim">(ownership ledger + live status)</span></h2>
+    <table id="apps">
+      <thead>
+        <tr><th>Name</th><th>Chart</th><th>Version</th><th>Target namespace</th><th>Status</th><th>Applied (ledger)</th><th>Details</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Managed chart versions <span class="dim">(uploaded to ChartMuseum)</span></h2>
+    <table id="charts">
+      <thead>
+        <tr><th>Chart</th><th>Version</th><th>Uploaded (ledger)</th><th>Filename</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<footer>
+  <p id="meta" class="dim"></p>
+  <p class="dim">Read-only. Data comes from the ownership ledger plus live cluster status; nothing here can modify the cluster. The API key is kept in sessionStorage only and is sent only to this origin.</p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

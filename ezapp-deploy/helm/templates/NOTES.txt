@@ -1,0 +1,83 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret | default (printf "%s-apikey" $name) -}}
+{{- $host := .Values.ezua.virtualService.endpoint -}}
+
+ezapp-deploy {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+This server DEPLOYS applications (ChartMuseum upload + EzAppConfig apply) —
+keep its API key and RBAC tight.
+
+════════════════════════════════════════════════════════════════════
+1. API key — the chart NEVER creates it (an empty-key apply once took
+   a live endpoint open). Create/rotate out-of-band, then restart:
+
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+    --from-literal="api-key=$(openssl rand -hex 32)" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n {{ $ns }} rollout restart deploy/{{ $name }}
+
+  Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-key}' | base64 -d
+
+════════════════════════════════════════════════════════════════════
+2. Endpoints (port-forward while testing; the PCAI VirtualService
+   fronts it for real):
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 9090:9090
+  MCP : http://localhost:9090/mcp   (Authorization: Bearer <api-key>)
+{{- if .Values.ui.enabled }}
+  UI  : http://localhost:9090/ui/   (read-only managed-apps view; paste
+        the API key in the page — same key as /mcp)
+{{- end }}
+{{- if and .Values.ezua.enabled $host }}
+
+  Public hostname: {{ $host }}
+    (Istio VirtualService: {{ $name }}-vs in {{ $ns }} via {{ .Values.ezua.virtualService.istioGateway }})
+{{- end }}
+
+════════════════════════════════════════════════════════════════════
+3. Sanity checks after install:
+  # ChartMuseum reachable from the pod (ClusterIP service):
+  kubectl -n {{ $ns }} run curl-test --rm -it --image=curlimages/curl --restart=Never -- \
+    curl -s -o /dev/null -w '%{http_code}' {{ .Values.chartmuseum.url }}/api/charts
+  # RBAC actually granted (expect: yes):
+  kubectl -n {{ $ns }} auth can-i create {{ .Values.ezappconfig.plural }}.{{ .Values.rbac.apiGroup }} \
+    --as=system:serviceaccount:{{ $ns }}:{{ $name }}
+
+════════════════════════════════════════════════════════════════════
+4. MCP client config:
+  {
+    "mcpServers": {
+      "ezapp-deploy": {
+        "type": "remote",
+        "url": "https://<public-host>/mcp",
+        "headers": { "Authorization": "Bearer <api-key>" }
+      }
+    }
+  }
+
+════════════════════════════════════════════════════════════════════
+Current settings:
+  chartmuseum.url         : {{ .Values.chartmuseum.url }}
+  ezappconfig.kind        : {{ .Values.ezappconfig.kind }}
+  ezappconfig.apiVersion  : {{ .Values.ezappconfig.apiVersion }}
+  targets.allowed         : {{ .Values.targets.allowed | quote }}
+  targets.blocked         : {{ .Values.targets.blocked | quote }}
+  rbac.apiGroup           : {{ .Values.rbac.apiGroup }}
+  ledger.configmap        : {{ .Values.ledger.configmap | default (printf "%s-ledger" .Values.deployment.name) }}
+
+════════════════════════════════════════════════════════════════════
+5. Verify:
+  kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
+  kubectl -n {{ $ns }} logs deploy/{{ $name }} | head -5
+  # → in-cluster kubeconfig created, ChartMuseum fallback note only if unset
+  # unauthenticated → 401; with the key → tools/list works.
+
+════════════════════════════════════════════════════════════════════
+6. Ownership ledger ({{ .Values.ledger.configmap | default (printf "%s-ledger" .Values.deployment.name) }}):
+  Records what this server deployed; its delete/force-overwrite tools work
+  ONLY on those objects. Kept across upgrades AND uninstall (helm
+  resource-policy: keep) — wipe history manually:
+    kubectl -n {{ $ns }} delete configmap {{ .Values.ledger.configmap | default (printf "%s-ledger" .Values.deployment.name) }}
+  A MISSING ledger is fail-safe: deletes/overwrites are refused until the
+  ConfigMap is recreated. Adopt an externally-created EzAppConfig by
+  seeding the ledger (edit ezappconfigs.json) — never auto-done.
