@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-import server
+from logsearch_mcp import server
 
 # ---------------------------------------------------------------------------
 # Fixtures & fakes
@@ -996,7 +996,7 @@ def test_stateless_http_app_exposes_health_and_mcp_routes():
 
 
 def test_decode_log_payload_decodes_bytes():
-    from server import _decode_log_payload
+    from logsearch_mcp.server import _decode_log_payload
 
     raw = b'2026-09-11T01:28:06Z INFO: "GET /healthz" 200 OK\n2026-09-11T01:28:07Z INFO: x\n'
     out = _decode_log_payload(raw)
@@ -1009,7 +1009,7 @@ def test_decode_log_payload_decodes_bytes():
 
 
 def test_decode_log_payload_replacement_chars_and_passthrough():
-    from server import _decode_log_payload
+    from logsearch_mcp.server import _decode_log_payload
 
     assert _decode_log_payload(b"\xff\xfe garbage").encode().count(b"\xef\xbf\xbd") == 2  # U+FFFD
     assert _decode_log_payload("already a str") == "already a str"
@@ -1025,7 +1025,7 @@ def test_decode_log_payload_replacement_chars_and_passthrough():
 
 
 def test_decode_log_payload_recovers_client_repr_poison():
-    from server import _decode_log_payload
+    from logsearch_mcp.server import _decode_log_payload
 
     poison = repr(b'2026-09-11T01:40:00Z INFO: line one "GET /healthz" 200 OK\nline two\n')
     assert poison.startswith("b'") and "\\n" in poison  # exactly what the client emits
@@ -1035,7 +1035,7 @@ def test_decode_log_payload_recovers_client_repr_poison():
 
 
 def test_decode_log_payload_genuine_bytes_literal_log_kept():
-    from server import _decode_log_payload
+    from logsearch_mcp.server import _decode_log_payload
 
     # A log that genuinely reads like a bytes literal must not be corrupted
     genuine = "b'not actually a repr with real text'"

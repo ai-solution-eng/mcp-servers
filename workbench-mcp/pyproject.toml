@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-workbench-mcp = "server:main"
+workbench-mcp = "workbench_mcp.server:main"
 
 [tool.setuptools]
 # DEPLOY-BLOCKER (Wave-6 packaging fix): the Dockerfile does a NON-editable
@@ -30,5 +30,20 @@ workbench-mcp = "server:main"
 # script from site-packages. server.py does `import mcp_auth` (auth wave) and
 # `from mcp_fleet_common import …` (G1 vendored package) — both MUST ship in
 # the wheel or the image crash-loops at startup with ModuleNotFoundError.
-py-modules = ["server", "webui", "mcp_auth"]
-packages = ["mcp_fleet_common"]
+#
+# Layout: the app modules (server, webui) live in the src layout under
+# src/workbench_mcp/ and ship as the workbench_mcp PACKAGE (package-dir
+# points setuptools at src/). The two repo-root entries stay as they are:
+# mcp_auth is the fleet-hardlink top-level py-module, and mcp_fleet_common is
+# the vendored fleet package (synced by fleet_common_sync.sh) that installs
+# from the repo root as a second top-level package.
+package-dir = {workbench_mcp = "src/workbench_mcp"}
+packages = ["workbench_mcp", "mcp_fleet_common"]
+py-modules = ["mcp_auth"]
+
+[tool.pytest.ini_options]
+# "src" makes "from workbench_mcp import ..." resolve (tests import the
+# package absolutely); "." makes the top-level "import mcp_auth" and
+# "from mcp_fleet_common import ..." resolve from the repo root. Both entries
+# are required when pytest runs from there.
+pythonpath = ["src", "."]

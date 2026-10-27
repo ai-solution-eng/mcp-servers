@@ -28,7 +28,7 @@ import json
 
 import pytest
 
-import server
+from logsearch_mcp import server
 
 
 @pytest.fixture(autouse=True)
@@ -446,7 +446,7 @@ class FakeRequest:
 def test_webui_search_endpoint_parity_unchanged(monkeypatch, search_k8s):
     """The console /api/search wraps the SAME search_logs coroutine and is
     byte-identical; export_matches is deliberately MCP-only (no /api route)."""
-    import webui as webui_module
+    from logsearch_mcp import webui as webui_module
 
     by_path = {getattr(r, "path", None): r for r in webui_module.build_ui_routes()}
     out = asyncio.run(by_path["/api/search"].endpoint(FakeRequest({"namespace": "ns", "pattern": "ERROR"})))

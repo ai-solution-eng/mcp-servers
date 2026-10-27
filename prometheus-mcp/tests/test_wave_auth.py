@@ -28,7 +28,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import mcp_auth
-import saved_queries
+from prometheus_mcp import saved_queries
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -61,7 +61,7 @@ def app(monkeypatch):
     it the SDK's implicit loopback-only protection applies — covered by the
     subprocess smoke test in test_prometheus_mcp.py, which binds real
     127.0.0.1 and passes)."""
-    import server
+    from prometheus_mcp import server
 
     for var in ("PROMETHEUS_API_KEYS", "MCP_API_KEYS", "MCP_HOSTNAME", "MCP_EXTRA_ALLOWED_HOSTS"):
         monkeypatch.delenv(var, raising=False)
@@ -125,7 +125,7 @@ def test_public_surface_stays_key_free_when_configured(app, monkeypatch):
 def test_auth_middleware_wraps_the_assembled_app():
     """The builder returns the AUTH-WRAPPED app (fleet convention: wrap in
     the builder so every consumer of _build_http_app gets the gate)."""
-    import server
+    from prometheus_mcp import server
 
     wrapped = server._build_http_app()
     assert isinstance(wrapped, mcp_auth.ApiKeyAuthMiddleware)
@@ -137,7 +137,7 @@ def test_warn_if_open_reported_in_http_main(monkeypatch, capsys):
     """HTTP main() must scream when no keys are configured (stdio dev use
     never warns). We do not boot uvicorn — main() runs with a stubbed
     uvicorn module and port 0."""
-    import server
+    from prometheus_mcp import server
 
     calls: list[dict] = []
 
@@ -171,7 +171,7 @@ def test_warn_if_open_reported_in_http_main(monkeypatch, capsys):
 
 
 def test_transport_security_none_without_env(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     for var in ("MCP_HOSTNAME", "MCP_EXTRA_ALLOWED_HOSTS"):
         monkeypatch.delenv(var, raising=False)
@@ -312,7 +312,7 @@ class _ManyRulesClient:
 
 
 def _rules_call(client, args):
-    import server
+    from prometheus_mcp import server
 
     original = server.client
     server.client = client
@@ -461,7 +461,10 @@ def test_no_wildcard_cors_middleware():
     absence of the middleware AND its import."""
     from pathlib import Path
 
-    source = (Path(__file__).resolve().parent.parent / "server.py").read_text(encoding="utf-8")
+    # Src layout: the module lives at src/prometheus_mcp/server.py now.
+    source = (
+        Path(__file__).resolve().parent.parent / "src" / "prometheus_mcp" / "server.py"
+    ).read_text(encoding="utf-8")
     assert "CORSMiddleware(" not in source, "the wildcard CORS block must stay deleted (fleet S-6)"
     assert "from starlette.middleware.cors" not in source
     assert "add_middleware" not in source, "no CORS middleware is re-added anywhere"

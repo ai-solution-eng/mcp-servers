@@ -12,13 +12,17 @@ import asyncio
 import os
 import sys
 
+# Runnable standalone (not just under pytest): supply BOTH roots the src
+# layout needs — <repo>/src for the searxng_mcp package and <repo> for the
+# top-level mcp_auth module (fleet hardlink at the repo root).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 from mcp_types import CallToolResult, TextContent
 
-import server
+from searxng_mcp import server
 
 
 def first_text(result: CallToolResult) -> str:

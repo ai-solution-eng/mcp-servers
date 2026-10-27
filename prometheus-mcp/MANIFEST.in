@@ -1,8 +1,10 @@
-# Ship the web UI asset in sdists (wheels from the flat layout won't carry
-# data files — the Docker image copies ui/ explicitly and webui.py has a
-# /app/ui fallback, so this only matters for source installs).
+# Ship the web UI asset in sdists (wheels don't carry data files — the
+# Docker image copies ui/ explicitly and webui.py has a /app/ui fallback, so
+# this only matters for source installs).
 include ui/index.html
-include saved_queries.py
+# saved_queries.py moved into the src-layout package (src/prometheus_mcp/):
+# the pyproject `packages` declaration ships it in wheels AND sdists now, so
+# the old root-level include line was removed with the move.
 # Auth module (fleet mcp_auth adoption): py-modules already covers wheels,
 # but an sdist built without this file would silently omit it — the exact
 # silent-omission class the packaging tests pin.

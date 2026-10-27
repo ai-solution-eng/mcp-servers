@@ -2,9 +2,10 @@
 
 Root cause being pinned: the server image is built with a NON-editable
 ``uv pip install --system ".[browser]"`` and runs the installed
-``searxng-mcp`` console script (= ``server:main``) from site-packages. Any
-top-level module that ``server.py`` imports but that the wheel does not
-ship makes the container crash-loop at startup with ModuleNotFoundError.
+``searxng-mcp`` console script (= ``searxng_mcp.server:main``) from
+site-packages. Any module/package that ``server.py`` imports but that the
+wheel does not ship makes the container crash-loop at startup with
+ModuleNotFoundError.
 TWO modules hit exactly this: ``mcp_auth`` (auth wave) and ``mcp_metrics``
 (Wave-3 C3 — which was ALSO missing from the Dockerfile COPY line, found
 and fixed in the same pass). The live images predate those waves, which is
@@ -12,13 +13,15 @@ why the crash was never seen until a rebuild.
 
 Three layers must agree, and each has a test:
 
-1. ``pyproject.toml`` declares every runtime-imported local module under
-   ``[tool.setuptools] py-modules`` — this app's five own modules plus
-   mcp_auth + mcp_metrics (plus an AST cross-check of server.py imports so
-   the list cannot silently drift again).
-2. The Dockerfile COPYs every one of those files into the build context
-   (and the existing .dockerignore excludes none of them — it excludes the
-   local ``searxng/`` directory, which no runtime module imports).
+1. ``pyproject.toml`` declares the src-layout ``searxng_mcp`` PACKAGE
+   (via ``package-dir`` + ``packages``) plus the top-level ``mcp_auth``
+   py-module — the app's own modules ship INSIDE the package, mcp_auth stays
+   a root-level py-module (plus an AST cross-check of the package's server
+   module imports so the list cannot silently drift again).
+2. The Dockerfile COPYs the build context those declarations need —
+   ``src/`` (the whole package) and ``mcp_auth.py`` — and the existing
+   .dockerignore excludes none of them (it excludes the local ``searxng/``
+   directory, which no runtime module imports).
 3. (skipif no local build backend) a wheel built from the tree with
    ``pip wheel --no-deps --no-build-isolation`` actually CONTAINS them all.
 
@@ -46,33 +49,34 @@ APP_DIR = Path(__file__).resolve().parent.parent
 PYPROJECT = APP_DIR / "pyproject.toml"
 DOCKERFILE = APP_DIR / "Dockerfile"
 
-# What server.py imports at runtime (verified 2026-09-13): the five own
-# modules + mcp_auth (auth wave) + mcp_metrics (Wave-3 C3, default-off
-# /metrics). mcp_types is provided by the mcp>=2 dependency, not local.
-REQUIRED_MODULES = [
+# What server.py imports at runtime (verified 2026-09-13): the app's own
+# modules (now the searxng_mcp package under src/) + mcp_auth (auth wave) +
+# mcp_metrics (Wave-3 C3, default-off /metrics). mcp_types is provided by the
+# mcp>=2 dependency, not local.
+PACKAGE = "searxng_mcp"
+REQUIRED_PACKAGE_MODULES = [
     "server",
     "searxng_client",
     "fetcher",
     "browser_client",
     "url_policy",
-    "mcp_auth",
     "mcp_metrics",
 ]
-REQUIRED_PACKAGES: list[str] = []
+# mcp_auth is the fleet-hardlink module at the REPO ROOT: it stays a
+# top-level py-module (imported as `import mcp_auth`, never relative) and
+# must ship at the wheel root, not inside the package.
+REQUIRED_TOP_LEVEL_MODULES = ["mcp_auth"]
+REQUIRED_PACKAGES: list[str] = [PACKAGE]
 
-# Build-context files/dirs the Dockerfile must COPY (pyproject + every
-# declared module — url_policy.py was itself missing from the COPY line
-# until the Wave-6 packaging proof caught it: Wave-1 added the module but
-# never touched this Dockerfile).
+# Build-context files/dirs the Dockerfile must COPY (pyproject + the src
+# package tree + the root-level py-module — url_policy.py was itself missing
+# from the COPY line until the Wave-6 packaging proof caught it: Wave-1 added
+# the module but never touched this Dockerfile, so the src/ tree is now
+# copied as a whole rather than file by file).
 REQUIRED_COPY_ENTRIES = [
     "pyproject.toml",
-    "server.py",
-    "searxng_client.py",
-    "fetcher.py",
-    "browser_client.py",
-    "url_policy.py",
+    "src",
     "mcp_auth.py",
-    "mcp_metrics.py",
 ]
 
 
@@ -119,23 +123,42 @@ def _build_backend_available() -> bool:
 
 
 def test_pyproject_declares_all_required_modules() -> None:
-    declared = set(_setuptools_config().get("py-modules", []))
-    missing = [m for m in REQUIRED_MODULES if m not in declared]
-    assert not missing, (
-        f"pyproject [tool.setuptools] py-modules is missing {missing}; the "
+    config = _setuptools_config()
+    declared_packages = set(config.get("packages", []))
+    declared_modules = set(config.get("py-modules", []))
+    missing_pkgs = [p for p in REQUIRED_PACKAGES if p not in declared_packages]
+    assert not missing_pkgs, (
+        f"pyproject [tool.setuptools] packages is missing {missing_pkgs}; the "
         "non-editable image install would crash-loop at startup "
         "(ModuleNotFoundError) because server.py imports them"
+    )
+    missing_mods = [m for m in REQUIRED_TOP_LEVEL_MODULES if m not in declared_modules]
+    assert not missing_mods, (
+        f"pyproject [tool.setuptools] py-modules is missing {missing_mods}; the "
+        "non-editable image install would crash-loop at startup "
+        "(ModuleNotFoundError) because server.py imports them"
+    )
+    # setuptools ships a declared package as a WHOLE, so every runtime module
+    # must also be present in the package tree — a file missing from src/ is
+    # silently absent from the wheel exactly like an undeclared py-module.
+    pkg_dir = APP_DIR / "src" / PACKAGE
+    missing_files = [m for m in REQUIRED_PACKAGE_MODULES if not (pkg_dir / f"{m}.py").is_file()]
+    assert not missing_files, (
+        f"src/{PACKAGE}/ is missing {missing_files}; the package ships as a "
+        "tree, so a module that is not there never reaches the wheel"
     )
 
 
 def test_pyproject_modules_cover_all_local_imports() -> None:
-    """AST drift-guard: every local top-level import of server.py must be
-    declared. New local import without a py-modules update = the next
-    image build crash-loops. (Non-local names like mcp_types, provided by
-    the mcp dependency, are excluded by the local-file filter.)"""
+    """AST drift-guard: every local top-level import of the package's
+    server module must be declared. New local import without a
+    py-modules/packages update = the next image build crash-loops.
+    (Non-local names like mcp_types, provided by the mcp dependency, are
+    excluded by the local-file filter; sibling modules inside the package
+    are imported RELATIVELY and are covered by the tree check above.)"""
     declared = set(_setuptools_config().get("py-modules", [])) | set(_setuptools_config().get("packages", []))
     imported: set[str] = set()
-    path = APP_DIR / "server.py"
+    path = APP_DIR / "src" / PACKAGE / "server.py"
     if path.is_file():
         imported |= _local_top_level_imports(path)
     undeclared = imported - declared
@@ -150,7 +173,7 @@ def test_console_script_entry_point_pins_server_main() -> None:
     whole crash class exists because THAT import must resolve from
     site-packages. Pin the mapping so it cannot be renamed silently."""
     scripts = _pyproject().get("project", {}).get("scripts", {})
-    assert scripts.get("searxng-mcp") == "server:main"
+    assert scripts.get("searxng-mcp") == "searxng_mcp.server:main"
 
 
 # ---------------------------------------------------------------- layer 2
@@ -195,10 +218,11 @@ def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
     EXACTLY the build context the Dockerfile COPY lines would assemble and
     assert every required module is inside. Derived from the Dockerfile
     (not a hand-maintained list) so the two layers cannot disagree — a
-    declared py-module missing from the build context is SILENTLY OMITTED
-    by setuptools (this exact hole shipped for url_policy.py: Wave-1 added
-    the module, the Dockerfile COPY line was never updated, and a wheel
-    built without the file just leaves it out)."""
+    declared module missing from the build context is SILENTLY OMITTED by
+    setuptools (this exact hole shipped for url_policy.py: Wave-1 added the
+    module, the Dockerfile COPY line was never updated, and a wheel built
+    without the file just leaves it out). The app ships as the src/<pkg>/
+    PACKAGE tree, so the whole src/ COPY is what the wheel is built from."""
     src = tmp_path / "build-src"
     src.mkdir()
     for entry in sorted(_copy_sources()):
@@ -231,8 +255,13 @@ def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
     wheels = list(out.glob("*.whl"))
     assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
     names = set(zipfile.ZipFile(wheels[0]).namelist())
-    for module in REQUIRED_MODULES:
+    for module in REQUIRED_PACKAGE_MODULES:
+        assert f"{PACKAGE}/{module}.py" in names, (
+            f"wheel {wheels[0].name} does not contain {PACKAGE}/{module}.py — "
+            "the image would crash-loop at startup (ModuleNotFoundError)"
+        )
+    for module in REQUIRED_TOP_LEVEL_MODULES:
         assert f"{module}.py" in names, (
-            f"wheel {wheels[0].name} does not contain {module}.py — the "
-            "image would crash-loop at startup (ModuleNotFoundError)"
+            f"wheel {wheels[0].name} does not contain the top-level {module}.py — "
+            "the image would crash-loop at startup (ModuleNotFoundError)"
         )

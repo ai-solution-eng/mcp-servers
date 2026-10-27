@@ -16,15 +16,18 @@ import urllib.request
 from collections.abc import Callable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root on sys.path (top-level fleet modules such as mcp_auth) plus src/
+# (the k8s_mcp package lives there since the src-layout refactor).
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "src"))
 
 # kubernetes stubs (same approach as test_namespace_policy.py)
 _install_kubernetes_stubs: Callable[[], None]  # bound by the exec below (shared k8s stub installer)
-_src = open(os.path.join(HERE, "test_namespace_policy.py")).read()
+_src = open(os.path.join(HERE, "tests", "test_namespace_policy.py")).read()
 exec(_src.split("def main()")[0])  # noqa: S102 — deliberate: reuse the kubernetes stubs without importing pytest
 _install_kubernetes_stubs()  # noqa: F821 — bound by the exec above
 
-import server  # noqa: E402
+from k8s_mcp import server  # noqa: E402
 
 PORT = 9191
 BASE = f"http://127.0.0.1:{PORT}"

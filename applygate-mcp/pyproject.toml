@@ -15,16 +15,34 @@ dependencies = [
     "PyYAML>=6.0",
     "starlette>=0.37.0",
     "uvicorn>=0.27.0",
+    # /metrics exposition (APPLYGATE_METRICS_ENABLED=true). Declared here AND
+    # in the Dockerfile's dependency RUN: the server import-guards the client,
+    # so a missing lib degrades to a comment-only /metrics body instead of a
+    # crash — which is how the write path shipped with ZERO metric samples
+    # while the site believed metrics were on (verified 2026-10-20:
+    # scrape_samples_scraped=0 for applygate while every peer exported
+    # counters). The build-time gate below now fails the image on drift.
+    "prometheus-client>=0.20.0",
 ]
 
 [project.scripts]
-applygate-mcp = "server:main"
+applygate-mcp = "applygate_mcp.server:main"
 
 [tool.setuptools]
 # DEPLOY-BLOCKER (Wave-6 packaging fix): the Dockerfile does a NON-editable
 # `uv pip install --system .` and runs the installed `applygate-mcp` console
-# script from site-packages. server.py does `import mcp_auth` (auth wave) —
-# it MUST ship in the wheel or the image crash-loops at startup with
-# ModuleNotFoundError. (applygate has no mcp_metrics module — its /metrics
-# surface is inline in server.py.)
-py-modules = ["server", "webui", "mcp_auth"]
+# script from site-packages. The app modules live in src/applygate_mcp/ (fleet
+# src layout) and ship as ONE package — package-dir maps it back to the tree
+# setuptools builds from. server does `import mcp_auth` (auth wave) and
+# mcp_auth.py stays a TOP-LEVEL module at the repo root (fleet hardlink), so it
+# is still declared under py-modules — it MUST ship in the wheel or the image
+# crash-loops at startup with ModuleNotFoundError. (applygate has no
+# mcp_metrics module — its /metrics surface is inline in server.)
+package-dir = {applygate_mcp = "src/applygate_mcp"}
+packages = ["applygate_mcp"]
+py-modules = ["mcp_auth"]
+
+[tool.pytest.ini_options]
+# "src" makes `from applygate_mcp import ...` resolve; "." makes the top-level
+# `import mcp_auth` (repo-root hardlink) resolve. Run pytest from the repo root.
+pythonpath = ["src", "."]

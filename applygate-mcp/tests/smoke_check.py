@@ -16,12 +16,17 @@ import tempfile
 import threading
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Standalone-runnable (not collected by pytest), so it supplies BOTH roots
+# itself: <repo>/src for the applygate_mcp package and <repo> for the
+# top-level mcp_auth.py (fleet hardlink at the repo root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
+sys.path.insert(0, _REPO_ROOT)
 
 os.environ["APPLYGATE_ALLOWED_NAMESPACES"] = "team-a"
 os.environ["APPLYGATE_AUDIT_FILE"] = os.path.join(tempfile.mkdtemp(prefix="applygate-smoke-"), "audit.jsonl")
 
-import server
+from applygate_mcp import server  # noqa: E402
 
 
 def fake_apply(ns, doc, dry_run):

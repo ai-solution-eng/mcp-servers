@@ -54,7 +54,7 @@ Off unless `K8S_MCP_EXEC_ENABLED=true` (the tool is not even registered). When e
 
 ## 6. Automatic exec RBAC provisioning
 
-- At startup (or `python server.py --provision-rbac`), the server ensures its own `pods/exec` RoleBindings for every namespace on the exec list — glob patterns expanded against the live namespace list, general-policy-blocked and nonexistent namespaces skipped, idempotent (`already present`), foreign bindings never touched.
+- At startup (or `python -m k8s_mcp.server --provision-rbac`), the server ensures its own `pods/exec` RoleBindings for every namespace on the exec list — glob patterns expanded against the live namespace list, general-policy-blocked and nonexistent namespaces skipped, idempotent (`already present`), foreign bindings never touched.
 - **Escalation-proof by construction**: the provisioner permission is `bind` + `get` **resourceNames-scoped** to the single exec-template ClusterRole — it can never reference another role, create or modify role content, or create ClusterRoleBindings.
 - **Migration-safe**: bindings whose subject points at a previous ServiceAccount/namespace are **repointed automatically** (the fix that made the dedicated-namespace migration a one-command operation).
 - **Degrade, don't die**: any provisioning failure is returned as a log line — it can never crash the server (a v0.1.0 crashloop taught us this the hard way).
@@ -109,7 +109,7 @@ Two charts in the PCAI house style (values-driven naming, `ezua:` integration bl
 
 ## 12. Verification
 
-- `test_namespace_policy.py` — **168 self-contained checks**: namespace policy and globs, precedence (blacklist wins), exec command guard (allowlist, hard-denies, token denials), argv building, per-client parsing/auth/narrowing, provisioning (create/keep/patch/skip/refuse/degrade), API-key middleware (401 paths, both headers, dev mode), MCP 2.0 envelope behavior, `check_rbac` answer surfacing, the VirtualServices tool (summary/detail rendering, policy filtering, kubectl fallback argv), and the built-in console (routing, CSP, traversal guards, disable knob). Runs without a cluster (the `kubernetes` package is stubbed when absent).
+- `tests/test_namespace_policy.py` — **168 self-contained checks**: namespace policy and globs, precedence (blacklist wins), exec command guard (allowlist, hard-denies, token denials), argv building, per-client parsing/auth/narrowing, provisioning (create/keep/patch/skip/refuse/degrade), API-key middleware (401 paths, both headers, dev mode), MCP 2.0 envelope behavior, `check_rbac` answer surfacing, the VirtualServices tool (summary/detail rendering, policy filtering, kubectl fallback argv), and the built-in console (routing, CSP, traversal guards, disable knob). Runs without a cluster (the `kubernetes` package is stubbed when absent).
 - `smoke_console.py` — boots the REAL ASGI wiring (uvicorn, kubernetes stubbed) and verifies over HTTP: static shell + CSP, traversal 404s, console toggle, modern `tools/list`/`tools/call` with the 2026-07-28 envelope, legacy SSE fallback, and the 401 gate with the console-shell exemption.
 - `audit_forms.py` — schema↔form contract audit: **20 tools / 40 parameters** (Wave-5: + `triage`), every widget output type round-trips to its server schema type (run after ANY change to tool signatures or `ui/app.js` widgets; exec enabled via env before import).
 - **Live protocol conformance**: stateless tools/list+call, `server/discover`, cache hints, legacy-era fallback, strict envelope rejection — verified over real HTTP.
@@ -176,7 +176,7 @@ table above was written — each additive, none changing the invariants:
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | The server — 19 tools (20 with exec enabled), auth, policy, triage, exec, provisioning, console serving |
+| `src/k8s_mcp/server.py` | The server — 19 tools (20 with exec enabled), auth, policy, triage, exec, provisioning, console serving |
 | `ui/` | Built-in HPE ops console (static: `index.html`, `style.css`, `app.js`) |
 | `helm/` | Trusted-operator chart (k8s-mcp): every security knob values-configurable, `ezua:` exposure, Kyverno vendor labels; packaged `.tgz` at the repo root |
 | `helm/values-examples/` | Secret-free paste-ready full-values examples (G2 lab, hosted trial) |
@@ -189,6 +189,6 @@ table above was written — each additive, none changing the invariants:
 | [`documentation/DEPLOYMENT.md`](DEPLOYMENT.md) | Operator runbook (PCAI values-driven deploy, clients, exec, migration, rotation, troubleshooting) |
 | `documentation/FEATURES.md` | This file |
 | `documentation/VERIFICATION.md` | Post-deployment verification checklist (MCP handshake, tool test, operator checks) |
-| `test_namespace_policy.py` | 168-check verification suite (no cluster required) |
+| `tests/test_namespace_policy.py` | 168-check verification suite (no cluster required); the full suite lives under `tests/` |
 | `smoke_console.py` | HTTP-level console + protocol smoke test (real ASGI wiring, kubernetes stubbed) |
 | `audit_forms.py` | Schema↔form audit — boots the server (exec enabled), simulates the console's inferWidget/read matrix for every parameter of all 20 tools, exits non-zero on any widget↔schema type mismatch |

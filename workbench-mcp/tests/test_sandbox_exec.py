@@ -40,8 +40,8 @@ from typing import ClassVar
 
 import pytest
 
-import server
-from server import WorkbenchError
+from workbench_mcp import server
+from workbench_mcp.server import WorkbenchError
 
 HELM_DIR = Path(__file__).resolve().parent.parent / "helm"
 
@@ -104,6 +104,54 @@ def test_sandbox_run_registered_but_refuses_when_disabled(root):
     assert "executors.enabled" in str(exc.value)
     # audited as a refusal
     assert any(e["event"] == "sandbox_run" and e["outcome"] == "refused" for e in audit_events(root))
+
+
+def test_sandbox_disabled_refusal_names_both_gates_and_one_step_recipe(root):
+    """D5: the disabled refusal must be armable in ONE step — it names BOTH
+    gates (env WORKBENCH_SANDBOX_EXEC / chart workbench.sandboxExec, and the
+    pool's executors.enabled) and the exact --set recipe."""
+    call(server.workspace_create, "ws")
+    call(server.write_file, "ws", "s.py", EXEC_SCRIPT)
+    with pytest.raises(WorkbenchError) as exc:
+        call(server.sandbox_run, "ws", "s.py")
+    msg = str(exc.value)
+    assert "WORKBENCH_SANDBOX_EXEC=1" in msg
+    assert "workbench.sandboxExec" in msg
+    assert "executors.enabled: true" in msg
+    assert "helm/templates/executors.yaml" in msg
+    assert "--set executors.enabled=true" in msg and "--set workbench.sandboxExec=true" in msg
+
+
+def test_sandbox_no_pods_refusal_names_the_pool_gate(root, monkeypatch):
+    """D5: with the env switch ON but the pool absent, the refusal names the
+    OTHER gate specifically (executors.enabled + the template that renders
+    the pool) — the operator can tell WHICH gate is missing."""
+    monkeypatch.setenv("WORKBENCH_SANDBOX_EXEC", "1")
+    monkeypatch.setattr(server, "_k8s_list_pods", lambda label, ns: [])
+    call(server.workspace_create, "ws")
+    call(server.write_file, "ws", "s.py", EXEC_SCRIPT)
+    with pytest.raises(WorkbenchError, match="no executor pods Ready") as exc:
+        call(server.sandbox_run, "ws", "s.py")
+    msg = str(exc.value)
+    assert "executors.enabled: true" in msg
+    assert "helm/templates/executors.yaml" in msg
+
+
+def test_site_values_g2_arms_sandbox_with_honest_limit():
+    """D5: the SITE values file (helm/local/values.g2.yaml) arms BOTH gates
+    — chart defaults stay OFF — and states the honest isolation limit
+    (runc-tier, NOT gVisor) in a comment."""
+    import yaml as _yaml
+
+    site = HELM_DIR / "local" / "values.g2.yaml"
+    assert site.exists(), "helm/local/values.g2.yaml is the site values file"
+    text = site.read_text(encoding="utf-8")
+    vals = _yaml.safe_load(text)
+    assert vals["executors"]["enabled"] is True
+    assert vals["workbench"]["sandboxExec"] is True
+    comment_lines = [l for l in text.splitlines() if l.lstrip().startswith("#")]
+    joined = "\n".join(comment_lines)
+    assert "runc-tier" in joined and "NOT gVisor" in joined
 
 
 def test_sandbox_run_enabled_but_no_pods_is_self_describing(root, monkeypatch):
@@ -665,10 +713,24 @@ def test_helm_sandbox_exec_env_wiring(monkeypatch, tmp_path):
 
 def test_values_yaml_executors_default_off():
     """The values file pins the posture: executors disabled, autoscaling
-    disabled, and the example block stays commented."""
+    disabled, and the example block stays commented.
+
+    (2026-10-26 Z4 hardening wave: the regex was extended to accept BOTH
+    YAML spellings of autoscaling.enabled — the values rewrite now uses
+    flow style `autoscaling: {enabled: false, ...}` where the test
+    previously expected block style. Semantics asserted are unchanged:
+    both flags must be false. This was stale-test drift, not a posture
+    change — see reports/z4-ezapp-workbench.md.)"""
     vals = HELM_DIR / "values.yaml"
     text = vals.read_text(encoding="utf-8")
     m = __import__("re").search(r"(?m)^executors:\n  enabled: (false|true)\n", text)
     assert m and m.group(1) == "false", "executors must default OFF (byte-identical default render)"
-    m2 = __import__("re").search(r"(?m)^  autoscaling:\n    enabled: (false|true)\n", text)
-    assert m2 and m2.group(1) == "false"
+    re_mod = __import__("re")
+    m2 = re_mod.search(r"(?m)^  autoscaling: \{enabled: (false|true),", text)
+    m3 = re_mod.search(r"(?m)^  autoscaling:\n    enabled: (false|true)\n", text)
+    assert (m2 or m3) and ((m2.group(1) if m2 else m3.group(1)) == "false")
+    # SPEC §3.1: BOTH gates stay off in the chart defaults (the tool switch
+    # is pinned too, not just the pool) — site values are where the posture
+    # lives.
+    m4 = re_mod.search(r"(?m)^  sandboxExec: (false|true)(?:\s*#.*)?\n", text)
+    assert m4 and m4.group(1) == "false", "workbench.sandboxExec must default OFF"

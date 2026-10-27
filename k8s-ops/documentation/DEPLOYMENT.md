@@ -84,10 +84,10 @@ ezua:
 | `console.enabled` | `true` | HPE ops console at `/ui/` (`K8S_MCP_CONSOLE_ENABLED=false` underneath). |
 | `rbac.create` / `rbac.scope` | `true` / `cluster` | `cluster` = read-only ClusterRole; `namespace` = Role clamped to the release namespace (auto-RBAC off in that mode). |
 | `rbac.extraResourceGroups` | `[]` | CRD apiGroups the tools may read (`resources: "*"`, get/list/watch only). Add one entry per installed operator (e.g. `serving.kserve.io`, `genai.hpe.com`). NEVER `["*"]` — refused at render time (it would re-grant secrets read). `networking.istio.io/virtualservices` is always granted. |
-| `namespaces.allowed` / `blocked` | `""` / `""` | `K8S_MCP_ALLOWED_NAMESPACES` / `K8S_MCP_BLOCKED_NAMESPACES` — comma-separated fnmatch globs; blacklist always wins; `""` = all namespaces readable. |
+| `namespaces.allowed` / `blocked` | `""` / `""` | `K8S_MCP_ALLOWED_NAMESPACES` / `K8S_MCP_BLOCKED_NAMESPACES` — comma-separated fnmatch globs; blacklist always wins; `""` = all namespaces readable. **Posture, not just a knob:** an empty `allowed` makes the policy BLACKLIST-ONLY (or fully OPEN with both empty), so every namespace not blocked — including namespaces created later — stays readable. The ALLOWLIST is the recommended posture; the server prints a startup WARNING naming the empty-allowlist state and the chart NOTES.txt repeats it. Silence it deliberately with `K8S_MCP_WARN_EMPTY_ALLOWLIST=false`. RBAC remains the true boundary; this layer is defence in depth. |
 | `exec.enabled` | `false` | Opt-in hardened exec tool (`exec_in_pod`; env `K8S_MCP_EXEC_ENABLED`). Off = the tool is not even registered. |
 | `exec.namespaces` | `""` | `K8S_MCP_EXEC_NAMESPACES` — the exec allowlist; `""` = follow the general namespace policy. |
-| `exec.requireLabel` | `true` | Target pod must carry `k8s-mcp.io/exec: "true"` (env `K8S_MCP_EXEC_REQUIRE_LABEL`). |
+| `exec.requireLabel` | `true` | Target pod must carry `k8s-mcp.io/exec: "true"` (env `K8S_MCP_EXEC_REQUIRE_LABEL`). **The label is the boundary.** With exec enabled and this `false`, the server prints a startup WARNING, records `label_gate=off` in every exec audit entry, appends the posture to every denial and to every successful result, and advertises the open posture in the `exec_in_pod` tool description — an open deployment cannot look hardened. Never ship `false` outside a throwaway lab. |
 | `exec.allowedCommands` | `""` | Extra binaries beyond the built-in read-only allowlist (`K8S_MCP_EXEC_ALLOWED_COMMANDS`). |
 | `exec.autoRbac` | `true` | Cluster scope only: the server binds its own pods/exec RoleBindings at startup (`K8S_MCP_EXEC_AUTO_RBAC`). Per-release naming: the provisioned role/binding are `<deployment.name>-pods-exec` / `<deployment.name>-exec` (chart-rendered `K8S_MCP_EXEC_TEMPLATE_ROLE` / `K8S_MCP_EXEC_BINDING_NAME`; the `K8S_MCP_SA_NAME` / `K8S_MCP_SA_NAMESPACE` envs override the assumed SA identity for bare-local runs), so multiple chart releases coexist in one cluster without colliding. |
 | `clients.value` / `clients.existingSecret` | `""` | Per-user keys with per-user exec assignments (`K8S_MCP_CLIENTS`, `name:key[:ns-patterns];…`). CONTAINS SECRETS — prefer `existingSecret`. |
@@ -121,15 +121,18 @@ the audience gets:
 | Endpoint / `${DOMAIN_NAME}` | The SE-G2 site files carry the **literal domain** (`k8s-mcp-2-0-server.your-cluster.example`) for plain `helm -f` readability; PCAI would envsubst a pasted placeholder either way. The endpoint doubles as `MCP_HOSTNAME` and must be unique per release. | **`${DOMAIN_NAME}` placeholders stay verbatim** (`k8s-mcp-customer.${DOMAIN_NAME}`) — PCAI resolves them before rendering on current builds; on a build that does not, substitute the literal domain (an unresolved placeholder registers a gateway host that matches nothing). |
 | SSO / AuthorizationPolicy | `ezua.authorizationPolicy.enabled: false` (the accepted lab trade — the built-in API key is the gate). The template is real: flipping it on enforces oauth2-proxy/PCAI tokens for this host **on top of** the API key. | Same key, same default-off posture, same template — flipping it on is the trial's user-identity story on top of the API key (a shared key authenticates the *key*, never a user). |
 | Secrets strategy | Out-of-band Secret **`k8s-mcp-2-0-apikey`** (the G2 example keeps its own Secret convention, key `api-key`) — created before the first apply; the chart never creates or inlines the key. | Out-of-band Secret per the customer's key process (`apiKey.existingSecret` names it; `""` = `<deployment.name>-apikey`). Same invariant: never created or inlined by the chart. |
-| RBAC & exec posture | Values-configurable: `rbac.scope: cluster` + `extraResourceGroups: [serving.kserve.io, genai.hpe.com]`; the G2 lab runs exec ON cluster-wide with the per-pod label gate off (`exec.enabled: true`, `namespaces: "*"`, `requireLabel: false`) — a deliberate lab posture, never a default. | **Baked**: read-only ClusterRole via a chart constant (clamp = edit the constant + repackage — a platform action); exec RBAC is **never minted** — exec stays impossible until an operator runs the NOTES.txt runbook by hand. |
+| RBAC & exec posture | Values-configurable: `rbac.scope: cluster` + `extraResourceGroups: [serving.kserve.io, genai.hpe.com]`; the G2 lab runs exec ON cluster-wide with the per-pod label gate ON (`exec.enabled: true`, `namespaces: "*"`, `requireLabel: true`) — the pod label is the boundary, and nothing opts in until an operator labels a workload. (`requireLabel: false` was the pre-2026-10-26 posture and was live-reachable into unlabelled pods; never ship it.) | **Baked**: read-only ClusterRole via a chart constant (clamp = edit the constant + repackage — a platform action); exec RBAC is **never minted** — exec stays impossible until an operator runs the NOTES.txt runbook by hand. |
 | Namespace policy | App-layer policy live: the G2 lab uses a blocked-only allowlist (`kube-system,kube-public,k8s-mcp-ops`). | The keys **do not exist** in the locked values — no app-layer policy; the RBAC clamp above is the only boundary. |
 | Network zone (`networkPolicy.*`) | Available, default off; the hardened-G2 example turns it on (in-cluster callers locked to the gateway-relay + agentic-frontend namespaces + `monitoring`, node `/32` probes; browser path stays open). | **Not in the locked chart** — the zone is a trusted-operator knob. |
 | Metrics | On (`metrics.enabled: true` + ServiceMonitor). | On (same key; the locked chart still exposes benign wiring). |
 
 ### Proxied corporate G2 site (SITE: your-cluster.example)
 
-- Trusted chart, lab posture made EXPLICIT: blocked-only namespace policy,
-  exec cluster-wide with `requireLabel: false`, CRD reads for the installed
+- Trusted chart, lab posture made EXPLICIT: blocked-only namespace policy
+  (the server warns at startup that an allowlist is the recommended posture —
+  see [Namespace policy](#namespace-policy-read-access)), exec cluster-wide
+  with the per-pod label gate ON (`requireLabel: true`; the label is the
+  boundary and no workload opts in today), CRD reads for the installed
   operators, metrics + ServiceMonitor on.
 - Fleet posture note: unlike applygate/logsearch (which point at the shared
   `mcp-fleet-apikeys` Secret), the k8s-mcp G2 example keeps its own
@@ -168,6 +171,25 @@ Releasing a new version is a maintainer flow: `./automation.sh <version>` bumps 
 
 Set `namespaces.allowed` / `namespaces.blocked` in values (or `kubectl -n <ns> set env deploy/<name> K8S_MCP_ALLOWED_NAMESPACES=…`). Read tools filter cluster-wide results to the policy; kubectl-backed tools require `-n`, reject namespaced queries without it, and rewrite/reject `-A` per the policy (glob expansion against live namespaces, cap 20; blacklist-only → rejected, since raw kubectl output cannot be filtered reliably).
 
+**The allowlist is the recommended posture.** An empty `namespaces.allowed`
+leaves a BLACKLIST-ONLY policy (or an OPEN one, with no blocked list either):
+every namespace you did not name is readable, *including namespaces created
+later*. That is a floor, not a boundary. Set `namespaces.allowed` to the
+namespaces callers actually read, and keep `namespaces.blocked` as the floor
+on top of it.
+
+The server is loud about this by design — at startup it prints the warning and
+the posture banner:
+
+```
+WARNING: namespace policy is BLACKLIST-ONLY — K8S_MCP_ALLOWED_NAMESPACES is empty, so every namespace not in K8S_MCP_BLOCKED_NAMESPACES (…) is visible, including namespaces created later. …
+POSTURE: namespaces: BLACKLIST-ONLY — … | exec: ENABLED — label gate ENFORCED …
+```
+
+Silence the warning deliberately with `K8S_MCP_WARN_EMPTY_ALLOWLIST=false`
+(default: warn). RBAC remains the true boundary — this app-layer policy is
+defence in depth and can never grant what RBAC denies.
+
 ### Exec in certain namespaces (opt-in)
 
 Exec is **off by default** — the tool doesn't even exist for clients. Turn on with `exec.enabled: true` + `exec.namespaces` in values. On startup the server provisions the pods/exec RoleBindings itself for every namespace on the list (globs expanded against live namespaces) and logs the summary:
@@ -195,7 +217,7 @@ EOF
 done
 ```
 
-(Standalone pre-provisioning also works without starting the server: `kubectl -n <ns> exec deploy/<name> -- python server.py --provision-rbac`.) Removing exec: set `exec.enabled: false` — the tool disappears on the next rollout; leftover RoleBindings are harmless but can be deleted.
+(Standalone pre-provisioning also works without starting the server: `kubectl -n <ns> exec deploy/<name> -- python -m k8s_mcp.server --provision-rbac`.) Removing exec: set `exec.enabled: false` — the tool disappears on the next rollout; leftover RoleBindings are harmless but can be deleted.
 
 ### Per-user keys with per-user exec assignments
 

@@ -130,6 +130,9 @@ spec:
               value: {{ .Values.deployment.name }}-pods-exec
             - name: K8S_MCP_EXEC_BINDING_NAME
               value: {{ .Values.deployment.name }}-exec
+            # Hash-chained exec audit trail (see the volumeMount below).
+            - name: K8S_MCP_AUDIT_FILE
+              value: {{ printf "%s/audit.jsonl" .Values.audit.mountPath | quote }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
@@ -140,6 +143,14 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # Durable home for exec_in_pod's hash-chained audit trail. The
+            # root filesystem is read-only, so without this mount the trail
+            # cannot be written at all and the server falls back to stdout
+            # only. emptyDir survives container restarts (not pod
+            # rescheduling); point audit.persistence.existingClaim at a PVC
+            # when the trail must outlive the pod.
+            - name: audit
+              mountPath: {{ .Values.audit.mountPath | quote }}
           readinessProbe:
             tcpSocket:
               port: {{ .Values.service.targetPort }}
@@ -153,6 +164,13 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: audit
+          {{- if .Values.audit.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.audit.persistence.existingClaim | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

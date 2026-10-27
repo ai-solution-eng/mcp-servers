@@ -22,8 +22,7 @@ from contextlib import contextmanager
 
 from starlette.testclient import TestClient
 
-import mcp_metrics
-import server
+from prometheus_mcp import mcp_metrics, server
 
 
 @contextmanager

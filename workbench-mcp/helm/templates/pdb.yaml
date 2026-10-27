@@ -1,0 +1,25 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF (podDisruptionBudget.enabled in
+# values.yaml), so the default helm render stays byte-identical.
+#
+# Single-replica caveat: every chart in this fleet ships replicaCount: 1.
+# With ONE replica and minAvailable: 1, this PDB blocks ALL voluntary
+# evictions — 'kubectl drain' waits and the pod stays put. That is the
+# intended safety trade: a drain during an apply window must not evict the
+# sole replica. Operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first; minAvailable: 1 then guarantees one
+# surviving replica through any drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    # Same selector labels as templates/deployment.yaml — do not invent labels.
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+{{- end }}

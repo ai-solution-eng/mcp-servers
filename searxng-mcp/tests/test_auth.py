@@ -11,7 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import mcp_auth
-import server
+from searxng_mcp import server
 
 PING = {"jsonrpc": "2.0", "method": "ping", "id": 1}
 MCP_ACCEPT = {"Accept": "application/json, text/event-stream"}

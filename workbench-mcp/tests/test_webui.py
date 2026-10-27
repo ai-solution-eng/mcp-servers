@@ -13,8 +13,7 @@ import re
 import pytest
 from starlette.testclient import TestClient
 
-import server
-import webui
+from workbench_mcp import server, webui
 
 
 @pytest.fixture()

@@ -13,7 +13,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import mcp_auth
-import server
+from workbench_mcp import server
 
 
 @pytest.fixture()

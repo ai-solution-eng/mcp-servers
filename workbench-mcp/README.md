@@ -414,11 +414,13 @@ sit behind gateway authn (PCAI Istio gateway).
 ## Run
 
 ```sh
+# src layout: the app is the workbench_mcp package under src/ — run the
+# module (or the installed workbench-mcp console script)
 # stdio (local MCP clients)
-python server.py --transport stdio
+python -m workbench_mcp.server --transport stdio
 
 # stateless streamable-http (fleet default), port 9103
-python server.py --transport streamable-http --host 0.0.0.0 --port 9103
+python -m workbench_mcp.server --transport streamable-http --host 0.0.0.0 --port 9103
 ```
 
 Health: `GET /health` / `/healthz`.

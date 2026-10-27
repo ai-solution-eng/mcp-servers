@@ -24,8 +24,8 @@ import os
 
 import pytest
 
-import server
-from server import WorkbenchError
+from workbench_mcp import server
+from workbench_mcp.server import WorkbenchError
 
 
 def call(fn, *args, **kwargs):

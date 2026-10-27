@@ -18,11 +18,11 @@ import types
 import httpx2
 import pytest
 
-import fetcher as fetcher_mod
-import url_policy
-from browser_client import BrowserClient, BrowserError, BrowserUnavailable
-from fetcher import WebContentFetcher
-from url_policy import UrlPolicyError, validate_fetch_url
+from searxng_mcp import fetcher as fetcher_mod
+from searxng_mcp import url_policy
+from searxng_mcp.browser_client import BrowserClient, BrowserError, BrowserUnavailable
+from searxng_mcp.fetcher import WebContentFetcher
+from searxng_mcp.url_policy import UrlPolicyError, validate_fetch_url
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -107,7 +107,7 @@ class StubBrowser:
 
 
 def rendered_page(html="<html><body>rendered</body></html>", url="https://spa.example/"):
-    from browser_client import RenderedPage
+    from searxng_mcp.browser_client import RenderedPage
 
     return RenderedPage(html=html, final_url=url, title="t", status=200)
 

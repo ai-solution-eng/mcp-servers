@@ -228,11 +228,14 @@ SEARXNG_URL=https://searxng.example.com SEARXNG_VERIFY_TLS=false \
     .venv/bin/python tests/live_check.py
 
 # Run locally (stdio for Claude Desktop / inspector):
-SEARXNG_URL=http://localhost:8080 .venv/bin/python server.py --transport stdio
+# (src layout: the app is the searxng_mcp package under src/ — run the module,
+#  or the installed searxng-mcp console script; the editable install above
+#  already puts src/ on the path)
+SEARXNG_URL=http://localhost:8080 .venv/bin/python -m searxng_mcp.server --transport stdio
 
 # Run locally (HTTP transports, like the container):
 SEARXNG_URL=http://localhost:8080 \
-    .venv/bin/python server.py --transport streamable-http sse --port 9090
+    .venv/bin/python -m searxng_mcp.server --transport streamable-http sse --port 9090
 
 # Bare-docker SearXNG for local testing (JSON format pre-enabled):
 docker run --rm -p 8080:8080 \
@@ -389,15 +392,20 @@ Or through the gateway (oauth2-proxy protected):
 
 ```
 searxng_mcp/
-├── server.py               # MCP 2.0 MCPServer + tools (search, fetch_content)
-├── searxng_client.py       # SearXNG JSON API client + formatting
-├── fetcher.py              # trafilatura → bs4/html2text → Wikipedia fetcher
-│                           #   (+ headless-browser escalation rung, redirect
-│                           #   hop loop, TTL cache/single-flight, body caps)
-├── url_policy.py           # SSRF guard: scheme allowlist, resolved-IP
-│                           #   denylist, DNS pin, allowlist/deny escapes
-├── browser_client.py       # Playwright-over-CDP client for the browser sidecar
-│                           #   (+ CDP route filter)
+├── src/
+│   └── searxng_mcp/        # the package (imported as searxng_mcp)
+│       ├── server.py       # MCP 2.0 MCPServer + tools (search, fetch_content)
+│       ├── searxng_client.py  # SearXNG JSON API client + formatting
+│       ├── fetcher.py      # trafilatura → bs4/html2text → Wikipedia fetcher
+│       │                   #   (+ headless-browser escalation rung, redirect
+│       │                   #   hop loop, TTL cache/single-flight, body caps)
+│       ├── url_policy.py   # SSRF guard: scheme allowlist, resolved-IP
+│       │                   #   denylist, DNS pin, allowlist/deny escapes
+│       ├── browser_client.py  # Playwright-over-CDP client for the browser
+│       │                   #   sidecar (+ CDP route filter)
+│       ├── mcp_metrics.py  # per-tool counters + /metrics endpoint
+│       └── formatter.sh    # fleet lint entry point (ruff/mypy)
+├── mcp_auth.py             # fleet-hardlinked auth module (top-level py-module)
 ├── browser/                # headless-browser sidecar image (Chromium headless
 │   ├── Dockerfile          #   shell, loopback CDP, CA/proxy entrypoint)
 │   └── entrypoint.sh

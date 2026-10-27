@@ -15,12 +15,7 @@ Run:
     /home/andrew/Code/HPE/SQLhandler/.venv312/bin/python -m pytest tests/test_rbac_hint.py -v
 """
 
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import server
+from applygate_mcp import server
 
 # The exact resource surface the chart Role (and the bootstrap manifest's
 # per-namespace Roles) grant — the kinds a 403 should NEVER be possible for

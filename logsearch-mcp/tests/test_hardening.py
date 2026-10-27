@@ -27,8 +27,7 @@ import time
 
 import pytest
 
-import server
-import webui
+from logsearch_mcp import server, webui
 
 # ---------------------------------------------------------------------------
 # Fixtures & fakes (same shape as tests/test_logsearch.py)

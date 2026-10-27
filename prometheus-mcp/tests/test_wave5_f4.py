@@ -38,10 +38,9 @@ import textwrap
 
 import pytest
 
-import saved_queries
-import webui
-from prom_client import MAX_HINTS, query_hints
-from saved_queries import (
+from prometheus_mcp import saved_queries, webui
+from prometheus_mcp.prom_client import MAX_HINTS, query_hints
+from prometheus_mcp.saved_queries import (
     MAX_SAVED_QUERIES,
     SavedQueryStore,
     get_store,
@@ -320,7 +319,7 @@ class _QueryStub:
 @pytest.fixture()
 def stub_server(monkeypatch):
     """The server module with a stub client + fresh in-memory store."""
-    import server
+    from prometheus_mcp import server
 
     monkeypatch.delenv("PROMETHEUS_SAVED_QUERIES_PATH", raising=False)
     saved_queries.reset_store()
@@ -757,18 +756,23 @@ def test_all_page_script_blocks_parse_under_node():
 
 def test_saved_queries_module_is_packaged_everywhere():
     """saved_queries.py must ship in EVERY packaging path — the source tree
-    import works implicitly, but a missing py-modules / Dockerfile COPY /
-    MANIFEST entry makes the installed image crash at first import."""
-    import saved_queries
+    import works implicitly, but a missing package declaration / Dockerfile
+    COPY makes the installed image crash at first import.
 
-    root = os.path.dirname(os.path.abspath(saved_queries.__file__))
-    pyproject = open(os.path.join(root, "pyproject.toml"), encoding="utf-8").read()
-    assert '"saved_queries"' in pyproject, "add saved_queries to [tool.setuptools] py-modules"
-    dockerfile = open(os.path.join(root, "Dockerfile"), encoding="utf-8").read()
-    copy_line = next((ln for ln in dockerfile.splitlines() if ln.startswith("COPY") and "server.py" in ln), "")
-    assert "saved_queries.py" in copy_line, "add saved_queries.py to the Dockerfile COPY line"
-    manifest = open(os.path.join(root, "MANIFEST.in"), encoding="utf-8").read()
-    assert "saved_queries.py" in manifest, "ship the module in sdists too"
+    Src layout: the module lives in src/prometheus_mcp/ and ships via the
+    pyproject `packages` declaration (wheels AND sdists), so the Dockerfile
+    pin is now the whole-src-tree COPY — setuptools SILENTLY omits any
+    package module that is missing from the build context (the W7 class)."""
+    from prometheus_mcp import saved_queries
+
+    repo = os.path.dirname(  # repo root = parent of src/prometheus_mcp/
+        os.path.dirname(os.path.dirname(os.path.abspath(saved_queries.__file__)))
+    )
+    pyproject = open(os.path.join(repo, "pyproject.toml"), encoding="utf-8").read()
+    assert 'packages = ["prometheus_mcp"]' in pyproject, "declare the prometheus_mcp package"
+    dockerfile = open(os.path.join(repo, "Dockerfile"), encoding="utf-8").read()
+    copy_line = next((ln for ln in dockerfile.splitlines() if ln.startswith("COPY") and "src/" in ln), "")
+    assert copy_line, "COPY the src/ package tree into the image (saved_queries rides inside it)"
 
 
 def test_mcp_auth_module_is_packaged_everywhere_and_byte_exact():

@@ -19,19 +19,34 @@ RUN apt-get update && \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+# src-layout: the k8s_mcp package is copied under /app/src (no pyproject/pip
+# install in this image — requirements.txt only), so the interpreter needs the
+# package root on PYTHONPATH to resolve "python -m k8s_mcp.server".
+ENV PYTHONPATH=/app/src
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY src/ ./src/
+# Shared fleet package (vendored copy, fleet decision D16): provides the
+# hash-chained audit writer behind exec_in_pod's durable trail. It MUST be
+# copied — otherwise the import falls back to stdout-only and the durable
+# record silently vanishes, which is exactly the "present in the tree, absent
+# from the image" class the sibling repos' test_packaging.py exists to catch.
+COPY mcp_fleet_common/ ./mcp_fleet_common/
 # Built-in HPE ops console (static shell served at /ui/ by server.py).
 COPY ui/ ./ui/
 # COPY preserves source file modes, and workspace defaults can be tighter
 # than the container user (uid 10001) needs: a+rX = directories traversable,
 # files readable, nothing executable that was not already.
 RUN chmod -R a+rX /app
+
+# Packaging gate: the audit writer must be importable FROM THE IMAGE, or
+# exec_in_pod degrades to stdout-only without failing anything. Fail the build
+# instead, so a missing COPY can never ship a silently weaker audit trail.
+RUN python -c "from mcp_fleet_common.audit import HashChainedAuditLog; print('fleet audit writer importable')"
 
 RUN addgroup --system --gid 10001 k8smcp && \
     adduser --system --uid 10001 --ingroup k8smcp k8smcp
@@ -40,4 +55,4 @@ USER 10001
 
 EXPOSE 9090
 
-CMD ["python", "server.py"]
+CMD ["python", "-m", "k8s_mcp.server"]

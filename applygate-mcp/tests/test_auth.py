@@ -20,16 +20,12 @@ Run:
 import asyncio
 import hashlib
 import json
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from starlette.testclient import TestClient
 
 import mcp_auth
-import server
+from applygate_mcp import server
 
 PING = {"jsonrpc": "2.0", "method": "ping", "id": 1}
 MCP_ACCEPT = {"Accept": "application/json, text/event-stream"}
@@ -269,7 +265,11 @@ def test_spoofed_caller_registry_cannot_authenticate_or_widen(monkeypatch):
     _spoofing_env(monkeypatch)
     monkeypatch.setenv(server.CLIENTS_ENV, "ops-bot:k1")
     no_key = mcp_auth.capture_caller(
-        {"type": "http", "headers": [(b"x-api-key", b"WRONG"), (b"x-mcp-caller", b"ops-bot")], "client": ("10.0.0.1", 1)},
+        {
+            "type": "http",
+            "headers": [(b"x-api-key", b"WRONG"), (b"x-mcp-caller", b"ops-bot")],
+            "client": ("10.0.0.1", 1),
+        },
         server.AUTH_ENV_NAMES,
         clients_env=server.CLIENTS_ENV,
     )
@@ -305,7 +305,11 @@ def test_via_sanitized_crlf_and_length_capped(monkeypatch):
     monkeypatch.setenv("MCP_CALLER_TRUSTED_CIDRS", "10.0.0.0/8")
     evil = "bob@evil\r\nX-Injected: yes\x1b[31m"
     c = mcp_auth.capture_caller(
-        {"type": "http", "headers": [(b"x-api-key", b"k1"), (b"x-mcp-caller", evil.encode("latin-1"))], "client": ("10.1.1.1", 2)},
+        {
+            "type": "http",
+            "headers": [(b"x-api-key", b"k1"), (b"x-mcp-caller", evil.encode("latin-1"))],
+            "client": ("10.1.1.1", 2),
+        },
         server.AUTH_ENV_NAMES,
     )
     assert c.via == "bob@evilX-Injected: yes\x1b[31m".replace("\x1b", "") or ("\r" not in c.via and "\n" not in c.via)
@@ -335,7 +339,9 @@ def test_stale_plan_cannot_be_replayed_even_with_spoofed_caller(monkeypatch):
     monkeypatch.delenv("APPLYGATE_UNPLANNED_APPLY", raising=False)  # deny
     run(server.plan_apply(namespace="team-a", manifest=SIMPLE))
     stale_sha = "0" * 64
-    server._caller_context.set(mcp_auth.Caller(key_fp="sha256:deadbeefdead", client="1.2.3.4:1", name="admin", via="root"))
+    server._caller_context.set(
+        mcp_auth.Caller(key_fp="sha256:deadbeefdead", client="1.2.3.4:1", name="admin", via="root")
+    )
     out = json.loads(
         run(server.apply_manifest(namespace="team-a", manifest=SIMPLE, confirm_apply=True, plan_sha256=stale_sha))
     )

@@ -29,8 +29,16 @@ COPY pyproject.toml ./
 RUN uv pip install --system "httpx2>=2.12.0" "mcp>=2.0.0" "starlette>=0.37.0" "uvicorn>=0.27.0"
 
 # App code + assets (cheap layers, keyed on the source files themselves).
-COPY server.py prom_client.py webui.py saved_queries.py mcp_auth.py ./
-COPY mcp_metrics.py ./mcp_metrics.py
+# src/ carries the whole prometheus_mcp package (server, prom_client, webui,
+# saved_queries, mcp_metrics — all inside the package now); the fleet-
+# hardlinked mcp_auth.py stays a top-level py-module at the repo root. The
+# non-editable `uv pip install --system --no-deps .` ships exactly what
+# pyproject declares (package-dir packages + py-modules), so both COPYs are
+# required — a missing one makes the wheel SILENTLY omit the module and the
+# image crash-loops at startup (the W7 deploy-blocker class this section
+# originally fixed for the loose-script mcp_metrics.py).
+COPY src/ ./src/
+COPY mcp_auth.py ./
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `prometheus-mcp`
 # script runs from there, not from /app).
@@ -41,12 +49,19 @@ RUN chmod -R a+rX /app || true
 # construction from the manifest-keyed layer above.
 RUN uv pip install --system --no-deps .
 
-# Sanity gate (build-time, cheap): these are loose scripts ([tool.setuptools]
-# py-modules, not a package), so the gate imports every shipped module by
-# name against the dependency layer — catching "dep added to pyproject but
-# not to the RUN above" drift in the build log instead of as a
-# ModuleNotFoundError in the pod.
-RUN python -c "import server, prom_client, webui, saved_queries, mcp_metrics, mcp_auth; print('prometheus-mcp imports clean')"
+# Sanity gate (build-time, cheap): the gate imports every shipped module of
+# the INSTALLED package by name (server pulls the package together via its
+# relative imports; mcp_auth rides as the top-level py-module) against the
+# dependency layer — catching "dep added to pyproject but not to the RUN
+# above" drift in the build log instead of as a ModuleNotFoundError in the
+# pod.
+#
+# cd /tmp is LOAD-BEARING: from WORKDIR /app, python puts /app first on
+# sys.path, so /app/mcp_auth.py (a COPY'd build-context file) would satisfy
+# the import even if the WHEEL did not ship it — the gate would pass while
+# the installed console script crash-looped. From /tmp every name must
+# resolve out of site-packages.
+RUN cd /tmp && python -c "from prometheus_mcp import server, prom_client, webui, saved_queries, mcp_metrics; import mcp_auth; print('prometheus-mcp imports clean')"
 
 EXPOSE 9095
 

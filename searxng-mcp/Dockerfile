@@ -40,25 +40,31 @@ RUN uv pip install --system \
 
 # App code — deliberately AFTER the dependency layer so editing any of these
 # files never invalidates the wheel layer above. ALL of server.py's runtime
-# imports must be in the build context: mcp_auth (auth wave), mcp_metrics
-# (Wave-3 C3) AND url_policy (Wave-1 P0-6 — added after this COPY line was
-# last touched; the Wave-6 packaging proof caught it missing). The
-# non-editable `uv pip install --system --no-deps .` below silently omits a
-# declared py-module whose file is not present, so a rebuilt image
-# crash-loops at startup without these (ModuleNotFoundError).
-COPY server.py searxng_client.py fetcher.py browser_client.py url_policy.py mcp_auth.py mcp_metrics.py ./
+# imports must be in the build context: the searxng_mcp package (src/
+# searxng_mcp/: server, searxng_client, fetcher, browser_client, url_policy,
+# mcp_metrics) AND mcp_auth (auth wave — the top-level py-module that stays
+# at the repo root). The non-editable `uv pip install --system --no-deps .`
+# below silently omits a declared module/package whose file is not present,
+# so a rebuilt image crash-loops at startup without these
+# (ModuleNotFoundError). (url_policy.py was itself missing from this COPY
+# line until the Wave-6 packaging proof caught it — which is exactly why the
+# gate at the bottom of this file exists.)
+COPY src/ ./src/
+COPY mcp_auth.py ./
 RUN chmod -R a+rX /app || true
 RUN uv pip install --system --no-deps .
 
 # Sanity gate (build-time, cheap): the INSTALLED code must import with zero
-# dependency resolution. Runs from /tmp (not WORKDIR /app) so `import server`
-# resolves from site-packages — the wheel the image actually runs — not the
-# source copy sitting in the build directory. Every direct dependency is
-# imported here explicitly (beautifulsoup4 under its import name bs4); this
-# is the drift-catcher for "dep added to pyproject but not to the RUN above"
-# (server.py imports most of these lazily, so a missing wheel would otherwise
-# surface only on first use).
-RUN cd /tmp && python -c "import server, httpx2, mcp, starlette, uvicorn, brotli, trafilatura, bs4, html2text, curl_cffi, playwright; print('searxng-mcp imports clean')"
+# dependency resolution. Runs from /tmp (not WORKDIR /app) so the installed
+# searxng_mcp PACKAGE resolves from site-packages — the wheel the image
+# actually runs — not the source copy sitting in the build directory. The
+# console script's entry module (server, = searxng_mcp.server:main) and the
+# top-level mcp_auth py-module are both imported from there. Every direct
+# dependency is imported here explicitly (beautifulsoup4 under its import
+# name bs4); this is the drift-catcher for "dep added to pyproject but not to
+# the RUN above" (server.py imports most of these lazily, so a missing wheel
+# would otherwise surface only on first use).
+RUN cd /tmp && python -c "from searxng_mcp import server; import mcp_auth, httpx2, mcp, starlette, uvicorn, brotli, trafilatura, bs4, html2text, curl_cffi, playwright; from importlib.metadata import version; print('searxng-mcp', version('searxng-mcp'), 'imports clean')"
 
 EXPOSE 9090
 

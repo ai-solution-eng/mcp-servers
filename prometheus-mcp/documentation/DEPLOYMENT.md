@@ -116,14 +116,18 @@ service. The vendor-label Kyverno ClusterPolicy ships ungated in this chart
 
 Site operators rarely rebuild, but if you do, know the failure mode this
 chart just fixed: `server.py` imports `mcp_metrics` (the Wave-3
-instrumentation), and the loose-scripts packaging (`[tool.setuptools]
-py-modules`) **silently omits a declared module whose file is not in the
-build context** — a rebuilt image without the explicit COPY crash-looped at
-startup (`ModuleNotFoundError`) while probes looked fine on the old pods.
-The fix, now in the Dockerfile, is threefold: `mcp_metrics.py` is declared in
-pyproject `py-modules` AND copied explicitly (`COPY mcp_metrics.py
-./mcp_metrics.py`), and a build-time sanity gate imports every shipped module
-so packaging drift fails in the build log instead of in a pod. The image also
+instrumentation), and the pre-src-layout loose-scripts packaging
+(`[tool.setuptools] py-modules`) **silently omits a declared module whose
+file is not in the build context** — a rebuilt image without the explicit
+COPY crash-looped at startup (`ModuleNotFoundError`) while probes looked
+fine on the old pods. That incident is why the app now ships as the src
+layout package (`src/prometheus_mcp/`): the whole package rides one
+`COPY src/ ./src/` + the pyproject `packages` declaration, the
+fleet-hardlinked `mcp_auth.py` stays a top-level py-module beside it
+(`COPY mcp_auth.py ./`), and a build-time sanity gate imports every shipped
+module of the INSTALLED package so packaging drift fails in the build log
+instead of in a pod. Setuptools still silently omits anything missing from
+the build context, so both COPYs remain load-bearing. The image also
 carries the fleet's build-time permission neutralizer (`chmod -R a+rX /app`)
 — files created by agents land `0600` on the ops box and COPY preserves
 modes, so a non-root container would otherwise fail on the first unreadable

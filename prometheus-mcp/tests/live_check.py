@@ -12,14 +12,21 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Make `from prometheus_mcp import server` work however this script is
+# invoked (pyproject's pythonpath ini supplies both roots for the sibling
+# tests): a runnable script puts only the SCRIPT's dir (tests/) on sys.path.
+# The repo root carries the top-level mcp_auth fleet module; src/ carries
+# the prometheus_mcp package.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
+sys.path.insert(0, _REPO)
 
 import httpx2
 from mcp.client._memory import InMemoryTransport
 from mcp.client.session import ClientSession
 from mcp.types import CallToolResult, TextContent
 
-import server
+from prometheus_mcp import server
 
 
 def _first_text(result: CallToolResult) -> str:

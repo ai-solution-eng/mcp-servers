@@ -11,9 +11,9 @@ from typing import Any
 import httpx2
 import pytest
 
-import server
-from fetcher import WebContentFetcher, clean_markdown_cruft, extract_via_bs4
-from searxng_client import (
+from searxng_mcp import server
+from searxng_mcp.fetcher import WebContentFetcher, clean_markdown_cruft, extract_via_bs4
+from searxng_mcp.searxng_client import (
     SearXNGClient,
     SearXNGError,
     engines_from_config_hint,
@@ -272,7 +272,7 @@ def test_engine_names_cache_failure_returns_none_and_retries_later():
 
 
 def test_cooldown_delays_next_acquire():
-    from searxng_client import RateLimiter
+    from searxng_mcp.searxng_client import RateLimiter
 
     rl = RateLimiter(1000)
     rl.push_cooldown(0.15)
@@ -776,7 +776,7 @@ def test_search_cache_single_flight():
 
 
 def test_mcp_tools_registered():
-    import server
+    from searxng_mcp import server
 
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
@@ -800,7 +800,7 @@ def test_mcp_search_end_to_end_mocked(monkeypatch):
     from mcp.client._memory import InMemoryTransport
     from mcp.client.session import ClientSession
 
-    import server
+    from searxng_mcp import server
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         assert request.url.params["format"] == "json"
@@ -826,7 +826,7 @@ def test_mcp_fetch_content_end_to_end_mocked(monkeypatch):
     from mcp.client._memory import InMemoryTransport
     from mcp.client.session import ClientSession
 
-    import server
+    from searxng_mcp import server
 
     async def fake_get_html(url):
         return SAMPLE_HTML

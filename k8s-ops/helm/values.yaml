@@ -32,7 +32,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v1.2.0   # keep in lockstep with Chart.yaml appVersion
+  tag: v1.3.0
   pullPolicy: IfNotPresent
 
 # Only for a PRIVATE GHCR package (public pulls are anonymous):
@@ -103,6 +103,26 @@ rbac:
 namespaces:
   allowed: ""                # K8S_MCP_ALLOWED_NAMESPACES ("" = all namespaces)
   blocked: ""                # K8S_MCP_BLOCKED_NAMESPACES
+
+# ============================================================================
+# Exec audit trail (fleet D16 / hash-chained)
+# ============================================================================
+
+# exec_in_pod runs an attacker-influenced argv inside a production container,
+# so its audit record is the only forensic trace of who ran what where. Entries
+# are written as JSONL through the fleet's shared HashChainedAuditLog (the same
+# writer applygate uses) and additionally echoed to stdout in the legacy
+# "AUDIT exec ..." shape, so existing log matchers keep working.
+#
+# The container filesystem is read-only, so the trail needs this mount; with
+# no writable path the server degrades to stdout-only (best-effort, never
+# blocks a tool call). emptyDir survives container restarts but NOT pod
+# rescheduling — set persistence.existingClaim when the trail must outlive the
+# pod (recommended wherever exec is enabled).
+audit:
+  mountPath: /var/lib/k8s-mcp
+  persistence:
+    existingClaim: ""        # PVC name; "" = emptyDir
 
 # ============================================================================
 # Hardened Exec
@@ -189,3 +209,17 @@ networkPolicy:
     # Intentionally unrestricted (admin MCPs reach the k8s API / Prometheus / internet).
     enabled: false
     extraEgress: []
+
+# ============================================================================
+# PodDisruptionBudget — ADDITIVE, DEFAULT OFF
+# ============================================================================
+
+# Voluntary-eviction guard for node drains (templates/pdb.yaml, policy/v1).
+# DEFAULT OFF keeps the default helm render byte-identical. Single-replica
+# caveat: with replicaCount 1 (every chart in this fleet), minAvailable: 1
+# blocks ALL voluntary evictions — a drain waits. That is the intended
+# safety trade; operators wanting drainable HA should raise
+# deployment.replicaCount (>= 2) first.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1

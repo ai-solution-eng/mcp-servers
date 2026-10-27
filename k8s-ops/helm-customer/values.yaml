@@ -34,7 +34,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/k8s-mcp
-  tag: v1.2.0   # same image as the internal chart — the locking lives in this chart
+  tag: v1.3.0
   pullPolicy: IfNotPresent
 
 # Only for a PRIVATE GHCR package (public pulls are anonymous):

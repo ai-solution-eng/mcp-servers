@@ -94,7 +94,7 @@ The server requires a static API key on every request (item 8). Operators create
 }
 ```
 
-`{"X-API-Key": "<API_KEY>"}` is accepted as an alternative header name. The key gates *who can call the tools*, not *which namespaces* — combine with the namespace policy below. Local development: `export K8S_MCP_API_KEY=dev-secret` before `python server.py` (unset = endpoint open, with a loud startup warning — never deploy that way).
+`{"X-API-Key": "<API_KEY>"}` is accepted as an alternative header name. The key gates *who can call the tools*, not *which namespaces* — combine with the namespace policy below. Local development: `export K8S_MCP_API_KEY=dev-secret` before `python -m k8s_mcp.server` (unset = endpoint open, with a loud startup warning — never deploy that way).
 
 ### Namespace governance (optional whitelist/blacklist)
 
@@ -216,7 +216,7 @@ A static, HPE-branded single-page console served by the server itself (`/` redir
 
 ## Requirements & development
 
-`mcp>=2.0.0,<3`, `kubernetes>=31.0.0` (see `requirements.txt`). The adversarial suite runs without a cluster under pytest — `python3 -m pytest -q` in this directory collects **277 tests**: the 168-check namespace-policy/command-guard suite (one test per original check, `test_namespace_policy.py` — also still runnable standalone), the 26-check console smoke (`test_smoke_console.py`), the schema↔form contract audit (`test_audit_forms.py`), the Wave-3 hardening matrix (`test_wave3_hardening.py`: impersonation denylist incl. `=` forms, fan-out parity, list caps, `/metrics`), and the Wave-5 triage matrix (`test_triage.py`: exact mixed-health attention list, app narrowing, composite cap, policy refusals byte-identical to `list_pods`, governed-paths-only proof). `python3 smoke_console.py` and `python3 audit_forms.py` remain available as standalone scripts. To build the image: `docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v<ver> . --push`.
+`mcp>=2.0.0,<3`, `kubernetes>=31.0.0` (see `requirements.txt`). The adversarial suite runs without a cluster under pytest — `python3 -m pytest -q` from this directory collects the whole tree (`tests/`, per `pytest.ini`): the 168-check namespace-policy/command-guard suite (one test per original check, `tests/test_namespace_policy.py` — also still runnable standalone), the 26-check console smoke (`tests/test_smoke_console.py`), the schema↔form contract audit (`tests/test_audit_forms.py`), the Wave-3 hardening matrix (`tests/test_wave3_hardening.py`: impersonation denylist incl. `=` forms, fan-out parity, list caps, `/metrics`), and the Wave-5 triage matrix (`tests/test_triage.py`: exact mixed-health attention list, app narrowing, composite cap, policy refusals byte-identical to `list_pods`, governed-paths-only proof). `python3 smoke_console.py` and `python3 audit_forms.py` remain available as standalone scripts. To build the image: `docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v<ver> . --push`.
 
 ## Documentation
 

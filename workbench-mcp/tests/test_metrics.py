@@ -30,8 +30,8 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError  # precise B017 target
 from starlette.testclient import TestClient
 
-import server
-from server import mcp_metrics  # the shared-package binding (Wave-6 G1)
+from workbench_mcp import server
+from workbench_mcp.server import mcp_metrics  # the shared-package binding (Wave-6 G1)
 
 
 def build_app(monkeypatch, tmp_path, *, enabled):

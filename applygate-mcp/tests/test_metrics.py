@@ -12,15 +12,10 @@ Run:
     /home/andrew/Code/HPE/SQLhandler/.venv312/bin/python -m pytest tests/test_metrics.py -v
 """
 
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import pytest
 from starlette.testclient import TestClient
 
-import server
+from applygate_mcp import server
 
 try:
     import prometheus_client  # noqa: F401

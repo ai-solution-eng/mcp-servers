@@ -6,7 +6,7 @@ route stays keyed. Fleet pattern: K8S-MCP console (public-but-inert HTML).
 
 import pytest
 
-import server
+from workbench_mcp import server
 
 
 @pytest.fixture()

@@ -17,14 +17,10 @@ Run:
 
 import asyncio
 import json
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-import server
+from applygate_mcp import server
 
 ENV_VARS = (
     "APPLYGATE_ALLOWED_NAMESPACES",

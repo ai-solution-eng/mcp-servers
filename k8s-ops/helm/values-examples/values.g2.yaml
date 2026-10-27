@@ -87,7 +87,13 @@ rbac:
 # Namespace Governance
 # ============================================================================
 
-# App layer; RBAC remains the true boundary. Lab posture — everything readable except the system namespaces.
+# App layer; RBAC remains the true boundary.
+# POSTURE: allowed: "" = BLACKLIST-ONLY — every namespace not named below is
+# visible, including namespaces created later, and the server prints a startup
+# WARNING saying so. The ALLOWLIST is the recommended posture: set allowed to
+# the namespaces your callers actually read (e.g. "team-*,debug-*") and keep
+# the blocked list as the floor. Silence the warning deliberately with
+# K8S_MCP_WARN_EMPTY_ALLOWLIST=false.
 namespaces:
   allowed: ""
   blocked: "kube-system,kube-public,k8s-mcp-ops"
@@ -96,12 +102,18 @@ namespaces:
 # Hardened Exec
 # ============================================================================
 
-# Lab posture — exec ON cluster-wide with the per-pod label gate OFF.
-# Tighter for shared clusters: enabled: false, or namespaces: "debug-*,team-a" with requireLabel: true.
+# Lab posture — exec ON, with the per-pod label gate ON: the pod label IS the
+# boundary. exec_in_pod reaches only pods carrying k8s-mcp.io/exec: "true", so
+# namespaces: "*" means "any LABELLED pod", not "any pod". Nothing opts in until
+# an operator labels a workload (kubectl label pod <pod> k8s-mcp.io/exec=true).
+# Tighter for shared clusters: enabled: false, or namespaces: "debug-*,team-a"
+# (narrower RBAC surface; recommended when exec is not needed fleet-wide).
+# Never ship requireLabel: false outside a throwaway lab — with it off, any pod
+# in an allowed namespace is reachable and the server says so at startup.
 exec:
   enabled: true
   namespaces: "*"
-  requireLabel: false
+  requireLabel: true
   allowedCommands: ""
   autoRbac: true
 

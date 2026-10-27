@@ -241,7 +241,7 @@ Given the trail file (default `/data/audit.jsonl`):
 
   ```bash
   kubectl -n <ns> exec deploy/applygate-mcp -- python -c \
-    "import json,sys; sys.path.insert(0,'/app'); import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
+    "import json; from applygate_mcp import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
   ```
 
 Known limitation (documented, standard for hash chains): the **last** line
@@ -334,7 +334,7 @@ comment block in `helm/templates/rbac.yaml`).
   leaves a hash-chained JSONL line on a persistent volume, attributed to a
   non-secret caller fingerprint; verification is one call — the
   parameter-free `verify_audit_chain` MCP tool, `GET /api/audit/verify` on
-  the console, or `server.verify_audit_chain(path)` under kubectl exec.
+  the console, or `applygate_mcp.server.verify_audit_chain(path)` under kubectl exec.
 - **Parser hygiene**: alias bombs, YAML quines, and over-deep manifests are
   refused at parse time, before any seam call.
 - **HTTP posture**: MCP 2.0 stateless (any replica serves any request, no
@@ -418,7 +418,7 @@ by construction, and the k8s seam only ever receives `dry_run=True`.
 The console is gated by `webui.enabled` (values) → `APPLYGATE_WEBUI_ENABLED`
 (env; unset = on, `false|0|no|off` strips `/`, `/ui` and `/api/*` while `/mcp`
 and the health endpoints keep working). The UI asset is `ui/index.html`,
-copied into `/app/ui` by the Dockerfile; `webui.py` also honors an
+copied into `/app/ui` by the Dockerfile; `src/applygate_mcp/webui.py` also honors an
 `APPLYGATE_WEBUI_HTML` override.
 
 ## Test

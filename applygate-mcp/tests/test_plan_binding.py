@@ -21,14 +21,11 @@ Run:
 import asyncio
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import yaml
 
-import server
+from applygate_mcp import server
 
 ENV_VARS = (
     "APPLYGATE_ALLOWED_NAMESPACES",
@@ -429,3 +426,63 @@ def test_confirmed_apply_refusals_other_than_binding_keep_the_plain_shape(monkey
     out = parse(run(server.apply_manifest(namespace="team-a", manifest=":::not yaml:::", confirm_apply=True)))
     assert out["refused"] is True
     assert set(out) == {"ok", "refused", "error"}
+
+
+# ---------------------------------------------------------------------------
+# A REFUSED plan must not authorise its own apply (P1, 2026-10-20)
+#
+# _plan_apply_sync recorded the D11 binding UNCONDITIONALLY, after per-document
+# refusals had already been collected. A manifest whose every doc was refused
+# therefore still left a valid binding behind, and _check_plan_binding returned
+# "apply" for exactly the bytes the plan had just rejected — README:145 claimed
+# the opposite. Verified by probe before the fix.
+# ---------------------------------------------------------------------------
+
+
+def _refused_manifest():
+    """One doc whose kind is outside the allowlist => refused per-document."""
+    return manifest({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "x"}})
+
+
+def test_refused_plan_records_no_binding(monkeypatch):
+    """A plan whose docs were ALL refused must leave no D11 binding."""
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    monkeypatch.setenv("APPLYGATE_ALLOWED_KINDS", "ConfigMap")
+    forbidden = _refused_manifest()
+    plan = parse(run(server.plan_apply(namespace="team-a", manifest=forbidden)))
+    assert plan["ok"] is False, "the plan itself must report failure"
+    assert plan["summary"]["failed"] >= 1
+    # nothing recorded => an apply of the same bytes refuses on the binding
+    out = parse(run(server.apply_manifest(namespace="team-a", manifest=forbidden, confirm_apply=True)))
+    assert out["refused"] is True
+    assert "no plan_apply has been recorded" in out["error"]
+
+
+def test_refused_plan_does_not_supersede_a_good_one(monkeypatch):
+    """A good plan stays authoritative when a later bad plan is refused.
+
+    This is the dangerous ordering: plan(good) -> plan(bad, refused) ->
+    apply(good). Before the fix the refused plan overwrote the binding, so the
+    GOOD bytes no longer matched and a valid apply was refused.
+    """
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    good = manifest(doc(name="app-config", data={"k": "good"}))
+    run(server.plan_apply(namespace="team-a", manifest=good))
+    monkeypatch.setenv("APPLYGATE_ALLOWED_KINDS", "ConfigMap")
+    bad_plan = parse(run(server.plan_apply(namespace="team-a", manifest=_refused_manifest())))
+    assert bad_plan["ok"] is False
+    # the good bytes are still the planned ones and still apply
+    out = parse(run(server.apply_manifest(namespace="team-a", manifest=good, confirm_apply=True)))
+    assert out["ok"] is True and out.get("refused") is not True
+
+
+def test_successful_plan_still_records_and_binds(monkeypatch):
+    """Guard the guard: the happy path is unchanged."""
+    allow(monkeypatch, "team-a")
+    install_apply_spy(monkeypatch)
+    plan = parse(run(server.plan_apply(namespace="team-a", manifest=SIMPLE)))
+    assert plan["ok"] is True
+    out = parse(run(server.apply_manifest(namespace="team-a", manifest=SIMPLE, confirm_apply=True)))
+    assert out["ok"] is True and out.get("refused") is not True

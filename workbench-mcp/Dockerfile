@@ -28,7 +28,10 @@ COPY pyproject.toml ./
 RUN uv pip install --system "mcp>=2.0.0" "starlette>=0.37.0" "uvicorn>=0.27.0" "kubernetes>=29.0.0"
 
 # App code + assets (cheap layers, keyed on the source files themselves).
-COPY server.py webui.py mcp_auth.py ./
+# The src layout ships as a whole: src/workbench_mcp/ is the package the
+# console script (workbench_mcp.server:main) imports from site-packages.
+COPY src/ ./src/
+COPY mcp_auth.py ./
 # The vendored mcp_fleet_common package (Wave-6 G1, D16): server.py imports
 # `from mcp_fleet_common import …` — without this COPY the non-editable
 # `uv pip install --system --no-deps .` builds a wheel without the package
@@ -44,13 +47,22 @@ RUN uv pip install --system --no-deps . \
     && chmod -R a+rX /app
 
 # Sanity gate (build-time, cheap): imports the console-script entry module
-# (server, = workbench-mcp server:main) plus every shipped module/package
-# against the dependency layer — catching "dep added to pyproject but not to
-# the RUN above" drift in the build log instead of as a ModuleNotFoundError
+# (the workbench_mcp package's server module, = workbench-mcp
+# workbench_mcp.server:main) plus every shipped module/package against the
+# dependency layer — catching "dep added to pyproject but not to the RUN
+# above" drift in the build log instead of as a ModuleNotFoundError
 # crash-loop in the pod. The kubernetes import here proves the sandbox-exec
 # dependency landed in the dependency layer (server imports it lazily, so
 # server's own import does not exercise it).
-RUN python -c "import server, webui, mcp_auth, mcp_fleet_common, kubernetes; print('workbench-mcp imports clean')"
+#
+# cd /tmp is LOAD-BEARING, not cosmetic: run from WORKDIR /app, python puts
+# /app first on sys.path, so a top-level module sitting in the build context
+# (mcp_auth.py is COPY'd to /app) satisfies the import even when the WHEEL
+# does not ship it — the gate would pass while the pod crash-loops, the exact
+# failure it exists to catch. From /tmp nothing shadows site-packages, so
+# every name below must resolve from the installed wheel. (Siblings
+# applygate/searxng already use this form; workbench was the outlier.)
+RUN cd /tmp && python -c "from workbench_mcp import server, webui; import mcp_auth, mcp_fleet_common, kubernetes; from importlib.metadata import version; print('workbench-mcp', version('workbench-mcp'), 'imports clean')"
 
 # Scratch pad by design: runs as non-root; /data is a PVC mounted by the
 # chart (fsGroup 10001) and holds no secrets.

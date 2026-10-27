@@ -23,9 +23,9 @@ import certifi
 import httpx2
 import pytest
 
-import fetcher
-from browser_client import BrowserClient
-from fetcher import CERT_ERROR_RE, WebContentFetcher
+from searxng_mcp import fetcher
+from searxng_mcp.browser_client import BrowserClient
+from searxng_mcp.fetcher import CERT_ERROR_RE, WebContentFetcher
 from tests.test_searxng_mcp import SAMPLE_HTML, DummyCtx
 
 BUNDLE = "/ca-bundle/ca-bundle.crt"

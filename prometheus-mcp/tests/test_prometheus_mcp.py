@@ -9,7 +9,7 @@ import asyncio
 import httpx2
 import pytest
 
-from prom_client import (
+from prometheus_mcp.prom_client import (
     PromConfig,
     PrometheusClient,
     PrometheusError,
@@ -167,7 +167,7 @@ def test_load_config_defaults_and_token_env_name():
 
 
 def _server():
-    import server
+    from prometheus_mcp import server
 
     return server.mcp
 
@@ -176,7 +176,7 @@ def test_all_six_tools_registered_read_only():
     from mcp.client._memory import InMemoryTransport
     from mcp.client.session import ClientSession
 
-    import server
+    from prometheus_mcp import server
 
     async def run():
         async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
@@ -216,7 +216,7 @@ def test_all_six_tools_registered_read_only():
 
 
 def test_prom_query_wire_round_trip(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     class StubClient:
         async def instant_query(self, query, ts=None):
@@ -242,7 +242,7 @@ def test_prom_query_wire_round_trip(monkeypatch):
 
 
 def test_prom_alerts_wire_round_trip(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     class StubClient:
         async def alerts(self):
@@ -274,7 +274,7 @@ def test_prom_alerts_wire_round_trip(monkeypatch):
 
 
 def test_prom_rules_filter_by_state_and_search(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     class StubClient:
         async def rules(self):
@@ -324,7 +324,7 @@ def test_prom_rules_filter_by_state_and_search(monkeypatch):
 
 
 def test_prom_query_range_wire(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     class StubClient:
         async def range_query(self, query, start, end, step):
@@ -356,20 +356,27 @@ def test_prom_query_range_wire(monkeypatch):
 
 
 def test_streamable_http_smoke_serves_mcp_after_lifespan():
+    import os
     import socket
     import subprocess
     import sys
     import time
     from pathlib import Path
 
-    server_path = Path(__file__).resolve().parent.parent / "server.py"
+    # Src layout: server.py lives at src/prometheus_mcp/server.py and uses
+    # relative imports, so it can no longer be spawned as a bare script — run
+    # it as a module with BOTH roots on PYTHONPATH (src/ for the package, the
+    # repo root for the top-level mcp_auth fleet module).
+    repo_root = Path(__file__).resolve().parent.parent
+    spawn_env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(repo_root / "src"), str(repo_root)))}
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     proc = subprocess.Popen(
         [
             sys.executable,
-            str(server_path),
+            "-m",
+            "prometheus_mcp.server",
             "--transport",
             "streamable-http",
             "--host",
@@ -377,6 +384,7 @@ def test_streamable_http_smoke_serves_mcp_after_lifespan():
             "--port",
             str(port),
         ],
+        env=spawn_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

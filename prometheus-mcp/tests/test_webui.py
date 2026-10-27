@@ -14,8 +14,8 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-import webui
-from prom_client import PromConfig, PrometheusError
+from prometheus_mcp import webui
+from prometheus_mcp.prom_client import PromConfig, PrometheusError
 
 
 class StubClient:
@@ -423,7 +423,7 @@ def test_gpu_domain_env_override(monkeypatch):
 
 
 def test_server_mounts_ui_routes():
-    import server
+    from prometheus_mcp import server
 
     app = server._build_http_app()
     paths = {getattr(r, "path", None) for r in app.routes}

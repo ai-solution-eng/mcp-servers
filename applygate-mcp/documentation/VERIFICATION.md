@@ -91,7 +91,7 @@ kubectl exec -n <namespace> deploy/applygate-mcp -- cat /data/audit.jsonl 2>/dev
 
 # Audit chain verification (tamper-evidence) — one command:
 kubectl exec -n <namespace> deploy/applygate-mcp -- python -c \
-  "import sys,json; sys.path.insert(0,'/app'); import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
+  "import json; from applygate_mcp import server; print(json.dumps(server.verify_audit_chain('/data/audit.jsonl')))"
 # → {"ok": true, "entries": N, "legacy_entries": 0, ...}. "ok": false with a
 # line number = the trail was tampered with/truncated/reordered (README
 # documents the manual procedure).

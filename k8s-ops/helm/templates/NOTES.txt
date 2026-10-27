@@ -53,6 +53,23 @@ Current settings:
   exec.requireLabel  : {{ .Values.exec.requireLabel }}
   rbac.scope         : {{ .Values.rbac.scope }}
   console            : {{ .Values.console.enabled }}
+{{- if not .Values.namespaces.allowed }}
+
+  POSTURE WARNING — namespace policy is {{ if .Values.namespaces.blocked }}BLACKLIST-ONLY{{ else }}OPEN{{ end }}:
+  namespaces.allowed is empty, so every namespace {{ if .Values.namespaces.blocked }}not blocked above{{ else }}in the cluster{{ end }}
+  is readable, including namespaces created later. The ALLOWLIST is the
+  recommended posture: set namespaces.allowed to the namespaces your callers
+  actually read. The server prints the same warning at startup; silence it
+  deliberately with K8S_MCP_WARN_EMPTY_ALLOWLIST=false.
+{{- end }}
+{{- if and .Values.exec.enabled (not .Values.exec.requireLabel) }}
+
+  POSTURE WARNING — exec_in_pod is ENABLED with the per-pod label gate OFF
+  (exec.requireLabel: false). ANY pod in the allowed namespaces is reachable
+  for exec: this deployment is NOT hardened. Set exec.requireLabel: true and
+  label only the workloads that should accept exec (k8s-mcp.io/exec="true").
+  Every exec attempt is audit-logged with label_gate=off while this is live.
+{{- end }}
 
 ════════════════════════════════════════════════════════════════════
 4. Verify:

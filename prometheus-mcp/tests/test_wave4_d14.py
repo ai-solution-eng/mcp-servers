@@ -32,8 +32,8 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-import webui
-from prom_client import (
+from prometheus_mcp import webui
+from prometheus_mcp.prom_client import (
     LABEL_NAME_RE,
     PromConfig,
     PrometheusClient,
@@ -152,7 +152,7 @@ class _RangeStub:
 
 
 def _call_range(stub, args):
-    import server
+    from prometheus_mcp import server
 
     async def run():
         from mcp.client._memory import InMemoryTransport
@@ -166,7 +166,7 @@ def _call_range(stub, args):
 
 
 def test_mcp_prom_query_range_clamps_and_says_so(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     monkeypatch.delenv("PROMETHEUS_MIN_STEP_SECONDS", raising=False)
     stub = _RangeStub()
@@ -179,7 +179,7 @@ def test_mcp_prom_query_range_clamps_and_says_so(monkeypatch):
 
 
 def test_mcp_prom_query_range_unclamped_has_no_notice(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     monkeypatch.delenv("PROMETHEUS_MIN_STEP_SECONDS", raising=False)
     stub = _RangeStub()
@@ -190,7 +190,7 @@ def test_mcp_prom_query_range_unclamped_has_no_notice(monkeypatch):
 
 
 def test_mcp_prom_query_range_disabled_clamp_sends_requested_step(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     monkeypatch.setenv("PROMETHEUS_MIN_STEP_SECONDS", "0")
     stub = _RangeStub()
@@ -446,7 +446,7 @@ def test_client_label_values_valid_names_reach_the_server():
 
 
 def test_mcp_prom_label_values_rejects_weird_and_accepts_valid(monkeypatch):
-    import server
+    from prometheus_mcp import server
 
     class StubClient:
         """Keeps the REAL client's label-name validation (the contract under

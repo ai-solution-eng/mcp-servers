@@ -17,7 +17,21 @@ dependencies = [
 ]
 
 [project.scripts]
-prometheus-mcp = "server:main"
+prometheus-mcp = "prometheus_mcp.server:main"
 
 [tool.setuptools]
-py-modules = ["server", "prom_client", "webui", "saved_queries", "mcp_metrics", "mcp_auth"]
+# Layout: the app modules live in the src layout under src/prometheus_mcp/ and
+# ship as the prometheus_mcp PACKAGE (package-dir points setuptools at src/).
+# Only the repo-root mcp_auth.py — the fleet hardlink, imported as a top-level
+# module — remains a top-level py-module. Every package module must be INSIDE
+# src/prometheus_mcp/ in the build context or setuptools SILENTLY omits it
+# (the W7 deploy-blocker class) — the Dockerfile COPYs the whole src/ tree.
+package-dir = {prometheus_mcp = "src/prometheus_mcp"}
+packages = ["prometheus_mcp"]
+py-modules = ["mcp_auth"]
+
+[tool.pytest.ini_options]
+# "src" makes "from prometheus_mcp import ..." resolve (tests import the
+# package absolutely); "." makes the top-level "import mcp_auth" resolve from
+# the repo root. Both entries are required when pytest runs from there.
+pythonpath = ["src", "."]

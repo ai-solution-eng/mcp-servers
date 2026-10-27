@@ -24,27 +24,39 @@ COPY pyproject.toml ./
 
 RUN uv pip install --system mcp kubernetes starlette uvicorn
 
-# mcp_metrics.py MUST be in the build context: server.py imports it
-# (Wave-3 C3) and the non-editable `uv pip install --system --no-deps .`
-# only ships what pyproject py-modules declares + what gets COPY'd here —
-# a rebuilt image crash-loops at startup without it (same class as mcp_auth).
-# App code is copied after the dependency layer (cheap code-only rebuilds);
-# MANIFEST.in ships ui/index.html in sdists (wheels from the flat layout
-# won't carry data files — the image copies ui/ explicitly and webui.py has
-# a /app/ui fallback, so this only matters for source installs).
-COPY server.py webui.py mcp_auth.py mcp_metrics.py MANIFEST.in ./
+# App code is copied after the dependency layer (cheap code-only rebuilds):
+# src/ carries the whole logsearch_mcp package (server.py imports mcp_metrics
+# — Wave-3 C3 — and webui, all inside the package now), and the fleet-
+# hardlinked mcp_auth.py stays a top-level py-module at the repo root. The
+# non-editable `uv pip install --system --no-deps .` ships exactly what
+# pyproject declares (package-dir packages + py-modules), so both COPYs are
+# required — a missing one makes the wheel SILENTLY omit the module and the
+# image crash-loops at startup (the Wave-6 deploy-blocker class).
+# MANIFEST.in ships ui/index.html in sdists (wheels don't carry data files —
+# the image copies ui/ explicitly and webui.py has a /app/ui fallback, so
+# this only matters for source installs).
+COPY src/ ./src/
+COPY mcp_auth.py MANIFEST.in ./
 # The web UI asset: webui.py falls back to /app/ui/index.html when the
 # module is installed into site-packages (the installed `logsearch-mcp`
 # script runs from there, not from /app).
 COPY ui/ ./ui/
 RUN uv pip install --system --no-deps .
 
-# Sanity gate (build-time, cheap): the local package must import with the
-# dependency closure from the RUN above — catches "dep added to pyproject
+# Sanity gate (build-time, cheap): the INSTALLED package must import with
+# the dependency closure from the RUN above — catches "dep added to pyproject
 # but not to the RUN" drift in the build log instead of as a first-query
-# ImportError in the pod. server.py imports mcp_auth AND mcp_metrics, so
-# this covers the whole py-modules list (Wave-6 packaging fix).
-RUN python -c "import server, webui, mcp_auth, mcp_metrics; from importlib.metadata import version; print('logsearch-mcp', version('logsearch-mcp'), 'imports clean')"
+# ImportError in the pod. Naming every shipped module covers the whole set:
+# the logsearch_mcp package modules (relative imports wire them together)
+# plus the top-level mcp_auth py-module (Wave-6 packaging fix, carried over
+# to the src layout).
+#
+# cd /tmp is LOAD-BEARING: from WORKDIR /app, python puts /app first on
+# sys.path, so /app/mcp_auth.py (a COPY'd build-context file) would satisfy
+# the import even if the WHEEL did not ship it — the gate would pass while
+# the installed console script crash-looped. From /tmp every name must
+# resolve out of site-packages.
+RUN cd /tmp && python -c "from logsearch_mcp import server, webui, mcp_metrics; import mcp_auth; from importlib.metadata import version; print('logsearch-mcp', version('logsearch-mcp'), 'imports clean')"
 
 # Read-only by design: run as non-root; the only cluster access is the
 # read-only Role (pods get/list + pods/log get — see helm/templates/rbac.yaml).

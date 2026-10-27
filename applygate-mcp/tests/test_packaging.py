@@ -10,16 +10,17 @@ which is why it was never seen until a rebuild.
 
 Three layers must agree, and each has a test:
 
-1. ``pyproject.toml`` declares every runtime-imported local module under
-   ``[tool.setuptools] py-modules`` (plus an AST cross-check of
-   server.py/webui.py imports so the list cannot silently drift again).
+1. ``pyproject.toml`` declares the src-layout package (``packages`` +
+   ``package-dir``) and every runtime-imported TOP-LEVEL module under
+   ``[tool.setuptools] py-modules`` (with an AST cross-check of the package
+   modules' imports so neither list can silently drift again).
 2. The Dockerfile COPYs every one of those files into the build context
    (and the existing .dockerignore excludes none of them).
 3. (skipif no local build backend) a wheel built from the tree with
    ``pip wheel --no-deps --no-build-isolation`` actually CONTAINS them all.
 
 Hermetic and offline: no network (build isolation off, --no-deps), no
-import of server.py, and the wheel build runs on a tmp COPY of the build
+import of the app modules, and the wheel build runs on a tmp COPY of the build
 inputs so the source tree stays clean (no build/ residue in git status).
 
 Known environment split (fleet unit-test convention): this suite normally
@@ -43,18 +44,21 @@ APP_DIR = Path(__file__).resolve().parent.parent
 PYPROJECT = APP_DIR / "pyproject.toml"
 DOCKERFILE = APP_DIR / "Dockerfile"
 
-# What server.py imports at runtime (verified 2026-09-13): mcp_auth only.
-# applygate has NO mcp_metrics module — its /metrics surface is inline in
-# server.py (Wave-3 C4), unlike workbench/logsearch/searxng.
-REQUIRED_MODULES = ["server", "webui", "mcp_auth"]
-REQUIRED_PACKAGES: list[str] = []
+# What the installed wheel must ship (fleet src layout): the PACKAGE under
+# src/applygate_mcp/ holding every app module, plus the TOP-LEVEL mcp_auth
+# py-module that the package's server does `import mcp_auth` for (verified
+# 2026-09-13: mcp_auth is the only local top-level import). applygate has NO
+# mcp_metrics module — its /metrics surface is inline in server (Wave-3 C4),
+# unlike workbench/logsearch/searxng.
+REQUIRED_MODULES = ["mcp_auth"]  # -> [tool.setuptools] py-modules (repo-root files)
+REQUIRED_PACKAGES = ["applygate_mcp"]  # -> [tool.setuptools] packages (src/<pkg>/)
+REQUIRED_PACKAGE_MODULES = ["server", "webui"]  # app modules inside the package
 
-# Build-context files/dirs the Dockerfile must COPY (pyproject + every
-# declared module).
+# Build-context files/dirs the Dockerfile must COPY (pyproject + the src tree
+# + every root-level py-module).
 REQUIRED_COPY_ENTRIES = [
     "pyproject.toml",
-    "server.py",
-    "webui.py",
+    "src",
     "mcp_auth.py",
 ]
 
@@ -89,8 +93,15 @@ def _local_top_level_imports(py_file: Path) -> set[str]:
             names.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module.split(".")[0])
-    # Keep only names that resolve to a local file/package in the app dir.
-    return {n for n in names if (APP_DIR / f"{n}.py").is_file() or (APP_DIR / n / "__init__.py").is_file()}
+    # Keep only names that resolve to a local file/package in the app dir, the
+    # src tree, or a package dir. Sibling modules INSIDE src/<pkg>/ are imported
+    # relatively (node.level > 0) and never reach here; an absolute `import
+    # webui` written inside the package still resolves to the package file, so
+    # the drift guard keeps its teeth after the src-layout move.
+    roots = [APP_DIR, *(APP_DIR / "src" / p for p in REQUIRED_PACKAGES)]
+    return {
+        n for n in names if any((root / f"{n}.py").is_file() or (root / n / "__init__.py").is_file() for root in roots)
+    }
 
 
 def _build_backend_available() -> bool:
@@ -107,33 +118,56 @@ def test_pyproject_declares_all_required_modules() -> None:
     assert not missing, (
         f"pyproject [tool.setuptools] py-modules is missing {missing}; the "
         "non-editable image install would crash-loop at startup "
-        "(ModuleNotFoundError) because server.py imports them"
+        "(ModuleNotFoundError) because the package's server imports them"
     )
 
 
+def test_pyproject_declares_the_src_package() -> None:
+    """Layer 1 for the fleet src layout: the package must be mapped via
+    package-dir/packages AND every app module must actually live inside it.
+    setuptools SILENTLY OMITS a module that is not inside a declared package,
+    so a module left behind at the repo root ships nothing — the same
+    crash-loop class this file exists for."""
+    config = _setuptools_config()
+    missing = [p for p in REQUIRED_PACKAGES if p not in set(config.get("packages", []))]
+    assert not missing, (
+        f"pyproject [tool.setuptools] packages is missing {missing}; the wheel "
+        "would carry no app code and the image would crash-loop at startup"
+    )
+    package_dir = config.get("package-dir", {})
+    for pkg in REQUIRED_PACKAGES:
+        assert package_dir.get(pkg) == f"src/{pkg}", (
+            f"[tool.setuptools] package-dir must map {pkg} -> src/{pkg} (got {package_dir.get(pkg)!r})"
+        )
+        for module in REQUIRED_PACKAGE_MODULES:
+            path = APP_DIR / "src" / pkg / f"{module}.py"
+            assert path.is_file(), f"missing app module {path} — the src-layout move left it behind"
+
+
 def test_pyproject_modules_cover_all_local_imports() -> None:
-    """AST drift-guard: every local top-level import of server.py/webui.py
+    """AST drift-guard: every local top-level import of the package modules
     must be declared. New local import without a py-modules update = the
     next image build crash-loops."""
     declared = set(_setuptools_config().get("py-modules", [])) | set(_setuptools_config().get("packages", []))
     imported: set[str] = set()
-    for src in ("server.py", "webui.py"):
-        path = APP_DIR / src
-        if path.is_file():
-            imported |= _local_top_level_imports(path)
+    for pkg in REQUIRED_PACKAGES:
+        for module in REQUIRED_PACKAGE_MODULES:
+            path = APP_DIR / "src" / pkg / f"{module}.py"
+            if path.is_file():
+                imported |= _local_top_level_imports(path)
     undeclared = imported - declared
     assert not undeclared, (
-        f"server.py/webui.py import local modules {sorted(undeclared)} that "
+        f"the package modules import local modules {sorted(undeclared)} that "
         f"pyproject does not declare (declared: {sorted(declared)})"
     )
 
 
 def test_console_script_entry_point_pins_server_main() -> None:
-    """The image CMD runs the installed console script = server:main — the
-    whole crash class exists because THAT import must resolve from
+    """The image CMD runs the installed console script = applygate_mcp.server:main
+    — the whole crash class exists because THAT import must resolve from
     site-packages. Pin the mapping so it cannot be renamed silently."""
     scripts = _pyproject().get("project", {}).get("scripts", {})
-    assert scripts.get("applygate-mcp") == "server:main"
+    assert scripts.get("applygate-mcp") == "applygate_mcp.server:main"
 
 
 # ---------------------------------------------------------------- layer 2
@@ -217,3 +251,9 @@ def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
             f"wheel {wheels[0].name} does not contain {module}.py — the "
             "image would crash-loop at startup (ModuleNotFoundError)"
         )
+    for pkg in REQUIRED_PACKAGES:
+        for module in REQUIRED_PACKAGE_MODULES:
+            assert f"{pkg}/{module}.py" in names, (
+                f"wheel {wheels[0].name} does not contain {pkg}/{module}.py — "
+                "the image would crash-loop at startup (ModuleNotFoundError)"
+            )

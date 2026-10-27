@@ -20,17 +20,13 @@ Run:
 
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import yaml
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-import server
-import webui
+from applygate_mcp import server, webui
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers (same conventions as tests/test_applygate.py)

@@ -21,8 +21,7 @@ from contextlib import contextmanager
 
 import pytest
 
-import mcp_metrics
-import server
+from logsearch_mcp import mcp_metrics, server
 
 
 class FakeRequest:
@@ -146,7 +145,7 @@ def test_counters_export_no_sensitive_fields(monkeypatch):
 def test_fallback_backend_renders_prom_text_format():
     if mcp_metrics._HAVE_PROMETHEUS_CLIENT:
         pytest.skip("prometheus_client installed — fallback not active here")
-    from mcp_metrics import _MiniCounter
+    from logsearch_mcp.mcp_metrics import _MiniCounter
 
     c = _MiniCounter("demo_total", "demo help", ("tool", "outcome"))
     c.inc(("a", "ok"))

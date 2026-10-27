@@ -9,14 +9,14 @@ import asyncio
 
 import pytest
 
-from browser_client import (
+from searxng_mcp.browser_client import (
     RENDER_MODES,
     BrowserClient,
     BrowserError,
     BrowserUnavailable,
     RenderedPage,
 )
-from fetcher import WebContentFetcher
+from searxng_mcp.fetcher import WebContentFetcher
 
 RICH_HTML = """
 <html><head><title>Rich</title></head><body>
@@ -396,7 +396,7 @@ def test_wikipedia_url_skips_browser_and_uses_api(monkeypatch):
 
 
 def test_fetch_content_schema_has_render_and_screenshot():
-    import server
+    from searxng_mcp import server
 
     tools = asyncio.run(server.mcp.list_tools())
     fc = next(t for t in tools if t.name == "fetch_content")
@@ -411,7 +411,7 @@ def test_fetch_content_rejects_unknown_render_over_wire():
     from mcp.client._memory import InMemoryTransport
     from mcp.client.session import ClientSession
 
-    import server
+    from searxng_mcp import server
 
     async def run_wire():
         async with InMemoryTransport(server.mcp) as streams, ClientSession(streams[0], streams[1]) as session:

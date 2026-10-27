@@ -19,8 +19,8 @@ import time
 
 import pytest
 
-import server
-from server import WorkbenchError
+from workbench_mcp import server
+from workbench_mcp.server import WorkbenchError
 
 
 def call(fn, *args, **kwargs):
@@ -98,6 +98,143 @@ def test_audit_jsonl_is_denied_to_commands(root, allowexec):
     for ref in ["../.audit.jsonl", f"{root}/.audit.jsonl", f"{root}/./.audit.jsonl"]:
         with pytest.raises(WorkbenchError, match="WORKBENCH_SHARED_PATHS"):
             call(server.run_command, "ws", ["cat", ref])
+
+
+# ---------------------------------------------------------------------------
+# D7 round 2 (P0, 2026-10-20): the literal-token screen is not enough.
+#
+# `_assert_argv_confined` inspects argv TOKENS, so a path computed at RUNTIME
+# inside a delegation flag never appears literally and sailed through. Verified
+# live before the fix: from wsB, `cat ../wsA/secret.txt` was refused while
+# `find . -exec sh -c 'cat $PWD/../wsA/secret.txt'` returned the secret. D18
+# removed interpreters for this exact reason, but allow-listed binaries
+# re-opened the hole. These pin the closed behaviour.
+# ---------------------------------------------------------------------------
+
+# Each case delegates execution to a second program. The payload is benign
+# (".", or a path INSIDE the workspace) so the literal-token confinement in
+# _assert_argv_confined cannot be what refuses it — only the new
+# secondary-execution screen can. That distinction matters: the original
+# exploit worked precisely because the payload's path never appeared literally.
+_DELEGATION_FLAGS = [
+    ["find", ".", "-maxdepth", "0", "-exec", "cat", "self.txt", ";"],
+    ["find", ".", "-execdir", "cat", "self.txt", ";"],
+    ["find", ".", "-ok", "cat", "self.txt", ";"],
+    ["find", ".", "-okdir", "cat", "self.txt", ";"],
+    ["tar", "-cf", "/dev/null", "--checkpoint=1", "--checkpoint-action=exec=cat self.txt", "."],
+    ["tar", "-cf", "/dev/null", "--to-command=cat self.txt", "."],
+    ["tar", "-cf", "/dev/null", "--use-compress-program=sh", "."],
+]
+
+
+@pytest.mark.parametrize("argv", _DELEGATION_FLAGS)
+def test_delegation_flags_are_refused_even_with_an_inside_path(root, allowexec, argv):
+    """Secondary-execution flags are refused outright — not merely confined.
+
+    A benign in-workspace payload proves the refusal comes from the flag
+    screen itself, so the same flag carrying a runtime-computed path (which no
+    token screen can see) is also refused.
+    """
+    _two_workspaces(root)
+    call(server.write_file, "wsB", "self.txt", "benign")
+    with pytest.raises(WorkbenchError, match="runs another program"):
+        call(server.run_command, "wsB", argv)
+
+
+def test_runtime_computed_escape_is_refused(root, allowexec):
+    """The exact live exploit: no literal '..' token, path built at runtime.
+
+    Before the fix this returned wsA's secret from wsB.
+    """
+    _two_workspaces(root)
+    with pytest.raises(WorkbenchError, match="runs another program"):
+        call(
+            server.run_command,
+            "wsB",
+            ["find", ".", "-maxdepth", "0", "-exec", "sh", "-c", "cat $PWD/../wsA/secret.txt", ";"],
+        )
+    # and the secret is still only in wsA
+    assert "TOPSECRET" in json.loads(call(server.read_file, "wsA", "secret.txt"))["content"]
+
+
+def test_runtime_computed_escape_via_tar_is_refused(root, allowexec):
+    """The tar variant of the same live exploit."""
+    _two_workspaces(root)
+    with pytest.raises(WorkbenchError, match="runs another program"):
+        call(
+            server.run_command,
+            "wsB",
+            ["tar", "-cf", "/dev/null", "--checkpoint=1", "--checkpoint-action=exec=cat $PWD/../wsA/secret.txt", "."],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Allowlist round 2 (P0, 2026-10-20): a path-typed argv[0] was executed as
+# given after only its BASENAME was allowlist-checked, so `cp /bin/sh ./git`
+# then `./git -c 'id'` produced a shell. Now the resolved target must live on
+# the server PATH (i.e. not be a file the workspace could have written).
+# ---------------------------------------------------------------------------
+
+
+def test_planted_binary_by_path_is_refused(root, allowexec, monkeypatch):
+    _two_workspaces(root)
+    # 'git' must be allowlisted for this to reach the location check at all
+    monkeypatch.setenv(
+        "WORKBENCH_EXEC_ALLOWLIST", "cat,ls,cp,find,tar,git,diff,sort,uniq,wc,du,head,tail,grep,mv,touch,mkdir"
+    )
+    # planting succeeds — writing inside your own workspace is legitimate
+    call(server.run_command, "wsB", ["cp", "/bin/sh", "./git"])
+    with pytest.raises(WorkbenchError, match="not in any directory on the server PATH"):
+        call(server.run_command, "wsB", ["./git", "-c", "echo PWNED"])
+
+
+def test_planted_binary_cannot_shadow_an_allowlisted_name(root, allowexec, monkeypatch):
+    """The precise bypass: argv[0]='./git' has basename 'git', which IS
+    allowlisted, so only the location check stops it. Pin that an allowlisted
+    basename alone is not sufficient."""
+    _two_workspaces(root)
+    monkeypatch.setenv(
+        "WORKBENCH_EXEC_ALLOWLIST", "cat,ls,cp,find,tar,git,diff,sort,uniq,wc,du,head,tail,grep,mv,touch,mkdir"
+    )
+    call(server.run_command, "wsB", ["cp", "/bin/sh", "./git"])
+    with pytest.raises(WorkbenchError, match="not in any directory on the server PATH"):
+        call(server.run_command, "wsB", ["./git", "-c", "echo PWNED"])
+    # the real git still works by name
+    out = json.loads(call(server.run_command, "wsB", ["git", "--version"]))
+    assert out["exit_code"] == 0
+
+
+def test_planted_binary_relative_subpath_is_refused(root, allowexec):
+    _two_workspaces(root)
+    call(server.run_command, "wsB", ["mkdir", "bin"])
+    call(server.run_command, "wsB", ["cp", "/bin/sh", "bin/ls"])
+    with pytest.raises(WorkbenchError, match="not in any directory on the server PATH"):
+        call(server.run_command, "wsB", ["bin/ls"])
+
+
+def test_real_system_binary_by_path_passes_the_location_guard(root, allowexec):
+    """The fix must not break legitimate absolute-path invocation.
+
+    Asserts the GUARD's verdict, not the child's exit code: this test env
+    ships uu-coreutils, whose multi-call binary misparses when invoked by
+    absolute path ("coreutils: unknown program '.'"), so an exit-code
+    assertion would test coreutils, not our confinement. What matters here is
+    that a genuine system binary is NOT refused by the location check.
+    """
+    import shutil as _shutil
+
+    ls_path = _shutil.which("ls")
+    assert ls_path, "test requires a real ls on the server PATH"
+    call(server.workspace_create, "ws")
+    out = json.loads(call(server.run_command, "ws", [ls_path, "."]))
+    # reached execution (no WorkbenchError) => the guard admitted the path
+    assert "exit_code" in out
+
+
+def test_plain_binary_name_still_runs(root, allowexec):
+    call(server.workspace_create, "ws")
+    out = json.loads(call(server.run_command, "ws", ["ls", "."]))
+    assert out["exit_code"] == 0
     # ...and not writable either
     with pytest.raises(WorkbenchError, match="WORKBENCH_SHARED_PATHS"):
         call(server.run_command, "ws", ["touch", "../.audit.jsonl"])
