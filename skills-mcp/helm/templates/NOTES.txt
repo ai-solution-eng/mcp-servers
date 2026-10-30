@@ -1,0 +1,26 @@
+{{- $ns := .Release.Namespace -}}
+{{- $secret := .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) -}}
+
+skills-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namespace {{ $ns }}.
+
+  in-cluster MCP URL: http://{{ .Values.deployment.name }}-service.{{ $ns }}.svc.cluster.local:{{ .Values.service.port }}/mcp
+  probes (no key):    /healthz
+
+API key
+  Secret: {{ $secret }} (key: {{ .Values.apiKey.existingSecretKey }})
+  {{- if .Values.apiKey.existingSecret }}
+  Operator-created — the pod stays in CreateContainerConfigError until it exists:
+    kubectl -n {{ $ns }} create secret generic {{ $secret }} \
+      --from-literal="{{ .Values.apiKey.existingSecretKey }}=$(openssl rand -hex 32)"
+  {{- else }}
+  Created by this chart from apiKey.value (DEMO mode — never use on a shared site).
+  {{- end }}
+
+Skills source
+  paths:    {{ .Values.skills.sourcePaths }}
+  tarball:  {{ .Values.skills.sourceUrl | default "<unset: bundled snapshot only>" }}
+  ref:      {{ .Values.skills.sourceRef }}   every {{ .Values.skills.refreshIntervalS }}s
+
+Refresh on demand (behind the API key):
+  curl -sS -X POST -H "Authorization: Bearer <key>" \
+    http://{{ .Values.deployment.name }}-service.{{ $ns }}.svc.cluster.local:{{ .Values.service.port }}/admin/refresh
