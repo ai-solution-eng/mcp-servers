@@ -39,7 +39,7 @@ PACKAGE_SRC = APP_DIR / "src" / PACKAGE
 
 # Modules inside the package that must ship. Add new ones here as the server
 # grows (catalog.py arrives in step 2) — the AST test catches the omission too.
-REQUIRED_PACKAGE_MODULES = ["server"]
+REQUIRED_PACKAGE_MODULES = ["server", "catalog", "state", "refresh"]
 # Top-level modules at the repo root that must ship (the fleet hardlink).
 REQUIRED_TOP_LEVEL_MODULES = ["mcp_auth"]
 REQUIRED_PACKAGES = [PACKAGE]

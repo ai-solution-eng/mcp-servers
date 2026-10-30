@@ -18,7 +18,7 @@ RUN apt-get update \
 # re-resolves and re-downloads every dependency. This list must stay equal to
 # [project].dependencies — the sanity gate at the bottom catches drift.
 COPY pyproject.toml ./
-RUN uv pip install --system mcp starlette uvicorn
+RUN uv pip install --system mcp starlette uvicorn pyyaml
 
 # App code after the dependency layer (cheap code-only rebuilds). The
 # non-editable install ships exactly what pyproject declares (package-dir
@@ -38,7 +38,7 @@ ARG SKILLS_REF=main
 ADD https://codeload.github.com/${SKILLS_REPO}/tar.gz/${SKILLS_REF} /tmp/tools.tar.gz
 RUN mkdir -p /opt/skills-bundled \
     && tar -xzf /tmp/tools.tar.gz -C /tmp \
-    && cp -r /tmp/tools-*/skills/. /opt/skills-bundled/ \
+    && cp -r /tmp/tools-*/skills* /opt/skills-bundled/ \
     && printf '%s' "${SKILLS_REF}" > /opt/skills-bundled/.ref \
     && rm -rf /tmp/tools*
 

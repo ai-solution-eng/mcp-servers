@@ -36,6 +36,14 @@ GitHub          (same public tarball)    -> replaces the working copy, on demand
 merges. It validates before swapping, so a bad pull keeps the old catalogue
 serving. The pod is a cache; the repo is the truth.
 
+## Admin endpoints (same API key as /mcp)
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /admin/refresh` | fetch `SKILLS_SOURCE_URL/<ref>` → extract only `SKILLS_SOURCE_PATHS` → parse → **abort if 0 skills** → new release dir → atomic symlink swap → prune to 3. Failure = HTTP 502 and the old catalogue keeps serving. |
+| `GET /admin/status` | what is served (origin/ref/commit/refreshed_at/count/warnings/source_dir) plus refresh config and the last error. |
+| `GET /healthz` | probes, key-free: `{"status","server","skills","origin"}`. |
+
 ## Run it locally
 
 ```bash
@@ -65,6 +73,7 @@ curl -s -X POST localhost:9101/mcp \
 | `SKILLS_ROOT` | `/data` | Where `releases/` and the `skills-current` symlink live. |
 | `SKILLS_BUNDLED_ROOT` | `/opt/skills-bundled` | The snapshot baked into the image. |
 | `MCP_HOSTNAME` | *(chart sets it)* | Pinned public FQDN. **Required when gateway-fronted** or every request is a 421. |
+| `SKILLS_MCP_API_KEYS` | *(unset)* | Keys for `/mcp` **and** `/admin/*`. Unset = fail open (local only). |
 
 ## Deploy
 
