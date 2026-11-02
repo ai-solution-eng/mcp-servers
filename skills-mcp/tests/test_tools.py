@@ -1,7 +1,7 @@
 """Unit tests for the three MCP tools.
 
 The tools are plain async functions (the SDK decorator returns the function),
-so they are called directly with asyncio.run — no server, no HTTP, no MCP
+so they are called directly with asyncio.run: no server, no HTTP, no MCP
 handshake. State is injected per test via server.set_state().
 """
 
@@ -58,7 +58,7 @@ def _isolate(monkeypatch):
     server.set_state(server.State(catalog=Catalog(), source=server.Source(origin="test")))
 
 
-# ---------------------------------------------------------------- list_skills
+# list_skills
 
 
 def test_list_skills_returns_the_catalogue(tmp_path: Path) -> None:
@@ -92,7 +92,7 @@ def test_list_skills_has_files_flag(tmp_path: Path) -> None:
     assert rows["loaded"]["has_files"] is True
 
 
-# ---------------------------------------------------------------- get_skill
+# get_skill
 
 
 def test_get_skill_returns_body_files_and_related(tmp_path: Path) -> None:
@@ -133,7 +133,7 @@ def test_get_skill_unknown_name_lists_valid_ones(tmp_path: Path) -> None:
     assert payload["valid_names"] == ["alpha"]
 
 
-# ---------------------------------------------------------------- get_skill_file
+# get_skill_file
 
 
 def test_get_skill_file_returns_text(tmp_path: Path) -> None:
@@ -217,7 +217,7 @@ def test_get_skill_file_unknown_skill(tmp_path: Path) -> None:
     assert payload["valid_names"] == ["alpha"]
 
 
-# ---------------------------------------------------------------- registration
+# registration
 
 
 def test_exactly_three_tools_are_exposed() -> None:

@@ -1,6 +1,6 @@
 """Load, validate and index skill folders.
 
-A SKILL is a directory directly under a configured source path that contains a
+A skill is a directory directly under a configured source path that contains a
 ``SKILL.md`` with YAML frontmatter::
 
     ---
@@ -9,18 +9,15 @@ A SKILL is a directory directly under a configured source path that contains a
     ---
     <markdown body>
 
-Nothing else counts. No recursion, no ``*.bak*`` files, no ``__pycache__``:
-a backup file carrying the same `name:` as its live sibling would otherwise
-serve LAST WEEK's instructions under today's name, silently.
+Nothing else counts: no recursion, no ``*.bak*`` files, no ``__pycache__``. A
+backup file carrying the same `name:` as its live sibling would otherwise serve
+last week's instructions under today's name, silently.
 
-Two rules this module exists to enforce:
-
-1. **Strict contract, loud failures.** A skill that does not parse is SKIPPED
-   and recorded as a warning — never half-loaded, never a crash. The warnings
-   surface in /admin/status so a broken file is visible, not invisible.
-2. **Cheap catalogue.** Loading a skill reads its SKILL.md once and keeps the
-   body in memory (the whole corpus is ~200 KB). `files` is names only — file
-   CONTENT is read on demand by `get_skill_file`, never here.
+A skill that does not parse is skipped and recorded as a warning, never
+half-loaded and never a crash. Warnings surface in /admin/status so a broken
+file is visible. Loading reads each SKILL.md once and keeps the body in memory
+(the whole corpus is ~200 KB); `files` is names only, and file content is read
+on demand by `get_skill_file`.
 """
 
 from __future__ import annotations
@@ -40,8 +37,8 @@ SKILL_FILE = "SKILL.md"
 # "a-", "-a" and "a_b" are all rejected.
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-# Clients truncate descriptions around 500 chars — and every author puts the
-# "do NOT use this for X" hint at the END, so a long description loses exactly
+# Clients truncate descriptions around 500 chars, and every author puts the
+# "do NOT use this for X" hint at the end, so a long description loses exactly
 # the routing information that makes it useful. Warn well before the cliff.
 DESCRIPTION_WARN_CHARS = 400
 
@@ -71,12 +68,12 @@ class Skill:
     directory: Path
     #: Files inside the skill directory (POSIX relative paths), SKILL.md excluded.
     files: tuple[str, ...] = ()
-    #: Non-fatal problems found while loading THIS skill (e.g. long description).
+    #: Non-fatal problems found while loading this skill (e.g. long description).
     warnings: tuple[str, ...] = ()
 
     def catalogue_row(self) -> dict:
-        """The cheap row ``list_skills`` returns — name, description, has_files.
-        Never the body: the catalogue is loaded on every agent turn."""
+        """The cheap row ``list_skills`` returns: name, description, has_files.
+        Never the body, because the catalogue is loaded on every agent turn."""
         return {
             "name": self.name,
             "description": self.description,
@@ -139,7 +136,7 @@ def is_ignored_file(name: str) -> bool:
 
 def _skill_files(directory: Path) -> tuple[str, ...]:
     """Every file inside the skill directory except SKILL.md, backups, and
-    bytecode — POSIX relative paths, sorted (deterministic output)."""
+    bytecode: POSIX relative paths, sorted (deterministic output)."""
     found: list[str] = []
     for entry in sorted(directory.rglob("*")):
         rel = entry.relative_to(directory)
@@ -156,7 +153,7 @@ def _skill_files(directory: Path) -> tuple[str, ...]:
 
 
 def load_skill(directory: Path) -> Skill:
-    """Load ONE skill directory. Raises SkillError when it is not a valid skill."""
+    """Load one skill directory. Raises SkillError when it is not a valid skill."""
     skill_md = directory / SKILL_FILE
     if not skill_md.is_file():
         raise SkillError(f"no {SKILL_FILE}")
@@ -205,8 +202,8 @@ def load_catalog(root: Path | str, source_paths: Sequence[str] = ("skills",)) ->
     """Load every skill under ``root/<source path>/<skill dir>/SKILL.md``.
 
     ``root`` is the checkout (or the extracted tarball, or the working copy);
-    ``source_paths`` are the folders inside it to read — the demo/team switch.
-    A source path that does not exist is a WARNING, not an error: one bad path
+    ``source_paths`` are the folders inside it to read (the demo/team switch).
+    A source path that does not exist is a warning, not an error: one bad path
     must not blank the catalogue.
     """
     root = Path(root)

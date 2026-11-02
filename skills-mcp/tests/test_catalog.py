@@ -1,4 +1,4 @@
-"""Unit tests for the skill loader — the contract, one rule per test.
+"""Unit tests for the skill loader: the contract, one rule per test.
 
 Every test builds its own tiny tree in tmp_path: no dependence on the real
 skills repo, so the suite is fast and hermetic.
@@ -39,7 +39,7 @@ def make_skill(
     return directory
 
 
-# ------------------------------------------------------------------ loading
+# loading
 
 
 def test_loads_a_valid_skill(tmp_path: Path) -> None:
@@ -106,7 +106,7 @@ def test_no_recursion_into_subdirectories(tmp_path: Path) -> None:
     assert catalog.names() == ["alpha"]
 
 
-# ------------------------------------------------------------------ rejection
+# rejection
 
 
 def test_name_must_match_folder(tmp_path: Path) -> None:
@@ -154,7 +154,7 @@ def test_missing_description_is_skipped(tmp_path: Path) -> None:
     assert any("no 'description'" in warning for warning in catalog.warnings)
 
 
-# ------------------------------------------------------------------ warnings
+# warnings
 
 
 def test_long_description_warns_but_loads(tmp_path: Path) -> None:
@@ -195,7 +195,7 @@ def test_empty_catalog_is_not_an_error(tmp_path: Path) -> None:
     assert catalog.names() == []
 
 
-# ------------------------------------------------------------------ primitives
+# primitives
 
 
 def test_split_frontmatter_returns_mapping_and_body() -> None:

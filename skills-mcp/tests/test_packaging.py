@@ -1,14 +1,14 @@
-"""Packaging regression tests — the "wheel built fine, pod crash-loops" class.
+"""Packaging regression tests: the "wheel built fine, pod crash-loops" class.
 
 The image installs NON-editable (``uv pip install --system .``) and runs the
 installed ``skills-mcp`` console script from site-packages. Any module the
 server imports that the wheel does NOT ship makes the container crash-loop at
-startup with ModuleNotFoundError — while the build stays green. Three layers
+startup with ModuleNotFoundError, while the build stays green. Three layers
 must agree, and each has a test:
 
 1. pyproject.toml declares the app as the ``skills_mcp`` PACKAGE
    (package-dir -> src/skills_mcp) with the fleet-hardlinked ``mcp_auth`` as
-   the only top-level py-module — plus an AST cross-check of the package's
+   the only top-level py-module, plus an AST cross-check of the package's
    imports so that list cannot drift silently.
 2. The Dockerfile COPYs every one of those files into the build context (and
    .dockerignore excludes none of them).
@@ -38,7 +38,7 @@ PACKAGE = "skills_mcp"
 PACKAGE_SRC = APP_DIR / "src" / PACKAGE
 
 # Modules inside the package that must ship. Add new ones here as the server
-# grows (catalog.py arrives in step 2) — the AST test catches the omission too.
+# grows; the AST test catches the omission too.
 REQUIRED_PACKAGE_MODULES = ["server", "catalog", "state", "refresh"]
 # Top-level modules at the repo root that must ship (the fleet hardlink).
 REQUIRED_TOP_LEVEL_MODULES = ["mcp_auth"]
@@ -63,7 +63,7 @@ def _copy_sources() -> set[str]:
         stripped = line.strip()
         if stripped.startswith("COPY ") and not stripped.startswith("COPY --"):
             parts = stripped.split()
-            # COPY <src...> <dest> — last token is the destination.
+            # COPY <src...> <dest>: the last token is the destination.
             sources.update(p.rstrip("/") for p in parts[1:-1])
     return sources
 
@@ -100,7 +100,7 @@ def _build_backend_available() -> bool:
     )
 
 
-# ---------------------------------------------------------------- layer 1
+# layer 1
 
 
 def test_pyproject_declares_all_required_modules() -> None:
@@ -116,10 +116,11 @@ def test_pyproject_declares_all_required_modules() -> None:
 
 
 def test_pyproject_modules_cover_all_local_imports() -> None:
-    """AST drift-guard: every local import in the package must be declared —
-    relative imports wire the src-layout package together, so the PACKAGE must
+    """AST drift-guard: every local import in the package must be declared.
+    Relative imports wire the src-layout package together, so the package must
     be declared, and the repo-root fleet module must stay a py-module. A new
-    local import without a pyproject update = the next image build crash-loops."""
+    local import without a pyproject update means the next image build
+    crash-loops."""
     declared = set(_setuptools_config().get("py-modules", []))
     packages = set(_setuptools_config().get("packages", []))
     imported: set[str] = set()
@@ -136,14 +137,14 @@ def test_pyproject_modules_cover_all_local_imports() -> None:
 
 
 def test_console_script_entry_point_pins_server_main() -> None:
-    """The image CMD runs the installed console script = server:main — the
-    whole crash class exists because THAT import must resolve from
+    """The image CMD runs the installed console script = server:main, the
+    whole crash class exists because that import must resolve from
     site-packages. Pin the mapping so it cannot be renamed silently."""
     scripts = _pyproject().get("project", {}).get("scripts", {})
     assert scripts.get("skills-mcp") == f"{PACKAGE}.server:main"
 
 
-# ---------------------------------------------------------------- layer 2
+# layer 2
 
 
 def test_dockerfile_copies_all_build_context_files() -> None:
@@ -172,20 +173,20 @@ def test_dockerignore_does_not_exclude_required_entries() -> None:
     assert not hit, f".dockerignore excludes build-required entries: {hit}"
 
 
-# ---------------------------------------------------------------- layer 3
+# layer 3
 
 
 @pytest.mark.skipif(
     not _build_backend_available(),
-    reason="no local build backend (setuptools) in this interpreter — the "
+    reason="no local build backend (setuptools) in this interpreter, so the "
     "wheel-content proof runs in the image build's sanity gate instead",
 )
 def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
     """Deterministic offline proof: build the wheel from a tmp COPY of EXACTLY
     the build context the Dockerfile COPY lines would assemble, and assert
     every required module is inside. Derived from the Dockerfile (not a
-    hand-maintained list) so the two layers cannot disagree — a declared
-    py-module missing from the build context is SILENTLY OMITTED by setuptools,
+    hand-maintained list) so the two layers cannot disagree: a declared
+    py-module missing from the build context is silently omitted by setuptools,
     which is precisely how this crash class ships unnoticed."""
     src = tmp_path / "build-src"
     src.mkdir()
@@ -213,10 +214,10 @@ def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
     for module in REQUIRED_PACKAGE_MODULES:
         assert f"{PACKAGE}/{module}.py" in names, (
             f"wheel {wheels[0].name} does not contain {PACKAGE}/{module}.py "
-            "— the image would crash-loop at startup (ModuleNotFoundError)"
+            ": the image would crash-loop at startup (ModuleNotFoundError)"
         )
     for module in REQUIRED_TOP_LEVEL_MODULES:
         assert f"{module}.py" in names, (
-            f"wheel {wheels[0].name} does not contain {module}.py — the image "
+            f"wheel {wheels[0].name} does not contain {module}.py: the image "
             "would crash-loop at startup (ModuleNotFoundError)"
         )

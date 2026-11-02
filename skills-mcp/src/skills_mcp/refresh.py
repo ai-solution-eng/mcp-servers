@@ -1,15 +1,15 @@
-"""Refresh the skills catalogue from the tools repo — replace, never merge.
+"""Refresh the skills catalogue from the tools repo: replace, never merge.
 
-Three layers, one rule (git wins, the pod is a cache):
+Three layers:
 
   bundled snapshot (image)  ->  seeds the working copy when it is empty
   working copy (/data)      ->  what the tools read, via the skills-current symlink
-  GitHub tarball            ->  REPLACES the working copy, on demand or on a timer
+  GitHub tarball            ->  replaces the working copy, on demand or on a timer
 
-A refresh is: download -> extract ONLY the source paths -> parse every SKILL.md
--> if zero skills parsed, ABORT -> write a new release dir -> swap the symlink
-in ONE os.replace() -> prune old releases. A failure at any step leaves the
-previous release serving: there is no half-updated catalogue.
+A refresh is: download, extract only the source paths, parse every SKILL.md,
+abort if zero skills parsed, write a new release dir, swap the symlink in one
+os.replace(), prune old releases. A failure at any step leaves the previous
+release serving, so there is no half-updated catalogue.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def _now_iso() -> str:
 
 def ensure_working_copy() -> State | None:
     """Return the state for the current working copy, seeding it from the
-    bundled snapshot when it is missing or unreadable. None = no source at all."""
+    bundled snapshot when it is missing or unreadable. None means no source."""
     root = root_dir()
     link = root / CURRENT_LINK
 
@@ -194,8 +194,8 @@ def refresh_from_source() -> dict:
                     shutil.rmtree(final)
                 shutil.move(str(release), str(final))
 
-                # THE swap: one atomic os.replace of the symlink. Readers either
-                # see the old release or the new one, never a half-written tree.
+                # One atomic os.replace of the symlink. Readers either see the
+                # old release or the new one, never a half-written tree.
                 _swap_link(root, final)
                 served = load_state(final, source)
                 state_mod.set_state(served)
@@ -251,10 +251,10 @@ def _download(url: str, dest: Path) -> None:
 
 
 def _extract(tar_path: Path, dest: Path, sources: list[str]) -> None:
-    """Extract ONLY <top>/<source path>/... members, safely.
+    """Extract only <top>/<source path>/... members, safely.
 
     Members are written one by one: no symlinks, no devices, no absolute paths
-    and no '..' — a tarball is untrusted input even when it comes from GitHub.
+    and no '..'. A tarball is untrusted input even when it comes from GitHub.
     """
     with tarfile.open(tar_path, "r:gz") as archive:
         members = [m for m in archive.getmembers() if m.name]
@@ -308,7 +308,7 @@ _CODELOAD_RE = re.compile(
 
 def _resolve_commit(url: str, ref: str) -> str | None:
     """Best-effort commit sha for the fetched ref. None is fine (rate limit,
-    no network, a non-GitHub URL) — the refresh itself already succeeded."""
+    no network, a non-GitHub URL); the refresh itself already succeeded."""
     match = _CODELOAD_RE.match(url)
     if not match:
         return None

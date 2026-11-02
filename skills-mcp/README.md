@@ -21,10 +21,7 @@ tools per key, default-deny, with no wildcard — one tool per skill would mean
 every new skill is invisible and uncallable until a human adds a grant row.
 The catalogue is data.
 
-> Status: step 1 skeleton (transport, auth, health). The loader and the three
-> tools are the next two steps.
-
-## How skills get in (three layers, one rule)
+## How skills get in
 
 ```
 bundled snapshot (baked into the image)  -> seeds the working copy on boot
@@ -65,7 +62,7 @@ curl -s -X POST localhost:9101/mcp \
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `SKILLS_MCP_API_KEYS` | *(unset)* | Comma-separated keys for `/mcp`. **Unset = fail open** (local only). |
+| `SKILLS_MCP_API_KEYS` | *(unset)* | Comma-separated keys for `/mcp` **and** `/admin/*`. **Unset = fail open** (local only). |
 | `SKILLS_SOURCE_PATHS` | `skills` | Comma list of folders in the repo to load. The demo/team switch. |
 | `SKILLS_SOURCE_URL` | *(unset)* | Tarball base URL. Unset = refresh disabled, bundled snapshot only. |
 | `SKILLS_SOURCE_REF` | `main` | Branch, tag or commit sha to fetch. |
@@ -73,10 +70,9 @@ curl -s -X POST localhost:9101/mcp \
 | `SKILLS_ROOT` | `/data` | Where `releases/` and the `skills-current` symlink live. |
 | `SKILLS_BUNDLED_ROOT` | `/opt/skills-bundled` | The snapshot baked into the image. |
 | `MCP_HOSTNAME` | *(chart sets it)* | Pinned public FQDN. **Required when gateway-fronted** or every request is a 421. |
-| `SKILLS_MCP_API_KEYS` | *(unset)* | Keys for `/mcp` **and** `/admin/*`. Unset = fail open (local only). |
 
 ## Deploy
 
 `helm/` is a PCAI-ported chart (VirtualService on `istio-system/ezaf-gateway`).
-Import it as an EzAppConfig — see `documentation/DEPLOYMENT.md` (step 6).
+Import it as an EzAppConfig.
 The server needs **zero Kubernetes RBAC**: it reads files, not the cluster.

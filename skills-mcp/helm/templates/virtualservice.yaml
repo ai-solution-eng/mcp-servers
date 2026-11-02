@@ -25,7 +25,7 @@ spec:
             port:
               number: {{ .Values.service.port }}
       timeout: {{ .Values.ezua.virtualService.timeout }}
-    # Everything else: /healthz and the human status page — routed to the same
+    # Everything else: /healthz and the human status page, routed to the same
     # service so a browser hitting the edge host gets an answer, not a 404.
     - match:
         - uri:

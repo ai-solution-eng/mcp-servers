@@ -32,7 +32,7 @@ spec:
           env:
             # ---- API key for /mcp (comma-separated = zero-downtime rotation)
             # From the operator-created Secret (fleet mode) or the Secret this
-            # chart creates from apiKey.value (demo mode) — same name either way.
+            # chart creates from apiKey.value (demo mode); same name either way.
             - name: SKILLS_MCP_API_KEYS
               valueFrom:
                 secretKeyRef:
@@ -53,7 +53,7 @@ spec:
               value: {{ .Values.skills.bundledRoot | quote }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
             {{- if $transportActive }}
-            # Public FQDN — pins the Host header (DNS-rebinding protection ON).
+            # Public FQDN: pins the Host header (DNS-rebinding protection on).
             # Gateway-fronted without this pin = every request answers 421.
             - name: MCP_HOSTNAME
               value: {{ .Values.ezua.virtualService.endpoint | quote }}
@@ -92,7 +92,7 @@ spec:
             - name: skills-data
               mountPath: {{ .Values.skills.root }}
           # /healthz is served by the same Starlette app as /mcp and needs no
-          # MCP handshake — stateless MCP 2.0 keeps every replica equivalent.
+          # MCP handshake: stateless MCP 2.0 keeps every replica equivalent.
           startupProbe:
             httpGet:
               path: /healthz

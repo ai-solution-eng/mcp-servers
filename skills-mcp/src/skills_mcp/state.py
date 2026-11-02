@@ -1,13 +1,13 @@
 """Served state: what the tools read, and where it came from.
 
-Everything the tools consult lives in ONE frozen State object. A refresh builds
-a new State and assigns it once (set_state) — no reader can observe a
-half-updated catalogue, and no lock is needed.
+Everything the tools consult lives in one frozen State object. A refresh builds
+a new State and assigns it once (set_state), so no reader can observe a
+half-updated catalogue and no lock is needed.
 
 Boot order (first valid source wins):
   1. SKILLS_SOURCE_DIR      local dev: a checkout of the tools repo
   2. the working copy       <SKILLS_ROOT>/skills-current (a symlink a refresh
-                            swapped in) — survives a restart when /data is a PVC
+                            swapped in); survives a restart when /data is a PVC
   3. the bundled snapshot   <SKILLS_BUNDLED_ROOT>, baked into the image
   4. nothing                an empty catalogue plus a warning (never a crash)
 """
@@ -31,7 +31,7 @@ DEFAULT_BUNDLED_ROOT = "/opt/skills-bundled"
 
 @dataclass(frozen=True)
 class Source:
-    """Where the served catalogue came from — echoed in every tool response so
+    """Where the served catalogue came from, echoed in every tool response so
     a caller can tell a bundled snapshot from a fresh GitHub pull."""
 
     origin: str  # "local" | "bundled" | "github" | "none"
@@ -87,7 +87,7 @@ def current_state() -> State:
 
 
 def set_state(state: State) -> None:
-    """Replace the served catalogue. One assignment = atomic for every reader."""
+    """Replace the served catalogue. One assignment is atomic for every reader."""
     global _state
     _state = state
 

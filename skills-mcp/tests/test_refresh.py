@@ -58,7 +58,7 @@ def serve(monkeypatch, tarball: Path) -> None:
     monkeypatch.setattr(refresh, "_download", lambda url, dest: shutil.copy(tarball, dest))
 
 
-# ------------------------------------------------------------------ seeding
+# seeding
 
 
 def test_seeds_working_copy_from_the_bundled_snapshot(env, tmp_path: Path) -> None:
@@ -79,7 +79,7 @@ def test_no_source_at_all_returns_none(env) -> None:
     assert refresh.ensure_working_copy() is None
 
 
-# ------------------------------------------------------------------ refresh
+# refresh
 
 
 def test_refresh_swaps_in_the_new_text(env, tmp_path: Path, monkeypatch) -> None:
@@ -188,7 +188,7 @@ def test_prune_keeps_three_releases(env, tmp_path: Path, monkeypatch) -> None:
     assert state_mod.current_state().catalog.get("alpha").body == "v4"
 
 
-# ------------------------------------------------------------------ boot
+# boot
 
 
 def test_boot_reads_the_state_file_after_a_refresh(env, tmp_path: Path, monkeypatch) -> None:
@@ -221,7 +221,7 @@ def test_broken_working_copy_falls_back_to_the_bundle(env, tmp_path: Path) -> No
     assert served.catalog.get("alpha").body == "bundled body"
 
 
-# ------------------------------------------------------------------ config
+# config
 
 
 def test_refresh_disabled_without_a_url(env, monkeypatch) -> None:

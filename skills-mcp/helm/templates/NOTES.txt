@@ -9,11 +9,11 @@ skills-mcp {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) deployed to namesp
 API key
   Secret: {{ $secret }} (key: {{ .Values.apiKey.existingSecretKey }})
   {{- if .Values.apiKey.existingSecret }}
-  Operator-created — the pod stays in CreateContainerConfigError until it exists:
+  Operator-created: the pod stays in CreateContainerConfigError until it exists:
     kubectl -n {{ $ns }} create secret generic {{ $secret }} \
       --from-literal="{{ .Values.apiKey.existingSecretKey }}=$(openssl rand -hex 32)"
   {{- else }}
-  Created by this chart from apiKey.value (DEMO mode — never use on a shared site).
+  Created by this chart from apiKey.value (demo mode, never use on a shared site).
   {{- end }}
 
 Skills source
