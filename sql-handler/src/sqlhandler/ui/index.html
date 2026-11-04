@@ -526,7 +526,7 @@
   </div>
   <a href="#" id="id-key-link" title="Paste a key for this page session — the same credential the Access-control panel uses">Use an API key</a>
   <a href="/oauth/login?next=%2Fui" id="id-sso-link" style="display:none;color:var(--muted);font-size:12px;text-decoration:none" title="Start the SSO round trip (the verified session carries your username, not the IdP sub UUID)">Sign in with SSO</a>
-  <button id="id-signout" class="ghost" title="Clear this page's credential (and end an edge SSO session when deployed behind the gateway)">Sign out</button>
+  <button id="id-signout" class="ghost" title="Forget the API key this page holds (and end an edge SSO session when deployed behind the gateway)">Sign out</button>
   <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
 </header>
 
@@ -863,21 +863,32 @@ function toast(msg, isErr) {
 //   wrong key is never redeemed as the browser user behind it); a keyless
 //   request resolves through the ladder (SSO bearer JWT → browser headers).
 // * The chip shows the resolved identity + the rung tag (oidc / browser /
-//   key / sso) — including via="anonymous" with require_identity on, which
-//   is exactly the "why can't I mint?" answer rendered in place.
+//   key / relay) — including via="anonymous" with require_identity on,
+//   which is exactly the "why can't I mint?" answer rendered in place.
 // * Use an API key: sets `adminCredential` — the SAME variable the
 //   Access-control panel reads (single credential per page; no second
 //   storage location to forget). The key is NOT persisted (the panel's
 //   no-storage contract, pinned by test_admin_ui).
-// * Sign out: clears that credential and — when deployed behind the
-//   gateway's oauth2-proxy — ends the edge SSO session too (best-effort:
-//   a 404 from a non-gated deployment falls back to a plain reload).
+// * Sign out: offered ONLY when this page holds the credential it would
+//   forget — the pasted key that resolved the session (via="key"). An
+//   SSO/OIDC session is owned by the identity provider (the edge's
+//   oauth2-proxy cookie, or the D22 HttpOnly session cookie): clearing page
+//   state cannot end the platform's IdP session, which re-authenticates on
+//   the next request — so for an SSO-only user the button is a visible
+//   no-op (RAG D24 parity: renderIdentityChip decides, not the button).
+//   When offered it clears that credential and — behind the gateway's
+//   oauth2-proxy — ends the edge SSO session too.
+// The chip's rung tag. Keys are exactly the AUTHENTICATED rungs the identity
+// ladder emits (identity.py Caller.via: relay | jwt | browser | key;
+// anonymous/stdio never render a chip). The D22 SSO-cookie session
+// deliberately resolves as jwt — that rung is load-bearing server-side (the
+// self-mint gates require via=="jwt") — so it tags "oidc" here; the chip must
+// never invent an "sso-cookie" rung no server path produces.
 const ID_SRC_LABELS = {
   jwt: "oidc",
   browser: "browser",
   key: "key",
   relay: "relay",
-  "sso-cookie": "SSO",
 };
 
 function idCredentialName(caller) {
@@ -914,7 +925,14 @@ function renderIdentityChip(sess) {
   chip.classList.add("show");
   keylink.style.display = sess.via === "jwt" || sess.via === "browser" ? "inline" : "none";
   if (ssolink) ssolink.style.display = "none";
-  signout.style.display = "inline-flex";
+  // Sign out only when THIS page holds the credential it would forget: the
+  // pasted key that resolved this session (via="key"). An SSO/OIDC session
+  // belongs to the identity provider — the edge's oauth2-proxy cookie or the
+  // D22 HttpOnly session cookie — and clearing page state cannot end the
+  // platform's IdP session, which re-authenticates on the next request: the
+  // button would look like a no-op for exactly those users (RAG D24 parity).
+  const holdsPageKey = sess.via === "key" && !!adminCredential;
+  signout.style.display = holdsPageKey ? "inline-flex" : "none";
 }
 
 async function probeIdentity() {
@@ -973,6 +991,8 @@ async function applyIdKey() {
 }
 
 function idSignOut() {
+  // Reachable only for a page-held key session: renderIdentityChip hides the
+  // button on every SSO/OIDC rung (the identity provider owns that session).
   // Clear the page credential (adminCredential + the panel field), then end
   // the server-side sessions: the app's own D22 SSO cookie (/oauth/logout)
   // and — when deployed behind the gateway's oauth2-proxy — the edge

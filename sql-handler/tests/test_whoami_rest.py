@@ -19,6 +19,9 @@ identity gate's current posture. Contracts pinned here:
 * The UI asset carries the widget wired to this endpoint: chip ids, the
   use-key dialog feeding the Access-control panel's single credential
   (adminCredential — never localStorage), and the sign-out clearing it.
+  The sign-out is offered ONLY for a page-held key (the via="key" rung):
+  an SSO/OIDC session is owned by the identity provider, so the button
+  would be a no-op there — it is hidden instead (RAG D24 parity).
 
 Run:  python -m pytest tests/test_whoami_rest.py -v
 """
@@ -459,3 +462,47 @@ def test_ui_widget_uses_the_panel_credential_not_storage():
     # The sign-out clears the credential before the edge redirect.
     signout_idx = widget_js.index("function idSignOut")
     assert "adminCredential" in widget_js[signout_idx : signout_idx + 400]
+
+
+def test_ui_signout_is_offered_only_for_a_page_held_key():
+    """D-UI / RAG D24 parity: the header offers Sign out ONLY when this page
+    holds the credential it would forget — the pasted key, the rung the
+    server reports as via="key". An SSO/OIDC session is owned by the identity
+    provider (the edge's oauth2-proxy cookie, or the D22 HttpOnly session
+    cookie); clearing page state cannot end the platform's IdP session, which
+    re-authenticates on the next request, so for an SSO-only user the button
+    is a visible no-op — the confusing case this rule removes. The rung
+    values the rule keys on are pinned server-side by tests/test_sso_flow.py
+    (SSO cookie → "jwt", trusted browser headers → "browser", X-API-Key →
+    "key")."""
+    from sqlhandler.webui import _HTML
+
+    widget_js = _HTML[_HTML.index("// ---- header identity widget") : _HTML.index("// ---- header status")]
+    # The rule: the page-held key decides; every other rung hides the button.
+    # Pin the WHOLE guard — dropping `&& !!adminCredential` would still show
+    # the button for a via="key" session this page holds no credential for.
+    assert 'const holdsPageKey = sess.via === "key" && !!adminCredential;' in widget_js
+    assert 'signout.style.display = holdsPageKey ? "inline-flex" : "none";' in widget_js
+    # No unconditional show may survive — the regression this test exists for
+    # (an SSO-only user was offered a dead button on every authenticated rung).
+    assert 'signout.style.display = "inline-flex";' not in widget_js
+    # The anonymous branch keeps hiding it outright.
+    anon_branch = widget_js[widget_js.index("if (!sess || !sess.authenticated)") :]
+    assert 'signout.style.display = "none";' in anon_branch[:600]
+
+
+def test_ui_rung_labels_cover_exactly_the_authenticated_ladder_rungs():
+    """The chip's rung tag maps ONLY the rungs the ladder actually emits
+    (identity.py ``Caller.via``: relay | jwt | browser | key; anonymous and
+    stdio never render a chip). A label for a rung no server path produces is
+    a lie the chip can never show — the phantom "sso-cookie" entry was exactly
+    that: the D22 SSO-cookie session deliberately resolves via="jwt" (the
+    self-mint gates require that rung), so its tag is "oidc", not "SSO"."""
+    from sqlhandler.webui import _HTML
+
+    block = _HTML[_HTML.index("const ID_SRC_LABELS = {") :]
+    block = block[: block.index("};")]
+    keys = set(re.findall(r'^\s*"?([a-z-]+)"?\s*:', block, re.MULTILINE))
+    assert keys == {"jwt", "browser", "key", "relay"}, keys
+    # The specific regression this test exists for: the phantom rung.
+    assert '"sso-cookie"' not in block
