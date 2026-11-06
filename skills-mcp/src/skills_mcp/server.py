@@ -67,6 +67,7 @@ import mcp_auth
 
 from . import catalog as catalog_mod
 from . import refresh as refresh_mod
+from . import ui as ui_mod
 from .catalog import Catalog, Skill
 from .state import (
     Source,
@@ -474,6 +475,8 @@ def _build_http_app():
     routes: list = [
         Route("/health", health),
         Route("/healthz", health),
+        # Browser UI (read-only). Empty list when SKILLS_UI_ENABLED=0.
+        *ui_mod.build_ui_routes(),
         Route("/admin/status", _admin_status, methods=["GET"]),
         Route("/admin/refresh", _admin_refresh, methods=["POST"]),
     ]
