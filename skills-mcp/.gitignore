@@ -29,3 +29,4 @@ helm/local/*
 
 # session handoff notes — not product documentation
 /documentation/
+scripts/
