@@ -5,6 +5,11 @@ deployment:
   name: skills-mcp
   appName: skills-mcp
   replicaCount: 1
+  # Recreate is REQUIRED while /data is a ReadWriteOnce PVC: RollingUpdate
+  # starts the new pod before stopping the old one, and the second pod can
+  # never attach the volume (Multi-Attach deadlock). Recreate stops, then
+  # starts — seconds of downtime instead of a stuck rollout.
+  strategy: Recreate
 
 image:
   repository: ghcr.io/ai-solution-eng/skills-mcp

@@ -7,6 +7,10 @@ metadata:
     app: {{ .Values.deployment.appName }}
 spec:
   replicas: {{ .Values.deployment.replicaCount }}
+  {{- with .Values.deployment.strategy }}
+  strategy:
+    type: {{ . }}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Values.deployment.appName }}
