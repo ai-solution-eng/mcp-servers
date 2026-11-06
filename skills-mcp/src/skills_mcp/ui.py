@@ -27,6 +27,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse
 from starlette.routing import Route
 
 from . import state as state_mod
+from . import visibility as visibility_mod
 
 ENV_UI_ENABLED = "SKILLS_UI_ENABLED"
 
@@ -80,6 +81,7 @@ a{color:inherit;text-decoration:none}
 .who{font-size:12px;color:var(--muted);border:1px solid var(--border);
   border-radius:999px;padding:2px 10px;white-space:nowrap}
 .who.anon{opacity:.55}
+.role{font-size:12px;color:var(--primary);border:1px solid var(--border);border-radius:999px;padding:2px 10px}
 
 /* the shell: bordered, rounded, sidebar + inset (borrowed from the fleet UI) */
 .shell{display:flex;min-height:78vh;border:1px solid var(--border);
@@ -170,8 +172,8 @@ def _source_line(state) -> str:
 
 def _shell(state, identity: str | None, selected: str | None, inset: str) -> str:
     rows = []
-    for name in state.catalog.names():
-        skill = state.catalog.skills[name]
+    for skill in visibility_mod.visible_skills(identity):
+        name = skill.name
         active = " active" if name == selected else ""
         badge = f"<span class=badge>{len(skill.files)}</span>" if skill.files else ""
         rows.append(
@@ -184,9 +186,11 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         if identity
         else "<span class='who anon'>anonymous</span>"
     )
+    role = visibility_mod.role_label(identity)
+    role_chip = f"<span class=role>role: {html.escape(role)}</span>" if role else ""
     return (
         "<div class=page-head>"
-        f"<h1>skills</h1><span class=count>{len(state.catalog)} skills</span>"
+        f"<h1>skills</h1><span class=count>{len(rows)} skills</span>{role_chip}"
         f"<span class=source>{_source_line(state)}</span>{who}</div>"
         "<div class=shell id=shell>"
         "<aside class=sidebar>"
@@ -212,20 +216,21 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
 
 async def index(request):
     state = state_mod.current_state()
-    names = state.catalog.names()
-    if names:
+    identity = identity_of(request)
+    visible = visibility_mod.visible_skills(identity)
+    if visible:
         from starlette.responses import RedirectResponse
 
-        return RedirectResponse(f"/skills/{names[0]}", status_code=307)
-    inset = "<p class=empty>No skills loaded. Check /admin/status.</p>"
-    return _page("skills", _shell(state, identity_of(request), None, inset), identity_of(request))
+        return RedirectResponse(f"/skills/{visible[0].name}", status_code=307)
+    inset = "<p class=empty>No skills are visible to you. Check /admin/status.</p>"
+    return _page("skills", _shell(state, identity, None, inset), identity)
 
 
 async def skill_detail(request):
     name = request.path_params.get("name", "")
     state = state_mod.current_state()
-    skill = state.catalog.get(name)
     identity = identity_of(request)
+    skill = visibility_mod.get_visible(name, identity)
     if skill is None:
         inset = (
             f"<h2>Unknown skill</h2><p class=desc>{html.escape(name)} is not in the catalogue.</p>"
@@ -258,7 +263,7 @@ async def skill_detail(request):
 
 async def skill_raw(request):
     name = request.path_params.get("name", "")
-    skill = state_mod.current_state().catalog.get(name)
+    skill = visibility_mod.get_visible(name, identity_of(request))
     if skill is None:
         return PlainTextResponse("unknown skill: " + name, status_code=404)
     return PlainTextResponse(skill.body, media_type="text/markdown; charset=utf-8")

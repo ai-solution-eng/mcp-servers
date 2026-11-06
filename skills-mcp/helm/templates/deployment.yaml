@@ -61,6 +61,11 @@ spec:
               value: {{ .Values.skills.root | quote }}
             - name: SKILLS_BUNDLED_ROOT
               value: {{ .Values.skills.bundledRoot | quote }}
+            {{- if .Values.policy.enabled }}
+            # Visibility policy file (identity -> role -> source paths).
+            - name: SKILLS_POLICY_FILE
+              value: {{ .Values.policy.file | quote }}
+            {{- end }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
             {{- if $transportActive }}
             # Public FQDN: pins the Host header (DNS-rebinding protection on).
@@ -101,6 +106,11 @@ spec:
             # The working copy (releases/ + the skills-current symlink).
             - name: skills-data
               mountPath: {{ .Values.skills.root }}
+            {{- if .Values.policy.enabled }}
+            - name: skills-policy
+              mountPath: /etc/skills/policy
+              readOnly: true
+            {{- end }}
           # /healthz is served by the same Starlette app as /mcp and needs no
           # MCP handshake: stateless MCP 2.0 keeps every replica equivalent.
           startupProbe:
@@ -127,3 +137,8 @@ spec:
         # Ephemeral on purpose: a restart re-seeds from the bundled snapshot.
         - name: skills-data
           emptyDir: {}
+        {{- if .Values.policy.enabled }}
+        - name: skills-policy
+          configMap:
+            name: {{ .Values.deployment.name }}-policy
+        {{- end }}

@@ -66,6 +66,9 @@ class Skill:
     description: str
     body: str
     directory: Path
+    #: Which configured source path this skill came from ("skills", "skills-demo").
+    #: This is the TIER key: visibility policy is expressed in terms of it.
+    source_path: str = ""
     #: Files inside the skill directory (POSIX relative paths), SKILL.md excluded.
     files: tuple[str, ...] = ()
     #: Non-fatal problems found while loading this skill (e.g. long description).
@@ -152,7 +155,7 @@ def _skill_files(directory: Path) -> tuple[str, ...]:
     return tuple(found)
 
 
-def load_skill(directory: Path) -> Skill:
+def load_skill(directory: Path, source_path: str = "") -> Skill:
     """Load one skill directory. Raises SkillError when it is not a valid skill."""
     skill_md = directory / SKILL_FILE
     if not skill_md.is_file():
@@ -193,6 +196,7 @@ def load_skill(directory: Path) -> Skill:
         description=description,
         body=body,
         directory=directory,
+        source_path=source_path,
         files=_skill_files(directory),
         warnings=tuple(warnings),
     )
@@ -221,7 +225,7 @@ def load_catalog(root: Path | str, source_paths: Sequence[str] = ("skills",)) ->
                 catalog.ignored += 1
                 continue
             try:
-                skill = load_skill(child)
+                skill = load_skill(child, source_path=source)
             except SkillError as exc:
                 catalog.warnings.append(f"{source}/{child.name}: {exc} (skipped)")
                 continue

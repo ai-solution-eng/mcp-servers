@@ -39,7 +39,7 @@ PACKAGE_SRC = APP_DIR / "src" / PACKAGE
 
 # Modules inside the package that must ship. Add new ones here as the server
 # grows; the AST test catches the omission too.
-REQUIRED_PACKAGE_MODULES = ["server", "catalog", "state", "refresh"]
+REQUIRED_PACKAGE_MODULES = ["server", "catalog", "state", "refresh", "policy", "visibility", "ui"]
 # Top-level modules at the repo root that must ship (the fleet hardlink).
 REQUIRED_TOP_LEVEL_MODULES = ["mcp_auth"]
 REQUIRED_PACKAGES = [PACKAGE]

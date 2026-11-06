@@ -68,6 +68,7 @@ import mcp_auth
 from . import catalog as catalog_mod
 from . import refresh as refresh_mod
 from . import ui as ui_mod
+from . import visibility as visibility_mod
 from .catalog import Catalog, Skill
 from .state import (
     Source,
@@ -142,6 +143,13 @@ def _caller_payload() -> dict | None:
     return {key: value for key, value in data.items() if value is not None and key != "client"} or None
 
 
+def _caller_identity() -> str | None:
+    """The caller's registry NAME (identity), or None when anonymous."""
+    caller = _caller_payload() or {}
+    name = caller.get("name")
+    return name if isinstance(name, str) and name else None
+
+
 def _with_caller(payload: dict) -> dict:
     caller = _caller_payload()
     if caller:
@@ -180,13 +188,19 @@ async def list_skills() -> str:
     """
     try:
         state = current_state()
-        rows = [state.catalog.skills[name].catalogue_row() for name in state.catalog.names()]
-        _note("list_skills", count=len(rows))
-        return json.dumps(
-            _with_caller(
-                {"skills": rows, "count": len(rows), "source": state.source.as_dict()}
-            )
-        )
+        identity = _caller_identity()
+        skills = visibility_mod.visible_skills(identity)
+        rows = [skill.catalogue_row() for skill in skills]
+        _note("list_skills", count=len(rows), role=visibility_mod.role_label(identity))
+        payload = {
+            "skills": rows,
+            "count": len(rows),
+            "source": state.source.as_dict(),
+        }
+        role = visibility_mod.role_label(identity)
+        if role is not None:
+            payload["role"] = role
+        return json.dumps(_with_caller(payload))
     except Exception as exc:  # noqa: BLE001 - the tool contract is "never raise"
         return _err("list_skills", exc)
 
@@ -208,10 +222,14 @@ async def get_skill(name: str) -> str:
     """
     try:
         state = current_state()
-        skill = state.catalog.get((name or "").strip())
+        identity = _caller_identity()
+        skill = visibility_mod.get_visible((name or "").strip(), identity)
         if skill is None:
-            return _error(f"unknown skill {name!r}", valid_names=state.catalog.names())
-        _note("get_skill", skill=skill.name)
+            return _error(
+                f"unknown skill {name!r}",
+                valid_names=visibility_mod.visible_names(identity),
+            )
+        _note("get_skill", skill=skill.name, role=visibility_mod.role_label(identity))
         return json.dumps(
             _with_caller(
                 {
@@ -219,7 +237,7 @@ async def get_skill(name: str) -> str:
                     "description": skill.description,
                     "body": skill.body,
                     "files": list(skill.files),
-                    "related": _related(skill, state.catalog),
+                    "related": _related(skill, state.catalog, set(visibility_mod.visible_names(identity))),
                     "base_uri": f"skill://{skill.name}/",
                     "source": state.source.as_dict(),
                 }
@@ -247,9 +265,13 @@ async def get_skill_file(name: str, path: str) -> str:
     """
     try:
         state = current_state()
-        skill = state.catalog.get((name or "").strip())
+        identity = _caller_identity()
+        skill = visibility_mod.get_visible((name or "").strip(), identity)
         if skill is None:
-            return _error(f"unknown skill {name!r}", valid_names=state.catalog.names())
+            return _error(
+                f"unknown skill {name!r}",
+                valid_names=visibility_mod.visible_names(identity),
+            )
 
         try:
             relative = _safe_relative_path(path)
@@ -319,10 +341,16 @@ async def get_skill_file(name: str, path: str) -> str:
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
-def _related(skill: Skill, catalog: Catalog) -> list[str]:
-    """The skill names this body references that actually resolve."""
+def _related(skill: Skill, catalog: Catalog, allowed: set[str] | None = None) -> list[str]:
+    """The skill names this body references that resolve AND are visible to the
+    caller — otherwise the body leaks names of skills they cannot open."""
     tokens = set(_TOKEN_RE.findall(skill.body))
-    return sorted(name for name in tokens if name in catalog.skills and name != skill.name)
+    names = {
+        name
+        for name in tokens
+        if name in catalog.skills and name != skill.name and (allowed is None or name in allowed)
+    }
+    return sorted(names)
 
 
 def _safe_relative_path(raw: str) -> PurePosixPath:
