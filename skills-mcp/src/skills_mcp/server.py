@@ -36,6 +36,9 @@ Configuration:
   SKILLS_BUNDLED_ROOT   snapshot baked into the image (default /opt/skills-bundled).
   SKILLS_MCP_API_KEYS   comma-separated keys for /mcp and /admin (the
                         fleet-universal MCP_API_KEYS is honoured too).
+  SKILLS_MCP_CLIENTS    per-user key -> name registry, "alice:keyA;bob:keyB".
+                        SECRET material (it carries the keys) — lives in the
+                        Secret. Unset = anonymous callers, unchanged output.
 
 Every tool returns a JSON string and never raises: an expected failure is
 {"error": "..."} with enough context to act on.
@@ -81,6 +84,12 @@ SERVER_NAME = "skills-mcp"
 API_KEYS_ENV = "SKILLS_MCP_API_KEYS"
 AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, API_KEYS_ENV)
 
+# Per-user key -> name registry: "alice:keyA;bob:keyB" (SEMICOLON separated,
+# re-read per request so a Secret rotation reaches a running pod). This is
+# SECRET material — it carries the keys themselves — so it lives in the Secret,
+# never in values. Unset = every caller is anonymous, exactly as before.
+CLIENTS_ENV = "SKILLS_MCP_CLIENTS"
+
 # Hard ceiling on any single file served by get_skill_file. The response is the
 # agent's context window; a skill may ship a script, not a data dump.
 MAX_FILE_BYTES = 256 * 1024
@@ -113,6 +122,44 @@ def _err(context: str, exc: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Attribution — WHO is calling (never an authorization decision)
+# ---------------------------------------------------------------------------
+
+
+def _caller_payload() -> dict | None:
+    """The caller as far as mcp_auth can resolve them.
+
+    None for anonymous callers (no registry configured, no key, or a key that
+    matched but carries no name) — in which case responses stay byte-identical
+    to what they were before identity existed.
+    """
+    caller = mcp_auth.current_caller()
+    if caller is None:
+        return None
+    data = caller.as_dict()
+    # "client" is an internal IP:port — noise for the model, keep the identity.
+    return {key: value for key, value in data.items() if value is not None and key != "client"} or None
+
+
+def _with_caller(payload: dict) -> dict:
+    caller = _caller_payload()
+    if caller:
+        payload["caller"] = caller
+    return payload
+
+
+def _note(tool: str, **fields) -> None:
+    """One stderr line per call — the operator's view of who did what."""
+    caller = _caller_payload() or {}
+    who = caller.get("name") or caller.get("key_fp") or "anonymous"
+    detail = " ".join(f"{key}={value}" for key, value in fields.items() if value)
+    print(
+        f"[skills-mcp] {tool} caller={who}" + (f" {detail}" if detail else ""),
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -133,8 +180,11 @@ async def list_skills() -> str:
     try:
         state = current_state()
         rows = [state.catalog.skills[name].catalogue_row() for name in state.catalog.names()]
+        _note("list_skills", count=len(rows))
         return json.dumps(
-            {"skills": rows, "count": len(rows), "source": state.source.as_dict()}
+            _with_caller(
+                {"skills": rows, "count": len(rows), "source": state.source.as_dict()}
+            )
         )
     except Exception as exc:  # noqa: BLE001 - the tool contract is "never raise"
         return _err("list_skills", exc)
@@ -160,16 +210,19 @@ async def get_skill(name: str) -> str:
         skill = state.catalog.get((name or "").strip())
         if skill is None:
             return _error(f"unknown skill {name!r}", valid_names=state.catalog.names())
+        _note("get_skill", skill=skill.name)
         return json.dumps(
-            {
-                "name": skill.name,
-                "description": skill.description,
-                "body": skill.body,
-                "files": list(skill.files),
-                "related": _related(skill, state.catalog),
-                "base_uri": f"skill://{skill.name}/",
-                "source": state.source.as_dict(),
-            }
+            _with_caller(
+                {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "body": skill.body,
+                    "files": list(skill.files),
+                    "related": _related(skill, state.catalog),
+                    "base_uri": f"skill://{skill.name}/",
+                    "source": state.source.as_dict(),
+                }
+            )
         )
     except Exception as exc:  # noqa: BLE001
         return _err("get_skill", exc)
@@ -240,14 +293,17 @@ async def get_skill_file(name: str, path: str) -> str:
             content = base64.b64encode(data).decode("ascii")
             encoding = "base64"
 
+        _note("get_skill_file", skill=skill.name, path=relative.as_posix())
         return json.dumps(
-            {
-                "name": skill.name,
-                "path": relative.as_posix(),
-                "encoding": encoding,
-                "bytes": size,
-                "content": content,
-            }
+            _with_caller(
+                {
+                    "name": skill.name,
+                    "path": relative.as_posix(),
+                    "encoding": encoding,
+                    "bytes": size,
+                    "content": content,
+                }
+            )
         )
     except Exception as exc:  # noqa: BLE001
         return _err("get_skill_file", exc)
@@ -283,6 +339,40 @@ def _safe_relative_path(raw: str) -> PurePosixPath:
     if any(part == ".." for part in parts):
         raise ValueError("path must not contain '..' (directory traversal is refused)")
     return PurePosixPath(*parts)
+
+
+# ---------------------------------------------------------------------------
+# Attribution middleware
+# ---------------------------------------------------------------------------
+
+
+class CallerCapture:
+    """Outermost ASGI wrapper: resolve WHO is calling into a ContextVar.
+
+    Deliberately OUTSIDE ApiKeyAuthMiddleware: capture never gates anything, so
+    it must also see requests that auth will reject (key_fp stays None for
+    those, which is what the audit line should say).
+
+    The ContextVar is what lets the MCP TOOLS see the caller — they are plain
+    functions with no access to the HTTP request. scripts/probe_caller_context.py
+    proves the value survives into the tool call for this SDK.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        caller = mcp_auth.capture_caller(
+            scope, env_names=AUTH_ENV_NAMES, clients_env=CLIENTS_ENV
+        )
+        token = mcp_auth.CALLER_CONTEXT.set(caller)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            mcp_auth.CALLER_CONTEXT.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -389,11 +479,16 @@ def _build_http_app():
     ]
     routes.extend(http_app.routes)
 
-    # API-key auth on /mcp and /admin; the probes stay public for kubelet.
-    return mcp_auth.ApiKeyAuthMiddleware(
-        Starlette(routes=routes, lifespan=lifespan),
-        env_names=AUTH_ENV_NAMES,
-        protected=lambda p: p.startswith("/mcp") or p.startswith("/admin"),
+    # Two wrappers, outermost first:
+    #   CallerCapture        resolves WHO is calling (attribution only)
+    #   ApiKeyAuthMiddleware rejects requests without a valid key
+    # Capture is outside auth on purpose — see the class docstring.
+    return CallerCapture(
+        mcp_auth.ApiKeyAuthMiddleware(
+            Starlette(routes=routes, lifespan=lifespan),
+            env_names=AUTH_ENV_NAMES,
+            protected=lambda p: p.startswith("/mcp") or p.startswith("/admin"),
+        )
     )
 
 

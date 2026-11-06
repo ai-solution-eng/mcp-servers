@@ -63,6 +63,7 @@ curl -s -X POST localhost:9101/mcp \
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `SKILLS_MCP_API_KEYS` | *(unset)* | Comma-separated keys for `/mcp` **and** `/admin/*`. **Unset = fail open** (local only). |
+| `SKILLS_MCP_CLIENTS` | *(unset)* | Per-user key → name registry: `alice:keyA;bob:keyB` (semicolons). Rides the Secret under key `clients`. Unset = anonymous callers, unchanged output. |
 | `SKILLS_SOURCE_PATHS` | `skills` | Comma list of folders in the repo to load. The demo/team switch. |
 | `SKILLS_SOURCE_URL` | *(unset)* | Tarball base URL. Unset = refresh disabled, bundled snapshot only. |
 | `SKILLS_SOURCE_REF` | `main` | Branch, tag or commit sha to fetch. |

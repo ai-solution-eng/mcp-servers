@@ -38,6 +38,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            # Per-user key -> name registry ("alice:keyA;bob:keyB"). SECRET
+            # material: it carries the keys, so it rides the same Secret under a
+            # separate key, and it is OPTIONAL — an absent entry simply means
+            # every caller is anonymous (byte-identical to pre-identity output).
+            - name: SKILLS_MCP_CLIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
+                  key: clients
+                  optional: true
             # ---- where the skills come from
             - name: SKILLS_SOURCE_PATHS
               value: {{ .Values.skills.sourcePaths | quote }}
