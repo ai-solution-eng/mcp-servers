@@ -61,11 +61,15 @@ spec:
               value: {{ .Values.skills.root | quote }}
             - name: SKILLS_BUNDLED_ROOT
               value: {{ .Values.skills.bundledRoot | quote }}
-            {{- if .Values.policy.enabled }}
-            # Visibility policy file (identity -> role -> source paths).
-            - name: SKILLS_POLICY_FILE
-              value: {{ .Values.policy.file | quote }}
-            {{- end }}
+            # ---- per-user state (PVC) ----
+            - name: SKILLS_STATE_DIR
+              value: {{ .Values.state.dir | quote }}
+            - name: SKILLS_PRIVATE_DIR
+              value: {{ .Values.state.privateDir | quote }}
+            # Trust the SSO proxy's identity header? OFF by default: only safe
+            # when the pod is unreachable except through that proxy.
+            - name: SKILLS_TRUST_PROXY_IDENTITY
+              value: {{ .Values.state.trustProxyIdentity | quote }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
             {{- if $transportActive }}
             # Public FQDN: pins the Host header (DNS-rebinding protection on).
@@ -106,11 +110,6 @@ spec:
             # The working copy (releases/ + the skills-current symlink).
             - name: skills-data
               mountPath: {{ .Values.skills.root }}
-            {{- if .Values.policy.enabled }}
-            - name: skills-policy
-              mountPath: /etc/skills/policy
-              readOnly: true
-            {{- end }}
           # /healthz is served by the same Starlette app as /mcp and needs no
           # MCP handshake: stateless MCP 2.0 keeps every replica equivalent.
           startupProbe:
@@ -134,11 +133,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
-        # Ephemeral on purpose: a restart re-seeds from the bundled snapshot.
+        # Per-user state + the refresh working copy.
         - name: skills-data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-data" .Values.deployment.name) }}
+          {{- else }}
           emptyDir: {}
-        {{- if .Values.policy.enabled }}
-        - name: skills-policy
-          configMap:
-            name: {{ .Values.deployment.name }}-policy
-        {{- end }}
+          {{- end }}

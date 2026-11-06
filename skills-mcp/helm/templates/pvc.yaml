@@ -1,0 +1,26 @@
+{{- /*
+Per-user state lives here: /data/state/<identity>.json (disabled list, token
+hash) and /data/private/<identity>/ (private skills). The refresh working copy
+also lives under /data, so a refresh survives a restart.
+
+ReadWriteOnce is correct for deployment.replicaCount: 1. Two or more replicas
+need an RWX class (and the state files become shared, so revisit the locks).
+*/}}
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.deployment.name }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

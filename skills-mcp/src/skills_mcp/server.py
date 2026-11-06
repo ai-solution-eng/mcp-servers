@@ -67,6 +67,8 @@ import mcp_auth
 
 from . import catalog as catalog_mod
 from . import refresh as refresh_mod
+from . import auth as auth_mod
+from . import prefs as prefs_mod
 from . import ui as ui_mod
 from . import visibility as visibility_mod
 from .catalog import Catalog, Skill
@@ -191,15 +193,12 @@ async def list_skills() -> str:
         identity = _caller_identity()
         skills = visibility_mod.visible_skills(identity)
         rows = [skill.catalogue_row() for skill in skills]
-        _note("list_skills", count=len(rows), role=visibility_mod.role_label(identity))
+        _note("list_skills", count=len(rows))
         payload = {
             "skills": rows,
             "count": len(rows),
             "source": state.source.as_dict(),
         }
-        role = visibility_mod.role_label(identity)
-        if role is not None:
-            payload["role"] = role
         return json.dumps(_with_caller(payload))
     except Exception as exc:  # noqa: BLE001 - the tool contract is "never raise"
         return _err("list_skills", exc)
@@ -229,7 +228,7 @@ async def get_skill(name: str) -> str:
                 f"unknown skill {name!r}",
                 valid_names=visibility_mod.visible_names(identity),
             )
-        _note("get_skill", skill=skill.name, role=visibility_mod.role_label(identity))
+        _note("get_skill", skill=skill.name)
         return json.dumps(
             _with_caller(
                 {
@@ -371,40 +370,6 @@ def _safe_relative_path(raw: str) -> PurePosixPath:
 
 
 # ---------------------------------------------------------------------------
-# Attribution middleware
-# ---------------------------------------------------------------------------
-
-
-class CallerCapture:
-    """Outermost ASGI wrapper: resolve WHO is calling into a ContextVar.
-
-    Deliberately OUTSIDE ApiKeyAuthMiddleware: capture never gates anything, so
-    it must also see requests that auth will reject (key_fp stays None for
-    those, which is what the audit line should say).
-
-    The ContextVar is what lets the MCP TOOLS see the caller — they are plain
-    functions with no access to the HTTP request. scripts/probe_caller_context.py
-    proves the value survives into the tool call for this SDK.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
-            await self.app(scope, receive, send)
-            return
-        caller = mcp_auth.capture_caller(
-            scope, env_names=AUTH_ENV_NAMES, clients_env=CLIENTS_ENV
-        )
-        token = mcp_auth.CALLER_CONTEXT.set(caller)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            mcp_auth.CALLER_CONTEXT.reset(token)
-
-
-# ---------------------------------------------------------------------------
 # HTTP transport
 # ---------------------------------------------------------------------------
 
@@ -457,6 +422,80 @@ async def _refresh_loop(interval: int) -> None:
             print(f"  ! scheduled refresh failed: {exc}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Per-user API (used by the browser UI; every route needs an identity)
+# ---------------------------------------------------------------------------
+
+
+def _current_identity() -> str | None:
+    caller = mcp_auth.current_caller()
+    return caller.name if caller else None
+
+
+async def _me_state(_request):
+    from starlette.responses import JSONResponse
+
+    identity = _current_identity()
+    if not identity:
+        return JSONResponse({"error": "no identity"}, status_code=401)
+    token = prefs_mod.token_record(identity)
+    return JSONResponse(
+        {
+            "identity": identity,
+            "disabled": sorted(prefs_mod.disabled(identity)),
+            "has_token": token is not None,
+            "token_prefix": (token or {}).get("prefix"),
+            "token_created_at": (token or {}).get("created_at"),
+            "visible": len(visibility_mod.visible_skills(identity)),
+            "private": len(visibility_mod.private_skills(identity)),
+        }
+    )
+
+
+async def _me_toggle(request):
+    from starlette.responses import JSONResponse
+
+    identity = _current_identity()
+    if not identity:
+        return JSONResponse({"error": "no identity"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "expected JSON body"}, status_code=400)
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if visibility_mod.get_visible(name, identity) is None:
+        return JSONResponse({"error": f"unknown skill {name!r}"}, status_code=404)
+    disabled = prefs_mod.set_disabled(identity, name, bool((body or {}).get("disabled", True)))
+    return JSONResponse({"name": name, "disabled": disabled})
+
+
+async def _me_token(request):
+    from starlette.responses import JSONResponse
+
+    identity = _current_identity()
+    if not identity:
+        return JSONResponse({"error": "no identity"}, status_code=401)
+    if identity in auth_mod.env_managed_names():
+        return JSONResponse(
+            {"error": f"{identity!r} is managed by the operator key registry; ask an operator to rotate it"},
+            status_code=409,
+        )
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    rotate = bool((body or {}).get("rotate")) if isinstance(body, dict) else False
+    if prefs_mod.token_record(identity) and not rotate:
+        return JSONResponse(
+            {"error": "a token already exists for this identity; pass {\"rotate\": true} to replace it"},
+            status_code=409,
+        )
+    key = auth_mod.mint(identity)
+    return JSONResponse({"identity": identity, "key": key, "note": "shown once — store it now"})
+
+
 def _build_http_app():
     """Starlette app for the streamable-http transport.
 
@@ -507,20 +546,15 @@ def _build_http_app():
         *ui_mod.build_ui_routes(),
         Route("/admin/status", _admin_status, methods=["GET"]),
         Route("/admin/refresh", _admin_refresh, methods=["POST"]),
+        Route("/api/me", _me_state, methods=["GET"]),
+        Route("/api/me/skills", _me_toggle, methods=["POST"]),
+        Route("/api/me/token", _me_token, methods=["POST"]),
     ]
     routes.extend(http_app.routes)
 
-    # Two wrappers, outermost first:
-    #   CallerCapture        resolves WHO is calling (attribution only)
-    #   ApiKeyAuthMiddleware rejects requests without a valid key
-    # Capture is outside auth on purpose — see the class docstring.
-    return CallerCapture(
-        mcp_auth.ApiKeyAuthMiddleware(
-            Starlette(routes=routes, lifespan=lifespan),
-            env_names=AUTH_ENV_NAMES,
-            protected=lambda p: p.startswith("/mcp") or p.startswith("/admin"),
-        )
-    )
+    # One wrapper: authenticate (env keys ∪ minted keys ∪ trusted SSO header)
+    # AND publish the caller into mcp_auth.CALLER_CONTEXT for the tools.
+    return auth_mod.AuthMiddleware(Starlette(routes=routes, lifespan=lifespan))
 
 
 def main():

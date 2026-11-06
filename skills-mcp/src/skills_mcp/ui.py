@@ -186,11 +186,9 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         if identity
         else "<span class='who anon'>anonymous</span>"
     )
-    role = visibility_mod.role_label(identity)
-    role_chip = f"<span class=role>role: {html.escape(role)}</span>" if role else ""
     return (
         "<div class=page-head>"
-        f"<h1>skills</h1><span class=count>{len(rows)} skills</span>{role_chip}"
+        f"<h1>skills</h1><span class=count>{len(rows)} skills</span>"
         f"<span class=source>{_source_line(state)}</span>{who}</div>"
         "<div class=shell id=shell>"
         "<aside class=sidebar>"

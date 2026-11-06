@@ -103,7 +103,9 @@ def test_matched_key_without_registry_name_is_anonymous(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ wiring
 
 
-def test_app_is_wrapped_with_caller_capture() -> None:
-    """Capture must be the OUTERMOST wrapper so rejected requests are still
-    attributable — this test fails if someone reorders the wrappers."""
-    assert isinstance(server._build_http_app(), server.CallerCapture)
+def test_app_is_wrapped_with_the_auth_middleware() -> None:
+    """One outermost wrapper does both jobs: authenticate AND publish the caller
+    into CALLER_CONTEXT. This test fails if someone drops it."""
+    from skills_mcp import auth
+
+    assert isinstance(server._build_http_app(), auth.AuthMiddleware)

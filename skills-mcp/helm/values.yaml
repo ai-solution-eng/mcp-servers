@@ -8,7 +8,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/skills-mcp
-  tag: v0.1.3
+  tag: v0.2.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []   # only if the GHCR package stays PRIVATE
@@ -48,21 +48,24 @@ skills:
   # The snapshot baked into the image at build time.
   bundledRoot: /opt/skills-bundled
 
-# Visibility policy (P2): identity -> role -> source paths.
-# OFF by default: no policy = unfiltered catalogue (backwards compatible).
-# Turn it on and describe roles; the chart renders a ConfigMap and the server
-# re-reads it per request (mtime-cached) — a values edit changes visibility
-# without a rebuild.
-policy:
-  enabled: false
-  file: /etc/skills/policy/access.yaml
-  accessYaml: |
-    default:
-      paths: [skills]
-    roles:
-      demo:
-        members: [bryan]
-        paths: [skills, skills-demo]
+# ---------------------------------------------------------------------------
+# Persistent state (P4/C1): per-user prefs + private skills + the refresh copy
+# ---------------------------------------------------------------------------
+# A PVC is required for anything a person creates: disabled lists, minted token
+# hashes, private skills. With enabled=false the pod falls back to an emptyDir
+# and everything resets on restart (fine for a quick local run, not for users).
+state:
+  dir: /data/state
+  privateDir: /data/private
+  # "true" = believe X-Forwarded-User from the SSO proxy. Requires a
+  # NetworkPolicy limiting ingress to that proxy — never expose the pod directly.
+  trustProxyIdentity: "false"
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""        # "" = cluster default
+  existingClaim: ""       # set to adopt a PVC you created yourself
 
 # Resources / security
 resources:
@@ -72,6 +75,9 @@ resources:
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
+  # Required once /data is a PVC: the volume is created root:root, so the
+  # non-root app user needs the group ownership to write.
+  fsGroup: 10001
 
 # Networking
 service:
