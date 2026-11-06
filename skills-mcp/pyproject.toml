@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skills-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Skills MCP Server — serves the team's markdown skills (SKILL.md folders) over MCP 2.0: catalogue, body, and per-skill files"
 requires-python = ">=3.10"
 keywords = ["mcp", "skills", "model-context-protocol", "hpe", "pcai"]

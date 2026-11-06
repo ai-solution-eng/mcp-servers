@@ -33,6 +33,30 @@ GitHub          (same public tarball)    -> replaces the working copy, on demand
 merges. It validates before swapping, so a bad pull keeps the old catalogue
 serving. The pod is a cache; the repo is the truth.
 
+## The model (model C)
+
+| Action | Where | Effect on you | Effect on others |
+| --- | --- | --- | --- |
+| Merge a skill to `tools/skills` | GitHub | you see it | **everyone sees it** |
+| Disable a skill | UI toggle | you don't see it | nothing |
+| Create a private skill | UI / PVC | you see it | **nobody sees it** |
+
+`visible = every global skill − your disabled list + your private skills` (a private skill
+shadows a global of the same name, for its owner only).
+
+## Browser + personal API
+
+| Route | What |
+| --- | --- |
+| `GET /` | catalogue, sidebar, reader |
+| `GET /me` | your identity, token panel, disabled list, private skills |
+| `POST /me/token` · `POST /me/token/rotate` | mint / rotate your token (shown once) |
+| `POST /skills/{name}/toggle` | disable/enable for yourself |
+| `GET /api/me` | JSON state for the above |
+
+Identity for these comes from `auth.resolve`: an API key, or a trusted SSO header.
+Without either, the UI renders read-only and says "anonymous".
+
 ## Admin endpoints (same API key as /mcp)
 
 | Endpoint | What it does |
@@ -64,6 +88,9 @@ curl -s -X POST localhost:9101/mcp \
 | --- | --- | --- |
 | `SKILLS_MCP_API_KEYS` | *(unset)* | Comma-separated keys for `/mcp` **and** `/admin/*`. **Unset = fail open** (local only). |
 | `SKILLS_MCP_CLIENTS` | *(unset)* | Per-user key → name registry: `alice:keyA;bob:keyB` (semicolons). Rides the Secret under key `clients`. Unset = anonymous callers, unchanged output. |
+| `SKILLS_STATE_DIR` | `/data/state` | Per-identity JSON: disabled skills + minted token hash. Needs the PVC. |
+| `SKILLS_PRIVATE_DIR` | `/data/private` | Per-identity private skills (`<id>/<skill>/SKILL.md`). Needs the PVC. |
+| `SKILLS_TRUST_PROXY_IDENTITY` | `"false"` | Believe `X-Forwarded-User` from an SSO proxy. Only safe with a NetworkPolicy limiting ingress to that proxy. |
 | `SKILLS_SOURCE_PATHS` | `skills` | Comma list of folders in the repo to load. The demo/team switch. |
 | `SKILLS_SOURCE_URL` | *(unset)* | Tarball base URL. Unset = refresh disabled, bundled snapshot only. |
 | `SKILLS_SOURCE_REF` | `main` | Branch, tag or commit sha to fetch. |

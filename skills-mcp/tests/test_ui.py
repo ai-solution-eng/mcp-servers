@@ -103,13 +103,23 @@ def test_raw_unknown_is_404() -> None:
 # ------------------------------------------------------------------ identity
 
 
-def test_identity_header_is_displayed() -> None:
+def test_identity_header_is_displayed_when_trusted(monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
     response = run(
         ui.skill_detail(
             make_request("/skills/beta", headers={"X-Forwarded-User": "bryan@corp"}, path_params={"name": "beta"})
         )
     )
     assert "bryan@corp" in response.body.decode()
+
+
+def test_identity_header_is_ignored_by_default() -> None:
+    response = run(
+        ui.skill_detail(
+            make_request("/skills/beta", headers={"X-Forwarded-User": "bryan@corp"}, path_params={"name": "beta"})
+        )
+    )
+    assert "anonymous" in response.body.decode()
 
 
 def test_anonymous_is_labelled() -> None:
@@ -127,4 +137,74 @@ def test_ui_can_be_disabled(monkeypatch) -> None:
 
 def test_routes_present_by_default() -> None:
     paths = [route.path for route in ui.build_ui_routes()]
-    assert paths == ["/", "/skills/{name}", "/skills/{name}/raw"]
+    assert paths == [
+        "/",
+        "/me",
+        "/me/token",
+        "/me/token/rotate",
+        "/skills/{name}",
+        "/skills/{name}/toggle",
+        "/skills/{name}/raw",
+    ]
+
+
+# ------------------------------------------------------------------ personal actions
+
+
+def _trusted(monkeypatch, identity: str = "alice"):
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    return {"X-Forwarded-User": identity}
+
+
+def test_toggle_disables_then_enables(tmp_path, monkeypatch) -> None:
+    from skills_mcp import prefs
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+
+    response = run(ui.skill_toggle(make_request("/skills/beta/toggle", headers=headers, path_params={"name": "beta"})))
+    assert response.status_code == 303
+    assert "beta" in prefs.disabled("alice")
+
+    run(ui.skill_toggle(make_request("/skills/beta/toggle", headers=headers, path_params={"name": "beta"})))
+    assert "beta" not in prefs.disabled("alice")
+
+
+def test_toggle_requires_an_identity(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    response = run(ui.skill_toggle(make_request("/skills/beta/toggle", path_params={"name": "beta"})))
+    assert response.status_code == 401
+
+
+def test_me_page_shows_identity_and_panels(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.me_page(make_request("/me", headers=headers))).body.decode()
+    assert "alice" in body
+    assert "Mint your token" in body
+    assert "Private skills" in body
+
+
+def test_mint_shows_the_key_once(tmp_path, monkeypatch) -> None:
+    from skills_mcp import auth, prefs
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+
+    response = run(ui.me_token(make_request("/me/token", headers=headers)))
+    assert response.status_code == 200
+    body = response.body.decode()
+    assert "sk_live_" in body
+    assert prefs.token_record("alice") is not None
+
+    again = run(ui.me_token(make_request("/me/token", headers=headers)))
+    assert again.status_code == 409
+
+
+def test_mint_refused_for_operator_managed_names(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
+    headers = _trusted(monkeypatch)
+    response = run(ui.me_token(make_request("/me/token", headers=headers)))
+    assert response.status_code == 409

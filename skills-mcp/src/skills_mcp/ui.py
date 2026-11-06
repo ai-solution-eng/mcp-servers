@@ -26,6 +26,8 @@ import os
 from starlette.responses import HTMLResponse, PlainTextResponse
 from starlette.routing import Route
 
+from . import auth as auth_mod
+from . import prefs as prefs_mod
 from . import state as state_mod
 from . import visibility as visibility_mod
 
@@ -48,11 +50,13 @@ def ui_enabled() -> bool:
 
 
 def identity_of(request) -> str | None:
-    for header in _IDENTITY_HEADERS:
-        value = request.headers.get(header)
-        if value and value.strip():
-            return value.strip()
-    return None
+    """Who is this request? Delegates to auth.resolve, so the UI accepts the
+    same credentials the MCP does (SSO header when trusted, or an API key)."""
+    try:
+        found = auth_mod.resolve(request.scope)
+    except Exception:  # noqa: BLE001 - the UI must render even if auth misbehaves
+        return None
+    return found.name if found and found.name else None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,22 @@ pre.body{background:var(--bg);border:1px solid var(--border);border-radius:var(-
   padding:16px;overflow:auto;white-space:pre-wrap;word-wrap:break-word;
   font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:#d4d4d8;margin:0}
 .empty{color:var(--muted);font-size:13px}
+.banner{border:1px solid var(--border);background:var(--surface-2);color:var(--muted);
+  border-radius:var(--radius);padding:10px 14px;font-size:13px;margin-bottom:16px}
+.row.off .name{opacity:.45;text-decoration:line-through}
+.row.off .badge{display:inline}
+.badge.off{color:var(--muted)}
+.toggle{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;
+  border-radius:calc(var(--radius) - 2px);border:1px solid var(--border);
+  background:var(--surface);color:var(--fg);font-size:13px;cursor:pointer}
+.toggle:hover{border-color:var(--primary);color:var(--primary)}
+.panel{border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin:0 0 18px;background:var(--surface)}
+.panel h3{margin:0 0 6px;font-size:14px}
+.panel p{margin:0 0 12px;color:var(--muted);font-size:13px}
+code.key{display:block;background:var(--bg);border:1px solid var(--primary);border-radius:8px;
+  padding:10px 12px;font:12px ui-monospace,Menlo,monospace;color:var(--primary);
+  word-break:break-all;margin:10px 0 6px}
+.warn{color:var(--primary);font-size:12px}
 """
 
 _FOLDER_ICON = (
@@ -171,24 +191,44 @@ def _source_line(state) -> str:
 
 
 def _shell(state, identity: str | None, selected: str | None, inset: str) -> str:
+    hidden = prefs_mod.disabled(identity)
+    all_skills = visibility_mod.visible_skills(identity)
+    private_names = {s.name for s in visibility_mod.private_skills(identity)}
+    # disabled skills are not "visible" for tools, but the UI still lists them
+    # so their owner can switch them back on.
+    listed = list(all_skills)
+    for name in sorted(hidden):
+        skill = state.catalog.get(name)
+        if skill is not None and name not in {s.name for s in listed}:
+            listed.append(skill)
+    listed.sort(key=lambda s: s.name)
+
     rows = []
-    for skill in visibility_mod.visible_skills(identity):
+    for skill in listed:
         name = skill.name
-        active = " active" if name == selected else ""
-        badge = f"<span class=badge>{len(skill.files)}</span>" if skill.files else ""
+        classes = "row"
+        if name == selected:
+            classes += " active"
+        if name in hidden:
+            classes += " off"
+        if name in private_names:
+            badge = "<span class='badge off'>private</span>"
+        elif skill.files:
+            badge = f"<span class=badge>{len(skill.files)}</span>"
+        else:
+            badge = ""
         rows.append(
-            f"<a class='row{active}' href='/skills/{html.escape(name)}' "
+            f"<a class='{classes}' href='/skills/{html.escape(name)}' "
             f"data-name='{html.escape(name)}'>{_FOLDER_ICON}"
             f"<span class=name>{html.escape(name)}</span>{badge}</a>"
         )
-    who = (
-        f"<span class=who>{html.escape(identity)}</span>"
-        if identity
-        else "<span class='who anon'>anonymous</span>"
-    )
+    if identity:
+        who = f"<a class=who href='/me'>{html.escape(identity)}</a>"
+    else:
+        who = "<span class='who anon'>anonymous</span>"
     return (
         "<div class=page-head>"
-        f"<h1>skills</h1><span class=count>{len(rows)} skills</span>"
+        f"<h1><a href='/'>skills</a></h1><span class=count>{len(listed)} skills</span>"
         f"<span class=source>{_source_line(state)}</span>{who}</div>"
         "<div class=shell id=shell>"
         "<aside class=sidebar>"
@@ -229,6 +269,9 @@ async def skill_detail(request):
     state = state_mod.current_state()
     identity = identity_of(request)
     skill = visibility_mod.get_visible(name, identity)
+    if skill is None and identity and name in prefs_mod.disabled(identity):
+        # Hidden for its owner, but still theirs to switch back on.
+        skill = state.catalog.get(name)
     if skill is None:
         inset = (
             f"<h2>Unknown skill</h2><p class=desc>{html.escape(name)} is not in the catalogue.</p>"
@@ -241,14 +284,33 @@ async def skill_detail(request):
         items = "".join(f"<li>{html.escape(path)}</li>" for path in skill.files)
         files = f"<h3 class=sec>Files</h3><ul class=files>{items}</ul>"
 
+    hidden = identity is not None and skill.name in prefs_mod.disabled(identity)
+    if identity is None:
+        toggle = (
+            "<div class=banner>You are browsing anonymously. "
+            "Sign in (or use your token) to enable/disable skills for yourself.</div>"
+        )
+    else:
+        label = "Enable for me" if hidden else "Disable for me"
+        toggle = (
+            f"<form method=post action='/skills/{html.escape(skill.name)}/toggle' style='display:inline'>"
+            f"<button class=toggle type=submit>{label}</button></form>"
+        )
+    state_note = (
+        "<div class=banner>Disabled for you — your agent will not see this skill.</div>"
+        if hidden
+        else ""
+    )
     inset = (
         f"<div class=crumb><a href='/'>all skills</a><span class=sep></span>"
         f"{html.escape(skill.name)}</div>"
         f"<h2>{html.escape(skill.name)}</h2>"
         f"<p class=desc>{html.escape(skill.description)}</p>"
+        f"{state_note}"
         "<div class=actions>"
         f"<a class=btn href='/skills/{html.escape(skill.name)}/raw'>raw markdown</a>"
-        "<button class=btn id=copy>copy markdown</button></div>"
+        "<button class=btn id=copy>copy markdown</button>"
+        f"{toggle}</div>"
         f"{files}"
         f"<h3 class=sec>Body</h3><pre class=body id=body>{html.escape(skill.body)}</pre>"
         "<script>document.getElementById('copy').onclick=async()=>{"
@@ -267,12 +329,153 @@ async def skill_raw(request):
     return PlainTextResponse(skill.body, media_type="text/markdown; charset=utf-8")
 
 
+async def skill_toggle(request):
+    """Flip this skill on/off for the caller. Form post → redirect back."""
+    from starlette.responses import RedirectResponse
+
+    name = request.path_params.get("name", "")
+    identity = identity_of(request)
+    if identity is None:
+        return _page(
+            "sign in required",
+            "<h1>Sign in required</h1><p class=desc>Personal settings need an identity "
+            "(SSO header or your API key).</p><a class=btn href='/'>back</a>",
+            None,
+            status_code=401,
+        )
+    if visibility_mod.get_visible(name, identity) is None and name not in prefs_mod.disabled(identity):
+        return _page("unknown skill", f"<h1>Unknown skill</h1><p class=desc>{html.escape(name)}</p>", identity, status_code=404)
+    currently_hidden = name in prefs_mod.disabled(identity)
+    prefs_mod.set_disabled(identity, name, not currently_hidden)
+    return RedirectResponse(f"/skills/{name}", status_code=303)
+
+
+async def me_page(request):
+    state = state_mod.current_state()
+    identity = identity_of(request)
+    if identity is None:
+        body = (
+            "<h2>You</h2>"
+            "<div class=banner>Anonymous. The UI personalizes only when the request "
+            "carries an identity — an SSO header from the proxy, or an API key.</div>"
+            "<a class=btn href='/'>back to skills</a>"
+        )
+        return _page("you", _shell(state, None, None, body), None)
+
+    token = prefs_mod.token_record(identity)
+    hidden = sorted(prefs_mod.disabled(identity))
+    private = visibility_mod.private_skills(identity)
+
+    if token:
+        token_panel = (
+            "<div class=panel><h3>Your token</h3>"
+            f"<p>Prefix <code>{html.escape(str(token.get('prefix')))}</code> · "
+            f"created {html.escape(str(token.get('created_at')))}</p>"
+            "<form method=post action='/me/token/rotate'>"
+            "<button class=toggle type=submit>Rotate token</button></form>"
+            "<p class=warn>Rotating invalidates the old token immediately.</p></div>"
+        )
+    else:
+        token_ok = identity not in auth_mod.env_managed_names()
+        if token_ok:
+            token_panel = (
+                "<div class=panel><h3>Mint your token</h3>"
+                "<p>One token per person. It carries exactly your current access and is "
+                "shown once.</p>"
+                "<form method=post action='/me/token'>"
+                "<button class=toggle type=submit>Mint my token</button></form></div>"
+            )
+        else:
+            token_panel = (
+                "<div class=panel><h3>Your token</h3>"
+                "<p>This identity is managed by the operator registry — ask an operator "
+                "to rotate your key.</p></div>"
+            )
+
+    hidden_block = (
+        "<div class=panel><h3>Disabled for you (" + str(len(hidden)) + ")</h3><p>"
+        + ", ".join(f"<a href='/skills/{html.escape(n)}'>{html.escape(n)}</a>" for n in hidden)
+        + "</p></div>"
+        if hidden
+        else "<div class=panel><h3>Disabled for you</h3><p>Nothing disabled — you see every global skill.</p></div>"
+    )
+    private_block = (
+        "<div class=panel><h3>Private skills (" + str(len(private)) + ")</h3><p>"
+        + ", ".join(f"<a href='/skills/{html.escape(s.name)}'>{html.escape(s.name)}</a>" for s in private)
+        + "</p><p class=warn>Private skills live only on this cluster, never in git.</p></div>"
+        if private
+        else "<div class=panel><h3>Private skills</h3><p>None yet. Private skills are stored "
+             "per person and are invisible to everyone else.</p></div>"
+    )
+
+    body = (
+        f"<h2>{html.escape(identity)}</h2>"
+        f"<p class=desc>Visible to you: {len(visibility_mod.visible_skills(identity))} skills</p>"
+        f"{token_panel}{hidden_block}{private_block}"
+        "<a class=btn href='/'>back to skills</a>"
+    )
+    return _page("you", _shell(state, identity, None, body), identity)
+
+
+def _key_page(request, identity: str, key: str, *, rotated: bool):
+    state = state_mod.current_state()
+    verb = "rotated" if rotated else "minted"
+    body = (
+        f"<h2>Token {verb}</h2>"
+        "<p class=desc>This is the only time the full token is shown. Store it now.</p>"
+        f"<code class=key>{html.escape(key)}</code>"
+        "<div class=banner>Configure your agent with it:<br>"
+        f"<code>X-API-Key: {html.escape(key[:14])}…</code> — or "
+        "<code>Authorization: Bearer …</code></div>"
+        "<a class=btn href='/me'>back to you</a>"
+    )
+    return _page("token", _shell(state, identity, None, body), identity)
+
+
+async def me_token(request):
+    identity = identity_of(request)
+    if identity is None:
+        return _page("sign in required", "<h1>Sign in required</h1>", None, status_code=401)
+    if identity in auth_mod.env_managed_names():
+        return _page(
+            "operator-managed",
+            f"<h1>Operator-managed identity</h1><p class=desc>{html.escape(identity)} is in the "
+            "operator key registry; an operator must rotate that key.</p><a class=btn href='/me'>back</a>",
+            identity,
+            status_code=409,
+        )
+    if prefs_mod.token_record(identity):
+        return _page(
+            "token exists",
+            "<h1>A token already exists</h1><p class=desc>Rotate it instead.</p>"
+            "<a class=btn href='/me'>back</a>",
+            identity,
+            status_code=409,
+        )
+    key = auth_mod.mint(identity)
+    return _key_page(request, identity, key, rotated=False)
+
+
+async def me_token_rotate(request):
+    identity = identity_of(request)
+    if identity is None:
+        return _page("sign in required", "<h1>Sign in required</h1>", None, status_code=401)
+    if identity in auth_mod.env_managed_names():
+        return _page("operator-managed", "<h1>Operator-managed identity</h1>", identity, status_code=409)
+    key = auth_mod.mint(identity)
+    return _key_page(request, identity, key, rotated=True)
+
+
 def build_ui_routes() -> list:
     """The browser routes, or [] when SKILLS_UI_ENABLED=0."""
     if not ui_enabled():
         return []
     return [
         Route("/", index),
+        Route("/me", me_page),
+        Route("/me/token", me_token, methods=["POST"]),
+        Route("/me/token/rotate", me_token_rotate, methods=["POST"]),
         Route("/skills/{name}", skill_detail),
+        Route("/skills/{name}/toggle", skill_toggle, methods=["POST"]),
         Route("/skills/{name}/raw", skill_raw),
     ]
