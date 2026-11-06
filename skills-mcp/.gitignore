@@ -1,0 +1,31 @@
+# local dev
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[co]
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+
+# build output
+*.tgz
+dist/
+build/
+
+# local secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# local-only deployment values (helm/.helmignore also keeps these out of the chart)
+helm/local/*
+!helm/local/README.md
+!helm/local/values.example.yaml
+
+# OS/editor
+.DS_Store
+
+# session handoff notes — not product documentation
+/documentation/

@@ -1,0 +1,39 @@
+{{- if and .Values.ezua.enabled .Values.ezua.virtualService.enabled }}
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: {{ .Values.deployment.name }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    hpe-ezua/app: {{ .Values.deployment.appName }}
+    hpe-ezua/type: vendor-service
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required "\nValid .Values.ezua.virtualService.endpoint is required !" }}
+  http:
+    # MCP clients: streamable-http (JSON responses, stateless) at /mcp ->
+    # the server's 9101. This is the route agents use.
+    - match:
+        - uri:
+            prefix: /mcp
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+    # Everything else: /healthz and the human status page, routed to the same
+    # service so a browser hitting the edge host gets an answer, not a 404.
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ .Values.deployment.name }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: {{ .Values.ezua.virtualService.timeout }}
+{{- end }}

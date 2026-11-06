@@ -1,0 +1,18 @@
+# skills-mcp: serves the team's markdown skills over MCP 2.0
+# (catalogue, body, and per-skill files) for PCAI.
+apiVersion: v2
+name: skills-mcp
+description: >-
+  Skills MCP Server: one small service that serves the team's markdown
+  skills (SKILL.md folders) over MCP 2.0: list_skills, get_skill,
+  get_skill_file. Bundled snapshot + on-demand refresh from GitHub.
+type: application
+version: 0.1.1
+appVersion: "v0.1.1"
+keywords:
+  - mcp
+  - skills
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering

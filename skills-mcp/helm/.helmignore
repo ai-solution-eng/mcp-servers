@@ -1,0 +1,14 @@
+local/
+
+# Never package a previously built chart or editor/OS debris
+*.tgz
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.git/
+.gitignore
+.idea/
+.vscode/

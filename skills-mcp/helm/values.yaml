@@ -1,0 +1,80 @@
+# skills-mcp: serves the team's markdown skills over MCP 2.0.
+# Three tools only: list_skills / get_skill / get_skill_file.
+
+deployment:
+  name: skills-mcp
+  appName: skills-mcp
+  replicaCount: 1
+
+image:
+  repository: ghcr.io/ai-solution-eng/skills-mcp
+  tag: v0.1.1
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []   # only if the GHCR package stays PRIVATE
+
+# API key: /mcp is never open in the cluster.
+#
+# Two modes, pick one:
+#   1. FLEET: set existingSecret to an operator-created Secret. The pod fails
+#      loud (CreateContainerConfigError) until it exists. That is the fleet
+#      rule: the chart must never invent key material.
+#   2. DEMO: leave existingSecret empty and set value; the chart creates
+#      <deployment.name>-apikey itself. That value also lands in the
+#      EzAppConfig CR, so treat it as a demo key, never a shared-site key.
+#
+# Neither set means the pod fails loud (CreateContainerConfigError). The chart
+# never creates an empty key, because an empty key list makes mcp_auth fail open.
+apiKey:
+  existingSecret: ""
+  existingSecretKey: api-keys
+  value: ""
+
+# Where skills come from: bundled snapshot plus refresh, no sidecar.
+skills:
+  # Comma list of folders in the repo to load. This is the demo/team switch:
+  #   team -> "skills"        demo -> "skills,skills-demo"
+  sourcePaths: "skills"
+  # Tarball base URL. Leave empty to disable refresh (bundled snapshot only).
+  sourceUrl: "https://codeload.github.com/ai-solution-eng/tools/tar.gz"
+  # Branch, tag or commit sha to fetch.
+  sourceRef: "main"
+  # 14400 = 4 h. 0 disables the timer (the manual refresh endpoint still works).
+  refreshIntervalS: 14400
+  # Working copy. An emptyDir: a restart re-seeds from the bundled snapshot, so
+  # a refresh does not survive a restart. Fine for the demo, and it keeps the
+  # pod permission-free (no PVC, no RBAC).
+  root: /data
+  # The snapshot baked into the image at build time.
+  bundledRoot: /opt/skills-bundled
+
+# Resources / security
+resources:
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {memory: 256Mi}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+# Networking
+service:
+  type: ClusterIP
+  port: 9101
+  targetPort: 9101
+
+# Extra Host headers for in-cluster callers (`host:*` form).
+extraAllowedHosts: []
+
+# Corporate proxy for the GitHub fetch (each key wired only when non-empty).
+proxy: {}
+
+# PCAI exposure: the Istio VirtualService on the ezaf-gateway.
+ezua:
+  enabled: false
+  domainName: "${DOMAIN_NAME}"
+  virtualService:
+    enabled: true
+    endpoint: "skills-mcp.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s

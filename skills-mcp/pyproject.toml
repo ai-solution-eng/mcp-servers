@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skills-mcp"
+version = "0.1.1"
+description = "Skills MCP Server — serves the team's markdown skills (SKILL.md folders) over MCP 2.0: catalogue, body, and per-skill files"
+requires-python = ">=3.10"
+keywords = ["mcp", "skills", "model-context-protocol", "hpe", "pcai"]
+
+dependencies = [
+    "mcp>=2.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.27.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+skills-mcp = "skills_mcp.server:main"
+
+[tool.setuptools]
+# The image installs NON-editable (uv pip install --system .) and runs the
+# installed console script from site-packages, so the wheel MUST contain the
+# skills_mcp package AND the repo-root mcp_auth.py (imported as a top-level
+# module). A missing entry here builds green and then crash-loops the pod with
+# ModuleNotFoundError — the fleet's Wave-6 deploy-blocker class.
+# tests/test_packaging.py pins all three layers (pyproject / Dockerfile / wheel).
+package-dir = {skills_mcp = "src/skills_mcp"}
+packages = ["skills_mcp"]
+py-modules = ["mcp_auth"]
+
+[tool.pytest.ini_options]
+# "src" resolves "from skills_mcp import ..." (tests import the package
+# absolutely); "." resolves the top-level "import mcp_auth" from the repo root.
+pythonpath = ["src", "."]

@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  replicas: {{ .Values.deployment.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.appName }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      # No ServiceAccount / Role on purpose: this server reads FILES it ships
+      # with, not the Kubernetes API. Zero cluster permissions is the feature.
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: {{ .Values.deployment.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          env:
+            # ---- API key for /mcp (comma-separated = zero-downtime rotation)
+            # From the operator-created Secret (fleet mode) or the Secret this
+            # chart creates from apiKey.value (demo mode); same name either way.
+            - name: SKILLS_MCP_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
+                  key: {{ .Values.apiKey.existingSecretKey }}
+            # Per-user key -> name registry ("alice:keyA;bob:keyB"). SECRET
+            # material: it carries the keys, so it rides the same Secret under a
+            # separate key, and it is OPTIONAL — an absent entry simply means
+            # every caller is anonymous (byte-identical to pre-identity output).
+            - name: SKILLS_MCP_CLIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKey.existingSecret | default (printf "%s-apikey" .Values.deployment.name) }}
+                  key: clients
+                  optional: true
+            # ---- where the skills come from
+            - name: SKILLS_SOURCE_PATHS
+              value: {{ .Values.skills.sourcePaths | quote }}
+            - name: SKILLS_SOURCE_URL
+              value: {{ .Values.skills.sourceUrl | quote }}
+            - name: SKILLS_SOURCE_REF
+              value: {{ .Values.skills.sourceRef | quote }}
+            - name: SKILLS_REFRESH_INTERVAL_S
+              value: {{ .Values.skills.refreshIntervalS | quote }}
+            - name: SKILLS_ROOT
+              value: {{ .Values.skills.root | quote }}
+            - name: SKILLS_BUNDLED_ROOT
+              value: {{ .Values.skills.bundledRoot | quote }}
+            {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
+            {{- if $transportActive }}
+            # Public FQDN: pins the Host header (DNS-rebinding protection on).
+            # Gateway-fronted without this pin = every request answers 421.
+            - name: MCP_HOSTNAME
+              value: {{ .Values.ezua.virtualService.endpoint | quote }}
+            {{- end }}
+            {{- if or $transportActive .Values.extraAllowedHosts }}
+            {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
+            # In-cluster callers (svc DNS). The gateway relay hop arrives with
+            # Host: <name>-service.<ns>.svc.cluster.local:<port>.
+            - name: MCP_EXTRA_ALLOWED_HOSTS
+              {{- if .Values.extraAllowedHosts }}
+              value: {{ printf "%s,%s" $svcHost (join "," .Values.extraAllowedHosts) | quote }}
+              {{- else }}
+              value: {{ $svcHost | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ .Values.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ .Values.proxy.http | quote }}
+            {{- end }}
+            {{- if .Values.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ .Values.proxy.https | quote }}
+            {{- end }}
+            {{- if .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.proxy.noProxy | quote }}
+            {{- end }}
+          volumeMounts:
+            # The working copy (releases/ + the skills-current symlink).
+            - name: skills-data
+              mountPath: {{ .Values.skills.root }}
+          # /healthz is served by the same Starlette app as /mcp and needs no
+          # MCP handshake: stateless MCP 2.0 keeps every replica equivalent.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        # Ephemeral on purpose: a restart re-seeds from the bundled snapshot.
+        - name: skills-data
+          emptyDir: {}
