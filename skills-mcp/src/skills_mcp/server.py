@@ -438,14 +438,11 @@ async def _me_state(_request):
     identity = _current_identity()
     if not identity:
         return JSONResponse({"error": "no identity"}, status_code=401)
-    token = prefs_mod.token_record(identity)
     return JSONResponse(
         {
             "identity": identity,
             "disabled": sorted(prefs_mod.disabled(identity)),
-            "has_token": token is not None,
-            "token_prefix": (token or {}).get("prefix"),
-            "token_created_at": (token or {}).get("created_at"),
+            "keys": prefs_mod.keys(identity),
             "visible": len(visibility_mod.visible_skills(identity)),
             "private": len(visibility_mod.private_skills(identity)),
         }
@@ -486,14 +483,31 @@ async def _me_token(request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
-    rotate = bool((body or {}).get("rotate")) if isinstance(body, dict) else False
-    if prefs_mod.token_record(identity) and not rotate:
-        return JSONResponse(
-            {"error": "a token already exists for this identity; pass {\"rotate\": true} to replace it"},
-            status_code=409,
-        )
-    key = auth_mod.mint(identity)
+    if not isinstance(body, dict):
+        body = {}
+    label = str(body.get("label") or "").strip()
+    expires_at = body.get("expires_at") or None
+    if expires_at is not None:
+        from datetime import datetime
+
+        try:
+            datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            return JSONResponse({"error": "expires_at must be an ISO-8601 timestamp"}, status_code=400)
+    key = auth_mod.mint(identity, label=label, expires_at=expires_at)
     return JSONResponse({"identity": identity, "key": key, "note": "shown once — store it now"})
+
+
+async def _me_revoke(request):
+    from starlette.responses import JSONResponse
+
+    identity = _current_identity()
+    if not identity:
+        return JSONResponse({"error": "no identity"}, status_code=401)
+    key_id = request.path_params.get("key_id", "")
+    if not prefs_mod.revoke_key(identity, key_id):
+        return JSONResponse({"error": f"no active key {key_id!r}"}, status_code=404)
+    return JSONResponse({"id": key_id, "revoked": True})
 
 
 def _build_http_app():
@@ -549,6 +563,7 @@ def _build_http_app():
         Route("/api/me", _me_state, methods=["GET"]),
         Route("/api/me/skills", _me_toggle, methods=["POST"]),
         Route("/api/me/token", _me_token, methods=["POST"]),
+        Route("/api/me/keys/{key_id}/revoke", _me_revoke, methods=["POST"]),
     ]
     routes.extend(http_app.routes)
 

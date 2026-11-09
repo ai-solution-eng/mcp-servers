@@ -362,35 +362,44 @@ async def me_page(request):
         )
         return _page("you", _shell(state, None, None, body), None)
 
-    token = prefs_mod.token_record(identity)
     hidden = sorted(prefs_mod.disabled(identity))
     private = visibility_mod.private_skills(identity)
-
-    if token:
-        token_panel = (
-            "<div class=panel><h3>Your token</h3>"
-            f"<p>Prefix <code>{html.escape(str(token.get('prefix')))}</code> · "
-            f"created {html.escape(str(token.get('created_at')))}</p>"
-            "<form method=post action='/me/token/rotate'>"
-            "<button class=toggle type=submit>Rotate token</button></form>"
-            "<p class=warn>Rotating invalidates the old token immediately.</p></div>"
+    keys = prefs_mod.keys(identity)
+    can_mint = identity not in auth_mod.env_managed_names()
+    rows = []
+    for record in keys:
+        active = prefs_mod.is_active(record)
+        status = "active" if active else ("revoked" if record.get("revoked_at") else "expired")
+        label = html.escape(record.get("label") or record.get("prefix") or record.get("id") or "")
+        expires = html.escape(str(record.get("expires_at") or "never"))
+        created = html.escape(str(record.get("created_at") or ""))
+        action = (
+            f"<form method=post action='/me/keys/{html.escape(str(record.get('id')))}/revoke' style='display:inline'>"
+            "<button class=toggle type=submit>Revoke</button></form>"
+            if active
+            else ""
         )
-    else:
-        token_ok = identity not in auth_mod.env_managed_names()
-        if token_ok:
-            token_panel = (
-                "<div class=panel><h3>Mint your token</h3>"
-                "<p>One token per person. It carries exactly your current access and is "
-                "shown once.</p>"
-                "<form method=post action='/me/token'>"
-                "<button class=toggle type=submit>Mint my token</button></form></div>"
-            )
-        else:
-            token_panel = (
-                "<div class=panel><h3>Your token</h3>"
-                "<p>This identity is managed by the operator registry — ask an operator "
-                "to rotate your key.</p></div>"
-            )
+        rows.append(
+            "<div style='display:flex;gap:12px;align-items:center;padding:6px 0;border-top:1px solid var(--border)'>"
+            f"<b style='min-width:140px'>{label}</b>"
+            f"<code style='color:var(--muted)'>{html.escape(str(record.get('prefix')))}…</code>"
+            f"<span style='color:var(--muted);font-size:12px'>created {created} · expires {expires} · {status}</span>"
+            f"<span style='margin-left:auto'>{action}</span></div>"
+        )
+    key_rows = "".join(rows) or "<p>No keys yet.</p>"
+    mint_form = (
+        "<form method=post action='/me/token' style='display:flex;gap:8px;margin-top:12px'>"
+        "<input name=label placeholder='label (e.g. laptop-dsh)' "
+        "style='padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)'>"
+        "<button class=toggle type=submit>Mint a key</button></form>"
+        if can_mint
+        else "<p class=warn>This identity is operator-managed; ask an operator to rotate it.</p>"
+    )
+    token_panel = (
+        f"<div class=panel><h3>Your keys ({len(keys)})</h3>"
+        "<p>One key per agent. Each is shown once, and can be revoked or expire independently.</p>"
+        f"{key_rows}{mint_form}</div>"
+    )
 
     hidden_block = (
         "<div class=panel><h3>Disabled for you (" + str(len(hidden)) + ")</h3><p>"
@@ -444,26 +453,25 @@ async def me_token(request):
             identity,
             status_code=409,
         )
-    if prefs_mod.token_record(identity):
-        return _page(
-            "token exists",
-            "<h1>A token already exists</h1><p class=desc>Rotate it instead.</p>"
-            "<a class=btn href='/me'>back</a>",
-            identity,
-            status_code=409,
-        )
-    key = auth_mod.mint(identity)
+    label = ""
+    try:
+        form = await request.form()
+        label = str(form.get("label") or "").strip()
+    except Exception:  # noqa: BLE001 - a plain POST without a body is fine
+        label = ""
+    key = auth_mod.mint(identity, label=label)
     return _key_page(request, identity, key, rotated=False)
 
 
-async def me_token_rotate(request):
+async def me_revoke(request):
+    """Revoke one key from the browser."""
+    from starlette.responses import RedirectResponse
+
     identity = identity_of(request)
     if identity is None:
         return _page("sign in required", "<h1>Sign in required</h1>", None, status_code=401)
-    if identity in auth_mod.env_managed_names():
-        return _page("operator-managed", "<h1>Operator-managed identity</h1>", identity, status_code=409)
-    key = auth_mod.mint(identity)
-    return _key_page(request, identity, key, rotated=True)
+    prefs_mod.revoke_key(identity, request.path_params.get("key_id", ""))
+    return RedirectResponse("/me", status_code=303)
 
 
 def build_ui_routes() -> list:
@@ -474,7 +482,7 @@ def build_ui_routes() -> list:
         Route("/", index),
         Route("/me", me_page),
         Route("/me/token", me_token, methods=["POST"]),
-        Route("/me/token/rotate", me_token_rotate, methods=["POST"]),
+        Route("/me/keys/{key_id}/revoke", me_revoke, methods=["POST"]),
         Route("/skills/{name}", skill_detail),
         Route("/skills/{name}/toggle", skill_toggle, methods=["POST"]),
         Route("/skills/{name}/raw", skill_raw),

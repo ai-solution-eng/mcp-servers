@@ -62,11 +62,18 @@ def test_minted_key_resolves_its_identity() -> None:
     assert found.source == "minted"
 
 
-def test_rotating_a_token_kills_the_old_one() -> None:
-    first = auth.mint("carol")
-    second = auth.mint("carol")
+def test_revoking_a_key_kills_only_that_key() -> None:
+    first = auth.mint("carol", label="one")
+    second = auth.mint("carol", label="two")
+    victim = [k for k in prefs.keys("carol") if k["label"] == "one"][0]["id"]
+    assert prefs.revoke_key("carol", victim) is True
     assert auth.resolve(scope_with("x-api-key", first)) is None
     assert auth.resolve(scope_with("x-api-key", second)).name == "carol"
+
+
+def test_an_expired_key_does_not_resolve() -> None:
+    key = auth.mint("carol", expires_at="2020-01-01T00:00:00Z")
+    assert auth.resolve(scope_with("x-api-key", key)) is None
 
 
 def test_env_key_wins_over_a_minted_key(monkeypatch) -> None:

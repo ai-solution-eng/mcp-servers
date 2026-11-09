@@ -3,16 +3,24 @@
 One JSON file per identity under SKILLS_STATE_DIR (default /data/state):
 
     {
-      "disabled": ["memory-curation"],            # global skills this person turned off
-      "token": {"sha256": "…", "prefix": "sk_live_9f3a", "created_at": "…"}
+      "disabled": ["memory-curation"],          # global skills this person turned off
+      "keys": [                                  # credentials this person minted
+        {"id": "k_9f3a1c", "label": "laptop-dsh",
+         "sha256": "…", "prefix": "sk_live_9f3a",
+         "created_at": "2026-11-09T18:00:00Z",
+         "expires_at": null, "revoked_at": null}
+      ]
     }
 
-Why a file and not env: a minted token appears at runtime, env is frozen at
-container start. Why hashed: we only ever verify ("does sha256(presented)
-match?"), never recall, so a leaked file yields nothing usable.
+Why files: a minted key appears at runtime; env is frozen at container start.
+Why hashes: we only ever verify ("does sha256(presented) match?"), never recall,
+so a leaked file yields nothing usable. The plaintext key is shown ONCE, at mint.
 
-Writes are atomic (temp + os.replace) and serialised by a per-path lock, so a
-crash can never leave a half-written JSON file behind.
+A key is USABLE when it is neither revoked nor expired. Revoke is permanent
+(the record stays for the audit trail); expiry is a timestamp. Both are checked
+on every request, so no restart is needed.
+
+Writes are atomic (temp + os.replace) and serialised by a per-path lock.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,13 +70,52 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ------------------------------------------------------------------ storage
+
+
+def _migrate(doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """v0.2.x stored a single {"token": {...}}; v1.0 stores {"keys": [...]}.
+
+    Migrated lazily and written back once, so an existing token keeps working
+    across the upgrade without anyone re-minting.
+    """
+    token = doc.get("token")
+    if not isinstance(token, dict) or not token.get("sha256"):
+        return doc, False
+    migrated = {
+        "id": "k_legacy",
+        "label": "default",
+        "sha256": token.get("sha256"),
+        "prefix": token.get("prefix") or "",
+        "created_at": token.get("created_at") or _now(),
+        "expires_at": None,
+        "revoked_at": None,
+    }
+    keys = doc.get("keys")
+    doc["keys"] = ([migrated] + list(keys)) if isinstance(keys, list) else [migrated]
+    doc.pop("token", None)
+    return doc, True
+
+
 def load(identity: str) -> dict[str, Any]:
-    """This identity's state, or an empty document. Never raises on bad JSON."""
+    """This identity's state (migrated). Never raises on bad JSON."""
     try:
         raw = json.loads(_path_for(identity).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    doc, changed = _migrate(raw)
+    if changed:
+        try:
+            save(identity, doc)
+        except OSError:
+            pass
+    return doc
 
 
 def save(identity: str, doc: dict[str, Any]) -> None:
@@ -103,36 +151,85 @@ def set_disabled(identity: str, name: str, is_disabled: bool) -> list[str]:
     return doc["disabled"]
 
 
-# ------------------------------------------------------------------ tokens
+# ------------------------------------------------------------------ keys
 
 
-def token_record(identity: str | None) -> dict[str, Any] | None:
+def _public(record: dict[str, Any]) -> dict[str, Any]:
+    """What the API/UI may see: never the hash, never the plaintext."""
+    return {
+        "id": record.get("id"),
+        "label": record.get("label") or "",
+        "prefix": record.get("prefix") or "",
+        "created_at": record.get("created_at"),
+        "expires_at": record.get("expires_at"),
+        "revoked_at": record.get("revoked_at"),
+    }
+
+
+def is_active(record: dict[str, Any], now: datetime | None = None) -> bool:
+    """Usable = not revoked AND not expired."""
+    if record.get("revoked_at"):
+        return False
+    expires = record.get("expires_at")
+    if expires:
+        try:
+            deadline = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return deadline > (now or _now_dt())
+    return True
+
+
+def keys(identity: str | None) -> list[dict[str, Any]]:
+    """Public view of every key this identity ever minted (active or not)."""
     if not identity:
-        return None
-    token = load(identity).get("token")
-    return token if isinstance(token, dict) else None
+        return []
+    records = load(identity).get("keys") or []
+    return [_public(r) for r in records if isinstance(r, dict)]
 
 
-def set_token(identity: str, key: str) -> dict[str, Any]:
-    """Store the HASH of a freshly minted key; return the public view."""
+def add_key(
+    identity: str, key: str, *, label: str = "", expires_at: str | None = None
+) -> dict[str, Any]:
+    """Store the HASH of a freshly minted key; return its public view."""
     record = {
+        "id": "k_" + secrets.token_hex(4),
+        "label": (label or "").strip()[:60],
         "sha256": hashlib.sha256(key.encode()).hexdigest(),
         "prefix": key[:14],
         "created_at": _now(),
+        "expires_at": expires_at or None,
+        "revoked_at": None,
     }
     doc = load(identity)
-    doc["token"] = record
+    doc["keys"] = list(doc.get("keys") or []) + [record]
     save(identity, doc)
-    return record
+    return _public(record)
 
 
-def clear_token(identity: str) -> bool:
+def revoke_key(identity: str, key_id: str) -> bool:
+    """Permanently revoke one key. The record stays for the audit trail."""
     doc = load(identity)
-    if "token" not in doc:
-        return False
-    doc.pop("token")
-    save(identity, doc)
-    return True
+    changed = False
+    for record in doc.get("keys") or []:
+        if isinstance(record, dict) and record.get("id") == key_id and not record.get("revoked_at"):
+            record["revoked_at"] = _now()
+            changed = True
+    if changed:
+        save(identity, doc)
+    return changed
+
+
+def rename_key(identity: str, key_id: str, label: str) -> bool:
+    doc = load(identity)
+    changed = False
+    for record in doc.get("keys") or []:
+        if isinstance(record, dict) and record.get("id") == key_id:
+            record["label"] = (label or "").strip()[:60]
+            changed = True
+    if changed:
+        save(identity, doc)
+    return changed
 
 
 def iter_identities() -> Iterator[tuple[str, dict[str, Any]]]:
@@ -148,4 +245,10 @@ def iter_identities() -> Iterator[tuple[str, dict[str, Any]]]:
         except (OSError, ValueError):
             continue
         if isinstance(doc, dict):
-            yield entry.stem, doc
+            migrated, changed = _migrate(doc)
+            if changed:
+                try:
+                    save(entry.stem, migrated)
+                except OSError:
+                    pass
+            yield entry.stem, migrated

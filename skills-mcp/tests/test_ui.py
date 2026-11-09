@@ -141,7 +141,7 @@ def test_routes_present_by_default() -> None:
         "/",
         "/me",
         "/me/token",
-        "/me/token/rotate",
+        "/me/keys/{key_id}/revoke",
         "/skills/{name}",
         "/skills/{name}/toggle",
         "/skills/{name}/raw",
@@ -182,24 +182,24 @@ def test_me_page_shows_identity_and_panels(tmp_path, monkeypatch) -> None:
     headers = _trusted(monkeypatch)
     body = run(ui.me_page(make_request("/me", headers=headers))).body.decode()
     assert "alice" in body
-    assert "Mint your token" in body
+    assert "Mint a key" in body
     assert "Private skills" in body
 
 
-def test_mint_shows_the_key_once(tmp_path, monkeypatch) -> None:
-    from skills_mcp import auth, prefs
+def test_mint_shows_the_key_once_and_allows_more(tmp_path, monkeypatch) -> None:
+    from skills_mcp import prefs
 
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     headers = _trusted(monkeypatch)
 
     response = run(ui.me_token(make_request("/me/token", headers=headers)))
     assert response.status_code == 200
-    body = response.body.decode()
-    assert "sk_live_" in body
-    assert prefs.token_record("alice") is not None
+    assert "sk_live_" in response.body.decode()
+    assert len(prefs.keys("alice")) == 1
 
     again = run(ui.me_token(make_request("/me/token", headers=headers)))
-    assert again.status_code == 409
+    assert again.status_code == 200
+    assert len(prefs.keys("alice")) == 2
 
 
 def test_mint_refused_for_operator_managed_names(tmp_path, monkeypatch) -> None:

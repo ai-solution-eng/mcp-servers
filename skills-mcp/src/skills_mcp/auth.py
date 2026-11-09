@@ -30,10 +30,14 @@ from . import prefs
 
 CLIENTS_ENV = "SKILLS_MCP_CLIENTS"
 TRUST_PROXY_ENV = "SKILLS_TRUST_PROXY_IDENTITY"
+# Ordered: the HUMAN name first, the opaque ids last. The edge injects all of
+# them; x-auth-request-user carries the Keycloak UUID (claim "user"), which is
+# useless as a display name and would split one person into two identities.
 _PROXY_IDENTITY_HEADERS = (
+    b"x-auth-request-preferred-username",
+    b"username",
     b"x-forwarded-user",
     b"x-auth-request-user",
-    b"x-auth-request-preferred-username",
 )
 API_KEYS_ENV = "SKILLS_MCP_API_KEYS"
 ENV_KEY_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, API_KEYS_ENV)
@@ -84,10 +88,12 @@ def minted_index() -> dict[str, str]:
         return _minted_cache[1]
     index: dict[str, str] = {}
     for identity, doc in prefs.iter_identities():
-        token = doc.get("token") or {}
-        digest = token.get("sha256")
-        if isinstance(digest, str) and digest:
-            index[digest] = identity
+        for record in doc.get("keys") or []:
+            if not isinstance(record, dict) or not prefs.is_active(record):
+                continue          # revoked or expired keys never resolve
+            digest = record.get("sha256")
+            if isinstance(digest, str) and digest:
+                index[digest] = identity
     _minted_cache = (stamp, index)
     return index
 
@@ -149,10 +155,14 @@ def identity_name(scope) -> str | None:
     return found.name if found else None
 
 
-def mint(identity: str) -> str:
-    """Create (or rotate) this identity's token. Returns the key ONCE."""
+def mint(identity: str, *, label: str = "", expires_at: str | None = None) -> str:
+    """Mint a NEW key for this identity. Returns the plaintext ONCE.
+
+    Multiple keys per identity are allowed: one per agent, independently
+    revocable and expirable.
+    """
     key = "sk_live_" + secrets.token_urlsafe(32)
-    prefs.set_token(identity, key)
+    prefs.add_key(identity, key, label=label, expires_at=expires_at)
     return key
 
 
