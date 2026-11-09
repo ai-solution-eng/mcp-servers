@@ -7,7 +7,7 @@ description: >-
   skills (SKILL.md folders) over MCP 2.0: list_skills, get_skill,
   get_skill_file. Bundled snapshot + on-demand refresh from GitHub.
 type: application
-version: 0.2.2
+version: 0.2.3
 appVersion: "v0.2.1"
 keywords:
   - mcp

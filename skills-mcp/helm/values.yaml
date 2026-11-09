@@ -93,12 +93,45 @@ service:
 # Extra Host headers for in-cluster callers (`host:*` form).
 extraAllowedHosts: []
 
+# ---------------------------------------------------------------------------
+# L3/L4 lock (see templates/networkpolicy.yaml)
+# ---------------------------------------------------------------------------
+# Required before state.trustProxyIdentity can be true. Ingress-only; egress
+# (the GitHub refresh) stays open.
+networkPolicy:
+  enabled: false
+  ingressGatewayNamespace: istio-system
+  ingressGatewayLabels:
+    istio: ingressgateway
+  # Namespaces allowed to call the pod directly (the LLM gateway relay).
+  gatewayNamespaces:
+    - pcai-llm
+  # NODE CIDRs allowed on the app port — kubelet probes + kubectl port-forward.
+  # Find yours with: kubectl get nodes -o wide   (INTERNAL-IP column)
+  probeCidrs: []
+  # Pod CIDR(s) carved back OUT of the allowance so pod traffic stays governed
+  # by the namespace rules above. Find it with: kubectl get pods -A -o wide
+  probeExceptCidrs: []
+
 # Corporate proxy for the GitHub fetch (each key wired only when non-empty).
 proxy: {}
 
 # PCAI exposure: the Istio VirtualService on the ezaf-gateway.
+# ---------------------------------------------------------------------------
+# Edge SSO (browser path only)
+# ---------------------------------------------------------------------------
+# A CUSTOM AuthorizationPolicy on the ingress gateway makes oauth2-proxy
+# authenticate the request before it reaches this app, then inject the identity
+# headers. Safe ONLY together with networkPolicy.enabled (otherwise an
+# in-cluster caller can bypass the edge and forge the header).
 ezua:
   enabled: false
+  authorizationPolicy:
+    enabled: false
+    namespace: istio-system
+    providerName: oauth2-proxy        # the ext_authz provider in Istio's MeshConfig
+    gatewayLabels:
+      istio: ingressgateway
   domainName: "${DOMAIN_NAME}"
   virtualService:
     enabled: true

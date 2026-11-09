@@ -1,0 +1,39 @@
+{{- /*
+Edge SSO for the browser path — the same pattern mm-rag ships.
+
+A CUSTOM AuthorizationPolicy on the INGRESS GATEWAY pods makes the oauth2-proxy
+ext_authz provider authenticate the request BEFORE it reaches this app, then
+inject the identity headers (X-Auth-Request-User / X-Forwarded-User). The app
+consumes them only when state.trustProxyIdentity is true.
+
+Scope notes:
+  * hosts = this app's VirtualService endpoint, so other apps are untouched.
+  * It applies to the EDGE (browser) leg only. Agents reach the pod through the
+    LLM gateway, which never traverses the ingress gateway — their API-key auth
+    is unchanged.
+  * The policy lives in istio-system (a different namespace than the release);
+    Helm manages it fine, but deleting the release deletes it too.
+*/}}
+{{- if and .Values.ezua.enabled .Values.ezua.authorizationPolicy.enabled }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-auth-policy
+  namespace: {{ .Values.ezua.authorizationPolicy.namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/app": {{ .Chart.Name }}
+    "hpe-ezua/type": vendor-service
+spec:
+  action: CUSTOM
+  provider:
+    name: {{ .Values.ezua.authorizationPolicy.providerName }}
+  rules:
+    - to:
+        - operation:
+            hosts:
+              - {{ .Values.ezua.virtualService.endpoint | required "ezua.virtualService.endpoint is required when the authorization policy is enabled" }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.ezua.authorizationPolicy.gatewayLabels | nindent 6 }}
+{{- end }}

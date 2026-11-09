@@ -1,0 +1,71 @@
+{{- /*
+L3/L4 lock: once this policy exists, anything NOT matched is DENIED on ingress.
+It is the control that makes trusting the identity headers safe — without it,
+any pod in the cluster could call the service directly and forge
+X-Forwarded-User.
+
+Ingress-only on purpose: egress stays open so the GitHub refresh (through the
+corporate proxy) keeps working.
+
+Kubelet probes and `kubectl port-forward` originate at the NODE, which no
+namespace/pod selector can match — that is what probeCidrs is for. Leave it
+empty and probes WILL fail.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.deployment.name }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+    "hpe-ezua/app": {{ .Chart.Name }}
+    "hpe-ezua/type": vendor-service
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.deployment.appName }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # (i) the edge: ingress-gateway pods that terminate the public route
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressGatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressGatewayLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.targetPort }}
+          protocol: TCP
+    # (ii) the LLM gateway relay — agents' MCP calls arrive from there
+    {{- range .Values.networkPolicy.gatewayNamespaces }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      ports:
+        - port: {{ $.Values.service.targetPort }}
+          protocol: TCP
+    {{- end }}
+    # (iii) same namespace: probes of our own tooling, port-forward from the ns
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.service.targetPort }}
+          protocol: TCP
+    # (iv) node-originated kubelet probes (+ kubectl port-forward from the node)
+    {{- with .Values.networkPolicy.probeCidrs }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | first }}
+            {{- with $.Values.networkPolicy.probeExceptCidrs }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - port: {{ $.Values.service.targetPort }}
+          protocol: TCP
+    {{- end }}
+{{- end }}
