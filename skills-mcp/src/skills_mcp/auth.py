@@ -113,11 +113,15 @@ def proxy_identity(scope) -> str | None:
 
 
 def resolve(scope) -> Identity | None:
-    """Resolve the caller: key first (stronger), then a trusted SSO header."""
+    """Resolve the caller: a matching KEY first (stronger), then a trusted SSO
+    header.
+
+    The fallback matters: an enforcing proxy injects
+    ``Authorization: Bearer <id_token>``` upstream, which LOOKS like a key.
+    Without the fallback, that unmatched pseudo-key would short-circuit and every
+    browser session would resolve to anonymous.
+    """
     keys = mcp_auth.presented_keys(scope)
-    if not keys:
-        sso = proxy_identity(scope)
-        return Identity(sso.lower(), "sso", "sso:" + sso.lower()[:12]) if sso else None
     registry = client_registry()
     for key in keys:
         if key in registry:
@@ -133,6 +137,10 @@ def resolve(scope) -> Identity | None:
             for stored, identity in index.items():
                 if hmac.compare_digest(digest, stored):
                     return Identity(identity, "minted", _fingerprint(key))
+    # Nothing matched. A trusted proxy may still have told us who this is.
+    sso = proxy_identity(scope)
+    if sso:
+        return Identity(sso.lower(), "sso", "sso:" + sso.lower()[:12])
     return None
 
 

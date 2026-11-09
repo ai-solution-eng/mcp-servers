@@ -119,3 +119,34 @@ def test_fingerprint_is_short_and_stable() -> None:
     assert one == auth._fingerprint("abc")
     assert one.startswith("sha256:") and len(one) == len("sha256:") + 12
     assert one != auth._fingerprint("abd")
+
+
+def test_unmatched_bearer_falls_back_to_the_sso_header(monkeypatch) -> None:
+    """The bug this pins: an enforcing proxy injects Authorization: Bearer
+    <id_token> upstream. That looks like a key but matches nothing — the resolver
+    must still fall through to the identity header."""
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"authorization", b"Bearer eyJhbGciOiJSUzI1NiJ9.fake.id-token"),
+            (b"x-auth-request-preferred-username", b"bryan-lliguicota"),
+        ],
+    }
+    found = auth.resolve(scope)
+    assert found is not None
+    assert found.name == "bryan-lliguicota"
+    assert found.source == "sso"
+
+
+def test_a_matching_key_still_beats_the_sso_header(monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"authorization", b"Bearer keyA"),
+            (b"x-auth-request-preferred-username", b"mallory"),
+        ],
+    }
+    assert auth.resolve(scope).name == "alice"

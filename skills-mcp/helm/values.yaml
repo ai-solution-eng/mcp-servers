@@ -13,7 +13,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/skills-mcp
-  tag: v0.2.1
+  tag: v0.2.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []   # only if the GHCR package stays PRIVATE
