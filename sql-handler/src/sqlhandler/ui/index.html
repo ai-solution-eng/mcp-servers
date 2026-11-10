@@ -1,24 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script>
   // Resolve the theme before first paint to avoid a flash of the wrong theme.
-  // Precedence: saved choice > OS preference > dark (the historical default).
+  // Precedence: saved choice (light/dark) > "auto" — auto follows the OS live
+  // via CSS prefers-color-scheme, so nothing is pre-resolved here.
   (function () {
     var t = null;
     try { t = localStorage.getItem("sqlhandler-theme"); } catch (e) {}
-    if (t !== "light" && t !== "dark") {
-      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
-        ? "light" : "dark";
-    }
+    if (t !== "light" && t !== "dark") t = "auto";
     document.documentElement.dataset.theme = t;
   })();
 </script>
 <title>SQLhandler · Data Explorer</title>
 <style>
-  :root {
+  :root,
+  :root[data-theme="dark"] {
     color-scheme: dark;
     --bg: #0f1420;
     --panel: #161d2e;
@@ -44,9 +43,38 @@
     --shadow: rgba(0, 0, 0, 0.4);
     --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
   }
-  /* Light theme: opt in via <html data-theme="light">, set before first paint
-     by the head script (OS preference) and toggled from the header. */
-  [data-theme="light"] {
+  /* Auto theme: follow the OS. The declarations in this media block are
+     KEEP IN SYNC with the :root[data-theme="light"] block below — byte-identical
+     (fleet theme spec, invariant I4). Kept at the same indent so the lines match. */
+  @media (prefers-color-scheme: light) {
+  :root[data-theme="auto"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --active-bg: #d6f2e8;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+  }
+  }
+  /* Explicit light: KEEP IN SYNC with the :root[data-theme="auto"] block above. */
+  :root[data-theme="light"] {
     color-scheme: light;
     --bg: #f3f5fa;
     --panel: #ffffff;
@@ -309,16 +337,28 @@
     color: var(--text);
   }
   button.ghost:hover { border-color: var(--accent); }
-  button.theme-toggle {
-    background: var(--panel-2);
+  .theme-seg {
+    display: inline-flex;
     border: 1px solid var(--border);
-    color: var(--text);
-    font-size: 14px;
-    line-height: 1;
-    padding: 6px 9px;
     border-radius: 6px;
+    overflow: hidden;
   }
-  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  .theme-seg button {
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    color: var(--muted);
+    padding: 6px 9px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .theme-seg button:hover { background: transparent; color: var(--text); }
+  .theme-seg button.on {
+    background: var(--active-bg, var(--accent));
+    color: var(--text);
+    font-weight: 600;
+  }
   .query-actions .spacer { flex: 1; }
   .hint { color: var(--muted); font-size: 12px; }
   .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
@@ -527,7 +567,11 @@
   <a href="#" id="id-key-link" title="Paste a key for this page session — the same credential the Access-control panel uses">Use an API key</a>
   <a href="/oauth/login?next=%2Fui" id="id-sso-link" style="display:none;color:var(--muted);font-size:12px;text-decoration:none" title="Start the SSO round trip (the verified session carries your username, not the IdP sub UUID)">Sign in with SSO</a>
   <button id="id-signout" class="ghost" title="Forget the API key this page holds (and end an edge SSO session when deployed behind the gateway)">Sign out</button>
-  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+  <div class="theme-seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 
 <!-- Use-an-API-key dialog: the pasted key becomes adminCredential — the SAME
@@ -1398,24 +1442,47 @@ function switchTab(tab) {
   if (tab === "access") accessRefresh();
 }
 
-// ---- theme toggle ---------------------------------------------------------
-function initThemeToggle() {
-  const btn = $("theme-toggle");
-  if (!btn) return;
-  const sync = () => {
-    const dark = document.documentElement.dataset.theme !== "light";
-    btn.textContent = dark ? "☀️" : "🌙";
-    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
-  };
-  btn.onclick = () => {
-    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = t;
-    try { localStorage.setItem("sqlhandler-theme", t); } catch (e) { /* ignore */ }
-    sync();
-    document.dispatchEvent(new CustomEvent("sv-theme-change"));
-    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
-  };
-  sync();
+// ---- theme control: Auto (follows OS) / Light / Dark -----------------------
+const THEME_KEY = "sqlhandler-theme";
+function effectiveTheme() {
+  // data-theme is three-state now — JS consumers resolve auto via the OS.
+  const t = document.documentElement.getAttribute("data-theme");
+  if (t === "light" || t === "dark") return t;
+  return (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+    ? "light" : "dark";
+}
+function applyTheme(t) {
+  if (t !== "light" && t !== "dark") t = "auto";
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* ignore */ }
+  document.querySelectorAll("[data-theme-btn]").forEach((b) => {
+    const on = b.getAttribute("data-theme-btn") === t;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  // App-specific follow-ups hang off this event — the syntax highlighter
+  // (makeSVEditor) re-runs on it, so every theme change must dispatch it.
+  document.dispatchEvent(new CustomEvent("sv-theme-change"));
+}
+function initThemeControl() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (e) { /* ignore */ }
+  applyTheme(saved); // marks the active segment; unset/other -> auto
+  document.querySelectorAll("[data-theme-btn]").forEach((b) => {
+    b.onclick = () => {
+      const t = b.getAttribute("data-theme-btn");
+      if (t === document.documentElement.getAttribute("data-theme")) return;
+      applyTheme(t);
+      toast(t === "auto" ? "auto theme — following OS (" + effectiveTheme() + ")" : t + " theme");
+    };
+  });
+  // OS flips while in Auto must reach the highlighter too: re-dispatch.
+  try {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (document.documentElement.getAttribute("data-theme") !== "auto") return;
+      document.dispatchEvent(new CustomEvent("sv-theme-change"));
+    });
+  } catch (e) { /* older engines lack addEventListener on MediaQueryList */ }
 }
 
 // ---- wiring ----------------------------------------------------------------
@@ -2512,7 +2579,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("sv-modal").classList.contains("hidden")) svModalClose(false);
 });
 
-initThemeToggle();
+initThemeControl();
 wireIdentityWidget();
 refreshStatus();
 renderIdentityFromServer();

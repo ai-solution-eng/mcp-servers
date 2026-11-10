@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from dataclasses import dataclass, field, replace
 
@@ -79,6 +80,39 @@ class RateLimiter:
         self._timestamps.append(now)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _response_bytes(resp: SearXNGResponse) -> int:
+    """Resident bytes of one cached search response (measured at insert).
+
+    sys.getsizeof walks the payload strings/lists the cache actually holds;
+    the response is small (KB range) so an exact-ish walk is cheap and
+    avoids serializing a second copy.
+    """
+    total = sys.getsizeof(resp) + sys.getsizeof(resp.query)
+    for result in resp.results:
+        total += sys.getsizeof(result)
+        total += sys.getsizeof(result.title) + sys.getsizeof(result.url)
+        total += sys.getsizeof(result.snippet) + sys.getsizeof(result.category)
+        total += sys.getsizeof(result.engines) + sum(sys.getsizeof(e) for e in result.engines)
+    for name in ("answers", "corrections", "suggestions", "unresponsive_engines", "infoboxes"):
+        value = getattr(resp, name)
+        total += sys.getsizeof(value)
+        for item in value:
+            total += sys.getsizeof(item)
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    total += sys.getsizeof(k) + sys.getsizeof(v)
+            elif isinstance(item, tuple):
+                total += sum(sys.getsizeof(x) for x in item)
+    return total
+
+
 class SearchResultCache:
     """Tiny TTL cache + single-flight coalescer for search outcomes.
 
@@ -88,45 +122,93 @@ class SearchResultCache:
     IP, so every avoided duplicate search is a meaningful chunk of the
     upstream rate-limit budget.
 
-    * TTL: entries expire after ``ttl_seconds`` (0 disables caching entirely).
+    * TTL: entries expire after ttl_seconds (0 disables caching entirely).
+      Expired entries are swept on every insert (lazy-only expiry kept
+      stale responses resident indefinitely).
     * Single flight: concurrent calls with the same key share ONE upstream
-      run — later callers await the same task instead of racing the engines.
+      run - later callers await the same task instead of racing the engines.
     * Failures are coalesced but never memoized: an exception propagates to
       every waiter, but the next call after the failure retries upstream.
-    * Bounded to ``max_entries`` (oldest evicted).
+    * Bounded by BYTES and entries: measured at insert, LRU-evicted until
+      both max_bytes and max_entries hold; a response larger than
+      max_entry_bytes is returned but never cached.
     """
 
-    def __init__(self, ttl_seconds: float, max_entries: int = 64):
+    def __init__(
+        self,
+        ttl_seconds: float,
+        max_entries: int = 64,
+        max_bytes: int = 8 * 1024 * 1024,
+        max_entry_bytes: int = 256 * 1024,
+    ):
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.max_entries = max(1, int(max_entries))
-        self._store: dict[tuple, tuple[float, SearXNGResponse]] = {}
+        self.max_bytes = max(0, int(max_bytes))
+        self.max_entry_bytes = max(0, int(max_entry_bytes))
+        self._store: dict[tuple, tuple[float, int, SearXNGResponse]] = {}
+        self._bytes = 0
         self._inflight: dict[tuple, asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self.hits = 0
         self.misses = 0
 
+    @property
+    def bytes(self) -> int:
+        """Payload bytes currently held by cached responses."""
+        return self._bytes
+
+    def _drop(self, key) -> None:
+        entry = self._store.pop(key, None)
+        if entry is not None:
+            self._bytes = max(0, self._bytes - entry[1])
+
+    def _purge_expired(self, now: float) -> None:
+        for key in [k for k, (expiry, _size, _resp) in self._store.items() if expiry <= now]:
+            self._drop(key)
+
     def _peek(self, key) -> SearXNGResponse | None:
         entry = self._store.get(key)
         if entry is None:
             return None
-        expiry, resp = entry
+        expiry, _size, resp = entry
         if expiry <= time.monotonic():
-            self._store.pop(key, None)
+            self._drop(key)
             return None
+        # LRU: refresh recency so a hot query is evicted last.
+        self._store[key] = self._store.pop(key)
         # Copy on read: callers mutate their response (cache_hit flag), and
         # one shared instance must never alias between callers.
         return replace(resp)
 
+    def _insert(self, key, resp) -> None:
+        if self.ttl_seconds <= 0:
+            return  # caching disabled
+        size = _response_bytes(resp)
+        if self.max_entry_bytes and size > self.max_entry_bytes:
+            return  # too big to cache - still returned to every caller
+        if self.max_bytes and size > self.max_bytes:
+            return
+        now = time.monotonic()
+        self._purge_expired(now)
+        self._drop(key)
+        self._store[key] = (now + self.ttl_seconds, size, resp)
+        self._bytes += size
+        while self._store and (
+            len(self._store) > self.max_entries
+            or (self.max_bytes and self._bytes > self.max_bytes)
+        ):
+            self._drop(next(iter(self._store)))
+
     async def run(self, key, factory, cacheable=None) -> tuple[SearXNGResponse, bool]:
-        """Run ``factory()`` once per key within the TTL window; returns
-        ``(response, cache_hit)``."""
+        """Run factory() once per key within the TTL window; returns
+        (response, cache_hit)."""
         hit = self._peek(key)
         if hit is not None:
             self.hits += 1
             return hit, True
         loop = asyncio.get_running_loop()
         # Coalesce: one shared task per key. All logic (publish + cleanup +
-        # memoize) lives in the task's done-callback so it happens even if
+        # memoize) lives in the task done-callback so it happens even if
         # the owner caller is cancelled mid-flight; asyncio.shield lets
         # individual waiters go away without killing the upstream run.
         async with self._lock:
@@ -148,12 +230,7 @@ class SearchResultCache:
                         return  # failures are coalesced but never memoized
                     resp = done.result()
                     if cacheable is None or cacheable(resp):
-                        self._store[key] = (
-                            time.monotonic() + self.ttl_seconds,
-                            resp,
-                        )
-                        while len(self._store) > self.max_entries:
-                            self._store.pop(next(iter(self._store)))
+                        self._insert(key, resp)
 
                 task.add_done_callback(_publish)
         self.misses += 1
@@ -374,7 +451,12 @@ class SearXNGClient:
                 ttl = float(os.getenv("SEARXNG_SEARCH_CACHE_TTL", "120"))
             except ValueError:
                 ttl = 120.0
-        self.result_cache = SearchResultCache(ttl_seconds=ttl)
+        self.result_cache = SearchResultCache(
+            ttl_seconds=ttl,
+            max_entries=_env_int("SEARXNG_SEARCH_CACHE_MAX_ENTRIES", 64),
+            max_bytes=_env_int("SEARXNG_SEARCH_CACHE_MAX_BYTES", 8 * 1024 * 1024),
+            max_entry_bytes=_env_int("SEARXNG_SEARCH_CACHE_MAX_ENTRY_BYTES", 256 * 1024),
+        )
         self._client = httpx2.AsyncClient(
             timeout=httpx2.Timeout(timeout),
             verify=verify_tls,

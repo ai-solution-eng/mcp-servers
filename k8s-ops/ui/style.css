@@ -1,6 +1,7 @@
 /* HPE Kubernetes Ops Console — no frameworks, no build step. */
 
-:root {
+:root, :root[data-theme="light"] {
+  color-scheme: light;
   --hpe-green: #00c389;          /* HPE GreenLake green */
   --hpe-green-dark: #01a982;
   --hpe-green-tint: rgba(0, 195, 137, .12);
@@ -14,6 +15,73 @@
   --warn: #b8781b;
   --radius: 8px;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  /* Surface colors that flip per mode (dark values in the blocks below). */
+  --sidebar-bg: #101820;
+  --field-bg: #ffffff;
+  --th-bg: #eef2f4;
+  --combo-border: #24313d;
+  --toast-bg: #101820;
+  --btn-primary-fg: #ffffff;
+  --badge-run: #027a5b;
+  --badge-warn-bg: #fdf3e0;
+  --badge-danger-bg: #fbe3e1;
+}
+
+/* Dark palette — wave theme-auto-20261105, THEME-SPEC §4. The media (auto)
+   and explicit (dark) blocks below carry identical declarations. */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    color-scheme: dark;
+    /* DARK VARS — KEEP IN SYNC with the block below */
+    --hpe-green: #2ed3a8;
+    --hpe-green-dark: #4be3b8;
+    --hpe-green-tint: rgba(46, 211, 168, .14);
+    --ink: #f2f4f6;
+    --ink-soft: #cfd8df;
+    --paper: #18181b;
+    --bg: #0e0e10;
+    --line: #2b2b30;
+    --muted: #9aa0a6;
+    --danger: #ff9a90;
+    --warn: #e0a84a;
+    --radius: 8px;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sidebar-bg: #18181b;
+    --field-bg: #0e0e10;
+    --th-bg: #1f1f24;
+    --combo-border: #3f454c;
+    --toast-bg: #2a2a30;
+    --btn-primary-fg: #101820;
+    --badge-run: #4be3b8;
+    --badge-warn-bg: #3a2f18;
+    --badge-danger-bg: #3a1d1a;
+  }
+}
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    /* DARK VARS — KEEP IN SYNC with the block above */
+    --hpe-green: #2ed3a8;
+    --hpe-green-dark: #4be3b8;
+    --hpe-green-tint: rgba(46, 211, 168, .14);
+    --ink: #f2f4f6;
+    --ink-soft: #cfd8df;
+    --paper: #18181b;
+    --bg: #0e0e10;
+    --line: #2b2b30;
+    --muted: #9aa0a6;
+    --danger: #ff9a90;
+    --warn: #e0a84a;
+    --radius: 8px;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sidebar-bg: #18181b;
+    --field-bg: #0e0e10;
+    --th-bg: #1f1f24;
+    --combo-border: #3f454c;
+    --toast-bg: #2a2a30;
+    --btn-primary-fg: #101820;
+    --badge-run: #4be3b8;
+    --badge-warn-bg: #3a2f18;
+    --badge-danger-bg: #3a1d1a;
 }
 
 * { box-sizing: border-box; }
@@ -36,7 +104,8 @@ body {
 .brand-mark {
   display: inline-grid; place-items: center;
   width: 34px; height: 34px; border-radius: 7px;
-  background: var(--hpe-green); color: var(--ink);
+  background: var(--hpe-green);
+  color: #101820; /* pinned dark: --ink inverts to a light color in dark mode */
   font-weight: 800; font-size: 12px; letter-spacing: .5px;
 }
 .brand-mark.big { width: 44px; height: 44px; font-size: 15px; }
@@ -44,6 +113,15 @@ body {
 .brand-text strong { font-size: 15px; }
 .brand-text small { color: var(--muted); font-size: 11.5px; }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
+.theme-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.theme-seg button {
+  background: transparent; color: var(--muted); border: 0; padding: 4px 10px;
+  font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
+}
+/* Active label uses --badge-run, not --hpe-green-dark: #01a982 on the green tint is
+   only 2.70:1 in light mode. --badge-run is the file's existing "green text on a
+   green tint" token (#027a5b light 4.79:1 / #4be3b8 dark). */
+.theme-seg button.on { background: var(--hpe-green-tint); color: var(--badge-run); font-weight: 600; }
 
 .conn-pill {
   display: inline-flex; align-items: center; gap: 7px;
@@ -58,7 +136,7 @@ body {
 .layout { display: flex; min-height: calc(100% - 56px); }
 .sidebar {
   width: 230px; flex: none;
-  background: var(--ink); color: #dfe7ec;
+  background: var(--sidebar-bg); color: #dfe7ec;
   display: flex; flex-direction: column; justify-content: space-between;
   padding: 14px 0 12px;
 }
@@ -100,7 +178,7 @@ body {
 .field input[type="text"], .field input[type="password"], .field input[type="number"],
 .field select, .field textarea {
   font: inherit; padding: 7px 10px;
-  border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; background: var(--field-bg); color: var(--ink);
 }
 .field textarea { font-family: var(--mono); font-size: 13px; min-height: 64px; }
 .field input:focus, .field select:focus, .field textarea:focus {
@@ -112,8 +190,8 @@ body {
 .combo { position: relative; }
 .combo-input {
   width: 100%; font: inherit; padding: 7px 30px 7px 10px;
-  border: 1px solid var(--ink-soft); border-radius: 6px;
-  background: #fff; color: var(--ink); cursor: text;
+  border: 1px solid var(--combo-border); border-radius: 6px;
+  background: var(--field-bg); color: var(--ink); cursor: text;
 }
 .combo-input:focus {
   outline: 2px solid var(--hpe-green); outline-offset: -1px; border-color: var(--hpe-green);
@@ -122,7 +200,7 @@ body {
 .combo-list {
   position: absolute; top: calc(100% + 2px); left: 0; right: 0; z-index: 30;
   max-height: 240px; overflow-y: auto;
-  background: #fff; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--field-bg); border: 1px solid var(--line); border-radius: 6px;
   box-shadow: 0 8px 24px rgba(16, 24, 32, 0.18);
 }
 .combo-opt { padding: 7px 10px; font-size: 13.5px; cursor: pointer; }
@@ -138,7 +216,7 @@ body {
 }
 .btn.primary {
   background: var(--hpe-green-dark);   /* deep brand green at rest */
-  color: #fff;
+  color: var(--btn-primary-fg);           /* dark text on the lightened dark-mode green */
 }
 .btn.primary:hover { background: #019374; }    /* deepen on hover */
 .btn.primary:active { background: #028366; }   /* darkest while pressed */
@@ -161,14 +239,14 @@ body {
 table.data { width: 100%; border-collapse: collapse; background: var(--paper);
   border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 table.data th, table.data td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
-table.data th { background: #eef2f4; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--ink-soft); }
+table.data th { background: var(--th-bg); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--ink-soft); }
 table.data tr:last-child td { border-bottom: 0; }
 table.data tbody tr.click { cursor: pointer; }
 table.data tbody tr.click:hover { background: var(--hpe-green-tint); }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
-.badge.Running { background: var(--hpe-green-tint); color: #027a5b; }
-.badge.Pending { background: #fdf3e0; color: var(--warn); }
-.badge.Failed, .badge.CrashLoopBackOff { background: #fbe3e1; color: var(--danger); }
+.badge.Running { background: var(--hpe-green-tint); color: var(--badge-run); }
+.badge.Pending { background: var(--badge-warn-bg); color: var(--warn); }
+.badge.Failed, .badge.CrashLoopBackOff { background: var(--badge-danger-bg); color: var(--danger); }
 
 /* ── Output ──────────────────────────────────────────────────────────── */
 #output-wrap { margin-top: 4px; }
@@ -208,7 +286,7 @@ dialog input { width: 100%; font: inherit; padding: 7px 10px; border: 1px solid 
 
 #toast {
   position: fixed; right: 18px; bottom: 18px; z-index: 60;
-  background: var(--ink); color: #fff; padding: 10px 16px;
+  background: var(--toast-bg); color: #fff; padding: 10px 16px;
   border-radius: 8px; border-left: 4px solid var(--hpe-green);
   max-width: 420px; box-shadow: 0 6px 18px rgba(16, 24, 32, .35);
 }
