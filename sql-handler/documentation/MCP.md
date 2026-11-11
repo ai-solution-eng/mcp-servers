@@ -17,7 +17,7 @@ Transport is **`streamable-http`**, stateless per-request (`stateless_http=True`
 
 The same process also serves the read-only web UI (`/ui`, `/`), a JSON API (`/api/*` — the REST twins of most tools), `/health`, `/ready`, and `/metrics`.
 
-**Auth (opt-in, per surface).** MCP API keys are configured through the Helm values — `security.apiKey.existingSecret` (a Kubernetes Secret; the chart wires it via `secretKeyRef`, never values literals) — and the server accepts `X-API-Key` or `Authorization: Bearer <key>` on `/mcp`; keys are re-read per request, so rotation needs no restart (append the new key to the Secret, move clients over, drop the old). Unset → the endpoint runs open with a loud startup warning (single-user local mode). Write-capable tools (`query_save` / `query_delete`, and the write tier) are **auth-gated regardless**: with no credential configured they refuse or degrade loudly, never silently. The underlying env the chart renders (`SQLHANDLER_API_KEYS` / `SQLHANDLER_API_TOKEN` for the REST `/api/*` surface) is an implementation detail — operators set values, not envs. See the *Key configuration knobs* table in [FEATURES.md](FEATURES.md).
+**Auth — MANDATORY for /mcp (breaking change, 2026-11).** SQLhandler reads the WHOLE data lake, so it now uses the same posture as applygate/k8s-mcp: the chart wires `MCP_API_KEYS` from an operator-created Kubernetes Secret **unconditionally** (`security.apiKey.existingSecret`, empty = `<fullname>-apikey`; `secretKeyRef`, never values literals), so the pod fails loudly (`CreateContainerConfigError`) until that Secret exists — the chart never creates it (see the chart's NOTES for the `kubectl create secret` command). The server accepts `X-API-Key` or `Authorization: Bearer <key>` on `/mcp`; keys are re-read per request, but Kubernetes does not update a `secretKeyRef` env var in a running pod, so rotation needs a **rollout restart** (append the new key to the Secret, move clients over, drop the old, then `kubectl rollout restart`). **Local-dev escape:** `security.apiKey.openMode=true` leaves the env unwired and `/mcp` runs open with a loud startup warning — off by default, never for a deployment anything else can reach. Write-capable tools (`query_save` / `query_delete`, and the write tier) are **auth-gated regardless**: with no credential configured they refuse or degrade loudly, never silently. The underlying env the chart renders (`MCP_API_KEYS`; `SQLHANDLER_API_TOKEN` for the REST `/api/*` surface) is an implementation detail — operators set values, not envs. See the *Key configuration knobs* table in [FEATURES.md](FEATURES.md).
 
 **Strict Host pinning.** `/mcp` rejects requests whose `Host` header does not match the configured host (DNS-rebinding defense; HTTP 421 on mismatch). Route agents through the deployed hostname or the port-forward above.
 
@@ -25,7 +25,7 @@ The same process also serves the read-only web UI (`/ui`, `/`), a JSON API (`/ap
 
 ---
 
-## 2. Available tools (19)
+## 2. Available tools (23)
 
 Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables` → `describe_table` → `profile_table` (or `column_stats`/`sample_rows`) → `explain_query` (optional) → `run_sql`. Errors carry structured codes and did-you-mean hints — a bad table name in SQL returns the nearest real table names, so an agent self-corrects in one round-trip.
 
@@ -100,6 +100,8 @@ Beyond tools, the server exposes two read-only **resources** and two **prompts**
 - **json / csv** — full fidelity for rows; csv loses dtypes on round-trip.
 - **arrow** — base64-encoded Arrow IPC stream; exact dtypes (decimals, timestamps, NULLs) preserved; use for programmatic callers and wide results.
 - All query tools cap rows (chart value `query.maxRows`, default 1000) and render nothing beyond it — pages are explicit (`limit`), not streamed.
+- **Result budget + pagination.** One tool result can never blow the caller's context: a byte ceiling (`SQLHANDLER_MAX_RESULT_BYTES`, default 100000) bounds the rendered page on top of the row cap. When rows or bytes are withheld, the result ends with ONE deterministic marker — a human line plus `{"truncated": {"total", "returned", "offset", "next_offset", "resume": {"tool", "arguments": {"offset"}}, "fix_hints"}}` — so the total, the returned count and the exact way to fetch more are always stated (rows are never dropped silently). `run_sql`, `scan_table` and `query_saved` accept `offset` to page; JSON output carries the same fields inside its payload as `page`; arrow output comment-prefixes the marker so the base64 body still decodes. `query_result` is fetch-once, so it reports the cap with `next_offset: null` and a hint to resubmit narrower.
+- **Tool annotations.** Every tool declares the MCP hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) explicitly, so clients that default pessimistically never present a read-only tool as destructive. Read-only: every catalog/query reader (including `run_sql` under the default guard, `query_submit`, `query_saved`). Destructive: `admin_policy_set`, `admin_key_revoke`, `query_delete`. Not idempotent: `admin_key_mint`, `query_submit`, `query_result` (fetch-once), `query_save` (bumps `updated_at`). Open-world: anything that reaches the lake or an attached database.
 
 > Raw-format (CSV/JSON) landing-zone tables, where enabled, behave identically at the tool surface — see the raw-format section of [FEATURES.md](FEATURES.md) for the discovery rules and honest performance notes. They are enabled via the `rawFiles.*` Helm values (discovery size-capped), badge as `RAW` in listings, and never take the count(*) metadata fast path.
 
@@ -122,7 +124,7 @@ Beyond tools, the server exposes two read-only **resources** and two **prompts**
 }
 ```
 
-All 18 tools are exposed on every connection; the client's `tools` config can hide specific tools from the model (e.g. disable `ask_data` for agents that should not plan without executing).
+All 23 tools are exposed on every connection; the client's `tools` config can hide specific tools from the model (e.g. disable `ask_data` for agents that should not plan without executing).
 
 ### 5.2 opencode
 
@@ -177,7 +179,7 @@ The tool surface is identical on every backend (values `backend:` / federated `s
 
 ## 6. Web UI inspector tab
 
-The Data Explorer's **Inspector** tab (next to Query/Schema/Semantic) is a browser-side MCP inspector: it lists **the same 18 tools and input schemas as this document** — `GET /api/inspector/tools` serves them from the registered tool definitions (one source of truth with `tools/list`) — builds an arguments form from each tool's `inputSchema` (required args marked, enums as selects), and shows the MCP-shaped result (`{content, isError}`): tool errors render inline with the did-you-mean hints, and a Raw toggle shows the exact bridge JSON. The `table` argument auto-fills from the selected table in the left list. Calls (`POST /api/inspector/call {name, arguments}`) dispatch through the server's own `tools/call` path, so identity, policy, caching, the audit trail and the saved-query write gate behave exactly as over `/mcp` — but auth rides the **`/api` surface** (`SQLHANDLER_API_TOKEN` / PCAI gateway), never the `/mcp` API keys. **No new env vars or config**: the tab is present wherever the web UI is.
+The Data Explorer's **Inspector** tab (next to Query/Schema/Semantic) is a browser-side MCP inspector: it lists **the same 23 tools and input schemas as this document** — `GET /api/inspector/tools` serves them from the registered tool definitions (one source of truth with `tools/list`) — builds an arguments form from each tool's `inputSchema` (required args marked, enums as selects), and shows the MCP-shaped result (`{content, isError}`): tool errors render inline with the did-you-mean hints, and a Raw toggle shows the exact bridge JSON. The `table` argument auto-fills from the selected table in the left list. Calls (`POST /api/inspector/call {name, arguments}`) dispatch through the server's own `tools/call` path, so identity, policy, caching, the audit trail and the saved-query write gate behave exactly as over `/mcp` — but auth rides the **`/api` surface** (`SQLHANDLER_API_TOKEN` / PCAI gateway), never the `/mcp` API keys. **No new env vars or config**: the tab is present wherever the web UI is.
 
 ---
 

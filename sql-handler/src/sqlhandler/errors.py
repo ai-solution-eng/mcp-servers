@@ -59,6 +59,32 @@ E_PARAM_INVALID = "E_PARAM_INVALID"
 # the first capture group of the pattern substituted in (e.g. the unknown
 # table/column name), so hints can say "table 'X' was not in list_tables".
 _ERROR_PATTERNS: list[tuple[re.Pattern, str, list[str]]] = [
+    # Per-CALLER caps (limits.py, identity-keyed): the companions to the two
+    # process-global gate refusals further down. They must match FIRST — their
+    # messages are a superset shape ("... for this caller (limit N, ENV)"), and
+    # the fix hint has to name the PER-CALLER knob, not the global one.
+    (
+        re.compile(r"Too many concurrent queries for this caller \(limit \d+"),
+        E_CONCURRENCY_GATE,
+        [
+            "Wait briefly and retry — your own in-flight queries are still draining.",
+            (
+                "Raise SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER (this caller's bucket) "
+                "or SQLHANDLER_MAX_CONCURRENT_QUERIES (the global outer bound)."
+            ),
+        ],
+    ),
+    (
+        re.compile(r"Too many active query jobs for this caller \(\d+ of \d+"),
+        E_CONCURRENCY_GATE,
+        [
+            "Poll query_status and fetch finished results with query_result (fetch-once frees your slot).",
+            (
+                "Raise SQLHANDLER_MAX_JOBS_PER_CALLER (this caller's cap) "
+                "or SQLHANDLER_MAX_JOBS (the global registry cap)."
+            ),
+        ],
+    ),
     # Read-only refusals: sqlguard's context-prefixed ValueErrors (MCP gate,
     # attached-catalog gate, PRAGMA/COPY/write refusals on any surface).
     (

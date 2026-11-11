@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     import duckdb
 
 from . import errors as _errors
+from . import limits as _limits
 from . import observability, resources
 from . import policy as policy_mod
 from . import writes as writes_mod
@@ -171,15 +172,25 @@ def _queue_timeout() -> float:
 class _QueryGate:
     """A resizable-ish concurrency gate for queries (semaphore based).
 
-    Sized once from SQLHANDLER_MAX_CONCURRENT_QUERIES at first use. Acquire
-    blocks (queueing) up to SQLHANDLER_QUEUE_TIMEOUT; cross-thread release
-    is safe with a plain Semaphore.
+    TWO layers, identity-keyed (additive): a PER-CALLER bucket
+    (:class:`limits.CallerGate`, keyed on the resolved Caller) is taken
+    first, then the process-global semaphore — so the global cap stays the
+    outer bound while one caller can no longer occupy every slot. With no
+    identity (stdio / dev / no gate) there is no per-caller bucket and the
+    behavior is exactly the historical one. Both layers are sized from env at
+    acquire time and rebuilt when the configured size changes.
+
+    Acquire blocks (queueing) up to SQLHANDLER_QUEUE_TIMEOUT; cross-thread
+    release is safe with a plain Semaphore. :meth:`acquire` returns the HELD
+    caller slot (or None) and :meth:`release` takes it back, so a size change
+    mid-flight can never release the wrong semaphore.
     """
 
     def __init__(self) -> None:
         self._sem: threading.Semaphore | None = None
         self._size = -1
         self._lock = threading.Lock()
+        self._callers = _limits.CallerGate()
 
     def _semaphore(self) -> threading.Semaphore | None:
         size = _max_concurrent_queries()
@@ -192,26 +203,48 @@ class _QueryGate:
                 self._size = size
             return self._sem
 
-    def acquire(self) -> None:
+    def acquire(self, caller=None) -> threading.Semaphore | None:
+        """Take the per-caller slot, then a global slot; returns the caller slot.
+
+        The caller bucket is acquired FIRST: a caller queued behind its own
+        per-caller cap must not hold a global slot while it waits (that would
+        let one caller starve everyone else's global capacity). The global
+        semaphore is still acquired on top, so the global cap remains the
+        outer bound. No identity -> no caller bucket (the historical path).
+        """
+        timeout = _queue_timeout()
+        per_caller = _limits.max_concurrent_per_caller(_max_concurrent_queries())
+        scope = _limits.gate_scope(caller)
+        acquired, held = self._callers.acquire(scope, per_caller, timeout)
+        if not acquired:
+            raise LakehouseError(
+                _errors.enrich(
+                    f"Too many concurrent queries for this caller (limit {per_caller}, "
+                    f"SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER), and the queue wait of "
+                    f"{timeout}s expired. Retry later."
+                )
+            )
         sem = self._semaphore()
         if sem is None:
-            return
-        timeout = _queue_timeout()
+            return held
         if not sem.acquire(timeout=timeout):
+            self._callers.release(held)
             raise LakehouseError(
                 _errors.enrich(
                     f"Too many concurrent queries (limit {_max_concurrent_queries()}), and the "
                     f"queue wait of {_queue_timeout()}s expired. Retry later."
                 )
             )
+        return held
 
-    def release(self) -> None:
+    def release(self, held: threading.Semaphore | None = None) -> None:
         sem = self._sem
         if sem is not None:
             try:
                 sem.release()
             except ValueError:
                 pass
+        self._callers.release(held)
 
 
 _query_gate = _QueryGate()
@@ -267,8 +300,15 @@ class QueryJob:
         # query queues in the caller's thread (works for both the sync path
         # and the async API, whose submit runs off the event loop). Raises
         # LakehouseError when the queue wait expires — construction fails,
-        # no job exists.
-        _query_gate.acquire()
+        # no job exists. The per-caller bucket is keyed on THIS job's caller
+        # (the identity layer's Caller, crossing the thread boundary on the
+        # job object like every other attribution).
+        gate_t0 = time.monotonic()
+        self._gate_slot = _query_gate.acquire(caller)
+        # Seconds this job waited for a slot — recorded with the outcome so
+        # "how slow/expensive per caller" includes contention, not just
+        # execution time.
+        self._gate_wait_s = time.monotonic() - gate_t0
         self._gate_held = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="sqlhandler-query")
         try:
@@ -281,7 +321,7 @@ class QueryJob:
             # until the pod restarts (the slot is one of a small fixed set).
             # Release here, then re-raise — construction fails loudly, no job.
             self._gate_held = False
-            _query_gate.release()
+            _query_gate.release(self._gate_slot)
             raise
 
     # ---------------------------------------------------------- execution
@@ -303,7 +343,7 @@ class QueryJob:
                 self._elapsed_ms = (time.monotonic() - self._t0) * 1000.0
             if self._gate_held:
                 self._gate_held = False
-                _query_gate.release()
+                _query_gate.release(self._gate_slot)
             return
         with self._lock:
             self._con = con
@@ -360,7 +400,12 @@ class QueryJob:
                     self._elapsed_ms = (time.monotonic() - self._t0) * 1000
             if self._state == "done":
                 self._engine._record_outcome(
-                    self.sql, self._elapsed_ms, arrow_table.num_rows, state="ok", caller=self._caller
+                    self.sql,
+                    self._elapsed_ms,
+                    arrow_table.num_rows,
+                    state="ok",
+                    caller=self._caller,
+                    queue_wait_s=self._gate_wait_s,
                 )
         except Exception as exc:
             elapsed = (time.monotonic() - self._t0) * 1000
@@ -374,7 +419,13 @@ class QueryJob:
                     hinted = _with_hints(self._engine, self.sql, exc)
                     self._error = f"DuckDB query failed: {hinted}"
             self._engine._record_outcome(
-                self.sql, elapsed, None, state=self._state, error=self._error, caller=self._caller
+                self.sql,
+                elapsed,
+                None,
+                state=self._state,
+                error=self._error,
+                caller=self._caller,
+                queue_wait_s=self._gate_wait_s,
             )
         finally:
             try:
@@ -385,7 +436,7 @@ class QueryJob:
                 self._con = None
             if self._gate_held:
                 self._gate_held = False
-                _query_gate.release()
+                _query_gate.release(self._gate_slot)
 
     # ------------------------------------------------------------ control
     def cancel(self) -> bool:
@@ -3301,6 +3352,7 @@ class SqlEngine:
         state: str,
         error: str | None = None,
         caller=None,
+        queue_wait_s: float | None = None,
     ) -> None:
         """Single outcome choke point: query memory + metrics + audit log.
 
@@ -3309,10 +3361,14 @@ class SqlEngine:
         break a query. ``caller`` (explicit, default None — the QueryJob
         thread boundary) feeds the audit ``caller`` field and the caller-class
         metric; None keeps every existing series byte-identical.
+        ``queue_wait_s`` (the concurrency-gate wait, when the job measured one)
+        feeds the per-caller queue-wait histogram — the "expensive" half of
+        "how slow/expensive per caller".
         """
         self.note_query(sql, duration_ms or 0.0, n_rows, error, caller=caller)
         observability.metrics.record_query(state, (duration_ms or 0.0) / 1000.0, n_rows)
         observability.metrics.record_caller_query(getattr(caller, "cls", None) or "anonymous")
+        observability.metrics.record_caller_scope(caller, (duration_ms or 0.0) / 1000.0, queue_wait_s)
         observability.audit_query(sql, state, duration_ms, n_rows, error, caller=caller)
 
     # ------------------------------------------------------------- scans

@@ -11,9 +11,16 @@ Metrics (rendered at GET /metrics):
   sqlhandler_query_rows_total              counter (rows returned, ok queries)
   sqlhandler_cache_hits_total{cache}       counter (describe | profile | dataset)
   sqlhandler_cache_misses_total{cache}     counter
+  sqlhandler_caller_query_duration_seconds histogram (per-query wall time, by caller scope)
+  sqlhandler_caller_queue_wait_seconds     histogram (gate queue wait, by caller scope)
   sqlhandler_tables                        gauge  (current table count)
   sqlhandler_process_rss_bytes             gauge
   sqlhandler_container_memory_limit_bytes  gauge (0 when unlimited)
+
+The caller-scope families answer "how slow/expensive is THIS caller": labels
+are the bounded caller-scope vocabulary (limits.bounded_scope — subject /
+key fingerprint / anonymous / other, never a raw key, hard-capped), and each
+family renders only after its first observation.
 
 Audit log (SQLHANDLER_AUDIT_LOG=path): one JSON line per query outcome —
 {"ts", "event": "query", "sql", "state", "duration_ms", "n_rows", "error"} —
@@ -86,6 +93,11 @@ class _Histogram:
                 self._totals.get(label, 0),
             )
 
+    def labels(self) -> list[str]:
+        """Every label observed so far (sorted; render iterates this)."""
+        with self._lock:
+            return sorted(self._counts)
+
 
 class Metrics:
     """Registry of the server's counters/histograms/gauges + text rendering."""
@@ -111,6 +123,21 @@ class Metrics:
         # above render byte-identically - this family only ADDS.
         self.caller_queries = _Counter(
             "sqlhandler_caller_queries_total", "Queries executed, by caller class.", "caller_class"
+        )
+        # ADDITIVE (per-caller budgets): cost per caller SCOPE, so
+        # "how slow/expensive is this caller" is answerable from /metrics.
+        # Labels are the bounded scope vocabulary (limits.bounded_scope):
+        # subject:<name> / key:<sha256:...> / anonymous / other - never a raw
+        # key, hard-capped, and rendered only after the first observation.
+        self.caller_duration = _Histogram(
+            "sqlhandler_caller_query_duration_seconds",
+            "Query wall time in seconds, by caller scope.",
+            _DURATION_BUCKETS,
+        )
+        self.caller_queue_wait = _Histogram(
+            "sqlhandler_caller_queue_wait_seconds",
+            "Seconds a query waited for a concurrency slot, by caller scope.",
+            _DURATION_BUCKETS,
         )
         # ADDITIVE (write tier, review 4): writes by backend + outcome.
         self.writes = _Counter("sqlhandler_writes_total", "Scratch writes executed, by backend and outcome.", "backend")
@@ -145,6 +172,26 @@ class Metrics:
         except Exception:
             logger.debug("caller metric record failed", exc_info=True)
 
+    def record_caller_scope(self, caller, duration_s: float, queue_wait_s: float | None = None) -> None:
+        """One query's cost attributed to its caller SCOPE (best-effort).
+
+        The per-caller companion to :meth:`record_caller_query`: the class
+        counter answers "which kind of caller", these histograms answer "which
+        caller, and how much did it cost" (wall time + gate queue wait). The
+        scope label comes from :func:`limits.bounded_scope`, so it is stable,
+        non-secret and bounded; an unknown/malformed caller degrades to the
+        anonymous series rather than dropping the observation.
+        """
+        try:
+            from . import limits
+
+            scope = limits.bounded_scope(limits.caller_scope(caller))
+            self.caller_duration.observe(scope, max(duration_s, 0.0))
+            if queue_wait_s is not None:
+                self.caller_queue_wait.observe(scope, max(queue_wait_s, 0.0))
+        except Exception:  # metrics must never break a query
+            logger.debug("caller-scope metric record failed", exc_info=True)
+
     def record_write(self, backend: str, outcome: str) -> None:
         """One write outcome: ``sqlhandler_writes_total{backend,outcome}``.
 
@@ -159,6 +206,31 @@ class Metrics:
             self.write_outcomes.inc(oc)
         except Exception:
             logger.debug("write metric record failed", exc_info=True)
+
+    @staticmethod
+    def _label_value(value: str) -> str:
+        """Escape one label value for the text exposition (quotes/backslashes)."""
+        return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+    def _emit_histogram(self, lines: list[str], hist: _Histogram, label_name: str) -> None:
+        """Render one labeled histogram family (headers ONCE, then samples).
+
+        Same shape the per-outcome query duration already emits: a single
+        HELP/TYPE pair per family, then per-label _bucket/_sum/_count lines.
+        """
+        labels = hist.labels()
+        if not labels:
+            return
+        lines.append(f"# HELP {hist.name} {hist.help}")
+        lines.append(f"# TYPE {hist.name} histogram")
+        for label in labels:
+            value = self._label_value(label)
+            counts, total_sum, total_n = hist.snapshot(label)
+            for i, bucket in enumerate(hist.buckets):
+                lines.append(f'{hist.name}_bucket{{{label_name}="{value}",le="{bucket}"}} {counts[i]}')
+            lines.append(f'{hist.name}_bucket{{{label_name}="{value}",le="+Inf"}} {total_n}')
+            lines.append(f'{hist.name}_sum{{{label_name}="{value}"}} {round(total_sum, 6)}')
+            lines.append(f'{hist.name}_count{{{label_name}="{value}"}} {total_n}')
 
     def render(self, engine=None) -> str:
         """Prometheus text exposition (engine gauges included when given)."""
@@ -238,6 +310,12 @@ class Metrics:
                 "counter",
                 [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(wo.items())],
             )
+        # ADDITIVE (per-caller budgets): the caller-scope histograms render
+        # after every pre-existing family, so all historical lines keep their
+        # byte position. Each family appears only once a scope was observed
+        # (the same absence convention as `rows`/`caller_queries` above).
+        self._emit_histogram(lines, self.caller_duration, "caller_scope")
+        self._emit_histogram(lines, self.caller_queue_wait, "caller_scope")
         # Readiness rollup (HA review 2026-09): rendered ALWAYS, engine or
         # not - it is most informative exactly when the backend is down.
         emit(

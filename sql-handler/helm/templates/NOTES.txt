@@ -1,39 +1,56 @@
 {{- $name := include "sqlhandler.fullname" . -}}
 {{- $ns := .Release.Namespace -}}
-{{- $secret := .Values.security.apiKey.existingSecret -}}
+{{- $secret := .Values.security.apiKey.existingSecret | default (printf "%s-apikey" (include "sqlhandler.fullname" .)) -}}
 
 sqlhandler {{ .Chart.Version }} deployed to namespace {{ $ns }}.
 
 ════════════════════════════════════════════════════════════════════
-1. MCP API key — OPTIONAL (auth is OFF until you enable it).
-   By default /mcp runs OPEN (the chart wires no key env) and relies on
-   the gateway / network position; /api/* keeps its separate
-   SQLHANDLER_API_TOKEN middleware (set SQLHANDLER_API_TOKEN to enable
-   that one). To turn on the /mcp key gate — the chart NEVER inlines a
-   key in values:
+1. MCP API key — REQUIRED BEFORE THE POD WILL START.
+   BREAKING CHANGE (2026-11): /mcp auth is now MANDATORY, the same
+   posture as applygate/k8s-mcp. SQLhandler reads the WHOLE data lake,
+   so the chart wires MCP_API_KEYS from an operator-created Secret
+   UNCONDITIONALLY — until the Secret below exists in this namespace
+   the pod sits in CreateContainerConfigError (by design, not a bug).
+   The chart NEVER creates the key Secret (an envsubst apply once
+   emptied a live key Secret — the K8S-MCP lesson). Create it first:
 
-  kubectl -n {{ $ns }} create secret generic sqlhandler-apikey \
+  kubectl -n {{ $ns }} create secret generic {{ $secret }} \
     --from-literal="api-keys=$(openssl rand -hex 32)" \
     --dry-run=client -o yaml | kubectl apply -f -
-  helm upgrade <release> . -n {{ $ns }} --reuse-values \
-    --set security.apiKey.existingSecret=sqlhandler-apikey
 
-   ROTATION (zero downtime once enabled): the value is a
-   COMMA-SEPARATED list of valid keys — append the new one, move
-   clients over, drop the old. The server re-reads the env per request
-   — no restart needed. The fleet-universal MCP_API_KEYS env is honored
-   too (either var works).
+   Read it back:
+  kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.api-keys}' | base64 -d
+
+   ROTATION: the value is a COMMA-SEPARATED list of valid keys —
+   append the new one, move clients over, drop the old. The SERVER
+   re-reads its env per request, but Kubernetes does NOT update a
+   secretKeyRef env var in a running pod, so the edit only takes
+   effect after a rollout:
+
+  kubectl -n {{ $ns }} rollout restart deploy/{{ $name }}
+
+   For true no-restart rotation, mount the Secret as a volume and
+   read the file per request — that is a chart change, not a value.
+
+   LOCAL-DEV ESCAPE: --set security.apiKey.openMode=true leaves the
+   env unwired so /mcp runs open (loud startup warning). Off by
+   default; never use it for a deployment anyone else can reach.
 
 ════════════════════════════════════════════════════════════════════
-2. Endpoints:
-  MCP   : /mcp   (X-API-Key: <api-key> — only when enabled)
-  API/UI: /  and /api/*  (SQLHANDLER_API_TOKEN when set)
-  Probes: /health /ready /metrics (always public)
-  MCP client config (when enabled):
+2. Endpoints — /mcp REQUIRES the key (X-API-Key or Authorization:
+   Bearer); /api/* keeps its separate SQLHANDLER_API_TOKEN middleware
+   (set it to enable), the read-only UI and the probes stay open.
+  kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 8001:9097
+  Console : http://localhost:8001/        (read-only UI)
+  MCP     : http://localhost:8001/mcp     (X-API-Key: <api-key>)
+  Probes  : /health /ready /metrics (always public)
+
+  MCP client config:
   { "mcpServers": { "sqlhandler": { "type": "remote", "url": "http://<host>/mcp", "headers": { "X-API-Key": "<api-key>" } } } }
 
 ════════════════════════════════════════════════════════════════════
 3. Verify:
   kubectl -n {{ $ns }} rollout status deploy/{{ $name }}
   kubectl -n {{ $ns }} logs deploy/{{ $name }} | grep -i "API-key auth"
-  # → "ENABLED" when a Secret is wired; "OPEN (optional-auth mode)" otherwise.
+  # → "ENABLED" (the mandatory default). "OPEN (LOCAL-DEV escape)" means
+  #   security.apiKey.openMode=true is set — remove it in production.

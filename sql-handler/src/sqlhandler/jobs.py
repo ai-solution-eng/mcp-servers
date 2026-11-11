@@ -76,6 +76,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from . import errors as _errors
+from . import limits as _limits
 from .engine import (
     LakehouseError,
     QueryJob,
@@ -153,6 +154,7 @@ class _JobRecord:
     __slots__ = (
         "_finished_monotonic",
         "_state",
+        "caller_scope",
         "fetched",
         "fetched_at",
         "job",
@@ -164,10 +166,20 @@ class _JobRecord:
         "timer",
     )
 
-    def __init__(self, job: QueryJob, job_id: str, owner: str | None = None):
+    def __init__(
+        self,
+        job: QueryJob,
+        job_id: str,
+        owner: str | None = None,
+        caller_scope: str | None = None,
+    ):
         self.job = job
         self.job_id = job_id
         self.owner = owner  # stable owner scope (policy.owner_key) or None (legacy/unowned)
+        # Per-caller accounting bucket (limits.caller_scope). Defaults to the
+        # owner scope so an enforcement-on deployment gets the per-caller cap
+        # even when the caller layer passes only `owner`.
+        self.caller_scope = caller_scope if caller_scope is not None else owner
         self.timer: threading.Timer | None = None
         self.timed_out = False
         self.timeout_message: str | None = None
@@ -593,6 +605,33 @@ class McpJobManager:
         """The cross-replica store when `SQLHANDLER_JOBS_DIR` is set, else None."""
         return self._shared
 
+    def _caller_cap_refusal(self, scope: str | None, per_caller: int) -> dict | None:
+        """The per-caller job-cap refusal, or None when the submit may proceed.
+
+        Counts the caller's RUNNING jobs only: the registry slots a finished
+        job still occupies are the GLOBAL cap's business (they are fetchable
+        and TTL-evicted), while "how many concurrent jobs does this caller
+        have" is what the per-caller cap bounds. Called under `self._lock`
+        both before the job starts and again after it is constructed (the
+        same race window the global cap re-checks).
+        """
+        if scope is None or per_caller <= 0:
+            return None
+        running = sum(
+            1
+            for record in self._records.values()
+            if record.caller_scope == scope and record.effective_state() == "running"
+        )
+        if running < per_caller:
+            return None
+        return {
+            "error": _errors.enrich(
+                f"Too many active query jobs for this caller ({running} of {per_caller}, "
+                "SQLHANDLER_MAX_JOBS_PER_CALLER); cancel or fetch results and retry later."
+            ),
+            "status": 429,
+        }
+
     # ------------------------------------------------------------ submit
     def submit(
         self,
@@ -603,6 +642,7 @@ class McpJobManager:
         version_as_of: int | None = None,
         caller=None,
         owner: str | None = None,
+        caller_scope: str | None = None,
     ) -> dict:
         """Validate + start a job; returns `{"job_id", "state"}`.
 
@@ -621,6 +661,14 @@ class McpJobManager:
         derivation, computed by the CALLER layer and passed in: jobs.py never
         derives identities). Set ONLY under policy enforcement; None keeps
         the job unowned, which every caller may access (backward compat).
+
+        `caller_scope` — the identity-keyed accounting bucket
+        (limits.caller_scope), also computed by the caller layer. When given,
+        the per-caller job cap (`SQLHANDLER_MAX_JOBS_PER_CALLER`) applies to
+        the submitter's RUNNING jobs; the global registry cap
+        (`SQLHANDLER_MAX_JOBS`) always applies on top. None (no identity, or a
+        caller layer that does not pass it) keeps the historical global-only
+        behavior; it falls back to `owner` when that is set.
         """
         if mcp_readonly_enabled():
             # Decision D2 at SUBMIT time: the same parser guard, the same
@@ -641,6 +689,8 @@ class McpJobManager:
             except LakehouseError as exc:
                 raise ValueError(str(exc)) from exc
 
+        scope = caller_scope if caller_scope is not None else owner
+        per_caller = _limits.max_jobs_per_caller(self._max_jobs)
         with self._lock:
             self._cleanup()
             if len(self._records) >= self._max_jobs:
@@ -652,6 +702,9 @@ class McpJobManager:
                     ),
                     "status": 429,
                 }
+            refusal = self._caller_cap_refusal(scope, per_caller)
+            if refusal is not None:
+                return refusal
         # QueryJob construction re-validates (cheap), acquires the
         # query-concurrency gate (may queue up to SQLHANDLER_QUEUE_TIMEOUT —
         # its LakehouseError surfaces as a submit-time refusal) and starts
@@ -671,7 +724,14 @@ class McpJobManager:
                     ),
                     "status": 429,
                 }
-            record = _JobRecord(job, job_id, owner=owner or None)
+            refusal = self._caller_cap_refusal(scope, per_caller)
+            if refusal is not None:
+                # A racing submit from the same caller filled its last slot:
+                # cancel (the losing job releases its gate slot when it
+                # unwinds) and refuse exactly like the pre-check would have.
+                job.cancel()
+                return refusal
+            record = _JobRecord(job, job_id, owner=owner or None, caller_scope=scope)
             self._records[job_id] = record
         self._arm_timeout(record)
         if self._shared is not None:
@@ -1149,13 +1209,15 @@ def reset_job_manager() -> None:
 # ---------------------------------------------------------------------------
 
 
-def api_job_submit(engine: SqlEngine, body: dict, *, caller=None, owner=None) -> dict:
+def api_job_submit(engine: SqlEngine, body: dict, *, caller=None, owner=None, caller_scope: str | None = None) -> dict:
     """POST /api/jobs + MCP query_submit — start a read-only query job.
 
     `caller` (identity spine) rides the QueryJob across the thread
     boundary so the outcome record attributes to the submitter. `owner`
     (the caller layer's policy.owner_key derivation) scopes the job: only
     that owner may status/result/cancel it while enforcement is on.
+    `caller_scope` (limits.caller_scope) enables the per-caller job cap; None
+    keeps the historical global-only behavior.
     """
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object.")  # noqa: TRY004
@@ -1167,6 +1229,7 @@ def api_job_submit(engine: SqlEngine, body: dict, *, caller=None, owner=None) ->
         version_as_of=body.get("version_as_of"),
         caller=caller,
         owner=owner,
+        caller_scope=caller_scope,
     )
     if result.get("error"):
         return result  # carries its own "status" for the route wrapper

@@ -19,7 +19,7 @@ podDisruptionBudget:
 terminationGracePeriodSeconds: 90
 image:
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v3.9.4
+  tag: v4.0.0
   digest: ''
   pullPolicy: IfNotPresent
 backend: s3
@@ -75,8 +75,12 @@ security:
   readOnlyRootFilesystem: true
   automountServiceAccountToken: false
   apiKey:
+    # REQUIRED (mandatory auth): the Secret must exist or the pod sits in
+    # CreateContainerConfigError. Create it out of band (see
+    # secrets.example.yaml); rotation = a comma-separated key list.
     existingSecret: mcp-fleet-apikeys
     existingSecretKey: api-keys
+    openMode: false
 fabric:
   credentialsSecret:
     name: fabric-credentials

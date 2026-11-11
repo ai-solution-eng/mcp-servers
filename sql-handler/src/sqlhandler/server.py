@@ -55,6 +55,7 @@ from mcp_types import (
     ListToolsResult,
     TextContent,
     Tool,
+    ToolAnnotations,
 )
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -65,6 +66,7 @@ from . import admin_keys as _admin_keys
 from . import errors as _errors
 from . import identity as _identity
 from . import jobs as _jobs
+from . import limits as _limits
 from . import policy as _policy
 from . import saved as _saved
 from . import writes as _writes
@@ -242,6 +244,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                 args.get("output_format") or "markdown",
                 params,
                 args.get("version_as_of"),
+                offset=args.get("offset", 0),
             ), False
         elif name == "scan_table":
             # An explicit limit of 0 is honored (empty result); only a
@@ -255,6 +258,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                 limit,
                 args.get("output_format") or "markdown",
                 args.get("version_as_of"),
+                offset=args.get("offset", 0),
             ), False
         elif name == "column_stats":
             raw_top = args.get("top_n")
@@ -303,6 +307,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                 args.get("limit"),
                 args.get("output_format") or "markdown",
                 args.get("version_as_of"),
+                offset=args.get("offset", 0),
             ), False
         return f"Unknown tool: {name}", True
     except Exception as exc:
@@ -320,15 +325,57 @@ async def _handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResul
     text, is_error = await asyncio.to_thread(
         _dispatch_tool, params.name, params.arguments or {}, getattr(ctx, "request", None)
     )
+    # Last-resort result budget (SQLHANDLER_MAX_RESULT_BYTES): the row-returning
+    # tools paginate at render time; this bounds EVERY other tool result too
+    # (a lake with tens of thousands of tables makes list_tables enormous). It
+    # truncates at a line boundary and appends the same deterministic marker,
+    # so no tool result can blow the caller's context.
+    text = _limits.cap_tool_text(text, params.name)
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         is_error=is_error,
     )
 
 
+def _tool_annotations(
+    *,
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
+) -> ToolAnnotations:
+    """Build one tool's MCP annotations — declared honestly, on EVERY tool.
+
+    Clients that predate (or pessimistically default) the 2026 hints treat an
+    ABSENT `destructiveHint` as "may be destructive", which presents a plain
+    SELECT as a dangerous operation. So every tool declares all four hints:
+
+    * `readOnly` — the tool does not modify its environment. A SELECT-shaped
+      tool (run_sql under the default read-only guard, query_submit, the
+      catalog readers) is read-only; `query_save`/`query_delete` and the admin
+      twins are not. run_sql's hint describes its DEFAULT posture: an operator
+      who sets `SQLHANDLER_MCP_READONLY=0` opted into DDL.
+    * `destructive` — the tool may destroy/overwrite state a caller cares
+      about (policy replacement, key revocation, saved-query deletion).
+      Additive/state-creating calls are NOT destructive.
+    * `idempotent` — repeating the identical call has no further effect.
+      Minting a key, submitting a job, saving a query (it bumps updated_at) and
+      fetching a job result ONCE are not idempotent.
+    * `openWorld` — the tool reaches outside this process (the lake, an
+      attached database) rather than serving only in-process state.
+    """
+    return ToolAnnotations(
+        read_only_hint=read_only,
+        destructive_hint=destructive,
+        idempotent_hint=idempotent,
+        open_world_hint=open_world,
+    )
+
+
 _TOOLS = [
     Tool(
         name="whoami",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=False),
         description=(
             "The caller's own identity + their own per-table ACL view. Returns the "
             "resolved Caller (audit-safe shape: class/subject/key_fp — never a raw "
@@ -341,6 +388,7 @@ _TOOLS = [
     ),
     Tool(
         name="admin_grants",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=False),
         description=(
             "The whole grants view (admin-gated): the designated admins, the raw datasets "
             "document, policy_text (the WHOLE authored policy as YAML), the assignments map, "
@@ -352,6 +400,7 @@ _TOOLS = [
     ),
     Tool(
         name="admin_policy_set",
+        annotations=_tool_annotations(read_only=False, destructive=True, idempotent=True, open_world=False),
         description=(
             "Replace the policy document (admin-gated). Pass the FULL document as a JSON or "
             "YAML string. Validated first: an invalid document is refused with the loader's "
@@ -366,6 +415,7 @@ _TOOLS = [
     ),
     Tool(
         name="admin_key_mint",
+        annotations=_tool_annotations(read_only=False, destructive=False, idempotent=False, open_world=False),
         description=(
             "Mint one API key (admin-gated). The raw key is returned ONCE in this response - "
             "store it now; the server keeps only the fingerprint. 'assign' is the optional list "
@@ -381,6 +431,7 @@ _TOOLS = [
     ),
     Tool(
         name="admin_key_revoke",
+        annotations=_tool_annotations(read_only=False, destructive=True, idempotent=True, open_world=False),
         description=(
             "Revoke one minted key by fingerprint (admin-gated). Removes the store entry AND its "
             "policy assignment. Secret-managed fingerprints are refused (409) - rotate those via "
@@ -394,6 +445,7 @@ _TOOLS = [
     ),
     Tool(
         name="list_tables",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "List the tables available in the configured data source, plus a live "
             "inventory of any attached (read-only) external databases."
@@ -402,6 +454,7 @@ _TOOLS = [
     ),
     Tool(
         name="describe_table",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description="Return column names, types, and the canonical URI for a table.",
         input_schema={
             "type": "object",
@@ -419,6 +472,7 @@ _TOOLS = [
     ),
     Tool(
         name="profile_table",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Column-level statistics for a table: min/max, approx distinct count, "
             "null %, avg/std and q25/q50/q75 quantiles, plus the total row count. "
@@ -445,6 +499,7 @@ _TOOLS = [
     ),
     Tool(
         name="search_tables",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Find tables by keyword: matches table names, columns and catalog "
             "descriptions, ranked best-first (exact/substring terms, then fuzzy "
@@ -461,6 +516,7 @@ _TOOLS = [
     ),
     Tool(
         name="run_sql",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Execute a read-only SQL query against the source tables and return results. "
             "Tables are referenced by folder name (e.g. work_order_header, or schema/name); "
@@ -485,6 +541,15 @@ _TOOLS = [
                     "type": "integer",
                     "description": (
                         "Optional max number of rows to return. Default: capped by SQLHANDLER_MAX_ROWS (1000)."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional continuation offset (rows to skip). A truncated result's "
+                        "marker names the exact next offset — pass it here to page the same "
+                        "result without re-scanning the earlier rows."
                     ),
                 },
                 "output_format": {
@@ -516,6 +581,7 @@ _TOOLS = [
     ),
     Tool(
         name="scan_table",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Fetch rows/columns from a table via pyarrow (columnar). Prefer run_sql "
             "when filters or aggregations can be pushed into the scan; use this to "
@@ -540,6 +606,15 @@ _TOOLS = [
                         "instead of the whole table."
                     ),
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional continuation offset (rows to skip). A truncated result's "
+                        "marker names the exact next offset — pass it here to page the same "
+                        "result without re-scanning the earlier rows."
+                    ),
+                },
                 "output_format": {
                     "type": "string",
                     "enum": ["markdown", "json", "csv"],
@@ -558,6 +633,7 @@ _TOOLS = [
     ),
     Tool(
         name="column_stats",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Per-column statistics for ONE column: distinct count, null count/%, "
             "min/max, q25/q50/q75 quantiles, and the top-5 values with counts — "
@@ -586,6 +662,7 @@ _TOOLS = [
     ),
     Tool(
         name="sample_rows",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Preview a table's actual rows plus per-column fill rates (fill %, "
             "null counts), in one bounded call — the 'what does this data look "
@@ -621,6 +698,7 @@ _TOOLS = [
     ),
     Tool(
         name="explain_query",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Estimate one read-only query's cost WITHOUT running it — use when a "
             "query looks slow or expensive, before run_sql. Reports referenced "
@@ -662,6 +740,7 @@ _TOOLS = [
 
 Tool(
         name="ask_data",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Turn a plain-language data question into a SQL plan — never executes. "
             "For 'how many work orders are overdue?' / 'answer this question about "
@@ -704,6 +783,7 @@ Tool(
 
     Tool(
         name="query_submit",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=False, open_world=True),
         description=(
             "Start an async query job and return its job_id immediately — for "
             "queries that may outlive a tool-call timeout. The read-only guard "
@@ -741,6 +821,7 @@ Tool(
     ),
     Tool(
         name="query_status",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=False),
         description=(
             "Poll an async query job: state (running/done/error/cancelled), "
             "elapsed_ms, error, and — when done and not yet fetched — the column "
@@ -754,6 +835,7 @@ Tool(
     ),
     Tool(
         name="query_result",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=False, open_world=False),
         description=(
             "Fetch a finished async query job's result ONCE (markdown default, "
             "json, csv), then the spooled result is freed from memory — a second "
@@ -774,6 +856,7 @@ Tool(
     ),
     Tool(
         name="query_cancel",
+        annotations=_tool_annotations(read_only=False, destructive=False, idempotent=True, open_world=False),
         description="Cancel a running async query job (DuckDB interrupt).",
         input_schema={
             "type": "object",
@@ -783,6 +866,7 @@ Tool(
     ),
     Tool(
         name="query_save",
+        annotations=_tool_annotations(read_only=False, destructive=False, idempotent=False, open_world=False),
         description=(
             "Save a parameterized query under a name for reuse: "
             "query_save(name, sql, params, description). The SQL is validated at "
@@ -811,15 +895,14 @@ Tool(
     ),
     Tool(
         name="query_list",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=False),
         description="List saved parameterized queries (name, SQL, default params, description).",
         input_schema={"type": "object", "properties": {}},
     ),
     Tool(
         name="query_delete",
-        description=(
-            "Delete a saved query by name. WRITES ARE AUTH-GATED (same posture as "
-            "query_save)."
-        ),
+        annotations=_tool_annotations(read_only=False, destructive=True, idempotent=True, open_world=False),
+        description=("Delete a saved query by name. WRITES ARE AUTH-GATED (same posture as query_save)."),
         input_schema={
             "type": "object",
             "properties": {"name": {"type": "string", "description": "The saved-query name to delete."}},
@@ -828,6 +911,7 @@ Tool(
     ),
     Tool(
         name="query_saved",
+        annotations=_tool_annotations(read_only=True, destructive=False, idempotent=True, open_world=True),
         description=(
             "Run a saved parameterized query by name. Call-time params override "
             "stored ones (dict merge) and travel as BIND parameters — the stored "
@@ -842,6 +926,15 @@ Tool(
                     "description": "Optional bind params overriding the stored defaults (object for $names / array for ?).",
                 },
                 "limit": {"type": "integer", "description": "Optional max rows (SQLHANDLER_MAX_ROWS caps it)."},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional continuation offset (rows to skip). A truncated result's "
+                        "marker names the exact next offset — pass it here to page the same "
+                        "result without re-scanning the earlier rows."
+                    ),
+                },
                 "output_format": {
                     "type": "string",
                     "enum": ["markdown", "json", "csv"],
@@ -1493,6 +1586,7 @@ def run_sql(
     params: object | None = None,
     version_as_of: int | None = None,
     *,
+    offset: int = 0,
     caller=None,
 ) -> str:
     """Execute a SQL query against the source tables and return results.
@@ -1511,9 +1605,13 @@ def run_sql(
             caps the result either way.
         output_format: markdown (default) | json | csv.
         params: optional bind parameters (named dict or positional list).
+        offset: continuation cursor — rows to skip before the page. A truncated
+            result's marker names the exact next offset; the engine fetches
+            offset+limit rows and the page is sliced out of that prefix.
     """
     try:
         fmt = _validate_output_format(output_format)
+        page_offset = _resolve_offset(offset)
         # Write tier FIRST (classification before the read guard): when the
         # global flag is ON, a single classified scratch-write statement is
         # ADMITTED here (the read guard would refuse it by shape) and the
@@ -1534,9 +1632,13 @@ def run_sql(
             sql = assert_mcp_readonly(sql)
         handler = _handler()
         arrow = handler.query_duckdb(
-            sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller
+            sql,
+            limit=_fetch_limit(limit, page_offset),
+            params=params,
+            version_as_of=version_as_of,
+            caller=caller,
         )
-        return _arrow_to_output(arrow, max_rows=limit, fmt=fmt)
+        return _arrow_to_output(arrow, max_rows=limit, fmt=fmt, offset=page_offset, tool="run_sql")
     except Exception as exc:
         return f"Error running SQL: {_errors.enrich(str(exc))}"
 
@@ -1574,6 +1676,8 @@ def scan_table(
     limit: int = 100,
     output_format: str = "markdown",
     version_as_of: int | None = None,
+    *,
+    offset: int = 0,
 ) -> str:
     """Fetch rows/columns from a table via pyarrow (columnar).
 
@@ -1593,14 +1697,23 @@ def scan_table(
             limit is honored exactly; ``SQLHANDLER_MAX_ROWS=0`` (cap
             disabled) resolves the negative/missing case to unlimited.
         output_format: markdown (default) | json | csv.
+        offset: continuation cursor — rows to skip before the page (the
+            truncation marker names the next offset; the scan fetches
+            offset+limit rows and the page is sliced out of that prefix).
     """
     try:
         fmt = _validate_output_format(output_format)
         handler = _handler()
         col_list = [c.strip() for c in columns.split(",") if c.strip()] if columns else None
+        page_offset = _resolve_offset(offset)
         resolved_limit = _resolve_scan_limit(limit)
-        arrow = handler.scan_arrow(table, columns=col_list, limit=resolved_limit, version_as_of=version_as_of)
-        return _arrow_to_output(arrow, max_rows=resolved_limit, fmt=fmt)
+        arrow = handler.scan_arrow(
+            table,
+            columns=col_list,
+            limit=_fetch_limit(resolved_limit, page_offset),
+            version_as_of=version_as_of,
+        )
+        return _arrow_to_output(arrow, max_rows=resolved_limit, fmt=fmt, offset=page_offset, tool="scan_table")
     except Exception as exc:
         return f"Error scanning table: {_errors.enrich(str(exc))}"
 
@@ -2188,6 +2301,9 @@ def query_submit(
         {"sql": sql, "limit": limit, "params": params, "version_as_of": version_as_of},
         caller=caller,
         owner=_job_owner(caller),
+        # Per-caller job cap: identity-keyed even when policy enforcement is
+        # off (owner is policy-gated; the concurrency budget is not).
+        caller_scope=_limits.gate_scope(caller),
     )
     if result.get("error"):
         raise JobError(result["error"], status=result.get("status", 429))
@@ -2207,7 +2323,10 @@ def query_result(job_id: str, output_format: str = "markdown", *, caller=None) -
     running job returns an error telling you to do exactly that.
     """
     arrow = _jobs.api_job_result(job_id, owner=_job_owner(caller))
-    return _arrow_to_output(arrow, max_rows=None, fmt=output_format)
+    # Fetch-once: the spooled result is already freed, so a byte-budget
+    # truncation here cannot offer a continuation — say so instead of a
+    # resume call that could not work.
+    return _arrow_to_output(arrow, max_rows=None, fmt=output_format, tool="query_result", pageable=False)
 
 
 def query_cancel(job_id: str, *, caller=None) -> str:
@@ -2272,6 +2391,8 @@ def query_saved(
     limit: int | None = None,
     output_format: str = "markdown",
     version_as_of: int | None = None,
+    *,
+    offset: int = 0,
 ) -> str:
     """Run a saved query by name; call-time params override stored ones.
 
@@ -2280,8 +2401,14 @@ def query_saved(
     time, so a hand-edited store cannot smuggle DDL past the read-only mode.
     """
     sql, merged, _entry = _saved.api_saved_run(name, {"params": params})
-    arrow = _handler().query_duckdb(sql, limit=limit, params=merged, version_as_of=version_as_of)
-    return _arrow_to_output(arrow, max_rows=limit, fmt=output_format)
+    page_offset = _resolve_offset(offset)
+    arrow = _handler().query_duckdb(
+        sql,
+        limit=_fetch_limit(limit, page_offset),
+        params=merged,
+        version_as_of=version_as_of,
+    )
+    return _arrow_to_output(arrow, max_rows=limit, fmt=output_format, offset=page_offset, tool="query_saved")
 
 
 # ---------------------------------------------------------------------------
@@ -2349,69 +2476,228 @@ def _validate_output_format(output_format: str) -> str:
     return fmt
 
 
-def _arrow_to_output(arrow, max_rows: int | None, fmt: str) -> str:
-    """Render a pyarrow Table as markdown (default), JSON, or CSV.
+def _output_row_cap() -> int:
+    """Hard row ceiling for one rendered result (SQLHANDLER_MAX_OUTPUT_ROWS).
 
-    All formats share the same row cap (SQLHANDLER_MAX_OUTPUT_ROWS) so a
-    machine-readable format can't smuggle an unbounded payload either. JSON
-    reuses the web API's payload shape ({columns, rows, n_rows, truncated});
-    CSV is pandas' RFC-style rendering (header row, no index).
+    Default 1000; 0 disables the ROW ceiling (the byte budget still applies).
+    A garbage value falls back to the default — an operator typo must never
+    disable the bound.
     """
-    import csv
-    import io
+    raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = _MAX_OUTPUT_ROWS
+    return max(cap, 0)
 
-    from .webui import arrow_to_payload
 
+def _resolve_offset(offset) -> int:
+    """Validate a continuation offset (rows to skip); ValueError names the fix."""
+    if offset is None:
+        return 0
+    try:
+        value = int(offset)
+    except (TypeError, ValueError):
+        raise ValueError(f"offset must be a non-negative integer, got {offset!r}.") from None
+    if value < 0:
+        raise ValueError(f"offset must be a non-negative integer, got {value}.")
+    return value
+
+
+def _fetch_limit(limit: int | None, offset: int) -> int | None:
+    """Rows the engine must fetch so rows [offset, offset+limit) are available.
+
+    A page needs the skipped rows TOO (the engine fetches a prefix, the
+    renderer slices it), so the fetch grows by the offset. The engine caps the
+    fetch at SQLHANDLER_MAX_ROWS, which bounds how far a result can be paged —
+    the truncation marker says so explicitly when the cap is reached.
+    """
+    if offset <= 0:
+        return limit
+    if limit is not None and limit <= 0:
+        return limit  # an explicit empty page fetches nothing
+    cap = _max_rows()
+    page = limit if limit is not None else cap
+    if page <= 0:
+        return limit  # row cap disabled and no explicit limit: keep it unbounded
+    fetch = offset + page
+    return min(fetch, cap) if cap > 0 else fetch
+
+
+def _render_result_rows(
+    arrow,
+    fmt: str,
+    *,
+    truncated: bool = False,
+    page: dict | None = None,
+    error: dict | None = None,
+) -> str:
+    """Render exactly these rows in *fmt* — no caps, no notices (the body).
+
+    JSON carries the truncation state INSIDE the payload (a trailing marker
+    line would make the payload unparseable): `truncated` stays the boolean it
+    always was, `page` is the same shape the markdown marker carries, and
+    `error` is the pre-existing E_ROWS_CAPPED notice.
+    """
+    from .webui import arrow_to_ipc_text, arrow_to_payload
+
+    if fmt == "arrow":
+        return arrow_to_ipc_text(arrow)
+    if fmt == "json":
+        payload = arrow_to_payload(arrow)
+        payload["truncated"] = bool(truncated)
+        if page is not None:
+            payload["page"] = page
+        if error is not None:
+            payload["error"] = error
+        return json.dumps(payload, default=str)
+    if fmt == "csv":
+        import csv
+        import io
+
+        payload = arrow_to_payload(arrow)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(payload["columns"])
+        writer.writerows(payload["rows"])
+        return buf.getvalue()
+    return _arrow_to_markdown(arrow, max_rows=None)
+
+
+def _arrow_to_output(
+    arrow,
+    max_rows: int | None,
+    fmt: str,
+    *,
+    offset: int = 0,
+    tool: str = "",
+    pageable: bool = True,
+) -> str:
+    """Render a result page: row cap, byte budget, and a pagination marker.
+
+    Three bounds, all deterministic:
+
+    * `SQLHANDLER_MAX_OUTPUT_ROWS` — the hard ROW ceiling (unchanged).
+    * `SQLHANDLER_MAX_RESULT_BYTES` — the BYTE ceiling for the rendered page
+      (limits.max_result_bytes). The page is the largest complete-row prefix
+      that fits, found by binary search, so the same result + budget always
+      yields the same page.
+    * `offset` — the continuation cursor: rows [offset, offset+page) are
+      returned, and the marker names `next_offset` plus the exact resume call.
+
+    When rows are withheld, ONE trailing marker (a human line + one JSON line,
+    the errors.py posture) states the TOTAL, the RETURNED count and how to
+    fetch more — rows are never dropped silently. JSON embeds the same fields
+    in its payload (`page`); arrow comment-prefixes the marker so the base64
+    body still decodes.
+
+    `pageable=False` (the fetch-once `query_result` path) reports the
+    truncation with `next_offset: null` and a "resubmit narrower" hint instead
+    of a continuation that cannot work.
+    """
+    fmt = (fmt or "markdown").strip().lower()
     # Boundary rule (decision D4): a non-positive max_rows is "unlimited",
     # never a row count — .head(-1) drops the LAST row and .head(0) drops
     # all of them, so neither may ever be applied to the rendered payload.
     if max_rows is not None and max_rows <= 0:
         max_rows = None
 
-    raw = os.environ.get("SQLHANDLER_MAX_OUTPUT_ROWS", str(_MAX_OUTPUT_ROWS))
-    try:
-        cap = int(raw)
-    except ValueError:
-        cap = _MAX_OUTPUT_ROWS
-    cap = max(cap, 0)
-    capped = False
-    if cap > 0 and max_rows is not None:
-        max_rows = min(max_rows, cap)
-    if cap > 0 and arrow.num_rows > cap:
-        arrow = arrow.slice(0, cap)
-        capped = True
+    # The TOTAL the marker reports: every row this call FETCHED (before the
+    # offset). It is what the tool can honestly count; the upstream table may
+    # hold more, and paging is how the caller reaches it.
+    total_rows = arrow.num_rows
+    if offset > 0:
+        arrow = arrow.slice(offset) if offset < total_rows else arrow.slice(0, 0)
+    available = arrow.num_rows
+    # The ROW ceiling bounds the PAGE, not the offset base: paging stays
+    # possible past SQLHANDLER_MAX_OUTPUT_ROWS rows. The engine's
+    # SQLHANDLER_MAX_ROWS fetch cap is what bounds the reachable total.
+    cap = _output_row_cap()
+    if cap > 0:
+        max_rows = cap if max_rows is None else min(max_rows, cap)
+    requested = available if max_rows is None else min(max_rows, available)
+    row_capped = cap > 0 and requested == cap and available > requested
 
-    fmt = (fmt or "markdown").strip().lower()
-    if fmt == "arrow":
-        # The IPC stream is written AFTER the row cap above, so the payload
-        # stays bounded like every other format; the header names the cap
-        # when it bit (same additive notice posture as the markdown tail).
-        from .webui import arrow_to_ipc_text
+    budget = _limits.max_result_bytes()
+    # A marker is due when rows are withheld HERE (available > requested) or
+    # when the page exactly filled the caller's limit — the pre-existing
+    # "more rows may exist upstream" heuristic.
+    page_full = max_rows is not None and requested == max_rows
+    # An EMPTY page past the end (offset beyond the fetched rows) still needs
+    # the marker: "0 rows here, the result had N" is the signal to stop paging.
+    needs_marker = available > requested or page_full or (offset > 0 and available == 0)
+    comment = "# " if fmt == "arrow" else ""
+    fetch_cap = _max_rows() if _max_rows() > 0 else None
 
-        body = arrow_to_ipc_text(arrow)
-        if capped:
-                body += "\n# rows capped at SQLHANDLER_MAX_OUTPUT_ROWS (more rows exist upstream)"
-        return body
-    if fmt == "json":
-        payload = arrow_to_payload(arrow, limit=max_rows)
-        # E_ROWS_CAPPED: JSON already carries `truncated`; the structured
-        # tail tells an agent WHY more rows exist and how to reach them.
-        if capped or payload.get("truncated"):
-            payload["error"] = {"code": _errors.E_ROWS_CAPPED, "fix_hints": _ROWS_CAPPED_HINTS}
-        return json.dumps(payload, default=str)
-    if fmt == "csv":
-        payload = arrow_to_payload(arrow, limit=max_rows)
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(payload["columns"])
-        writer.writerows(payload["rows"])
-        return buf.getvalue()
-    body = _arrow_to_markdown(arrow, max_rows=max_rows)
-    if capped or (max_rows is not None and max_rows > 0 and arrow.num_rows >= max_rows):
-        # Markdown has no truncated field - the machine-readable cap notice
-        # rides as a structured tail line (same additive posture as errors).
-        return body + _errors.structured(_errors.E_ROWS_CAPPED, _ROWS_CAPPED_HINTS)
-    return body
+    def _marker(n: int) -> dict:
+        end = offset + n
+        if n <= 0 or not pageable or (fetch_cap is not None and end >= fetch_cap):
+            next_offset = None
+        elif available > n or page_full:
+            next_offset = end
+        else:
+            next_offset = None
+        if not pageable:
+            # Fetch-once: there is no continuation to offer, so do not pretend
+            # there is one — say exactly how to get the missing rows.
+            hints = [
+                (
+                    "This result is handed over ONCE (query_result frees it): resubmit with a higher "
+                    "limit, fewer columns or a narrower WHERE to get more rows."
+                ),
+                "Raise SQLHANDLER_MAX_RESULT_BYTES / SQLHANDLER_MAX_OUTPUT_ROWS for bigger pages.",
+            ]
+        else:
+            hints = list(_limits.ROW_BUDGET_HINTS)
+            hints.insert(
+                0, "total = rows fetched by this call; keep paging until a page is shorter than the page size."
+            )
+            if next_offset is None and fetch_cap is not None and end >= fetch_cap:
+                hints.insert(
+                    0,
+                    f"SQLHANDLER_MAX_ROWS ({fetch_cap}) bounds how far one result can be paged; "
+                    "narrow the query (WHERE / aggregates) to reach later rows.",
+                )
+        return _limits.truncation_payload(
+            tool=tool,
+            reason="byte_budget" if n < requested else "row_budget",
+            unit="rows",
+            total=total_rows,
+            returned=n,
+            offset=offset,
+            next_offset=next_offset,
+            byte_limit=budget,
+            fix_hints=hints,
+        )
+
+    def _capped_error() -> dict | None:
+        # The pre-existing E_ROWS_CAPPED notice: rows were withheld by a row
+        # limit (the output cap or the caller's limit) — unchanged semantics.
+        if (row_capped or page_full) and _errors.structured_errors_enabled():
+            return {"code": _errors.E_ROWS_CAPPED, "fix_hints": _ROWS_CAPPED_HINTS}
+        return None
+
+    def body(n: int) -> str:
+        return _render_result_rows(arrow.slice(0, n), fmt)
+
+    def marked(n: int) -> str:
+        page = _marker(n)
+        error = _capped_error()
+        if fmt == "json":
+            return _render_result_rows(
+                arrow.slice(0, n), fmt, truncated=True, page=page[_limits.TRUNCATION_KEY], error=error
+            )
+        suffix = ""
+        if fmt == "arrow" and row_capped:
+            # The pre-existing arrow cap notice, kept byte-identical.
+            suffix = "\n# rows capped at SQLHANDLER_MAX_OUTPUT_ROWS (more rows exist upstream)"
+        if error is not None:
+            page["error"] = error
+        return body(n) + suffix + _limits.truncation_text(page, comment=comment)
+
+    body_fn = marked if needs_marker else body
+    text, _returned = _limits.fit_result(body_fn, marked, requested, budget)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -4188,8 +4474,11 @@ def _build_http_app():
     if api_token:
         app.add_middleware(_ApiTokenMiddleware, token=api_token)
 
-    # OPTIONAL /mcp API-key gate (fleet decision 2026-09 — SQL is optional
-    # until per-user keys/roles land): when neither MCP_API_KEYS (the
+    # /mcp API-key gate. The CHART now wires MCP_API_KEYS unconditionally
+    # from an operator-created Secret (auth is MANDATORY for SQLhandler: it
+    # reads the whole data lake), so the open path below is the documented
+    # LOCAL-DEV escape only (chart value security.apiKey.openMode=true, or a
+    # plain container run with no key env). When neither MCP_API_KEYS (the
     # fleet-universal var) nor SQLHANDLER_API_KEYS is set, /mcp behaves
     # exactly as before; when either is set, /mcp requires a key. Loud
     # startup line either way so the posture is never ambiguous.
@@ -4211,7 +4500,8 @@ def _build_http_app():
     if _mcp_keys:
         logging.getLogger("sqlhandler.server").info(
             "API-key auth ENABLED on /mcp (sources: MCP_API_KEYS/SQLHANDLER_API_KEYS; "
-            "%d key(s) configured — comma-separated lists rotate with zero downtime)",
+            "%d key(s) configured — comma-separated list; adding/removing a key needs a "
+            "rollout restart, because a secretKeyRef env var is not updated in a running pod)",
             len(_mcp_keys),
         )
     else:
@@ -4220,8 +4510,9 @@ def _build_http_app():
         )
         logging.getLogger("sqlhandler.server").warning(
             "Neither MCP_API_KEYS nor SQLHANDLER_API_KEYS is set — /mcp is OPEN "
-            "(optional-auth mode). Set one from a Secret for service-level auth "
-            "(the gateway remains the outer layer)."
+            "(LOCAL-DEV escape; SQLhandler reads the whole data lake, so this is "
+            "not a production posture). The chart wires the key from a Secret by "
+            "default; set security.apiKey.openMode=true only for local dev."
         )
         logging.getLogger("sqlhandler.server").warning("=" * 72)
 

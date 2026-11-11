@@ -143,14 +143,20 @@ spec:
             - name: SQLHANDLER_CATALOG
               value: {{ printf "%s/semantic-catalog.json" (.Values.semanticCatalog.mountPath | default "/etc/sqlhandler") | quote }}
             {{- end }}
-            {{- if .Values.security.apiKey.existingSecret }}
-            # OPTIONAL /mcp API-key auth (fleet decision 2026-09): wired ONLY
-            # when the values point at a Secret; unset → /mcp runs open with
-            # a loud startup warning (gateway-fronted deployments).
-            - name: SQLHANDLER_API_KEYS
+            {{- if .Values.security.apiKey.openMode }}
+            # LOCAL-DEV ESCAPE (values: security.apiKey.openMode): no key env,
+            # so /mcp runs OPEN and the server logs a loud startup warning.
+            # Never for a deployment reachable by anything but you.
+            {{- else }}
+            # /mcp API-key auth — MANDATORY (the applygate/k8s-mcp posture):
+            # wired UNCONDITIONALLY from an operator-created Secret, so the
+            # pod fails loudly (CreateContainerConfigError) until that Secret
+            # exists. The chart never creates it — see NOTES.txt. Empty
+            # existingSecret defaults to "<fullname>-apikey".
+            - name: MCP_API_KEYS
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.security.apiKey.existingSecret }}
+                  name: {{ .Values.security.apiKey.existingSecret | default (printf "%s-apikey" (include "sqlhandler.fullname" .)) }}
                   key: {{ .Values.security.apiKey.existingSecretKey }}
             {{- end }}
             {{- if .Values.semanticCatalog.store.enabled }}
