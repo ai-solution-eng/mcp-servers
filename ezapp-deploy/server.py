@@ -17,6 +17,12 @@ deliberately tiny write surface:
                     version this server uploaded
 - delete_ezappconfig delete one EzAppConfig — ONLY one this server applied
 
+APP STORE (HTTP + /ui/, not MCP tools): GET /api/store/catalog tiles every
+directory of a GitHub repo that contains a Helm chart; POST /api/store/install
+downloads that chart at a pinned ref, uploads it to ChartMuseum, renders the
+EzAppConfig CR from a fixed template and applies it — the whole deploy flow in
+one browser click.
+
 For charts too large for MCP tool-call arguments (clients/model caps
 truncate base64 blobs around 40 KB), POST the RAW .tgz to the server's
 authenticated HTTP endpoint instead:
@@ -126,7 +132,7 @@ import secrets
 import tarfile
 import tempfile
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 from mcp.server.caching import CacheHint
@@ -170,6 +176,11 @@ LEDGER_CONFIGMAP_ENV = "EZAPP_MCP_LEDGER_CONFIGMAP"
 LEDGER_NAMESPACE_ENV = "EZAPP_MCP_LEDGER_NAMESPACE"
 UI_ENABLED_ENV = "EZAPP_MCP_UI_ENABLED"
 CHUNKED_UPLOAD_ENABLED_ENV = "EZAPP_MCP_CHUNKED_UPLOAD_ENABLED"
+STORE_ENABLED_ENV = "EZAPP_MCP_STORE_ENABLED"
+GITHUB_API_URL_ENV = "GITHUB_API_URL"
+GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
+GITHUB_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
+MAX_REPO_MB_ENV = "EZAPP_MCP_MAX_REPO_MB"
 
 DEFAULT_EZAPPCONFIG_KIND = "EzAppConfig"
 DEFAULT_EZAPPCONFIG_API_VERSION = "ezconfig.hpe.ezaf.com/v1alpha1"
@@ -187,6 +198,41 @@ OUTPUT_TRUNCATE_CHARS = 50_000
 
 KUBECTL_TIMEOUT_SECONDS = 60
 CURL_TIMEOUT_SECONDS = 120
+
+# App-store knobs (GitHub catalog + install pipeline).
+DEFAULT_GITHUB_API_URL = "https://api.github.com"
+GITHUB_CURL_TIMEOUT_SECONDS = 60
+GITHUB_TARBALL_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_REPO_MB = 200
+GITHUB_MAX_TREES_BODY_CHARS = 50_000_000   # trees/recursive listing cap
+GITHUB_MAX_RAW_BODY_CHARS = 5_000_000      # Chart.yaml / values.yaml / logo cap
+STORE_CATALOG_TTL_SECONDS = 600
+STORE_CATALOG_MAX = 8
+STORE_INSTALL_MAX_CONCURRENT = 2
+MAX_STORE_VALUES_CHARS = 262_144
+MAX_STORE_STRING_CHARS = 200
+MAX_STORE_CATEGORY_CHARS = 60
+STORE_LOGO_MAX_BYTES = 256 * 1024
+_MAX_UPLOAD_LOGO_CHARS = 400_000   # base64 of a 256 KB image + data: prefix
+_STORE_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# Chart-logo convention: every packaged chart carries its logo inside the
+# package (icon.png / logo.png …); a logo is REQUIRED — when a package ships
+# none, the UI's upload dialog provides one and the API accepts it via the
+# `logo` field (a data: URI or base64 of the raw image bytes, <= 256 KB).
+# Inside-package lookup: the explicit candidate names below first (in
+# order), then any .png/.svg under the chart root whose name mentions
+# icon/logo (shallower first, then alphabetical). PNG and SVG both work:
+# the tile renders either as a data: URI; the CR's default logoImage is raw
+# base64 for PNG (the platform template's documented shape) and a
+# self-describing data:image/svg+xml;base64 URI for SVG.
+_STORE_LOGO_CANDIDATES = (
+    "icon.png", "logo.png", "icon.svg", "logo.svg",
+    "chart-icon.png", "chart-logo.png", "chart-icon.svg", "chart-logo.svg",
+    "img/icon.png", "img/logo.png", "img/icon.svg", "img/logo.svg",
+    "images/icon.png", "images/logo.png", "images/icon.svg", "images/logo.svg",
+    "icons/icon.png", "icons/logo.png", "icons/icon.svg", "icons/logo.svg",
+    "assets/icon.png", "assets/logo.png", "assets/icon.svg", "assets/logo.svg",
+)
 
 # Teardown watch: after an accepted DELETE the CR lingers in Terminating
 # while the operator uninstall (finalizer) runs — on the operator's own
@@ -434,14 +480,25 @@ def _clean_subprocess_env() -> dict:
     return env
 
 
-async def _run_subprocess(argv: list, timeout: int):
-    """Run one argv-list subprocess; returns (returncode, stdout, stderr)."""
+async def _run_subprocess(argv: list, timeout: int, env: dict | None = None):
+    """Run one argv-list subprocess; returns (returncode, stdout, stderr).
+
+    env=None keeps the default (proxy-stripped, in-cluster friendly) env.
+    External-host transports (the GitHub app-store fetches) pass env=os.environ
+    so corporate egress proxies still apply.
+    """
     try:
+        if env is None:
+            env = _clean_subprocess_env()
+        elif not isinstance(env, dict):
+            # os.environ is os._Environ — uvloop's subprocess_exec insists on
+            # a plain dict (the default asyncio loop tolerates it).
+            env = dict(env)
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_clean_subprocess_env(),
+            env=env,
         )
     except (OSError, ValueError) as e:
         return None, "", f"could not execute {argv[0]}: {e}"
@@ -1658,6 +1715,1097 @@ async def delete_ezappconfig(name: str) -> str:
     )
 
 
+# ─── App store (GitHub repo of Helm charts → catalog → one-click install) ─
+#
+# A GitHub repository acting as a chart catalog is turned into an "app store"
+# inside the /ui/ shell. Repo layout: the TOP-LEVEL directories are the
+# individual apps; charts are always PACKAGED — every .tgz / .tar.gz
+# `helm package` file inside an app directory is an installable chart
+# version (one or more per app). GET /api/store/catalog returns one tile per
+# app with its versions sorted newest-first for a dropdown; POST
+# /api/store/install runs the whole deploy flow for the selected version —
+# download the repo tarball at the pinned ref, pull that package out in
+# memory, upload it to ChartMuseum through the SAME pipeline as upload_chart
+# (sniff, ownership gate, ledger), then render the EzAppConfig CR from a
+# FIXED template and apply it via the SAME pipeline as apply_ezappconfig
+# (validation, namespace policy, ledger).
+#
+# Security posture (matches the rest of this server):
+# - GitHub is fetched with curl as fixed argv lists; only validated owner/
+#   repo/ref/dir tokens reach the URL. Hosts are pinned to the configured
+#   API host (+ its raw host) — user input can never redirect the fetch.
+# - Repo tarballs are size-capped (EZAPP_MCP_MAX_REPO_MB) and decompressed
+#   in memory only; members outside the chart directory or with '..' paths
+#   are dropped; only regular files are repackaged.
+# - Both endpoints sit behind the same API-key middleware as /mcp (the UI
+#   sends the key with every call), and install honors the target-namespace
+#   policy BEFORE anything is uploaded.
+# - Concurrent installs are capped with an in-memory semaphore. The CR name
+#   is <chart>-<version>-<epoch-ms> per the platform template, so every
+#   install creates a fresh EzAppConfig (a re-install never mutates someone
+#   else's CR — upgrades stay an explicit re-apply or delete+install).
+
+STORE_GITHUB_API_VERSION = '2022-11-28'
+
+# The only categories the store will write into the EzAppConfig. The install
+# dialog offers exactly these; the API rejects anything else.
+_STORE_CATEGORY_OPTIONS = ('dataScience', 'dataEngineering', 'analytics')
+
+_STORE_REPO_SEGMENT_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}')
+_STORE_REF_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}')
+_STORE_PATH_SEGMENT_RE = re.compile(r'[A-Za-z0-9._-]{1,120}')
+_STORE_GITHUB_REPO_RE = re.compile(
+    r'^(?:https?://)?(?P<host>[^\s/]+)/(?P<owner>[^\s/]+)/'
+    r'(?P<repo>[^\s/]+?)(?:\.git)?'
+    r'(?:/(?:tree|blob)/(?P<ref>[^\s?#]+))?/?$'
+)
+
+_catalog_cache: dict = {}
+_install_slots = asyncio.Semaphore(STORE_INSTALL_MAX_CONCURRENT)
+
+
+def _store_enabled() -> bool:
+    return os.environ.get(STORE_ENABLED_ENV, '').strip().lower() != 'false'
+
+
+def _max_repo_bytes() -> int:
+    raw = os.environ.get(MAX_REPO_MB_ENV, '').strip()
+    try:
+        mb = int(raw) if raw else DEFAULT_MAX_REPO_MB
+    except ValueError:
+        mb = DEFAULT_MAX_REPO_MB
+    return max(1, mb) * 1024 * 1024
+
+
+def _github_token() -> str:
+    return os.environ.get(GITHUB_TOKEN_ENV, '').strip()
+
+
+def _github_ca_argv() -> list:
+    """--cacert pin for GitHub fetches (corporate MITM CAs); off by default."""
+    ca = os.environ.get(GITHUB_CA_BUNDLE_ENV, '').strip()
+    if not ca:
+        return []
+    if not os.path.isfile(ca):
+        raise ValueError(
+            f'{GITHUB_CA_BUNDLE_ENV} points at a missing file: {ca}'
+        )
+    return ['--cacert', ca]
+
+
+def _github_endpoints() -> dict:
+    """(api_base, raw_base, allowed_hosts) for every GitHub fetch.
+
+    Default is github.com. Setting GITHUB_API_URL (e.g.
+    https://ghes.corp.example/api/v3 for GitHub Enterprise Server) moves all
+    fetches to that host: API under the given base, raw files under
+    <host>/raw/..., and repo URLs must point at the same host.
+    """
+    raw = os.environ.get(GITHUB_API_URL_ENV, '').strip().rstrip('/')
+    if not raw:
+        return {
+            'api_base': DEFAULT_GITHUB_API_URL,
+            'raw_base': 'https://raw.githubusercontent.com',
+            'web_base': 'https://github.com',
+            'hosts': ('github.com', 'www.github.com'),
+        }
+    parts = urlsplit(raw)
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        raise ValueError(
+            f'{GITHUB_API_URL_ENV} must be an http(s) URL (got {raw!r})'
+        )
+    prefix = parts.path.rstrip('/')
+    if prefix and not re.fullmatch(r'/[A-Za-z0-9._/\-]*', prefix):
+        raise ValueError(f'{GITHUB_API_URL_ENV} has an unusable path: {raw!r}')
+    return {
+        'api_base': f'{parts.scheme}://{parts.netloc}{prefix}',
+        'raw_base': f'{parts.scheme}://{parts.netloc}/raw',
+        'web_base': f'{parts.scheme}://{parts.netloc}',
+        'hosts': (parts.netloc.lower(),),
+    }
+
+
+def _clean_repo_segment(segment: str):
+    if not segment or segment in ('.', '..'):
+        return None
+    return segment if _STORE_REPO_SEGMENT_RE.fullmatch(segment) else None
+
+
+def _clean_ref(ref: str):
+    """Branch/tag/commit name; None when unusable (empty input → None)."""
+    ref = (ref or '').strip().strip('/')
+    if not ref:
+        return None
+    if '..' in ref or '\\' in ref:
+        return None
+    return ref if _STORE_REF_RE.fullmatch(ref) else None
+
+
+def _clean_chart_dir(dir_path: str):
+    """Chart directory inside the repo: clean relative path, '' = root."""
+    path = (dir_path or '').strip().strip('/')
+    if not path:
+        return ''
+    if '\\' in path or len(path) > 400:
+        return None
+    if '..' in path.split('/'):
+        return None
+    if not all(_STORE_PATH_SEGMENT_RE.fullmatch(seg) for seg in path.split('/')):
+        return None
+    return path
+
+
+def parse_store_repo(repo_str: str):
+    """Parse a GitHub repo URL into (owner, repo, ref | None).
+
+    Accepts https://github.com/<owner>/<repo>[/tree/<ref>], .git-suffixed
+    URLs, and the bare shorthand <owner>/<repo> — which always means the
+    CONFIGURED GitHub host (github.com by default, the GITHUB_API_URL host
+    when GitHub Enterprise is configured). `ref` is a branch/tag/commit when
+    the URL pins one via /tree/<ref>. Raises ValueError on anything else —
+    unknown hosts never leave the pod.
+    """
+    text = (repo_str or '').strip()
+    if not text:
+        raise ValueError(
+            'repo URL is empty — pass e.g. '
+            'https://github.com/<owner>/<repo>[/tree/<ref>]'
+        )
+    try:
+        endpoints = _github_endpoints()
+    except ValueError as e:
+        raise ValueError(str(e)) from e
+    if '://' not in text and ':' not in text and text.count('/') == 1:
+        head = text.split('/', 1)[0]
+        if '.' not in head and head not in ('localhost', '127', '0'):
+            # bare <owner>/<repo> shorthand — the configured host's web base
+            text = f"{endpoints['web_base']}/{text}"
+    match = _STORE_GITHUB_REPO_RE.match(text)
+    if match is None:
+        raise ValueError(
+            f'could not parse {repo_str!r} as a GitHub repository URL '
+            '(https://github.com/<owner>/<repo>[/tree/<ref>])'
+        )
+    host = match.group('host').lower()
+    if host not in endpoints['hosts']:
+        raise ValueError(
+            f'repo host {host!r} is not allowed (this server fetches from '
+            f"{', '.join(sorted(endpoints['hosts']))} only — configure "
+            f'{GITHUB_API_URL_ENV} for GitHub Enterprise)'
+        )
+    owner = _clean_repo_segment(match.group('owner'))
+    repo = _clean_repo_segment(match.group('repo'))
+    if owner is None or repo is None:
+        raise ValueError(f'invalid owner/repo segment in {repo_str!r}')
+    ref = match.group('ref')
+    if ref:
+        ref = _clean_ref(ref)
+        if ref is None:
+            raise ValueError(f'invalid ref in {repo_str!r}')
+    return owner, repo, ref
+
+
+def _github_base_argv() -> list:
+    """Shared curl argv prefix for every GitHub fetch (fixed argv list)."""
+    argv = [
+        'curl', '-sS', '-L', '--max-redirs', '5',
+        '-m', str(GITHUB_CURL_TIMEOUT_SECONDS),
+        '-w', '%{http_code}',
+        '-H', 'User-Agent: ezapp-deploy-mcp',
+        '-H', 'Accept: application/vnd.github+json',
+        '-H', f'X-GitHub-Api-Version: {STORE_GITHUB_API_VERSION}',
+    ]
+    token = _github_token()
+    if token:
+        argv += ['-H', f'Authorization: Bearer {token}']
+    argv += _github_ca_argv()
+    return argv
+
+
+async def _github_fetch_text(url: str, max_bytes: int) -> tuple:
+    """GET a text body from GitHub; returns (http_code, body) or raises."""
+    argv = [*_github_base_argv(), '--max-filesize', str(max_bytes), url]
+    rc, out, err = await _run_subprocess(
+        argv, GITHUB_CURL_TIMEOUT_SECONDS + 10, env=os.environ
+    )
+    if rc is None:
+        raise RuntimeError(err or 'curl could not be executed')
+    if rc != 0:
+        raise RuntimeError(
+            f'curl exited with code {rc} fetching GitHub: {err or "(no stderr)"}'
+        )
+    body, code_raw = out[:-3], out[-3:]
+    try:
+        code = int(code_raw)
+    except ValueError:
+        raise RuntimeError(
+            'could not parse the GitHub response (no HTTP status at the '
+            f'end): {_truncate(out, MAX_CHARTMUSEUM_BODY_CHARS)}'
+        ) from None
+    return code, body
+
+
+async def _github_fetch_bytes(url: str, max_bytes: int) -> tuple:
+    """GET a binary body from GitHub (chart logos); (http_code, bytes).
+
+    Downloads through a temp file — never through stdout — so binary content
+    (the PNG magic bytes) survives intact.
+    """
+    fd, path = tempfile.mkstemp(prefix='store-icon-', dir='/tmp')
+    try:
+        os.close(fd)
+        argv = [*_github_base_argv(), '--max-filesize', str(max_bytes),
+                '-f', '-o', path, '-w', '%{http_code}', url]
+        rc, out, err = await _run_subprocess(
+            argv, GITHUB_CURL_TIMEOUT_SECONDS + 10, env=os.environ
+        )
+        if rc is None:
+            raise RuntimeError(err or 'curl could not be executed')
+        if rc == 22:
+            code_raw = out[-3:] if len(out) >= 3 else ''
+            try:
+                return int(code_raw), b''
+            except ValueError:
+                raise RuntimeError(
+                    f'GitHub fetch failed (curl exit 22): {err or "(no stderr)"}'
+                ) from None
+        if rc != 0:
+            raise RuntimeError(
+                f'curl exited with code {rc} fetching GitHub: '
+                f'{err or "(no stderr)"}'
+            )
+        with open(path, 'rb') as fh:
+            data = fh.read()
+        if len(data) > max_bytes:
+            data = data[:max_bytes]
+        try:
+            return int(out[-3:]), data
+        except ValueError:
+            raise RuntimeError(
+                'could not parse the GitHub response status'
+            ) from None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+async def _github_download(url: str, dest: str) -> tuple:
+    """GET a binary body to `dest` (repo tarball); (http_code | None, msg)."""
+    argv = [
+        *_github_base_argv(),
+        '--max-filesize', str(_max_repo_bytes()),
+        '-f', '-o', dest, '-w', '%{http_code}',
+        url,
+    ]
+    rc, out, err = await _run_subprocess(
+        argv, GITHUB_TARBALL_TIMEOUT_SECONDS, env=os.environ
+    )
+    if rc is None:
+        return None, err or 'curl could not be executed'
+    if rc == 63:
+        return None, (
+            f'repo tarball exceeds the {_max_repo_bytes()} byte cap '
+            f'({MAX_REPO_MB_ENV})'
+        )
+    if rc == 22:
+        code_raw = out[-3:] if len(out) >= 3 else ''
+        try:
+            return int(code_raw), f'GitHub returned HTTP {code_raw} for the tarball'
+        except ValueError:
+            return None, (
+                f'GitHub fetch failed (curl exit 22): {err or "(no stderr)"}'
+            )
+    if rc != 0:
+        return None, (
+            f'curl exited with code {rc} fetching the tarball: '
+            f'{err or "(no stderr)"}'
+        )
+    try:
+        return int(out[-3:]), ''
+    except ValueError:
+        return None, 'could not parse the GitHub tarball response status'
+
+
+def _github_raw_url(endpoints: dict, owner: str, repo: str, ref: str,
+                    path: str) -> str:
+    return f"{endpoints['raw_base']}/{owner}/{repo}/{ref}/{path}"
+
+
+def _app_name_of(chart_dir: str) -> str:
+    """The app a chart belongs to: the repo's top-level directory.
+
+    Store-repo layout: the base directories are individual apps; each app
+    directory holds one or more chart versions (any subdirectory with a
+    Chart.yaml installs). '' (a chart at the repo root) has no app dir.
+    """
+    return chart_dir.split('/', 1)[0] if chart_dir else '(repo root)'
+
+
+def _version_sort_key(version: str) -> list:
+    """Pragmatic semver-ish sort key for chart versions.
+
+    Numeric chunks compare numerically, text chunks lexically, 'v' prefixes
+    are stripped, build metadata (+…) is ignored, and a prerelease (-…)
+    sorts BEFORE the release it belongs to (1.2 < 1.2.3-rc1 < 1.2.3 < 1.10).
+    Never raises on odd version strings.
+    """
+    text = (version or '').strip().lower()
+    if text.startswith('v') and text[1:2].isdigit():
+        text = text[1:]
+    release, _, _build = text.partition('+')   # build metadata: no precedence
+    core, _, pre = release.partition('-')
+
+    def chunks(part: str) -> list:
+        key = []
+        for chunk in part.split('.'):
+            if chunk.isdigit():
+                key.append((0, int(chunk), ''))
+            elif chunk:
+                key.append((1, 0, chunk))
+        return key
+
+    if pre:
+        return [chunks(core), 0, chunks(pre)]
+    return [chunks(core), 1]
+
+
+def _group_catalog_apps(charts: list) -> list:
+    """Group per-chart entries into app tiles for the store.
+
+    Returns one entry per app (the repo's top-level directories), each with
+    its chart versions sorted NEWEST FIRST (pragmatic semver key) and
+    default_dir pointing at the newest version. Apps without a single valid
+    version disappear (their chart dirs are reported as skipped upstream).
+    """
+    by_app: dict = {}
+    for entry in charts:
+        by_app.setdefault(_app_name_of(entry['dir']), []).append(entry)
+    apps = []
+    for app_name in sorted(by_app):
+        versions = sorted(
+            by_app[app_name],
+            key=lambda e: _version_sort_key(e['version']),
+            reverse=True,
+        )
+        apps.append({
+            'app': app_name,
+            'label': ('(repo root)' if app_name == '(repo root)'
+                      else _humanize_chart_name(app_name)),
+            'versions': versions,
+            'default_dir': versions[0]['dir'],
+        })
+    return apps
+
+
+def _is_packaged_chart_path(path: str) -> bool:
+    """True for packaged `helm package` files (.tgz / .tar.gz)."""
+    low = (path or '').lower()
+    return low.endswith('.tgz') or low.endswith('.tar.gz')
+
+
+# ─── packaged charts: (meta, values_text, logo, logo_file) ───────────────
+
+def _packaged_chart_extras(data: bytes) -> dict:
+    """(meta, values_text, logo, icon, logo_file) read from a packaged chart.
+
+    A `helm package` tarball holds everything under one <chart-name>/ root;
+    the logo lookup reuses the same candidate order as unpacked charts.
+    `logo` is the CR logoImage value (raw base64 png / svg data: uri) and
+    `icon` the tile-display data: URI.
+    """
+    empty = {'meta': None, 'values': '', 'logo': '', 'icon': '',
+             'logo_file': ''}
+    meta = None
+    files = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                parts = m.name.split('/')
+                if len(parts) != 2 or not parts[0]:
+                    continue
+                payload_file = tar.extractfile(m)
+                if payload_file is None:
+                    continue
+                payload = payload_file.read()
+                if parts[1].lower() == 'chart.yaml':
+                    try:
+                        meta = yaml.safe_load(payload.decode('utf-8'))
+                    except (yaml.YAMLError, UnicodeDecodeError):
+                        meta = None
+                else:
+                    files[parts[1]] = payload
+    except tarfile.TarError:
+        return empty
+    values = ''
+    raw_values = files.get('values.yaml')
+    if raw_values is not None:
+        try:
+            values = raw_values.decode('utf-8')
+        except UnicodeDecodeError:
+            values = ''
+    logo_value, logo_file = _logo_from_chart_files(files)
+    icon_uri = _logo_data_uri(files.get(logo_file) or b'') if logo_file else None
+    return {
+        'meta': meta if isinstance(meta, dict) else None,
+        'values': values,
+        'logo': logo_value,
+        'icon': icon_uri or '',
+        'logo_file': logo_file,
+    }
+
+
+def _sniff_svg(data: bytes) -> bool:
+    """True when `data` looks like an SVG document (XML decl or <svg root)."""
+    head = data[:512].lstrip().lower()
+    if head.startswith(b'<?xml'):
+        return b'<svg' in data[:4096].lower()
+    return head.startswith(b'<svg')
+
+
+def _sniff_chart_logo(data: bytes):
+    """Image format of a chart-logo file: 'png', 'svg', or None."""
+    if not data or len(data) > STORE_LOGO_MAX_BYTES:
+        return None
+    if data.startswith(_STORE_PNG_MAGIC):
+        return 'png'
+    if _sniff_svg(data):
+        return 'svg'
+    return None
+
+
+def _logo_data_uri(data: bytes):
+    """Tile-display data: URI for a chart logo; None when unusable."""
+    fmt = _sniff_chart_logo(data)
+    if fmt is None:
+        return None
+    mime = 'image/png' if fmt == 'png' else 'image/svg+xml'
+    return f'data:{mime};base64,' + base64.b64encode(data).decode('ascii')
+
+
+def _cr_logo_image(data: bytes):
+    """logoImage payload for the EzAppConfig CR: raw base64 for PNG (the
+    platform template's documented shape), a self-describing data: URI for
+    SVG; None when the bytes are not a usable logo."""
+    fmt = _sniff_chart_logo(data)
+    if fmt == 'png':
+        return base64.b64encode(data).decode('ascii')
+    if fmt == 'svg':
+        return 'data:image/svg+xml;base64,' + base64.b64encode(data).decode('ascii')
+    return None
+
+
+def _logo_from_chart_files(files: dict) -> tuple:
+    """Pick the chart logo out of the extracted chart files.
+
+    Returns (logoImage value, file name inside the chart dir) — ('', '')
+    when the chart ships no usable logo.
+    """
+    scan = []
+    for rel in files:
+        stem, _, ext = rel.rsplit('/', 1)[-1].lower().rpartition('.')
+        if ext in ('png', 'svg') and ('icon' in stem or 'logo' in stem):
+            scan.append(rel)
+    scan.sort(key=lambda r: (r.count('/'), r))
+    ordered = list(_STORE_LOGO_CANDIDATES) + [r for r in scan
+                                              if r not in _STORE_LOGO_CANDIDATES]
+    for rel in ordered:
+        data = files.get(rel)
+        if not data:
+            continue
+        value = _cr_logo_image(data)
+        if value is not None:
+            return value, rel
+    return '', ''
+
+
+def _decode_uploaded_logo(logo_str: str) -> bytes:
+    """Decode an uploaded logo (data: URI or bare base64) to image bytes.
+
+    Raises ValueError on anything that is not a PNG/SVG image within the
+    256 KB cap — the CR's logoImage is built from the decoded bytes by the
+    caller via _cr_logo_image.
+    """
+    text = (logo_str or '').strip()
+    if not text:
+        raise ValueError('uploaded logo is empty')
+    if text.startswith('data:'):
+        header, sep, payload = text.partition(',')
+        if not sep or ';base64' not in header.lower():
+            raise ValueError(
+                'uploaded logo must be a base64 data: URI '
+                '(data:image/png;base64,… or data:image/svg+xml;base64,…)'
+            )
+        text = payload
+    raw = ''.join(text.split())
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f'uploaded logo is not valid base64: {e}') from e
+    if not data:
+        raise ValueError('uploaded logo decodes to zero bytes')
+    if len(data) > STORE_LOGO_MAX_BYTES:
+        raise ValueError(
+            f'uploaded logo is {len(data) / 1024:.0f} KB, above the '
+            f'{STORE_LOGO_MAX_BYTES // 1024} KB limit — use a small image '
+            '(usually logo.png)'
+        )
+    if _sniff_chart_logo(data) is None:
+        raise ValueError(
+            'uploaded logo is not a recognizable PNG or SVG image'
+        )
+    return data
+
+
+def _sweep_store_cache():
+    now = time.monotonic()
+    for key, cached in list(_catalog_cache.items()):
+        if now - cached['built_at'] > STORE_CATALOG_TTL_SECONDS:
+            _catalog_cache.pop(key, None)
+
+
+async def _build_store_catalog(repo_str: str, ref_override: str = '',
+                               force_refresh: bool = False) -> dict:
+    """Fetch the repo listing; one tile per directory holding a Chart.yaml.
+
+    Cached per repo@ref for STORE_CATALOG_TTL_SECONDS. Chart content fetched
+    here is display data (defaults for the install dialog); the install
+    pipeline always re-downloads fresh tarball content at the same ref.
+    """
+    owner, repo, ref_from_url = parse_store_repo(repo_str)
+    try:
+        endpoints = _github_endpoints()
+    except ValueError as e:
+        raise ValueError(str(e)) from e
+    if ref_override:
+        cleaned = _clean_ref(ref_override)
+        if cleaned is None:
+            raise ValueError(f'invalid ref parameter {ref_override!r}')
+        ref_override = cleaned
+    if ref_override and ref_from_url and ref_override != ref_from_url:
+        raise ValueError(
+            f'the repo URL pins ref {ref_from_url!r} but ?ref= says '
+            f'{ref_override!r} — pass one of them, not two different refs'
+        )
+
+    ref = ref_override or ref_from_url or ''
+    cache_key = f'{owner}/{repo}@{ref}'
+    now = time.monotonic()
+    if not force_refresh:
+        _sweep_store_cache()
+        cached = _catalog_cache.get(cache_key)
+        if cached is not None:
+            return {**cached['catalog'], 'cached': True}
+
+    if not ref:
+        code, body = await _github_fetch_text(
+            f"{endpoints['api_base']}/repos/{owner}/{repo}",
+            GITHUB_MAX_TREES_BODY_CHARS,
+        )
+        if code == 403:
+            raise RuntimeError(
+                f'GitHub returned 403 for the repo (rate limit or private '
+                f'repo — set {GITHUB_TOKEN_ENV} for authenticated calls)'
+            )
+        if code != 200:
+            raise RuntimeError(
+                f'GitHub returned HTTP {code} for the repository'
+            )
+        try:
+            ref = str(json.loads(body).get('default_branch') or '')
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f'unreadable GitHub repo metadata: {e}') from e
+        if not ref:
+            raise RuntimeError('GitHub did not report a default branch')
+
+    code, body = await _github_fetch_text(
+        f"{endpoints['api_base']}/repos/{owner}/{repo}/git/trees/{ref}"
+        '?recursive=1',
+        GITHUB_MAX_TREES_BODY_CHARS,
+    )
+    if code == 403:
+        raise RuntimeError(
+            f'GitHub returned 403 for the repo tree (rate limit — set '
+            f'{GITHUB_TOKEN_ENV})'
+        )
+    if code != 200:
+        raise RuntimeError(f'GitHub returned HTTP {code} for the repo tree')
+    try:
+        tree_doc = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'unreadable GitHub tree listing: {e}') from e
+    if tree_doc.get('truncated'):
+        raise RuntimeError(
+            'GitHub truncated the repo tree listing (very large repository) '
+            '— the app store needs a repo whose listing fits one response'
+        )
+    tree = tree_doc.get('tree') or []
+    tree_paths = {str(entry.get('path')) for entry in tree
+                  if isinstance(entry, dict) and entry.get('type') == 'blob'}
+
+    chart_entries, skipped = [], []
+    # Charts are always PACKAGED: every .tgz / .tar.gz `helm package` file
+    # under the app directories is an installable version. Name, version,
+    # description, values and logo are read from the package itself — one
+    # raw fetch per file, capped at the chart-size cap.
+    for file_path in sorted(p for p in tree_paths
+                            if _is_packaged_chart_path(p)
+                            and _clean_chart_dir(p)):
+        try:
+            pcode, pkg_bytes = await _github_fetch_bytes(
+                _github_raw_url(endpoints, owner, repo, ref, file_path),
+                _max_chart_bytes(),
+            )
+        except RuntimeError as e:
+            skipped.append({'dir': file_path, 'reason': str(e)})
+            continue
+        if pcode != 200:
+            skipped.append({'dir': file_path,
+                            'reason': f'packaged chart fetch returned '
+                                      f'HTTP {pcode}'})
+            continue
+        try:
+            pkg_name, pkg_version = _inspect_chart_tarball(pkg_bytes)
+        except ValueError as e:
+            skipped.append({'dir': file_path,
+                            'reason': f'not a packaged helm chart: {e}'})
+            continue
+        extras = _packaged_chart_extras(pkg_bytes)
+        meta_doc = extras['meta'] or {}
+        chart_entries.append({
+            'dir': file_path,
+            'name': pkg_name,
+            'version': pkg_version,
+            'description': str(meta_doc.get('description') or '').strip(),
+            'app_version': str(meta_doc.get('appVersion') or '').strip(),
+            'kube_version': str(meta_doc.get('kubeVersion') or '').strip(),
+            'values': extras['values'],
+            'icon': extras['icon'],
+            'logo_file': extras['logo_file'],
+        })
+
+    # ── group into app tiles and resolve each tile's logo ────────────────
+    # One tile per app (repo top-level dir). The tile logo is the newest
+    # version's own package logo (already extracted during the metadata
+    # fetch — no extra requests); packages without one fall through to the
+    # next-newest version that ships a logo.
+    apps = []
+    for group in _group_catalog_apps(chart_entries):
+        app_logo_uri, app_logo_file = '', ''
+        for version in group['versions']:
+            if version.get('icon'):
+                app_logo_uri = version['icon']
+                app_logo_file = version.get('logo_file') or ''
+                break
+        apps.append({
+            'app': group['app'],
+            'label': group['label'],
+            'icon': app_logo_uri,
+            'logo_file': app_logo_file,
+            'default_dir': group['default_dir'],
+            'versions': group['versions'],
+        })
+
+    catalog = {
+        'repo': f'{owner}/{repo}',
+        'ref': ref,
+        'apps': apps,
+        'skipped': skipped,
+        'generated_at': _now_iso(),
+        'cache_ttl_seconds': STORE_CATALOG_TTL_SECONDS,
+    }
+    _sweep_store_cache()
+    if len(_catalog_cache) >= STORE_CATALOG_MAX:
+        oldest = min(_catalog_cache.values(), key=lambda c: c['built_at'])
+        _catalog_cache.pop(oldest['key'], None)
+    _catalog_cache[cache_key] = {
+        'key': cache_key, 'built_at': now, 'catalog': catalog,
+    }
+    return {**catalog, 'cached': False}
+
+
+
+
+
+
+def _extract_packaged_chart_from_repo_tarball(data: bytes,
+                                              file_path: str) -> dict:
+    """Pull one packaged chart (.tgz/.tar.gz) out of a repo tarball.
+
+    The extracted file already IS a `helm package` tarball — validated with
+    the standard sniffer and passed to ChartMuseum unmodified; the CR logo
+    and default values come from the files inside the package.
+    """
+    packaged_bytes = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                rel = m.name.split('/', 1)[1] if '/' in m.name else ''
+                if rel == file_path:
+                    payload = tar.extractfile(m)
+                    if payload is not None:
+                        packaged_bytes = payload.read()
+                    break
+    except tarfile.TarError as e:
+        raise ValueError(
+            f'repo tarball is not a readable gzipped archive: {e}'
+        ) from e
+    if packaged_bytes is None:
+        raise ValueError(
+            f'packaged chart {file_path!r} was not found in the repo tarball '
+            '— pass the file exactly as shown in the store tile'
+        )
+    try:
+        name, version = _inspect_chart_tarball(packaged_bytes)
+    except ValueError as e:
+        raise ValueError(f'not a packaged helm chart: {e}') from e
+    extras = _packaged_chart_extras(packaged_bytes)
+    meta = extras['meta'] or {}
+    return {
+        'tgz': packaged_bytes,
+        'name': name,
+        'version': version,
+        'description': str(meta.get('description') or '').strip(),
+        'values_text': extras['values'],
+        'logo': extras['logo'],
+        'logo_file': extras['logo_file'],
+        'warnings': [],
+    }
+
+
+def _sanitize_cr_name_segment(text: str) -> str:
+    """Lowercase DNS-1123-safe fragment (chart versions may carry '+')."""
+    cleaned = re.sub(r'[^a-z0-9.-]+', '-', text.strip().lower()).strip('-.')
+    return cleaned or 'app'
+
+
+def _humanize_chart_name(name: str) -> str:
+    """Humanized chart name for the label default: 'arize-phoenix' →
+    'Arize Phoenix' (deterministic split on -, _, .)."""
+    words = [w for w in re.split(r'[-_.]+', (name or '').strip()) if w]
+    return ' '.join(w[0].upper() + w[1:] for w in words) or (name or '')
+
+
+def _render_store_ezappconfig(*, kind: str, api_version: str, cr_name: str,
+                              chart_name: str, chart_version: str,
+                              category: str, label: str, description: str,
+                              namespace: str, values_text: str,
+                              logo_b64: str) -> str:
+    """The deterministic EzAppConfig template for store installs.
+
+    Layout matches the platform's imported-app template exactly; the edited
+    values ride inside the `values` block scalar verbatim (each line indented
+    by 4). Rendering is pure string work so the output is byte-for-byte
+    reproducible for identical inputs apart from the epoch-ms CR name.
+    """
+    values_block = '  values: |-'
+    if values_text:
+        normalized = values_text.replace('\r\n', '\n').replace('\r', '\n')
+        if normalized.endswith('\n'):
+            normalized = normalized[:-1]  # each emitted line closes itself
+        indented = ''.join(f'    {line}\n' for line in normalized.split('\n'))
+        values_block = f'  values: |-\n{indented}'.rstrip('\n')
+    return (
+        f'apiVersion: {api_version}\n'
+        f'kind: {kind}\n'
+        'metadata:\n'
+        '  labels:\n'
+        '    hpe-ezua/imported-app: "true"\n'
+        f'  name: {cr_name}\n'
+        'spec:\n'
+        '  backoffLimit: 3\n'
+        f'  category: {json.dumps(category)}\n'
+        f'  chartVersion: {json.dumps(chart_version)}\n'
+        f'  description: {json.dumps(description)}\n'
+        '  install: true\n'
+        f'  label: {json.dumps(label)}\n'
+        f'  logoImage: {json.dumps(logo_b64)}\n'
+        f'  name: {json.dumps(chart_name)}\n'
+        '  options:\n'
+        '    create-namespace: "true"\n'
+        f'    namespace: {json.dumps(namespace)}\n'
+        '    timeout: 45m\n'
+        '    wait: "true"\n'
+        f'{values_block}\n'
+        '  version: ""\n'
+    )
+
+
+def _validate_store_install_payload(payload: dict) -> dict:
+    """Normalize + validate one install request; raises ValueError."""
+    if not isinstance(payload, dict):
+        raise ValueError('the request body must be a JSON object')
+    repo = str(payload.get('repo') or '').strip()
+    if not repo:
+        raise ValueError('repo is required (the GitHub repository URL)')
+    chart_dir = _clean_chart_dir(str(payload.get('dir') or ''))
+    if chart_dir is None:
+        raise ValueError(
+            f"invalid chart directory {payload.get('dir')!r} — use the exact "
+            'directory shown in the store tile'
+        )
+    ref = str(payload.get('ref') or '').strip()
+    if ref:
+        cleaned = _clean_ref(ref)
+        if cleaned is None:
+            raise ValueError(f'invalid ref {ref!r}')
+        ref = cleaned
+
+    values = payload.get('values')
+    if values is not None and not isinstance(values, str):
+        raise ValueError('values must be a YAML string')
+    if isinstance(values, str) and len(values) > MAX_STORE_VALUES_CHARS:
+        raise ValueError(
+            f'values is {len(values)} chars, above the '
+            f'{MAX_STORE_VALUES_CHARS}-char cap'
+        )
+
+    def _opt(key, cap, what):
+        raw = payload.get(key)
+        if raw is None:
+            return ''
+        text = str(raw).replace('\r', '').replace('\n', ' ').strip()
+        if len(text) > cap:
+            raise ValueError(f'{what} is longer than {cap} chars')
+        return text
+
+    category_raw = _opt('category', MAX_STORE_CATEGORY_CHARS, 'category')
+    category = ''
+    if category_raw:
+        for option in _STORE_CATEGORY_OPTIONS:
+            if option.lower() == category_raw.lower():
+                category = option
+                break
+        if not category:
+            raise ValueError(
+                f'invalid category {category_raw!r} — must be one of: '
+                + ', '.join(_STORE_CATEGORY_OPTIONS)
+            )
+
+    logo = payload.get('logo')
+    if logo is not None:
+        if not isinstance(logo, str) or not logo.strip():
+            raise ValueError(
+                'logo must be a data: URI (or base64) of a png/svg image'
+            )
+        if len(logo) > _MAX_UPLOAD_LOGO_CHARS:
+            raise ValueError(
+                f'uploaded logo is too large — use an image under '
+                f'{STORE_LOGO_MAX_BYTES // 1024} KB'
+            )
+
+    return {
+        'repo': repo,
+        'dir': chart_dir,
+        'ref': ref,
+        'values': values,
+        'category': category,
+        'label': _opt('label', MAX_STORE_STRING_CHARS, 'label'),
+        'description': _opt('description', MAX_STORE_STRING_CHARS, 'description'),
+        'namespace': str(payload.get('namespace') or '').strip().lower(),
+        'logo': (logo or '').strip(),
+    }
+
+
+async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
+                         namespace: str = '', category: str = '',
+                         label: str = '', description: str = '',
+                         values: 'str | None' = None,
+                         logo: str = '') -> dict:
+    """Full store install pipeline; returns a JSON-ready result dict.
+
+    Stages: GitHub tarball → in-memory chart repackage → ChartMuseum upload
+    (same pipeline + ledger as upload_chart) → deterministic EzAppConfig
+    render → kubectl apply (same pipeline as apply_ezappconfig).
+    """
+    result = {'status': 'error', 'stage': None, 'chart': None, 'version': None,
+              'namespace': None, 'ezappconfig': None, 'logo_file': None,
+              'upload': '', 'apply': '', 'manifest': '', 'warnings': [],
+              'detail': ''}
+    try:
+        endpoints = _github_endpoints()
+    except ValueError as e:
+        result['detail'] = f'Error: {e}'
+        return result
+    try:
+        owner, repo, ref_from_url = parse_store_repo(repo_str)
+    except ValueError as e:
+        result['status'] = 'invalid'
+        result['detail'] = f'Error: {e}'
+        return result
+    ref = ref or ref_from_url or ''
+
+    # ── stage 1: download the repo tarball (capped) ──────────────────────
+    result['stage'] = 'github'
+    tarball_url = (
+        f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball/{ref}" if ref
+        else f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball"
+    )
+    fd, tarball_path = tempfile.mkstemp(prefix='store-repo-', suffix='.tar.gz',
+                                        dir='/tmp')
+    repo_bytes = b''
+    try:
+        os.close(fd)
+        code, message = await _github_download(tarball_url, tarball_path)
+        if code != 200:
+            result['detail'] = (
+                f'Error: could not download {owner}/{repo}'
+                + (f' at ref {ref}' if ref else '')
+                + f' from GitHub ({message or f"HTTP {code}"}).'
+            )
+            return result
+        with open(tarball_path, 'rb') as fh:
+            repo_bytes = fh.read()
+        if len(repo_bytes) > _max_repo_bytes():
+            result['detail'] = (
+                f'Error: repo tarball is {len(repo_bytes)} bytes, above the '
+                f'{_max_repo_bytes()} byte cap ({MAX_REPO_MB_ENV}).'
+            )
+            return result
+    finally:
+        try:
+            os.unlink(tarball_path)
+        except OSError:
+            pass
+
+    # ── stage 2: extract the packaged chart in memory ────────────────────
+    # Charts are always packaged (.tgz/.tar.gz): the file is pulled out of
+    # the repo tarball and passed to ChartMuseum unmodified — it already is
+    # a `helm package` tarball, validated by the standard sniffer.
+    result['stage'] = 'chart'
+    try:
+        packaged = _extract_packaged_chart_from_repo_tarball(repo_bytes,
+                                                             chart_dir)
+    except ValueError as e:
+        result['detail'] = f'Error: {e}'
+        return result
+    chart_name, chart_version = packaged['name'], packaged['version']
+    result['chart'], result['version'] = chart_name, chart_version
+    result['warnings'] = packaged['warnings']
+    result['logo_file'] = packaged['logo_file'] or None
+
+    # ── stage 3: resolve metadata (user input → deterministic defaults) ──
+    result['stage'] = 'metadata'
+    namespace = namespace or f'{_sanitize_cr_name_segment(chart_name)}-ns'
+    violation = target_namespace_violation(namespace)
+    if violation:
+        result['status'] = 'invalid'
+        result['detail'] = f'Error: {violation}'
+        return result
+    category = category or 'dataScience'
+    label = label or _humanize_chart_name(chart_name)
+    if not description:
+        description = chart_name
+    if values is None:
+        values = packaged['values_text']
+
+    # logo is REQUIRED: the package's own logo wins unless an uploaded one
+    # was provided (user override via the UI's upload dialog / `logo` field)
+    logo_image = packaged['logo']
+    logo_from = packaged['logo_file']
+    if logo:
+        try:
+            uploaded_bytes = _decode_uploaded_logo(logo)
+        except ValueError as e:
+            result['status'] = 'invalid'
+            result['detail'] = f'Error: {e}'
+            return result
+        logo_image = _cr_logo_image(uploaded_bytes)
+        logo_from = 'upload'
+    if not logo_image:
+        result['status'] = 'invalid'
+        result['detail'] = (
+            'Error: a logo is required — the packaged chart ships none and '
+            'none was uploaded. Attach a small png/svg image (< '
+            f'{STORE_LOGO_MAX_BYTES // 1024} KB, usually "logo.png") via the '
+            'upload dialog or the "logo" field.'
+        )
+        return result
+    result['logo_file'] = logo_from or None
+    result['namespace'] = namespace
+
+    # ── stage 4: ChartMuseum upload (same pipeline as upload_chart) ──────
+    result['stage'] = 'chartmuseum'
+    force = False
+    try:
+        force = await _get_ledger().has_chart(chart_name, chart_version)
+    except LedgerError:
+        force = False  # fail-safe: a plain upload can only ever 409
+    upload = await _upload_chart_bytes(
+        packaged['tgz'], force=force,
+        filename=f'store:{owner}/{repo}@{ref}:{chart_dir or "(root)"}',
+    )
+    result['upload'] = upload['detail']
+    if not upload.get('ok'):
+        if upload.get('status') == 'exists':
+            result['status'] = 'refused'
+            result['detail'] = (
+                f'Error: {chart_name}-{chart_version} already exists in '
+                'ChartMuseum and was not uploaded by this server — the store '
+                'cannot overwrite it (bump the version in the repo).'
+            )
+        else:
+            result['detail'] = (
+                f'Error: ChartMuseum upload failed for '
+                f'{chart_name}-{chart_version}: {upload["detail"]}'
+            )
+        return result
+
+    # ── stage 5: render the CR from the deterministic template ───────────
+    result['stage'] = 'render'
+    cr_name = (
+        f'{_sanitize_cr_name_segment(chart_name)}-'
+        f'{_sanitize_cr_name_segment(chart_version)}-{int(time.time() * 1000)}'
+    )
+    api_versions = _ezappconfig_api_versions()
+    api_version = (DEFAULT_EZAPPCONFIG_API_VERSION if '*' in api_versions
+                   else api_versions[0])
+    manifest_yaml = _render_store_ezappconfig(
+        kind=_ezappconfig_kind(),
+        api_version=api_version,
+        cr_name=cr_name,
+        chart_name=chart_name,
+        chart_version=chart_version,
+        category=category,
+        label=label,
+        description=description,
+        namespace=namespace,
+        values_text=values,
+        logo_b64=logo_image,
+    )
+    result['manifest'] = manifest_yaml
+    result['ezappconfig'] = cr_name
+
+    # ── stage 6: apply (same pipeline as apply_ezappconfig) ──────────────
+    result['stage'] = 'apply'
+    print(
+        f'AUDIT store install decision=allowed repo={owner}/{repo}'
+        + (f'@{ref}' if ref else '')
+        + f" dir={chart_dir or '(root)'} chart={chart_name} "
+        + f'version={chart_version} ezappconfig={cr_name} '
+        + f'logo_from={logo_from or "none"} '
+        + f'target_namespace={namespace}',
+        flush=True,
+    )
+    apply_text = await _apply_ezappconfig_text(manifest_yaml)
+    result['apply'] = apply_text
+    if apply_text.startswith('Error:'):
+        result['detail'] = (
+            f'Error: chart {chart_name}-{chart_version} is uploaded, but '
+            f'applying EzAppConfig {cr_name} failed: '
+            f'{apply_text.split(":", 1)[1].strip()}'
+        )
+        return result
+    result['status'] = 'installed'
+    result['detail'] = apply_text
+    return result
+
+
 # ─── HTTP API-key auth (transport layer) ─────────────────────────────────
 
 _UNAUTHORIZED_BODY = b'{"error": "unauthorized: missing or invalid API key"}'
@@ -2080,10 +3228,162 @@ async def _manifest_http(scope, receive, send):
         await send(message)
 
 
+async def _store_catalog_http(scope, receive, send):
+    """GET /api/store/catalog?repo=<github-url>[&ref=<ref>][&refresh=true]
+
+    One tile per APP (the repo's top-level directories), each carrying its
+    installable PACKAGED chart versions (every .tgz / .tar.gz `helm package`
+    file under it) sorted newest-first for a version dropdown. API-key gated
+    upstream; disabled with EZAPP_MCP_STORE_ENABLED=false (404).
+    """
+    if (scope.get('method') or '').upper() != 'GET':
+        for message in _json_asgi_response(
+            send, 405,
+            b'{"error": "GET the catalog here", "method": "GET"}',
+            [(b'allow', b'GET')],
+        ):
+            await send(message)
+        return
+    if not _store_enabled():
+        for message in _json_asgi_response(send, 404, b'{"error": "not found"}'):
+            await send(message)
+        return
+    query = scope.get('query_string') or b''
+    params = parse_qs(query.decode('latin-1'))
+    repo = params.get('repo', [''])[0].strip()
+    ref = params.get('ref', [''])[0].strip()
+    refresh = params.get('refresh', [''])[0].strip().lower() == 'true'
+    if not repo:
+        for message in _json_asgi_response(
+            send, 400,
+            b'{"error": "repo query parameter is required '
+            b'(a GitHub repository URL)"}',
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    try:
+        catalog = await _build_store_catalog(repo, ref, force_refresh=refresh)
+    except ValueError as e:
+        for message in _json_asgi_response(
+            send, 400, json.dumps({'error': str(e)}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    except (RuntimeError, LedgerError) as e:
+        for message in _json_asgi_response(
+            send, 502, json.dumps({'error': str(e)}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    for message in _json_asgi_response(
+        send, 200, json.dumps(catalog, indent=2).encode('utf-8'),
+        [(b'cache-control', b'no-store')],
+    ):
+        await send(message)
+
+
+async def _store_install_http(scope, receive, send):
+    """POST /api/store/install — one-click deploy of a store tile.
+
+    Body: JSON {repo, dir, ref?, namespace?, category?, label?,
+    description?, values?, logo?}. `logo` (a data: URI or base64 of a
+    png/svg image <= 256 KB) is REQUIRED when the packaged chart ships no
+    logo of its own, and overrides it when provided. The whole flow runs
+    server-side (GitHub download, ChartMuseum upload through the
+    ledger-gated pipeline, deterministic EzAppConfig render, kubectl apply)
+    and the response carries the receipts:
+    {status, ezappconfig, chart, version, namespace, upload, apply, manifest}.
+    """
+    if (scope.get('method') or '').upper() != 'POST':
+        for message in _json_asgi_response(
+            send, 405,
+            b'{"error": "POST the install request JSON here", '
+            b'"method": "POST"}',
+            [(b'allow', b'POST')],
+        ):
+            await send(message)
+        return
+    if not _store_enabled():
+        for message in _json_asgi_response(send, 404, b'{"error": "not found"}'):
+            await send(message)
+        return
+    max_body = MAX_STORE_VALUES_CHARS + STORE_LOGO_MAX_BYTES * 2 + 65_536
+    try:
+        data = await _read_body_capped(receive, max_body)
+    except _BodyTooLarge as e:
+        for message in _json_asgi_response(
+            send, 413, json.dumps({'error': str(e)}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    except _BodyReadError as e:
+        for message in _json_asgi_response(
+            send, 400, json.dumps({'error': str(e)}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    try:
+        payload = json.loads(data.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        for message in _json_asgi_response(
+            send, 400,
+            json.dumps({'error': f'body is not valid JSON: {e}'}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    try:
+        request = _validate_store_install_payload(payload)
+    except ValueError as e:
+        for message in _json_asgi_response(
+            send, 400, json.dumps({'error': str(e)}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    if _install_slots.locked():
+        for message in _json_asgi_response(
+            send, 503,
+            json.dumps({'error': f'{STORE_INSTALL_MAX_CONCURRENT} installs '
+                        'already in progress — retry in a moment'}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    async with _install_slots:
+        result = await _store_install(
+            request['repo'], request['dir'], ref=request['ref'],
+            namespace=request['namespace'], category=request['category'],
+            label=request['label'], description=request['description'],
+            values=request['values'], logo=request['logo'],
+        )
+    status_to_code = {
+        'installed': 200, 'invalid': 400, 'refused': 409, 'error': 502,
+    }
+    body = {k: result[k] for k in (
+        'status', 'stage', 'chart', 'version', 'namespace', 'ezappconfig',
+        'upload', 'apply', 'warnings', 'detail', 'logo_file',
+    )}
+    # The rendered CR rides along for transparency/audit when modest-sized.
+    if len(result['manifest']) <= 65_536:
+        body['manifest'] = result['manifest']
+    for message in _json_asgi_response(
+        send, status_to_code.get(result['status'], 502),
+        json.dumps(body, indent=2).encode('utf-8'),
+        [(b'cache-control', b'no-store')],
+    ):
+        await send(message)
+
+
 class _ApiOrMcpApp:
     """Dispatches the authenticated chain: /api/managed → data API,
     /upload → raw chart upload, /manifest → EzAppConfig staging,
-    everything else → MCP."""
+    /api/store/* → app store (catalog + install), everything else → MCP."""
 
     def __init__(self, mcp_app):
         self.mcp_app = mcp_app
@@ -2099,6 +3399,12 @@ class _ApiOrMcpApp:
                 return
             if path == "/manifest":
                 await _manifest_http(scope, receive, send)
+                return
+            if path == "/api/store/catalog":
+                await _store_catalog_http(scope, receive, send)
+                return
+            if path == "/api/store/install":
+                await _store_install_http(scope, receive, send)
                 return
         await self.mcp_app(scope, receive, send)
 
@@ -2152,9 +3458,11 @@ if __name__ == "__main__":
             flush=True,
         )
     print(
-        "Web UI: read-only managed-apps view at /ui/ "
+        "Web UI: managed-apps view at /ui/ "
         + ("enabled" if _ui_enabled() else "DISABLED")
-        + " (data endpoint /api/managed is API-key gated).",
+        + " (data endpoint /api/managed is API-key gated); app store "
+        + ("enabled" if _store_enabled() else "DISABLED")
+        + " (/api/store/catalog + /api/store/install).",
         flush=True,
     )
     # Host-header (DNS-rebinding) protection: when MCP_HOSTNAME is set (one

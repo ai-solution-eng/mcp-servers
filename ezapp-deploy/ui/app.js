@@ -1,6 +1,7 @@
-/* ezapp-deploy read-only UI. The shell carries no data: everything is
-   fetched from /api/managed with the user-supplied API key (sessionStorage
-   only). All cluster data is rendered via textContent — never HTML. */
+/* ezapp-deploy UI. The shell carries no data: everything is fetched from
+   /api/managed (read-only view) and /api/store/* (catalog + install) with
+   the user-supplied API key (sessionStorage only). All cluster data renders
+   via textContent — never HTML. */
 
 const KEY_STORAGE = "ezappDeployKey";
 const REFRESH_MS = 15000;
@@ -34,6 +35,8 @@ function cell(text) {
   return td;
 }
 
+/* ── Managed apps (read-only) ─────────────────────────────────────────── */
+
 function renderApps(rows) {
   const tbody = $("apps").tBodies[0];
   tbody.textContent = "";
@@ -42,7 +45,7 @@ function renderApps(rows) {
     const td = document.createElement("td");
     td.colSpan = 7;
     td.className = "dim";
-    td.textContent = "Nothing managed yet — upload_chart + apply_ezappconfig will populate this.";
+    td.textContent = "Nothing managed yet — install something from the app store, or use upload_chart + apply_ezappconfig.";
     tr.appendChild(td);
     tbody.appendChild(tr);
     return;
@@ -148,6 +151,307 @@ async function load() {
   }
 }
 
+/* ── App store ────────────────────────────────────────────────────────── */
+
+let currentRepo = "";
+let currentRef = "";
+let installing = false;
+
+function storeStatus(text, isError) {
+  const el = $("storestatus");
+  el.textContent = text;
+  el.classList.toggle("errortext", Boolean(isError));
+}
+
+function nsDefault(chartName) {
+  const cleaned = String(chartName || "").toLowerCase().replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return (cleaned || "app") + "-ns";
+}
+
+function humanizeChartName(name) {
+  // Mirrors the server's label default: "arize-phoenix" -> "Arize Phoenix".
+  const words = String(name || "").trim().split(/[-_.]+/).filter(Boolean);
+  const out = words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  return out || String(name || "");
+}
+
+function renderTiles(data) {
+  currentRepo = data.repo || currentRepo;
+  currentRef = data.ref || "";
+  const tiles = $("tiles");
+  tiles.textContent = "";
+  const apps = data.apps || [];
+  if (!apps.length) {
+    const p = document.createElement("p");
+    p.className = "dim";
+    p.textContent = "No packaged Helm charts found in this repository — store layout: one directory per app at the base, each holding packaged charts (.tgz / .tar.gz).";
+    tiles.appendChild(p);
+  }
+  for (const app of apps) {
+    tiles.appendChild(appTile(app));
+  }
+  if ((data.skipped || []).length) {
+    const p = document.createElement("p");
+    p.className = "dim";
+    p.textContent = "Skipped chart directories: " +
+      data.skipped.map((s) => `${s.dir} (${s.reason})`).join("; ");
+    tiles.appendChild(p);
+  }
+}
+
+function appTile(app) {
+  const box = document.createElement("div");
+  box.className = "tile";
+  const versions = app.versions || [];
+  const defaultVersion = versions.find((v) => v.dir === app.default_dir) || versions[0] || {};
+
+  const iconRow = document.createElement("div");
+  iconRow.className = "iconrow";
+  if (app.icon) {
+    const img = document.createElement("img");
+    img.className = "icon";
+    img.alt = "";
+    img.src = app.icon;
+    iconRow.appendChild(img);
+  } else {
+    const ph = document.createElement("div");
+    ph.className = "icon-placeholder";
+    ph.textContent = (app.app || "?").slice(0, 2).toUpperCase();
+    iconRow.appendChild(ph);
+  }
+  const count = document.createElement("span");
+  count.className = "tmeta";
+  count.textContent = versions.length + " version" + (versions.length === 1 ? "" : "s");
+  iconRow.appendChild(count);
+  box.appendChild(iconRow);
+
+  const name = document.createElement("div");
+  name.className = "tname";
+  name.textContent = app.label || app.app || "(unnamed app)";
+  box.appendChild(name);
+
+  const desc = document.createElement("div");
+  desc.className = "tdesc";
+  desc.textContent = defaultVersion.description || "No description in Chart.yaml.";
+  box.appendChild(desc);
+
+  if (!app.icon) {
+    const noLogo = document.createElement("div");
+    noLogo.className = "tmeta warnnote";
+    noLogo.textContent = "No logo file found — store convention is icon.png or logo.png (png/svg) in the app or chart directory.";
+    box.appendChild(noLogo);
+  }
+
+  const dir = document.createElement("div");
+  dir.className = "tmeta";
+  dir.textContent = (currentRepo || "") +
+    (app.app === "(repo root)" ? " (repo root)" : "/" + app.app) +
+    (currentRef ? " @ " + currentRef : "");
+  box.appendChild(dir);
+
+  // Version dropdown: newest first (server-side order), newest preselected.
+  const dupVersions = new Set();
+  const seen = {};
+  for (const v of versions) {
+    seen[v.version] = (seen[v.version] || 0) + 1;
+  }
+  for (const ver of Object.keys(seen)) {
+    if (seen[ver] > 1) dupVersions.add(ver);
+  }
+  const select = document.createElement("select");
+  select.className = "versel";
+  select.setAttribute("aria-label", "Version to deploy");
+  for (const v of versions) {
+    const opt = document.createElement("option");
+    opt.value = v.dir;
+    opt.textContent = "v" + v.version +
+      (dupVersions.has(v.version) ? " — " + v.dir : "");
+    select.appendChild(opt);
+  }
+  select.value = app.default_dir;
+  box.appendChild(select);
+
+  const installBtn = document.createElement("button");
+  installBtn.type = "button";
+  installBtn.className = "install";
+  installBtn.textContent = "Install";
+  installBtn.addEventListener("click", () => {
+    const selected = versions.find((v) => v.dir === select.value) || defaultVersion;
+    openInstallDialog(selected);
+  });
+  box.appendChild(installBtn);
+  return box;
+}
+
+async function loadCatalog(refresh) {
+  const key = getKey();
+  if (!key) {
+    storeStatus("Enter the MCP API key and press “Save key” first.", true);
+    return;
+  }
+  const repo = $("repobox").value.trim();
+  if (!repo) {
+    storeStatus("Enter a GitHub repository URL, e.g. https://github.com/&lt;owner&gt;/&lt;repo&gt;.", true);
+    return;
+  }
+  storeStatus("Loading catalog…");
+  const params = new URLSearchParams({ repo: repo });
+  if (refresh) params.set("refresh", "true");
+  let resp;
+  try {
+    resp = await fetch("/api/store/catalog?" + params.toString(), {
+      headers: { "Authorization": "Bearer " + key },
+    });
+  } catch (err) {
+    storeStatus("Network error: " + err, true);
+    return;
+  }
+  const body = await resp.json().catch(() => ({}));
+  if (resp.status === 401) {
+    storeStatus("401 — wrong or missing API key.", true);
+    return;
+  }
+  if (!resp.ok) {
+    storeStatus("HTTP " + resp.status + (body.error ? " — " + body.error : ""), true);
+    return;
+  }
+  renderTiles(body);
+  const apps = body.apps || [];
+  const versionCount = apps.reduce((n, a) => n + (a.versions || []).length, 0);
+  storeStatus(
+    (body.cached ? "Catalog (cached" : "Catalog (fresh") +
+    ", ref " + (body.ref || "?") + "): " + apps.length + " app" +
+    (apps.length === 1 ? "" : "s") + ", " + versionCount + " installable chart version" +
+    (versionCount === 1 ? "" : "s") + ". Pick a version, then Install." +
+    (refresh ? "" : " (Load again with refresh to force a re-fetch)"),
+  );
+}
+
+let dlgLogoUpload = "";   // data URI of a user-uploaded logo ("" = use package logo)
+let dlgChart = null;       // the version the dialog is open for
+const LOGO_MAX_BYTES = 256 * 1024;
+
+function setDialogLogo(chart) {
+  const preview = $("dlg-logo-preview");
+  const status = $("dlg-logo-status");
+  if (chart.icon) {
+    preview.src = chart.icon;
+    preview.classList.remove("hidden");
+    status.textContent = "Logo: " + (chart.logo_file || "from package") +
+      " — choose a file to replace it.";
+  } else {
+    preview.classList.add("hidden");
+    preview.removeAttribute("src");
+    status.textContent = "Required — this package ships no logo. " +
+      "Choose a png/svg image (< 256 KB).";
+  }
+}
+
+function openInstallDialog(chart) {
+  if (!getKey()) {
+    storeStatus("Enter the MCP API key and press “Save key” first.", true);
+    return;
+  }
+  dlgChart = chart;
+  dlgLogoUpload = "";
+  $("dlg-title").textContent = "Install " + (chart.name || "chart") + " " + (chart.version || "");
+  $("dlg-sub").textContent =
+    "Uploads the chart to ChartMuseum and applies a generated EzAppConfig " +
+    "(namespace " + nsDefault(chart.name) + " by default). Every field below is editable.";
+  $("dlg-namespace").value = nsDefault(chart.name);
+  $("dlg-category").value = "dataScience";
+  $("dlg-label").value = humanizeChartName(chart.name);
+  $("dlg-description").value = chart.name || "";
+  $("dlg-values").value = chart.values || "";
+  $("dlg-logo").value = "";
+  setDialogLogo(chart);
+  $("dlg-error").classList.add("hidden");
+  $("dlg-install").disabled = false;
+  $("installdialog").dataset.dir = chart.dir || "";
+  $("installdialog").dataset.ref = currentRef || "";
+  $("installdialog").showModal();
+}
+
+function showDlgError(text) {
+  const el = $("dlg-error");
+  el.textContent = text;
+  el.classList.remove("hidden");
+}
+
+async function confirmInstall() {
+  if (installing) return;
+  const key = getKey();
+  const dir = $("installdialog").dataset.dir || "";
+  const ref = $("installdialog").dataset.ref || "";
+  const payload = {
+    repo: currentRepo,
+    dir: dir,
+    namespace: $("dlg-namespace").value.trim(),
+    category: $("dlg-category").value,
+    label: $("dlg-label").value.trim(),
+    description: $("dlg-description").value.trim(),
+    values: $("dlg-values").value,
+  };
+  if (ref) payload.ref = ref;
+  if (dlgLogoUpload) {
+    payload.logo = dlgLogoUpload;         // uploaded logo (overrides package)
+  } else if (dlgChart && !dlgChart.icon) {
+    showDlgError("A logo is required — this package ships none. Choose a png/svg image (< 256 KB).");
+    return;
+  }
+  installing = true;
+  $("dlg-install").disabled = true;
+  showDlgError("Installing… (download → ChartMuseum upload → apply; this can take a minute)");
+  let resp;
+  try {
+    resp = await fetch("/api/store/install", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    installing = false;
+    $("dlg-install").disabled = false;
+    showDlgError("Network error: " + err);
+    return;
+  }
+  const body = await resp.json().catch(() => ({}));
+  installing = false;
+  $("dlg-install").disabled = false;
+  if (resp.ok && body.status === "installed") {
+    $("installdialog").close();
+    showView("apps");
+    load();
+    setStatus("Installed " + (body.chart || "chart") + " " + (body.version || "") +
+      " → EzAppConfig " + (body.ezappconfig || "?") +
+      " (namespace " + (body.namespace || "?") + "). Watch the rollout below.");
+    return;
+  }
+  const lines = [];
+  if (body.detail) lines.push(body.detail);
+  else if (body.error) lines.push(body.error);
+  else lines.push("HTTP " + resp.status);
+  if (body.stage) lines.push("(failed at stage: " + body.stage + ")");
+  if (body.upload && body.stage !== "chartmuseum") lines.push("upload: " + body.upload);
+  showDlgError(lines.join(" "));
+}
+
+/* ── View switching + wiring ──────────────────────────────────────────── */
+
+function showView(name) {
+  const apps = name === "apps";
+  $("view-apps").classList.toggle("hidden", !apps);
+  $("view-store").classList.toggle("hidden", apps);
+  $("tab-apps").classList.toggle("active", apps);
+  $("tab-store").classList.toggle("active", !apps);
+  $("refresh").style.display = apps ? "" : "none";
+  if (apps) load();
+}
+
 function setAutoRefresh(enabled) {
   if (window.__ezappTimer) {
     clearInterval(window.__ezappTimer);
@@ -178,6 +482,55 @@ $("refresh").addEventListener("click", load);
 
 $("autorefresh").addEventListener("change", (event) => {
   setAutoRefresh(event.target.checked);
+});
+
+$("tab-apps").addEventListener("click", () => showView("apps"));
+$("tab-store").addEventListener("click", () => showView("store"));
+$("loadstore").addEventListener("click", () => loadCatalog(false));
+$("repobox").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    loadCatalog(false);
+  }
+});
+$("dlg-cancel").addEventListener("click", () => $("installdialog").close());
+$("dlg-install").addEventListener("click", confirmInstall);
+
+$("dlg-logo").addEventListener("change", () => {
+  const file = $("dlg-logo").files[0];
+  dlgLogoUpload = "";
+  $("dlg-error").classList.add("hidden");
+  if (!file) {
+    setDialogLogo(dlgChart || {});
+    return;
+  }
+  if (file.size > LOGO_MAX_BYTES) {
+    setDialogLogo(dlgChart || {});
+    showDlgError("Logo image is too large (" + Math.round(file.size / 1024) +
+      " KB) — use an image under 256 KB.");
+    $("dlg-logo").value = "";
+    return;
+  }
+  if (file.type && file.type !== "image/png" && file.type !== "image/svg+xml") {
+    setDialogLogo(dlgChart || {});
+    showDlgError("Logo must be a PNG or SVG image.");
+    $("dlg-logo").value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    dlgLogoUpload = String(reader.result || "");
+    const preview = $("dlg-logo-preview");
+    preview.src = dlgLogoUpload;
+    preview.classList.remove("hidden");
+    $("dlg-logo-status").textContent = "Uploaded logo: " + file.name +
+      " (" + Math.round(file.size / 1024) + " KB) — used as the app logo.";
+  };
+  reader.onerror = () => {
+    showDlgError("Could not read the logo file: " + reader.error);
+    $("dlg-logo").value = "";
+    setDialogLogo(dlgChart || {});
+  };
+  reader.readAsDataURL(file);
 });
 
 $("keybox").value = getKey();

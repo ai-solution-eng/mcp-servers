@@ -11,6 +11,8 @@ An **application-deployment MCP server** for **HPE Private Cloud AI (PCAI / Ezme
 4. **`delete_chart`** — removes one chart version from ChartMuseum — **only a version this server uploaded itself**.
 5. **`delete_ezappconfig`** — deletes an EzAppConfig — **only one this server applied itself**.
 
+Plus an **app store** in the web UI (HTTP endpoints, no MCP tools): tiles every Helm chart in a GitHub repo and installs one — ChartMuseum upload, deterministic EzAppConfig render and apply in a single confirmed click. See [App store](#app-store-github-repo-of-charts--one-click-install).
+
 ### Large payloads: raw HTTP endpoints (charts AND EzAppConfigs)
 
 MCP tool-call arguments get truncated by client/model caps (observed ~40-43 KB), so anything big goes over raw HTTP with the API key — the LLM only relays the small JSON receipts:
@@ -59,14 +61,50 @@ Every successful chart upload and EzAppConfig apply is recorded in the **ownersh
 
 Fail-safe direction: a missing, unreadable, or wiped ledger means **refusal**, never permission — losing it locks the destructive tools out instead of unlocking everything. Operators can adopt an externally-created EzAppConfig by seeding `ezappconfigs.json` manually; nothing is auto-adopted. Both delete tools can be dropped entirely with `EZAPP_MCP_DELETE_ENABLED=false` (chart: `delete.enabled: false`) for automation-facing deployments where decommissioning should stay human-only — unregistered tools are invisible and uncallable for clients.
 
-## Web UI (read-only)
+## Web UI
 
-A small static shell is served by the server itself at **`/ui/`** (and `/` redirects there) listing what this MCP server manages:
+A small static shell is served by the server itself at **`/ui/`** (and `/` redirects there) with two tabs:
+
+**Managed apps** (read-only) — what this MCP server manages:
 
 - **EzAppConfigs table** — every CR in the ownership ledger merged with **live cluster status** (`ready | error | warning | initialized`, failure reason, chart/version/target namespace from the CR); CRs deleted out-of-band show as "not found" instead of disappearing.
 - **Managed chart versions table** — every `chart/version` this server uploaded to ChartMuseum.
 
-Hygiene (same model as the k8s-ops console): the shell is inert — it carries no data; the browser fetches `/api/managed` with the **same API key as `/mcp`** (paste it into the page; it lives in `sessionStorage` only). All cluster data renders as text, never HTML; CSP `default-src 'none'` + nosniff + no-referrer on the shell; traversal-guarded static handler; auto-refresh (15s) is a checkbox. `EZAPP_MCP_UI_ENABLED=false` (or chart `ui.enabled: false`) removes both the shell and the data endpoint.
+Hygiene (same model as the k8s-ops console): the shell is inert — it carries no data; the browser fetches `/api/managed` with the **same API key as `/mcp`** (paste it into the page; it lives in `sessionStorage` only). All cluster data renders as text, never HTML; CSP `default-src 'none'` + nosniff + no-referrer on the shell; traversal-guarded static handler; auto-refresh (15s) is a checkbox. `EZAPP_MCP_UI_ENABLED=false` (or chart `ui.enabled: false`) removes the shell and the data endpoint.
+
+## App store (GitHub repo of charts → one-click install)
+
+The second UI tab turns any **GitHub repository of Helm charts** into an app store.
+
+**Store repo layout** — the repository's **top-level directories are the individual apps**; charts are **always packaged**: inside each app directory, every **`.tgz` / `.tar.gz` `helm package` file** is an installable chart version (e.g. `arize-phoenix/arize-phoenix-1.2.0.tgz`, `arize-phoenix/arize-phoenix-1.3.0.tgz`, `grafana/grafana-10.0.0.tgz`, … — subdirectories are not scanned; unpacked chart sources are ignored). Name, version, description, values and logo are read from inside each package; files that are not valid helm packages are reported in the catalog's `skipped` list, never fatal. A `.tgz` at the repo root belongs to the "(repo root)" app.
+
+`GET /api/store/catalog?repo=<url>` returns **one tile per app** with its installable chart **versions sorted newest-first** for a dropdown (pragmatic semver ordering: numeric chunks numerically, `v` prefixes stripped, build metadata ignored, prereleases below their release — `1.2 < 1.2.3-rc1 < 1.2.3 < 1.10`; the newest version is preselected). Each tile shows the app's humanized name and its **logo image**: the logo lives **inside the packaged chart** (`icon.png` / `logo.png` — PNG or SVG; explicit names plus an `icon`/`logo`-named png/svg anywhere in the package, shallower first, also `img/…`, `images/…`, `icons/…`, `assets/…`) and the tile uses the newest version that ships one, fetched server-side and served as a `data:` URI so the CSP stays closed. The same logo file is the CR's **default `logoImage`**: raw base64 for PNG (the platform template's documented shape), a self-describing `data:image/svg+xml;base64` URI for SVG. **A logo is required**: packages that ship none are flagged on the tile, and their install dialog requires an **upload** — a small PNG/SVG image **under 256 KB** (conventionally `logo.png`) — which is validated (format sniffed, size capped) and becomes the CR's `logoImage`; the API accepts the same via the install request's `logo` field (a `data:` URI or bare base64), and an upload always overrides the package's own logo.
+
+Clicking **Install** (after picking a version in the tile's dropdown) opens a dialog where **every option is user-editable before the install runs**: the Helm values (pre-filled from the SELECTED version's `values.yaml`), the **target namespace** (free-text, default `<chart>-ns`), the **category** (one of `dataScience`, `dataEngineering`, `analytics` — enforced as a fixed enum server-side), the **label** (pre-filled with the humanized chart name — `arize-phoenix` → `Arize Phoenix`), the **description** (pre-filled with the chart name) and the **logo** (pre-filled from the package; when the package ships none, an **upload field is required** before Install unlocks — png/svg under 256 KB, with a live preview; an upload may also replace the package's logo). Confirming runs the whole deploy flow server-side in one request — no agent round-trips:
+
+1. **Download** the repo tarball at the pinned ref (`/tarball/<ref>`; ref comes from the URL's `/tree/<ref>`, else the repo's default branch).
+2. **Extract** the selected `.tgz`/`.tar.gz` package from the repo tarball in memory — it already is `helm package` output, validated by the standard sniffer (gzip magic, tar layout, `<chart-name>/Chart.yaml` with name+version, zip-bomb cap) and passed to ChartMuseum byte-for-byte unmodified.
+3. **Upload to ChartMuseum** through the exact `upload_chart` pipeline — sniffing, size cap, ownership ledger. A version this server uploaded before is force-overwritten (idempotent re-installs); a foreign existing version is refused (409).
+4. **Render the EzAppConfig deterministically** from the fixed template (below) — `name: <chart>-<version>-<epoch-ms>`, `logoImage` = base64 of the chart's icon PNG, the edited values inline in the `values` block scalar.
+5. **Apply** through the exact `apply_ezappconfig` pipeline — kind/apiVersion allowlist, DNS-1123 name, target-namespace policy (checked **before** the upload), ledger recording.
+
+The response carries the receipts (`status`, `ezappconfig`, `chart`, `version`, `namespace`, plus the rendered `manifest` when small). Because the CR name carries the epoch, **every install creates a fresh EzAppConfig** — re-installing never mutates an existing CR (delete via `delete_ezappconfig` for upgrades-in-place).
+
+Agents can use the same endpoints without the UI:
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+     "https://<public-host>/api/store/catalog?repo=https%3A%2F%2Fgithub.com%2F<owner>%2F<repo>"
+
+curl -X POST -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
+     -d '{"repo": "https://github.com/<owner>/<repo>", "dir": "arize-phoenix/arize-phoenix-1.3.0.tgz",
+          "ref": "main", "namespace": "foo-ns", "values": "replicaCount: 2\n"}' \
+     "https://<public-host>/api/store/install"
+```
+
+`dir` is the packaged chart file to install — exactly what the catalog's app tiles expose (`versions[].dir`, with `default_dir` naming the newest).
+
+Store-specific hardening (beyond the shared API-key gate): GitHub hosts are **pinned** to github.com (or the `GITHUB_API_URL` host — GitHub Enterprise Server is supported: API under that base, raw under `<host>/raw/...`, repo URLs must point at the same host); owner/repo/ref/dir are regex-validated before they reach a curl argv; repo tarballs are capped (`EZAPP_MCP_MAX_REPO_MB`, default 200) and decompressed in memory only; installs are capped at 2 concurrent; the catalog is cached per repo@ref for 10 minutes (`?refresh=true` bypasses). GitHub API rate limits are the practical ceiling — set `GITHUB_TOKEN` (chart: `store.githubToken.existingSecret`, out-of-band Secret) for authenticated calls; a 403 surfaces as a 502 with that hint. The store endpoints go away with `EZAPP_MCP_STORE_ENABLED=false` (chart: `store.enabled: false`).
 
 ## Reference deploy flow (PCAI / EZUA)
 
@@ -107,6 +145,34 @@ spec:
   values: ""               # inline helm values (string)
 ```
 
+The app store renders **exactly this template** for every install (deterministic string work, no LLM in the loop):
+
+```yaml
+apiVersion: ezconfig.hpe.ezaf.com/v1alpha1
+kind: EzAppConfig
+metadata:
+  labels:
+    hpe-ezua/imported-app: "true"
+  name: <chart-name>-<chart-version>-<epoch-ms>   # version sanitized to DNS-1123
+spec:
+  backoffLimit: 3
+  category: <dialog select: dataScience | dataEngineering | analytics; default dataScience>
+  chartVersion: <from Chart.yaml>
+  description: <user-editable, default the chart name>
+  install: true
+  label: <humanized chart name, e.g. "Arize Phoenix" for arize-phoenix — editable>
+  logoImage: <base64 of the chart's logo file (icon.png/logo.png; png or svg) — "" when the chart ships none>
+  name: <exact chart name from Chart.yaml>
+  options:
+    create-namespace: "true"
+    namespace: <install dialog, default <chart>-ns — policy-checked first>
+    timeout: 45m
+    wait: "true"
+  values: |-
+    <the edited values from the install dialog, verbatim, indented 4>
+  version: ""
+```
+
 ## Tools
 
 | Tool | Args | Effect |
@@ -131,6 +197,7 @@ This is a **write-capable** server (it deploys things). Every mutating path is b
 7. **Least-privilege RBAC.** A ClusterRole granting only `get/create/update/patch/delete` on `ezappconfigs.<group>` — deliberately **no `list`/`watch`**, so the server is structurally unable to enumerate EzAppConfigs it did not deploy (the UI and tools address CRs by name, ledger-driven only); a namespaced Role granting only `get/patch` on the ONE ledger ConfigMap (`resourceNames`-pinned — no other ConfigMap is readable). A wildcard `apiGroup` is refused at render time.
 8. **Pod hardening.** Non-root (uid/gid 10001), read-only root filesystem, all capabilities dropped, RuntimeDefault seccomp, `/tmp` as emptyDir.
 9. **Host-header pinning.** `MCP_HOSTNAME` (wired from the chart) is a comma-separated allowlist: the public `ezua.virtualService.endpoint` + the in-cluster service DNS name (with and without port) **by default**, plus operator `ezua.virtualService.extraEndpoints`. The chart fails to render if the endpoint is missing while ezua is enabled.
+10. **App store host pinning.** The store fetches GitHub with fixed argv curl calls whose URL host is the configured API host only (github.com by default, `GITHUB_API_URL` for GitHub Enterprise) — user input supplies regex-validated owner/repo/ref/dir path segments, never a host. Repo tarballs are size-capped and memory-only (no disk extraction of user content beyond a `0600` temp file that is unlinked immediately); only regular files inside the requested chart directory are repackaged, `..`-paths are dropped, and the target-namespace policy is enforced **before** anything is uploaded.
 
 ## Configuration
 
@@ -148,7 +215,12 @@ This is a **write-capable** server (it deploys things). Every mutating path is b
 | `EZAPP_MCP_BLOCKED_TARGET_NAMESPACES` | unset | Blacklist (always wins) |
 | `EZAPP_MCP_LEDGER_CONFIGMAP` | `ezapp-deploy-ledger` | Ownership-ledger ConfigMap name |
 | `EZAPP_MCP_LEDGER_NAMESPACE` | pod's SA namespace | Namespace the ledger lives in |
-| `EZAPP_MCP_UI_ENABLED` | `true` | Read-only web view at `/ui/` (`false` disables shell + data endpoint) |
+| `EZAPP_MCP_UI_ENABLED` | `true` | Managed-apps web view at `/ui/` (`false` disables shell + data endpoint) |
+| `EZAPP_MCP_STORE_ENABLED` | `true` | App store: `/api/store/catalog` + `/api/store/install` (`false` drops both endpoints — UI tab then reports the store as unavailable) |
+| `GITHUB_API_URL` | unset (github.com) | GitHub Enterprise Server API base (e.g. `https://ghes.corp.example/api/v3`) — moves all store fetches to that host and restricts repo URLs to it |
+| `GITHUB_TOKEN` | unset (anonymous) | GitHub token for authenticated store calls (higher rate limits, private catalog repos); the chart wires it from an out-of-band Secret |
+| `GITHUB_CA_BUNDLE` | unset (system trust) | `--cacert` pin for the outbound GitHub calls (corporate MITM CAs); mutually exclusive with nothing — ChartMuseum's TLS knobs are separate |
+| `EZAPP_MCP_MAX_REPO_MB` | `200` | Repo-tarball download cap for store installs (decoded; the chart inside still goes through `EZAPP_MCP_MAX_CHART_MB`) |
 | `EZAPP_MCP_CHUNKED_UPLOAD_ENABLED` | `true` | Chunked upload tools (`false` drops the three tools from the server) |
 | `EZAPP_MCP_DELETE_ENABLED` | `true` | `delete_chart` / `delete_ezappconfig` (`false` drops both tools — decommissioning becomes a purely human action) |
 | `MCP_HOSTNAME` | unset | Hostname(s) for DNS-rebinding protection — one FQDN or a comma-separated list (external gateway FQDN, internal service DNS name, …); `localhost`/`127.0.0.1` always allowed |
@@ -212,3 +284,7 @@ Local kubectl runs use your existing kubeconfig; in-cluster it uses the pod's se
 - Target-namespace governance and the ownership ledger are application-layer controls; the authoritative boundary is RBAC (which here only ever touches `ezappconfigs` + the one ledger ConfigMap — the platform operator does the actual installs with its own privileges).
 - A ledger entry can go stale (upload succeeded but the ledger write failed, or an operator deleted the object out-of-band): deletes then either 404 harmlessly (stale entry removed) or refuse — both fail-safe. An operator can seed `ezappconfigs.json`/`charts.json` manually to adopt pre-existing objects.
 - Chart uploads are buffered in pod memory (base64 decode + tar header scan); size the pod memory limit for your largest chart (default cap 30 MB keeps this modest).
+- The app store speaks github.com out of the box plus any GitHub Enterprise Server via `GITHUB_API_URL` (API + raw on one host); GitLab or plain git remotes are not supported.
+- Store installs are one-shot: each click creates a fresh epoch-named EzAppConfig. Upgrading an installed app means deleting its CR (`delete_ezappconfig`) and installing again, or re-applying an edited CR via `apply_ezappconfig` — there is no in-place upgrade from the store tile (yet).
+- The store catalog is cached for 10 minutes per repo@ref and counts against GitHub API rate limits (one meta/tree call + one raw call per chart file); unauthenticated github.com allows 60 calls/hour per source IP, so set `GITHUB_TOKEN` for real catalogs.
+- Store install concurrency (2) and the catalog cache are in-memory per pod — keep `replicaCount: 1` or accept best-effort behavior, same caveat as the chunked uploads and manifest staging.

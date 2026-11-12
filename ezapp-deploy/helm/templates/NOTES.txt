@@ -25,7 +25,7 @@ keep its API key and RBAC tight.
   kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 9090:9090
   MCP : http://localhost:9090/mcp   (Authorization: Bearer <api-key>)
 {{- if .Values.ui.enabled }}
-  UI  : http://localhost:9090/ui/   (read-only managed-apps view; paste
+  UI  : http://localhost:9090/ui/   (managed-apps view + app store; paste
         the API key in the page — same key as /mcp)
 {{- end }}
 {{- if and .Values.ezua.enabled $host }}
@@ -64,6 +64,8 @@ Current settings:
   targets.blocked         : {{ .Values.targets.blocked | quote }}
   rbac.apiGroup           : {{ .Values.rbac.apiGroup }}
   ledger.configmap        : {{ .Values.ledger.configmap | default (printf "%s-ledger" .Values.deployment.name) }}
+  store.enabled           : {{ .Values.store.enabled }}
+  store.githubApiUrl      : {{ .Values.store.githubApiUrl | default "(github.com)" }}
 
 ════════════════════════════════════════════════════════════════════
 5. Verify:

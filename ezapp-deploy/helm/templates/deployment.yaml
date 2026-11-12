@@ -125,6 +125,33 @@ spec:
             - name: EZAPP_MCP_UI_ENABLED
               value: "false"
             {{- end }}
+            {{- if not .Values.store.enabled }}
+            # App store (GitHub catalog + one-click install) — off when the
+            # operator wants an agents-and-API-only server.
+            - name: EZAPP_MCP_STORE_ENABLED
+              value: "false"
+            {{- end }}
+            {{- if .Values.store.githubApiUrl }}
+            # GitHub Enterprise Server: API base + accepted repo host.
+            - name: GITHUB_API_URL
+              value: {{ .Values.store.githubApiUrl | quote }}
+            {{- end }}
+            {{- if .Values.store.githubToken.existingSecret }}
+            # Optional GitHub token (rate limits / private catalog repos);
+            # the key lives in an out-of-band Secret.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.githubToken.existingSecret }}
+                  key: {{ .Values.store.githubToken.existingSecretKey }}
+            {{- end }}
+            {{- if .Values.store.caBundle }}
+            # CA pin for the outbound GitHub calls (mount the file yourself).
+            - name: GITHUB_CA_BUNDLE
+              value: {{ .Values.store.caBundle | quote }}
+            {{- end }}
+            - name: EZAPP_MCP_MAX_REPO_MB
+              value: {{ .Values.store.maxRepoMB | quote }}
             {{- if not .Values.chunkedUpload.enabled }}
             - name: EZAPP_MCP_CHUNKED_UPLOAD_ENABLED
               value: "false"

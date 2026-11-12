@@ -111,11 +111,35 @@ ledger:
                              # (always correct in-cluster; override only for
                              # exotic setups where the ledger lives elsewhere)
 
-# -- Web UI (read-only view of managed apps) ------------------------------------------------
+# -- Web UI (managed-apps view + app store) ------------------------------------------------
 # Static shell at /ui/ (no data in it); its /api/managed data endpoint is
 # gated by the same API key as /mcp.
 ui:
   enabled: true
+
+# -- App store (GitHub repo of charts → tiles → one-click install) -----------------------
+# GET /api/store/catalog tiles every directory of a GitHub repo that contains
+# a Chart.yaml; POST /api/store/install downloads that chart at the pinned
+# ref, uploads it to ChartMuseum and applies the generated EzAppConfig. Both
+# endpoints are gated by the same API key as /mcp.
+store:
+  enabled: true
+  # Repo tarball download cap (decoded). Charts inside still go through the
+  # EZAPP_MCP_MAX_CHART_MB cap at upload time.
+  maxRepoMB: 200
+  # GitHub Enterprise Server support: point the API base at the GHES instance
+  # (e.g. https://ghes.corp.example/api/v3). Empty = github.com.
+  githubApiUrl: ""
+  # Optional GitHub token for higher API rate limits and private catalog
+  # repos: reference an OUT-OF-BAND Secret (the chart never creates it and
+  # values never carry credentials).
+  githubToken:
+    existingSecret: ""         # empty = no Authorization header on GitHub calls
+    existingSecretKey: token
+  # Corporate MITM CAs are often NOT in the container trust store — pin a CA
+  # file mounted into the pod (e.g. the ezaf-root CA) for the outbound
+  # GitHub calls. Empty = system trust store.
+  caBundle: ""
 
 # -- Chunked upload tools (optional MCP statefulness) ---------------------------------------
 # upload_chart_begin/chunk/commit stream charts too big for one MCP tool

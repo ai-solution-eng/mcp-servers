@@ -87,3 +87,134 @@ tbody tr:hover { background: #1c2430; }
 
 footer { margin-top: 1.4rem; font-size: 0.8rem; }
 footer p { margin: 0.2rem 0; }
+
+/* ── View tabs ──────────────────────────────────────────────────────── */
+
+#views { display: flex; gap: 0.4rem; margin-top: 0.7rem; }
+.tab.active { border-color: var(--info); color: var(--text); }
+.hidden { display: none !important; }
+
+/* ── App store ──────────────────────────────────────────────────────── */
+
+#repoline { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+#repobox {
+  flex: 1;
+  min-width: 20rem;
+  padding: 0.35rem 0.55rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+#storestatus { margin: 0.55rem 0 0; }
+
+#tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0.8rem;
+  margin-top: 0.8rem;
+}
+
+.tile {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.iconrow { display: flex; align-items: center; gap: 0.6rem; }
+.tile .icon {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  background: #0b0e13;
+  border-radius: 6px;
+}
+.icon-placeholder {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  font-size: 1rem;
+}
+.tname { font-weight: bold; }
+.tdesc {
+  color: var(--dim);
+  font-size: 0.82rem;
+  flex: 1;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.tmeta { color: var(--dim); font-size: 0.75rem; overflow-wrap: anywhere; }
+.warnnote { color: var(--warn); }
+.tile .install { align-self: flex-start; margin-top: 0.2rem; }
+.tile .versel {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+  font-size: 0.82rem;
+}
+
+/* ── Install dialog ─────────────────────────────────────────────────── */
+
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  width: min(44rem, 94vw);
+  padding: 1rem 1.2rem;
+}
+dialog::backdrop { background: rgba(4, 6, 10, 0.65); }
+dialog h2 { margin-top: 0; }
+dialog label {
+  display: block;
+  margin: 0.6rem 0 0.15rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+dialog input, dialog select, dialog textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+}
+dialog textarea {
+  font-family: inherit;
+  white-space: pre;
+  resize: vertical;
+}
+#dlg-logo-row { display: flex; align-items: center; gap: 0.6rem; }
+.logo-preview {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  background: #0b0e13;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+dialog input[type="file"] { padding: 0.25rem; }
+.errortext { color: var(--err); }
+.errortext:not(.hidden) { white-space: normal; overflow-wrap: anywhere; }
+#dlg-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+}
+button.primary { border-color: var(--ok); }

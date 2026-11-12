@@ -109,6 +109,17 @@ def check_raises(label, message_part, fn, *args, **kwargs):
     check(label, False, f"expected ValueError containing {message_part!r}, no error raised")
 
 
+def _logo_check_raises(message_part, fn, *args, **kwargs):
+    """check_raises that returns True/False (for compound conditions)."""
+    try:
+        fn(*args, **kwargs)
+    except ValueError as e:
+        return message_part.lower() in str(e).lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def set_env(**kwargs):
     for key, value in kwargs.items():
         if value is None:
@@ -1565,6 +1576,908 @@ check("json output is raw and truncates with a marker",
 check("include_values=True puts the values back (then truncates)",
       "A" * 1000 in g["with_values"] and "truncated" in g["with_values"],
       g["with_values"][-120:])
+
+
+# ─── 13. App store (GitHub catalog → template render → install) ──────────
+
+print("13. App store (GitHub catalog → template → install)")
+
+import re  # noqa: E402
+import urllib.parse  # noqa: E402
+
+# ── 13a. repo URL / ref / dir parsing ────────────────────────────────────
+
+owner, repo, ref = server.parse_store_repo("https://github.com/acme/charts/tree/v1.2.3")
+check("repo URL with /tree/<ref> parses",
+      (owner, repo, ref) == ("acme", "charts", "v1.2.3"), f"{(owner, repo, ref)}")
+check("bare owner/repo parses",
+      server.parse_store_repo("acme/charts") == ("acme", "charts", None))
+check(".git suffix is stripped",
+      server.parse_store_repo("https://github.com/acme/charts.git")[1] == "charts")
+check("nested branch ref parses",
+      server.parse_store_repo("https://github.com/acme/charts/tree/feature/x")[2] == "feature/x")
+
+check_raises("empty repo URL is rejected", "empty",
+             server.parse_store_repo, "   ")
+check_raises("non-GitHub-looking text is rejected", "could not parse",
+             server.parse_store_repo, "not a url")
+check_raises("gitlab host is rejected (host pinning)", "not allowed",
+             server.parse_store_repo, "https://gitlab.com/acme/charts")
+check_raises(".. owner segment is rejected", "invalid owner/repo",
+             server.parse_store_repo, "https://github.com/../etc")
+check_raises(".. ref is rejected", "invalid ref",
+             server.parse_store_repo, "https://github.com/acme/charts/tree/..%2F..")
+
+check("clean chart dir passes", server._clean_chart_dir("charts/foo") == "charts/foo")
+check("repo-root dir is ''", server._clean_chart_dir("") == "")
+check("trailing slash is stripped", server._clean_chart_dir("charts/foo/") == "charts/foo")
+check("traversal dir is rejected", server._clean_chart_dir("../etc") is None)
+check("empty segment dir is rejected", server._clean_chart_dir("charts//foo") is None)
+
+# ── 13b. logo sniffing (tile + CR shapes) ────────────────────────────────
+
+png = b"\x89PNG\r\n\x1a\n" + b"fakepng" * 8
+svg = b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"><circle r="5"/></svg>'
+
+check("png magic makes a data uri",
+      (server._logo_data_uri(png) or "").startswith("data:image/png;base64,"))
+check("svg makes an svg data uri",
+      (server._logo_data_uri(svg) or "").startswith("data:image/svg+xml;base64,"),
+      str(server._logo_data_uri(svg)))
+check("non-image bytes are refused", server._logo_data_uri(b"\x00\x01") is None)
+check("png sniffing identifies the CR logo shape",
+      server._cr_logo_image(png) == base64.b64encode(png).decode())
+check("svg CR logo is a self-describing data uri",
+      server._cr_logo_image(svg) ==
+      "data:image/svg+xml;base64," + base64.b64encode(svg).decode())
+check("garbage CR logo is refused", server._cr_logo_image(b"nope") is None)
+
+# ── 13c. deterministic EzAppConfig template ──────────────────────────────
+
+TEMPLATE_CASES = [
+    ("replicaCount: 1\n", "simple"),
+    ("", "empty"),
+    ('a: 1\n\n\nb: "two\\nlines"\nlist:\n  - x\n  - y\n\n', "tricky"),
+    ("key: value", "no-trailing-newline"),
+]
+for values_text, label in TEMPLATE_CASES:
+    manifest = server._render_store_ezappconfig(
+        kind="EzAppConfig", api_version="ezconfig.hpe.ezaf.com/v1alpha1",
+        cr_name="foo-1-0-0-1700000000000", chart_name="foo", chart_version="1.0.0",
+        category="dataScience", label="Foo", description="A chart: with colon",
+        namespace="foo-ns", values_text=values_text, logo_b64="QUJD")
+    try:
+        doc = yaml.safe_load(manifest)
+        expected_values = values_text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+        check(f"template round-trips values ({label})",
+              doc["spec"]["values"] == expected_values,
+              f"{doc['spec']['values']!r} != {expected_values!r}")
+        check(f"template options are exact ({label})",
+              doc["spec"]["options"] == {"create-namespace": "true",
+                                         "namespace": "foo-ns",
+                                         "timeout": "45m", "wait": "true"},
+              str(doc["spec"]["options"]))
+        check(f"template passes the CR validator ({label})",
+              server._validate_ezappconfig(manifest) is not None)
+    except ValueError as e:
+        check(f"template round-trips values ({label})", False, str(e))
+
+full = server._render_store_ezappconfig(
+    kind="EzAppConfig", api_version="ezconfig.hpe.ezaf.com/v1alpha1",
+    cr_name="foo-1-0-0-1700000000000", chart_name="foo", chart_version="1.0.0",
+    category="dataScience", label="Foo", description="D", namespace="foo-ns",
+    values_text="k: v\n", logo_b64="QUJD")
+doc = yaml.safe_load(full)
+check("template carries the imported-app marker + fixed fields",
+      doc["metadata"]["labels"]["hpe-ezua/imported-app"] == "true"
+      and doc["spec"]["install"] is True
+      and doc["spec"]["backoffLimit"] == 3
+      and doc["spec"]["version"] == ""
+      and doc["spec"]["logoImage"] == "QUJD"
+      and doc["spec"]["name"] == "foo"
+      and doc["spec"]["chartVersion"] == "1.0.0",
+      full)
+check("template keeps the user's values byte-identical inside the block scalar",
+      '  values: |-\n    k: v\n  version: ""\n' in full, full[-120:])
+
+check("CR name segment sanitizes semver build metadata",
+      server._sanitize_cr_name_segment("1.2.3+build.5") == "1.2.3-build.5",
+      server._sanitize_cr_name_segment("1.2.3+build.5"))
+cr_name = (f"{server._sanitize_cr_name_segment('foo')}-"
+           f"{server._sanitize_cr_name_segment('1.0.0+build')}-1700000000000")
+check("sanitized CR name is a valid DNS subdomain",
+      bool(server._DNS_SUBDOMAIN_RE.fullmatch(cr_name)), cr_name)
+
+check("chart name humanizes for the label default",
+      server._humanize_chart_name("arize-phoenix") == "Arize Phoenix",
+      server._humanize_chart_name("arize-phoenix"))
+check("humanize splits on -, _, .",
+      server._humanize_chart_name("my_chart.name") == "My Chart Name",
+      server._humanize_chart_name("my_chart.name"))
+check("humanize of a single word capitalizes it",
+      server._humanize_chart_name("foo") == "Foo")
+
+# category is a fixed enum; case is normalized to the canonical spelling
+check("category enum is exactly the three supported options",
+      server._STORE_CATEGORY_OPTIONS == ("dataScience", "dataEngineering",
+                                         "analytics"),
+      str(server._STORE_CATEGORY_OPTIONS))
+check("category normalizes case-insensitively",
+      server._validate_store_install_payload(
+          {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz",
+           "category": "ANALYTICS"})["category"] == "analytics")
+check("empty category stays empty (install applies its default)",
+      server._validate_store_install_payload(
+          {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz"})["category"] == "")
+check_raises("unknown category is rejected with the valid options",
+             "must be one of: datascience, dataengineering, analytics",
+             server._validate_store_install_payload,
+             {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz", "category": "application"})
+
+# label/description/namespace defaults flow into the rendered CR
+_defaults = server._validate_store_install_payload(
+    {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz", "namespace": "my-ns"})
+check("namespace stays user-selectable verbatim",
+      _defaults["namespace"] == "my-ns")
+check("label/description/category default to empty in the payload (resolved at install)",
+      (_defaults["label"], _defaults["description"], _defaults["category"]) == ("", "", ""),
+      str((_defaults["label"], _defaults["description"], _defaults["category"])))
+
+# ── 13d. chart repackage from a GitHub repo tarball ──────────────────────
+
+def make_repo_tarball(files, prefix="owner-repo-abc123"):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, payload in files.items():
+            data = payload.encode("utf-8") if isinstance(payload, str) else payload
+            info = tarfile.TarInfo(name=f"{prefix}/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+REPO_FILES = {
+    "README.md": "# catalog\n",
+    # store layout: base dirs are apps; charts are always PACKAGED — every
+    # .tgz / .tar.gz `helm package` file inside an app dir is a version
+    "foo/foo-1.0.0.tgz": make_chart_tgz(
+        chart_name="foo", version="1.0.0",
+        chart_yaml="apiVersion: v2\nname: foo\nversion: 1.0.0\n"
+                   "description: Foo app\nappVersion: 2.0\n",
+        extra_members=[("foo/values.yaml", "replicaCount: 3\n"
+                        "image:\n  repository: quay.io/foo\n"),
+                       ("foo/templates/deploy.yaml", "apiVersion: v1\nkind: ConfigMap\n"),
+                       ("foo/icon.png", png)]),
+    "foo/foo-1.1.0.tgz": make_chart_tgz(
+        chart_name="foo", version="1.1.0",
+        chart_yaml="apiVersion: v2\nname: foo\nversion: 1.1.0\n"
+                   "description: Foo app\nappVersion: 2.1\n",
+        extra_members=[("foo/values.yaml", "replicaCount: 5\n")]),
+    "foo/foo-1.2.0.tgz": make_chart_tgz(
+        chart_name="foo", version="1.2.0",
+        chart_yaml="apiVersion: v2\nname: foo\nversion: 1.2.0\n"
+                   "description: Foo app\nappVersion: 2.2\n",
+        extra_members=[("foo/values.yaml", "replicaCount: 7\n"),
+                       ("foo/logo.png", png)]),
+    "nested-two/nested-two-0.3.0.tar.gz": make_chart_tgz(
+        chart_name="nested-two", version="0.3.0",
+        extra_members=[("nested-two/values.yaml", "depth: 2\n"),
+                       ("nested-two/logo.svg", svg)]),
+    "nested-two/nested-two-0.4.0.tgz": make_chart_tgz(
+        chart_name="nested-two", version="0.4.0"),
+    "plain/plain-2.0.0.tgz": make_chart_tgz(
+        chart_name="plain", version="2.0.0"),
+    # a non-chart tgz in an app dir must be skipped, not fatal
+    "plain/junk.tgz": b"definitely not a gzip archive",
+    "broken/broken-9.9.9.tgz": make_chart_tgz(
+        chart_name="broken", version="9.9.9",
+        chart_yaml="name: [unclosed"),
+}
+
+extracted = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "foo/foo-1.0.0.tgz")
+check("packaged chart extracts from the repo tarball unchanged",
+      extracted["tgz"] == REPO_FILES["foo/foo-1.0.0.tgz"]
+      and server._inspect_chart_tarball(extracted["tgz"]) == ("foo", "1.0.0")
+      and extracted["description"] == "Foo app",
+      str((extracted["name"], extracted["version"])))
+check("package logo becomes the CR logo (raw base64 png)",
+      extracted["logo"] == base64.b64encode(png).decode()
+      and extracted["logo_file"] == "icon.png",
+      str(extracted["logo"])[:40])
+check("package values.yaml is the dialog default",
+      "replicaCount: 3" in extracted["values_text"], extracted["values_text"])
+
+svg_extracted = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "nested-two/nested-two-0.3.0.tar.gz")
+check("svg logo becomes a self-describing CR logoImage",
+      svg_extracted["logo"] == "data:image/svg+xml;base64,"
+      + base64.b64encode(svg).decode(), str(svg_extracted["logo"])[:50])
+check("svg logo file is recorded",
+      svg_extracted["logo_file"] == "logo.svg")
+
+plain_extracted = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "plain/plain-2.0.0.tgz")
+check("logo-less packages get an empty CR logo",
+      plain_extracted["logo"] == "" and plain_extracted["logo_file"] == "",
+      str((plain_extracted["logo"], plain_extracted["logo_file"])))
+
+check_raises("unknown packaged file is refused", "not found in the repo tarball",
+             server._extract_packaged_chart_from_repo_tarball,
+             make_repo_tarball(REPO_FILES), "nope/nope-1.0.0.tgz")
+check_raises("corrupt packaged chart is refused at install time",
+             "not a packaged helm chart",
+             server._extract_packaged_chart_from_repo_tarball,
+             make_repo_tarball(REPO_FILES), "plain/junk.tgz")
+check_raises("non-gzip repo payload is refused", "gzipped archive",
+             server._extract_packaged_chart_from_repo_tarball,
+             b"not gzip", "foo/foo-1.0.0.tgz")
+
+# ── 13d'. app grouping + version ordering ────────────────────────────────
+
+check("app name is the repo top-level directory",
+      (server._app_name_of("foo/foo-1.0.0.tgz"), server._app_name_of("foo/x.tgz"),
+       server._app_name_of("")) == ("foo", "foo", "(repo root)"))
+check("version sort key is numeric where possible",
+      server._version_sort_key("1.10.0") > server._version_sort_key("1.9.0")
+      and server._version_sort_key("1.2") < server._version_sort_key("1.2.3")
+      and server._version_sort_key("v2.0") == server._version_sort_key("2.0"),
+      str(server._version_sort_key("1.10.0")))
+check("prerelease chunks sort after release",
+      server._version_sort_key("1.2.3") > server._version_sort_key("1.2.3-rc1"))
+check("odd version strings never raise",
+      server._version_sort_key("..weird..") is not None)
+
+groups = server._group_catalog_apps([
+    {"dir": "foo/foo-1.0.0.tgz", "name": "foo", "version": "1.0.0"},
+    {"dir": "foo/foo-1.1.0.tgz", "name": "foo", "version": "1.1.0"},
+    {"dir": "bar/bar-0.1.0.tgz", "name": "bar", "version": "0.1.0"},
+])
+check("chart entries group into app tiles sorted by app",
+      [g["app"] for g in groups] == ["bar", "foo"], str([g["app"] for g in groups]))
+foo_group = next(g for g in groups if g["app"] == "foo")
+check("versions sort newest-first and default to the newest",
+      [v["version"] for v in foo_group["versions"]] == ["1.1.0", "1.0.0"]
+      and foo_group["default_dir"] == "foo/foo-1.1.0.tgz"
+      and foo_group["label"] == "Foo",
+      str(foo_group))
+
+# packaged charts (.tgz / .tar.gz) are the only catalog versions
+check("packaged path detection covers both suffixes",
+      server._is_packaged_chart_path("app/foo-1.0.0.tgz")
+      and server._is_packaged_chart_path("app/foo-1.0.0.tar.gz")
+      and not server._is_packaged_chart_path("app/1.0.0/Chart.yaml")
+      and not server._is_packaged_chart_path("app/notes.txt.gz"))
+PKG_BYTES = make_chart_tgz(
+    chart_name="foo", version="1.2.0",
+    chart_yaml="apiVersion: v2\nname: foo\nversion: 1.2.0\n"
+               "description: Foo packaged\nappVersion: 2.2\n",
+    extra_members=[("foo/logo.png", png)])
+extras = server._packaged_chart_extras(PKG_BYTES)
+check("packaged chart extras: meta parsed",
+      (extras["meta"] or {}).get("description") == "Foo packaged"
+      and str((extras["meta"] or {}).get("appVersion")) == "2.2",
+      str(extras["meta"]))
+check("packaged chart extras: values + logo read from the package",
+      "replicaCount: 1" in extras["values"]
+      and extras["logo"] == base64.b64encode(png).decode()
+      and extras["icon"].startswith("data:image/png;base64,")
+      and extras["logo_file"] == "logo.png",
+      str((extras["logo_file"], extras["values"][:20])))
+extracted_pkg = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball({"foo/foo-1.2.0.tgz": PKG_BYTES}), "foo/foo-1.2.0.tgz")
+check("packaged chart extracts from the repo tarball unchanged",
+      server._inspect_chart_tarball(extracted_pkg["tgz"]) == ("foo", "1.2.0")
+      and extracted_pkg["tgz"] == PKG_BYTES
+      and extracted_pkg["logo_file"] == "logo.png"
+      and extracted_pkg["description"] == "Foo packaged",
+      str((extracted_pkg["name"], extracted_pkg["version"])))
+check_raises("missing packaged file is refused", "not found in the repo tarball",
+             server._extract_packaged_chart_from_repo_tarball,
+             make_repo_tarball({"foo/foo-1.2.0.tgz": PKG_BYTES}), "foo/nope.tgz")
+check_raises("corrupt packaged file is refused", "not a packaged helm chart",
+             server._extract_packaged_chart_from_repo_tarball,
+             make_repo_tarball({"foo/junk.tgz": b"not gzip"}), "foo/junk.tgz")
+
+# uploaded logos (required when a package ships none; <= 256 KB)
+check("uploaded logo data uri decodes to bytes",
+      server._decode_uploaded_logo("data:image/png;base64,"
+                                   + base64.b64encode(png).decode()) == png)
+check("bare base64 upload also decodes",
+      server._decode_uploaded_logo(base64.b64encode(svg).decode()) == svg)
+check("oversized upload is refused",
+      _logo_check_raises("above the 256 kb limit",
+                         server._decode_uploaded_logo,
+                         base64.b64encode(b"x" * (256 * 1024 + 1)).decode()))
+check("non-image upload is refused",
+      _logo_check_raises("not a recognizable png or svg",
+                         server._decode_uploaded_logo,
+                         base64.b64encode(b"just text").decode()))
+check("garbage data uri is refused",
+      _logo_check_raises("must be a base64 data: uri",
+                         server._decode_uploaded_logo, "data:text/html,hello"))
+check("oversized logo in the payload is refused early",
+      _logo_check_raises("too large",
+                         server._validate_store_install_payload,
+                         {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz",
+                          "logo": "x" * 400_001}))
+
+
+# ── 13e/f. catalog + install endpoints against a stub GitHub ─────────────
+
+class _StubGitHub:
+    """Local GitHub-API-shaped stub: meta, tree, raw files, tarball."""
+
+    def __init__(self, files, default_branch="main", mode="normal"):
+        self.files = files
+        self.default_branch = default_branch
+        self.mode = mode
+        self.requests = []
+        state = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _route(self):
+                state.requests.append(self.path)
+                if state.mode == "rate_limited":
+                    return 403, b'{"message": "API rate limit exceeded"}'
+                path = self.path.split("?")[0]
+                if path == "/repos/owner/repo" and self.command == "GET":
+                    body = json.dumps({"default_branch": state.default_branch,
+                                       "private": False}).encode()
+                    return 200, body
+                if path == "/repos/owner/repo/git/trees/main":
+                    tree_list = [{"path": p, "mode": "100644", "type": "blob",
+                                  "sha": f"s{i}", "size": len(c)}
+                                 for i, (p, c) in enumerate(sorted(state.files.items()))]
+                    return 200, json.dumps({"sha": "t", "tree": tree_list,
+                                            "truncated": False}).encode()
+                if path.startswith("/raw/owner/repo/main/"):
+                    rel = path[len("/raw/owner/repo/main/"):]
+                    if rel in state.files:
+                        data = state.files[rel]
+                        return 200, data.encode("utf-8") if isinstance(data, str) else data
+                    return 404, b"not found"
+                if path.startswith("/repos/owner/repo/tarball"):
+                    return 200, make_repo_tarball(state.files)
+                return 404, b"not found"
+
+            def do_GET(self):
+                code, body = self._route()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class CapturingSubprocess:
+    """kubectl-scripting subprocess fake that snapshots every `-f <file>`
+    payload; non-kubectl calls (curl against the stubs) pass through to the
+    real runner so one scenario can mix real HTTP with scripted kubectl."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.files = {}
+        self._original = server._run_subprocess
+
+    async def fake(self, argv, timeout, env=None):
+        if argv and argv[0] == "kubectl":
+            self.calls.append(list(argv))
+            if "-f" in argv:
+                path = argv[argv.index("-f") + 1]
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        self.files[path] = fh.read()
+                except OSError:
+                    self.files[path] = "<unreadable>"
+            return self.script.pop(0) if self.script else (1, "", "script exhausted")
+        return await self._original(argv, timeout, env)
+
+    def install(self):
+        server._run_subprocess = self.fake
+        return self
+
+    def restore(self):
+        server._run_subprocess = self._original
+
+
+STORE_RESOURCE = "ezappconfigs.ezconfig.hpe.ezaf.com"
+AUTH_HEADERS = [(b"authorization", b"Bearer s3cret")]
+PNG_UPLOAD = b"\x89PNG\r\n\x1a\n" + b"uploaded-logo" * 12
+
+
+async def _store_endpoint_scenarios():
+    out = {}
+    router = server._UiRouterApp(
+        server._ApiKeyAuthMiddleware(server._ApiOrMcpApp(_dummy_mcp_app())),
+        server._UiApp(os.path.join(os.path.dirname(server.__file__), "ui")))
+
+    def catalog_scope(repo, ref="", refresh=False, auth=True):
+        params = f"repo={urllib.parse.quote(repo, safe='')}"
+        if ref:
+            params += f"&ref={urllib.parse.quote(ref, safe='')}"
+        if refresh:
+            params += "&refresh=true"
+        return {"type": "http", "method": "GET", "path": "/api/store/catalog",
+                "query_string": params.encode(),
+                "headers": AUTH_HEADERS if auth else []}
+
+    def install_scope(auth=True):
+        return {"type": "http", "method": "POST", "path": "/api/store/install",
+                "query_string": b"",
+                "headers": (AUTH_HEADERS + [(b"content-type", b"application/json")])
+                if auth else []}
+
+    stub_gh = _StubGitHub(REPO_FILES)
+    set_env(GITHUB_API_URL=stub_gh.url, EZAPP_MCP_API_KEY="s3cret",
+            EZAPP_MCP_STORE_ENABLED=None)
+    server._catalog_cache.clear()
+    repo_url = f"{stub_gh.url}/owner/repo"
+
+    # unauthenticated requests are 401 (same middleware as /mcp)
+    out["catalog_no_auth"] = await _drive(router, catalog_scope(repo_url, auth=False))
+    out["install_no_auth"] = await _drive_body(
+        router, install_scope(auth=False),
+        json.dumps({"repo": repo_url, "dir": "foo/foo-1.0.0.tgz"}).encode())
+
+    # catalog: happy path (default branch resolved via the meta endpoint)
+    out["catalog"] = await _drive(router, catalog_scope(repo_url))
+    cat = json.loads(out["catalog"][1]["body"])
+    out["catalog_requests"] = list(stub_gh.requests)
+
+    # catalog: second call inside the TTL is served from cache
+    out["catalog_cached"] = await _drive(router, catalog_scope(repo_url))
+    out["catalog_cached_body"] = json.loads(out["catalog_cached"][1]["body"])
+    out["catalog_after_cache"] = list(stub_gh.requests)
+
+    # catalog: refresh=true re-fetches from GitHub
+    before = len(stub_gh.requests)
+    out["catalog_refresh"] = await _drive(router, catalog_scope(repo_url, refresh=True))
+    out["catalog_refresh_body"] = json.loads(out["catalog_refresh"][1]["body"])
+    out["catalog_refresh_growth"] = len(stub_gh.requests) - before
+
+    # catalog: ref mismatch between URL and ?ref= is rejected
+    out["catalog_ref_mismatch"] = await _drive(
+        router, catalog_scope(repo_url + "/tree/main", ref="other"))
+
+    # catalog: rate-limited GitHub → 502 (refresh bypasses the cache)
+    stub_gh.mode = "rate_limited"
+    out["catalog_ratelimited"] = await _drive(
+        router, catalog_scope(repo_url, ref="main", refresh=True))
+    stub_gh.mode = "normal"
+
+    # catalog: disallowed repo host → 400
+    out["catalog_bad_repo"] = await _drive(
+        router, catalog_scope("https://gitlab.com/a/b"))
+
+    # wrong methods → 405 (handlers driven directly, as in the /upload tests)
+    out["catalog_post"] = await _drive_body(
+        server._store_catalog_http,
+        {"type": "http", "method": "POST", "path": "/api/store/catalog",
+         "query_string": b"", "headers": []}, b"{}")
+    out["install_get"] = await _drive(
+        server._store_install_http,
+        {"type": "http", "method": "GET", "path": "/api/store/install",
+         "query_string": b"", "headers": []})
+
+    # disabled store → 404 on both endpoints
+    set_env(EZAPP_MCP_STORE_ENABLED="false")
+    out["install_disabled"] = (await _drive_body(
+        router, install_scope(),
+        json.dumps({"repo": repo_url, "dir": "foo/foo-1.0.0.tgz"}).encode()))
+    out["catalog_disabled"] = (await _drive(router, catalog_scope(repo_url)))
+    set_env(EZAPP_MCP_STORE_ENABLED=None)
+
+    # install: happy path with a pinned ref (endpoint driven directly, like
+    # the /upload tests; auth is exercised above through the router)
+    stub_gh.requests.clear()
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    ledger = FakeLedger()
+    server._ledger_instance = ledger
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000000 created", ""),
+    ]).install()
+    payload = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+               "namespace": "foo-ns", "category": "analytics",
+               "label": "Foo App", "description": "From the store",
+               "values": "replicaCount: 2\n"}
+    out["install"] = await _drive_body(server._store_install_http,
+                                       install_scope(), json.dumps(payload).encode())
+    out["install_gh_requests"] = list(stub_gh.requests)
+    out["install_ledger"] = dict(ledger.apps)
+    out["install_ledger_charts"] = dict(ledger.charts)
+    out["install_calls"] = [c[:2] for c in sub.calls]
+    out["install_manifest"] = next(iter(sub.files.values()), "")
+    out["install_cm_requests"] = list(stub_cm.state["requests"])
+    sub.restore()
+    stub_cm.stop()
+
+    # install: re-install of a ledger-managed chart version forces the upload
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger(charts={"foo/1.0.0": {"uploaded_at": "t"}})
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000001 configured", ""),
+    ]).install()
+    payload2 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                "values": "replicaCount: 2\n"}
+    out["reinstall"] = (await _drive_body(server._store_install_http,
+                                          install_scope(),
+                                          json.dumps(payload2).encode()))
+    out["reinstall_cm_requests"] = list(stub_cm.state["requests"])
+    sub.restore()
+    stub_cm.stop()
+
+    # install: always-blocked namespace → 400 before any upload
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    payload3 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                "namespace": "kube-system", "values": "x: 1\n"}
+    out["install_kube_system"] = (await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload3).encode()))
+    out["install_kube_system_cm"] = list(stub_cm.state["requests"])
+    stub_cm.stop()
+
+    # install: ChartMuseum 409 for an unmanaged version → 409 refused
+    stub_cm = _StubChartMuseum([409])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([]).install()
+    payload4 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                "values": "x: 1\n"}
+    out["install_conflict"] = (await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload4).encode()))
+    out["install_conflict_calls"] = len(sub.calls)
+    sub.restore()
+    stub_cm.stop()
+
+    # install: defaults-only request — label/description/category resolve on
+    # the server (humanized label, chart-name description, dataScience)
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000002 created", ""),
+    ]).install()
+    payload5 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                "namespace": "foo-ns", "values": "replicaCount: 2\n"}
+    out["install_defaults"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload5).encode())
+    out["install_defaults_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
+    # install: packaged chart (.tgz inside the app dir) — passed through
+    # unmodified; name/version/logo come from the package
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.2.0-1700000000003 created", ""),
+    ]).install()
+    payload_pkg = {"repo": repo_url, "dir": "foo/foo-1.2.0.tgz", "ref": "main",
+                   "values": "replicaCount: 4\n"}
+    out["install_packaged"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_pkg).encode())
+    out["install_packaged_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
+    # install: logo is REQUIRED — a package without a logo and no upload
+    # is a 400 before anything is uploaded or applied
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([]).install()
+    payload_nologo = {"repo": repo_url, "dir": "plain/plain-2.0.0.tgz",
+                      "ref": "main", "values": "x: 1\n"}
+    out["install_no_logo"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_nologo).encode())
+    out["install_no_logo_calls"] = len(sub.calls)
+    sub.restore()
+    stub_cm.stop()
+
+    # install: uploaded logo satisfies the requirement (data: URI, png)
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/plain-2.0.0-1700000000004 created", ""),
+    ]).install()
+    payload_upload = {"repo": repo_url, "dir": "plain/plain-2.0.0.tgz",
+                      "ref": "main", "values": "x: 1\n",
+                      "logo": "data:image/png;base64,"
+                              + base64.b64encode(PNG_UPLOAD).decode()}
+    out["install_uploaded_logo"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_upload).encode())
+    out["install_uploaded_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
+    # install: an uploaded logo overrides the package's own
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000005 created", ""),
+    ]).install()
+    payload_override = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz",
+                        "ref": "main", "values": "x: 1\n",
+                        "logo": "data:image/png;base64,"
+                                + base64.b64encode(PNG_UPLOAD).decode()}
+    out["install_logo_override"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_override).encode())
+    out["install_override_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
+    # install: unknown category is rejected by payload validation alone
+    stub_gh.requests.clear()
+    payload6 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                "category": "application", "values": "x: 1\n"}
+    out["install_bad_category"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload6).encode())
+    out["install_bad_category_gh"] = list(stub_gh.requests)
+
+    # install: request hygiene
+    server._ledger_instance = FakeLedger()
+    out["install_bad_body"] = (await _drive_body(
+        server._store_install_http, install_scope(), b"this is not json"))
+    out["install_bad_dir"] = (await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps({"repo": repo_url, "dir": "../etc"}).encode()))
+    out["install_no_repo"] = (await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps({"dir": "foo/foo-1.0.0.tgz"}).encode()))
+
+    stub_gh.stop()
+    server._ledger_instance = server._Ledger()
+    set_env(GITHUB_API_URL=None, EZAPP_MCP_API_KEY=None, CHARTMUSEUM_URL=None,
+            EZAPP_MCP_STORE_ENABLED=None)
+    return out
+
+
+store = asyncio.run(_store_endpoint_scenarios())
+
+cat = json.loads(store["catalog"][1]["body"])
+check("catalog endpoint lists one tile per app",
+      store["catalog"][0]["status"] == 200
+      and [a["app"] for a in cat["apps"]] == ["foo", "nested-two", "plain"]
+      and cat["ref"] == "main"
+      and cat["cached"] is False,
+      str(store["catalog"][0]) + store["catalog"][1]["body"][:300].decode())
+foo_tile = next((a for a in cat["apps"] if a["app"] == "foo"), None)
+check("app tile carries humanized label, versions and defaults",
+      foo_tile is not None
+      and foo_tile["label"] == "Foo"
+      and [v["version"] for v in foo_tile["versions"]]
+          == ["1.2.0", "1.1.0", "1.0.0"]
+      and foo_tile["default_dir"] == "foo/foo-1.2.0.tgz"
+      and all("values" in v and "dir" in v for v in foo_tile["versions"])
+      and foo_tile["versions"][1]["description"] == "Foo app"
+      and foo_tile["versions"][0]["values"].startswith("replicaCount: 7"),
+      json.dumps(foo_tile)[:400])
+check("tile logo comes from the newest version's package logo",
+      foo_tile is not None
+      and foo_tile["icon"].startswith("data:image/png;base64,")
+      and foo_tile["logo_file"] == "logo.png",
+      str((foo_tile or {}).get("logo_file")))
+nested_tile = next((a for a in cat["apps"] if a["app"] == "nested-two"), None)
+plain_tile = next((a for a in cat["apps"] if a["app"] == "plain"), None)
+check("packaged versions sort newest; tile falls back to the svg package",
+      nested_tile is not None
+      and [v["version"] for v in nested_tile["versions"]] == ["0.4.0", "0.3.0"]
+      and nested_tile["default_dir"] == "nested-two/nested-two-0.4.0.tgz"
+      and nested_tile["icon"].startswith("data:image/svg+xml;base64,")
+      and nested_tile["logo_file"] == "logo.svg"
+      and nested_tile["label"] == "Nested Two",
+      json.dumps(nested_tile)[:300])
+check("logo-less packages leave the tile flagged (no logo anywhere)",
+      plain_tile is not None
+      and plain_tile["icon"] == "" and plain_tile["logo_file"] == "",
+      str((plain_tile or {}).get("logo_file")))
+check("apps without a valid version disappear (reported as skipped)",
+      all(a["app"] != "broken" for a in cat["apps"])
+      and {s["dir"] for s in cat["skipped"]} == {"broken/broken-9.9.9.tgz",
+                                                 "plain/junk.tgz"}
+      and any("not a packaged helm chart" in s["reason"]
+              for s in cat["skipped"] if s["dir"] == "plain/junk.tgz"),
+      json.dumps(cat["skipped"]))
+check("catalog went through meta + tree + raws",
+      sum(1 for p in store["catalog_requests"] if "git/trees" in p) == 1
+      and "/repos/owner/repo" in store["catalog_requests"],
+      str(store["catalog_requests"]))
+check("second catalog call is served from cache (no new GitHub requests)",
+      store["catalog_cached"][0]["status"] == 200
+      and store["catalog_cached_body"]["cached"] is True
+      and store["catalog_after_cache"] == store["catalog_requests"],
+      f"{len(store['catalog_after_cache'])} vs {len(store['catalog_requests'])}")
+check("refresh=true re-fetches the catalog",
+      store["catalog_refresh"][0]["status"] == 200
+      and store["catalog_refresh_body"]["cached"] is False
+      and store["catalog_refresh_growth"] > 0,
+      f"growth={store['catalog_refresh_growth']}")
+check("catalog rate-limit surfaces as 502 with a token hint",
+      store["catalog_ratelimited"][0]["status"] == 502
+      and b"403" in store["catalog_ratelimited"][1]["body"],
+      str(store["catalog_ratelimited"][0]))
+check("catalog rejects disallowed repo hosts with 400",
+      store["catalog_bad_repo"][0]["status"] == 400, str(store["catalog_bad_repo"][0]))
+check("unauthenticated store requests are 401 (same gate as /mcp)",
+      store["catalog_no_auth"][0]["status"] == 401
+      and store["install_no_auth"][0]["status"] == 401,
+      f"{store['catalog_no_auth'][0]['status']} / {store['install_no_auth'][0]['status']}")
+check("POST /api/store/catalog → 405", store["catalog_post"][0]["status"] == 405,
+      str(store["catalog_post"][0]))
+check("GET /api/store/install → 405", store["install_get"][0]["status"] == 405,
+      str(store["install_get"][0]))
+check("disabled store → 404 on both endpoints",
+      store["install_disabled"][0]["status"] == 404
+      and store["catalog_disabled"][0]["status"] == 404,
+      f"{store['install_disabled'][0]['status']} / {store['catalog_disabled'][0]['status']}")
+check("repo URL /tree + ?ref= mismatch is rejected",
+      store["catalog_ref_mismatch"][0]["status"] == 400,
+      str(store["catalog_ref_mismatch"][0]))
+
+inst = json.loads(store["install"][1]["body"])
+check("install endpoint runs the full pipeline (200 installed)",
+      store["install"][0]["status"] == 200 and inst["status"] == "installed"
+      and inst["chart"] == "foo" and inst["version"] == "1.0.0"
+      and inst["namespace"] == "foo-ns",
+      str(store["install"][0]) + store["install"][1]["body"][:400].decode())
+check("install only touches the GitHub tarball endpoint",
+      store["install_gh_requests"] == ["/repos/owner/repo/tarball/main"],
+      str(store["install_gh_requests"]))
+check("install creates an epoch-ms-named EzAppConfig",
+      bool(re.fullmatch(r"foo-1\.0\.0-\d{13}", inst["ezappconfig"] or "")),
+      str(inst.get("ezappconfig")))
+check("install records chart + CR in the ownership ledger",
+      inst["ezappconfig"] in store["install_ledger"]
+      and "foo/1.0.0" in store["install_ledger_charts"],
+      f"{store['install_ledger']} / {store['install_ledger_charts']}")
+check("install applies via get → kubectl apply",
+      store["install_calls"] == [["kubectl", "get"], ["kubectl", "apply"]],
+      str(store["install_calls"]))
+inst_doc = (yaml.safe_load(store["install_manifest"])
+            if store["install_manifest"] else {})
+check("applied manifest is the deterministic template with edited values",
+      inst_doc.get("metadata", {}).get("name") == inst["ezappconfig"]
+      and inst_doc.get("spec", {}).get("values") == "replicaCount: 2"
+      and inst_doc.get("spec", {}).get("category") == "analytics"
+      and inst_doc.get("spec", {}).get("label") == "Foo App"
+      and inst_doc.get("spec", {}).get("description") == "From the store"
+      and inst_doc.get("spec", {}).get("options", {}).get("namespace") == "foo-ns"
+      and inst_doc.get("spec", {}).get("options", {}).get("timeout") == "45m"
+      and inst_doc.get("spec", {}).get("chartVersion") == "1.0.0"
+      and inst_doc.get("spec", {}).get("name") == "foo"
+      and inst_doc.get("spec", {}).get("install") is True
+      and inst_doc.get("spec", {}).get("backoffLimit") == 3
+      and inst_doc.get("metadata", {}).get("labels", {}).get("hpe-ezua/imported-app") == "true",
+      store["install_manifest"][:600])
+check("applied manifest carries the chart icon as logoImage",
+      inst_doc.get("spec", {}).get("logoImage") == base64.b64encode(png).decode())
+defaults_inst = json.loads(store["install_defaults"][1]["body"])
+defaults_doc = (yaml.safe_load(store["install_defaults_manifest"])
+                if store["install_defaults_manifest"] else {})
+check("defaults-only install: humanized label, chart-name description, dataScience",
+      store["install_defaults"][0]["status"] == 200
+      and defaults_doc.get("spec", {}).get("label") == "Foo"
+      and defaults_doc.get("spec", {}).get("description") == "foo"
+      and defaults_doc.get("spec", {}).get("category") == "dataScience"
+      and defaults_doc.get("spec", {}).get("options", {}).get("namespace") == "foo-ns",
+      store["install_defaults_manifest"][:500])
+check("defaults-only install response names the logo file",
+      json.loads(store["install_defaults"][1]["body"]).get("logo_file") == "icon.png",
+      store["install_defaults"][1]["body"][:200].decode())
+check("defaults-only CR carries the chart logo",
+      defaults_doc.get("spec", {}).get("logoImage") == base64.b64encode(png).decode())
+
+pkg_inst = json.loads(store["install_packaged"][1]["body"])
+pkg_doc = (yaml.safe_load(store["install_packaged_manifest"])
+           if store["install_packaged_manifest"] else {})
+check("packaged chart installs through the same pipeline",
+      store["install_packaged"][0]["status"] == 200
+      and pkg_inst["status"] == "installed"
+      and pkg_inst["chart"] == "foo" and pkg_inst["version"] == "1.2.0"
+      and pkg_inst["namespace"] == "foo-ns",
+      str(store["install_packaged"][0]) + store["install_packaged"][1]["body"][:300].decode())
+check("packaged install: CR named from the package metadata with its logo",
+      bool(re.fullmatch(r"foo-1\.2\.0-\d{13}", pkg_inst["ezappconfig"] or ""))
+      and pkg_doc.get("spec", {}).get("logoImage") == base64.b64encode(png).decode()
+      and pkg_doc.get("spec", {}).get("description") == "foo"
+      and pkg_doc.get("spec", {}).get("label") == "Foo"
+      and pkg_doc.get("spec", {}).get("values") == "replicaCount: 4",
+      store["install_packaged_manifest"][:500])
+
+nologo_resp = json.loads(store["install_no_logo"][1]["body"])
+upload_resp = json.loads(store["install_uploaded_logo"][1]["body"])
+upload_doc = (yaml.safe_load(store["install_uploaded_manifest"])
+              if store["install_uploaded_manifest"] else {})
+override_resp = json.loads(store["install_logo_override"][1]["body"])
+override_doc = (yaml.safe_load(store["install_override_manifest"])
+                if store["install_override_manifest"] else {})
+png_upload = PNG_UPLOAD
+check("logo is required when the package ships none",
+      store["install_no_logo"][0]["status"] == 400
+      and b"a logo is required" in store["install_no_logo"][1]["body"]
+      and store["install_no_logo_calls"] == 0,
+      f"{store['install_no_logo'][0]['status']} / "
+      f"calls={store['install_no_logo_calls']}")
+check("uploaded logo satisfies the requirement and lands in the CR",
+      store["install_uploaded_logo"][0]["status"] == 200
+      and upload_resp["status"] == "installed"
+      and upload_resp["logo_file"] == "upload"
+      and upload_doc.get("spec", {}).get("logoImage")
+          == base64.b64encode(png_upload).decode(),
+      store["install_uploaded_manifest"][:400])
+check("an uploaded logo overrides the package's own",
+      store["install_logo_override"][0]["status"] == 200
+      and override_resp["logo_file"] == "upload"
+      and override_doc.get("spec", {}).get("logoImage")
+          == base64.b64encode(png_upload).decode(),
+      store["install_override_manifest"][:400])
+check("humanized label splits multi-word chart names",
+      server._humanize_chart_name("nested-two") == "Nested Two")
+check("unknown category is a 400 before any GitHub request",
+      store["install_bad_category"][0]["status"] == 400
+      and b"must be one of" in store["install_bad_category"][1]["body"]
+      and store["install_bad_category_gh"] == [],
+      f"{store['install_bad_category'][0]['status']} / "
+      f"{store['install_bad_category_gh']}")
+check("install uploads to ChartMuseum without force on the first run",
+      store["install_cm_requests"] == [("POST", "/api/charts")],
+      str(store["install_cm_requests"]))
+check("re-install force-overwrites the ledger-managed chart version",
+      store["reinstall"][0]["status"] == 200
+      and store["reinstall_cm_requests"] == [("POST", "/api/charts?force=true")],
+      f"{store['reinstall'][0]['status']} / {store['reinstall_cm_requests']}")
+check("kube-system target is refused before any upload",
+      store["install_kube_system"][0]["status"] == 400
+      and b"never a valid deploy target" in store["install_kube_system"][1]["body"]
+      and store["install_kube_system_cm"] == [],
+      str(store["install_kube_system"][0]))
+check("unmanaged existing chart version → 409 refused, nothing applied",
+      store["install_conflict"][0]["status"] == 409
+      and b"cannot overwrite" in store["install_conflict"][1]["body"]
+      and store["install_conflict_calls"] == 0,
+      f"{store['install_conflict'][0]['status']} / calls={store['install_conflict_calls']}")
+check("install request hygiene (bad json / traversal dir / missing repo)",
+      store["install_bad_body"][0]["status"] == 400
+      and store["install_bad_dir"][0]["status"] == 400
+      and store["install_no_repo"][0]["status"] == 400,
+      f"{store['install_bad_body'][0]['status']} / "
+      f"{store['install_bad_dir'][0]['status']} / {store['install_no_repo'][0]['status']}")
 
 
 # ─── Summary ─────────────────────────────────────────────────────────────
