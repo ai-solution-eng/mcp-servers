@@ -237,3 +237,25 @@ dialog input[type="file"] { padding: 0.25rem; }
   margin-top: 0.9rem;
 }
 button.primary { border-color: var(--ok); }
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+button:disabled:hover { border-color: var(--line); }
+
+/* install progress phases */
+#dlg-phases {
+  list-style: none;
+  margin: 0.4rem 0 0.6rem;
+  padding: 0;
+}
+#dlg-phases li {
+  padding: 0.28rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+#dlg-phases li.pending { color: var(--dim); }
+#dlg-phases li.active { color: var(--info); }
+#dlg-phases li.done { color: var(--ok); }
+#dlg-phases li.failed { color: var(--err); }
+#dlg-result { white-space: normal; overflow-wrap: anywhere; }

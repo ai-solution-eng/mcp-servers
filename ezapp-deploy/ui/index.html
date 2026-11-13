@@ -64,32 +64,42 @@
   <h2 id="dlg-title">Install chart</h2>
   <p id="dlg-sub" class="dim"></p>
   <form id="installform" method="dialog">
-    <label for="dlg-namespace">Target namespace (editable — created on install)</label>
-    <input id="dlg-namespace" type="text" spellcheck="false" autocomplete="off">
-    <label for="dlg-category">Category</label>
-    <select id="dlg-category">
-      <option value="dataScience">dataScience</option>
-      <option value="dataEngineering">dataEngineering</option>
-      <option value="analytics">analytics</option>
-    </select>
-    <label for="dlg-label">Label (display name)</label>
-    <input id="dlg-label" type="text" spellcheck="false" autocomplete="off">
-    <label for="dlg-description">Description</label>
-    <input id="dlg-description" type="text" spellcheck="false" autocomplete="off">
-    <label for="dlg-logo">Logo (required, &lt; 256 KB, png/svg — pre-filled from the package)</label>
-    <div id="dlg-logo-row">
-      <img id="dlg-logo-preview" class="logo-preview hidden" alt="">
-      <span id="dlg-logo-status" class="tmeta"></span>
-    </div>
-    <input id="dlg-logo" type="file" accept="image/png,image/svg+xml">
-    <label for="dlg-values">Helm values (editable — sent as spec.values)</label>
-    <textarea id="dlg-values" rows="14" spellcheck="false"></textarea>
-    <p id="dlg-error" class="errortext hidden"></p>
-    <div id="dlg-buttons">
-      <button id="dlg-cancel" type="button">Cancel</button>
-      <button id="dlg-install" type="button" class="primary">Install</button>
+    <div id="dlg-form">
+      <label for="dlg-namespace">Target namespace (editable — created on install)</label>
+      <input id="dlg-namespace" type="text" spellcheck="false" autocomplete="off">
+      <label for="dlg-category">Category</label>
+      <select id="dlg-category">
+        <option value="dataScience">dataScience</option>
+        <option value="dataEngineering">dataEngineering</option>
+        <option value="analytics">analytics</option>
+      </select>
+      <label for="dlg-label">Label (display name)</label>
+      <input id="dlg-label" type="text" spellcheck="false" autocomplete="off">
+      <label for="dlg-description">Description</label>
+      <input id="dlg-description" type="text" spellcheck="false" autocomplete="off">
+      <label for="dlg-logo">Logo (required, &lt; 256 KB, png/svg — pre-filled from the package)</label>
+      <div id="dlg-logo-row">
+        <img id="dlg-logo-preview" class="logo-preview hidden" alt="">
+        <span id="dlg-logo-status" class="tmeta"></span>
+      </div>
+      <input id="dlg-logo" type="file" accept="image/png,image/svg+xml">
+      <label for="dlg-values">Helm values (editable — sent as spec.values)</label>
+      <textarea id="dlg-values" rows="14" spellcheck="false"></textarea>
+      <p id="dlg-error" class="errortext hidden"></p>
+      <div id="dlg-buttons">
+        <button id="dlg-cancel" type="button">Cancel</button>
+        <button id="dlg-install" type="button" class="primary">Install</button>
+      </div>
     </div>
   </form>
+  <div id="dlg-progress" class="hidden">
+    <ul id="dlg-phases"></ul>
+    <p id="dlg-result" class="hidden"></p>
+    <div id="dlg-progress-buttons" class="hidden">
+      <button id="dlg-back" type="button">Back to settings</button>
+      <button id="dlg-close" type="button" class="primary">Close</button>
+    </div>
+  </div>
 </dialog>
 <footer>
   <p id="meta" class="dim"></p>

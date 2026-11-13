@@ -102,15 +102,18 @@ curl -H "Authorization: Bearer <API_KEY>" \
 curl -N -H "Authorization: Bearer <API_KEY>" \
      "https://<public-host>/api/store/catalog?repo=…&stream=1"
 
-curl -X POST -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
+# the install endpoint streams too (stream=1): one {"type": "stage",
+# "stage": github|chart|metadata|chartmuseum|render|apply} line per phase,
+# then {"type": "done", …} with the full result
+curl -N -X POST -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
      -d '{"repo": "https://github.com/<owner>/<repo>", "dir": "arize-phoenix/arize-phoenix-1.3.0.tgz",
           "ref": "main", "namespace": "foo-ns", "values": "replicaCount: 2\n"}' \
-     "https://<public-host>/api/store/install"
+     "https://<public-host>/api/store/install?stream=1"
 ```
 
 `dir` is the packaged chart file to install — exactly what the catalog's app tiles expose (`versions[].dir`, with `default_dir` naming the newest).
 
-Store-specific hardening (beyond the shared API-key gate): GitHub hosts are **pinned** to github.com (or the `GITHUB_API_URL` host — GitHub Enterprise Server is supported: API under that base, raw under `<host>/raw/...`, repo URLs must point at the same host); owner/repo/ref/dir are regex-validated before they reach a curl argv; repo tarballs are capped (`EZAPP_MCP_MAX_REPO_MB`, default 200) and decompressed in memory only; installs are capped at 2 concurrent; the catalog is cached per repo@ref for a **full day** (`?refresh=true` — or the UI's shift-click Load — bypasses it for an immediate re-scan; installs always re-download the package fresh regardless of the cache). GitHub API rate limits are the practical ceiling — set `GITHUB_TOKEN` (chart: `store.githubToken.existingSecret`, out-of-band Secret) for authenticated calls; a 403 surfaces as a 502 with that hint. The store endpoints go away with `EZAPP_MCP_STORE_ENABLED=false` (chart: `store.enabled: false`).
+Store-specific hardening (beyond the shared API-key gate): GitHub hosts are **pinned** to github.com (or the `GITHUB_API_URL` host — GitHub Enterprise Server is supported: API under that base, raw under `<host>/raw/...`, repo URLs must point at the same host); owner/repo/ref/dir are regex-validated before they reach a curl argv; repo tarballs are capped (`EZAPP_MCP_MAX_REPO_MB`, default 200) and decompressed in memory only; installs are capped at 2 concurrent; a chart version that **already exists in ChartMuseum is reused** for the apply rather than failing (never overwritten, and never recorded in the chart ledger — overwrite/delete rights stay with whoever uploaded it); the catalog is cached per repo@ref for a **full day** (`?refresh=true` — or the UI's shift-click Load — bypasses it for an immediate re-scan; installs always re-download the package fresh regardless of the cache). GitHub API rate limits are the practical ceiling — set `GITHUB_TOKEN` (chart: `store.githubToken.existingSecret`, out-of-band Secret) for authenticated calls; a 403 surfaces as a 502 with that hint. The store endpoints go away with `EZAPP_MCP_STORE_ENABLED=false` (chart: `store.enabled: false`).
 
 ## Reference deploy flow (PCAI / EZUA)
 

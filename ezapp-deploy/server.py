@@ -2803,17 +2803,35 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
                          namespace: str = '', category: str = '',
                          label: str = '', description: str = '',
                          values: 'str | None' = None,
-                         logo: str = '') -> dict:
+                         logo: str = '',
+                         progress=None) -> dict:
     """Full store install pipeline; returns a JSON-ready result dict.
 
     Stages: GitHub tarball → in-memory chart repackage → ChartMuseum upload
     (same pipeline + ledger as upload_chart) → deterministic EzAppConfig
     render → kubectl apply (same pipeline as apply_ezappconfig).
+
+    `progress` (optional) is an async callable receiving {'type': 'stage',
+    'stage': <name>} events as each phase begins — the streaming endpoint
+    forwards them to the UI for a live phase display. A chart version that
+    already exists in ChartMuseum (uploaded by someone else) is REUSED for
+    the apply rather than failing; result['chartmuseum'] reports
+    'uploaded' or 'reused'.
     """
     result = {'status': 'error', 'stage': None, 'chart': None, 'version': None,
               'namespace': None, 'ezappconfig': None, 'logo_file': None,
+              'chartmuseum': '',
               'upload': '', 'apply': '', 'manifest': '', 'warnings': [],
               'detail': ''}
+
+    async def _set_stage(name: str):
+        result['stage'] = name
+        if progress:
+            try:
+                await progress({'type': 'stage', 'stage': name})
+            except Exception:
+                pass  # a dead stream must not abort the install
+
     try:
         endpoints = _github_endpoints()
     except ValueError as e:
@@ -2828,7 +2846,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
     ref = ref or ref_from_url or ''
 
     # ── stage 1: download the repo tarball (capped) ──────────────────────
-    result['stage'] = 'github'
+    await _set_stage('github')
     tarball_url = (
         f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball/{ref}" if ref
         else f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball"
@@ -2864,7 +2882,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
     # Charts are always packaged (.tgz/.tar.gz): the file is pulled out of
     # the repo tarball and passed to ChartMuseum unmodified — it already is
     # a `helm package` tarball, validated by the standard sniffer.
-    result['stage'] = 'chart'
+    await _set_stage('chart')
     try:
         packaged = _extract_packaged_chart_from_repo_tarball(repo_bytes,
                                                              chart_dir)
@@ -2877,7 +2895,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
     result['logo_file'] = packaged['logo_file'] or None
 
     # ── stage 3: resolve metadata (user input → deterministic defaults) ──
-    result['stage'] = 'metadata'
+    await _set_stage('metadata')
     namespace = namespace or f'{_sanitize_cr_name_segment(chart_name)}-ns'
     violation = target_namespace_violation(namespace)
     if violation:
@@ -2917,7 +2935,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
     result['namespace'] = namespace
 
     # ── stage 4: ChartMuseum upload (same pipeline as upload_chart) ──────
-    result['stage'] = 'chartmuseum'
+    await _set_stage('chartmuseum')
     force = False
     try:
         force = await _get_ledger().has_chart(chart_name, chart_version)
@@ -2927,24 +2945,30 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
         packaged['tgz'], force=force,
         filename=f'store:{owner}/{repo}@{ref}:{chart_dir or "(root)"}',
     )
-    result['upload'] = upload['detail']
-    if not upload.get('ok'):
-        if upload.get('status') == 'exists':
-            result['status'] = 'refused'
-            result['detail'] = (
-                f'Error: {chart_name}-{chart_version} already exists in '
-                'ChartMuseum and was not uploaded by this server — the store '
-                'cannot overwrite it (bump the version in the repo).'
-            )
-        else:
-            result['detail'] = (
-                f'Error: ChartMuseum upload failed for '
-                f'{chart_name}-{chart_version}: {upload["detail"]}'
-            )
+    if upload.get('ok'):
+        result['chartmuseum'] = 'uploaded'
+        result['upload'] = upload['detail']
+    elif upload.get('status') == 'exists':
+        # the version is already in ChartMuseum (uploaded by someone else or
+        # an earlier server instance) — REUSE it for the apply instead of
+        # failing. Using an existing chart is read-only on ChartMuseum; it
+        # is NOT recorded in the ledger, so delete/overwrite rights over it
+        # stay with whoever uploaded it.
+        result['chartmuseum'] = 'reused'
+        result['upload'] = (
+            f'ChartMuseum already has {chart_name}-{chart_version} — '
+            'reusing the existing package for this install.'
+        )
+    else:
+        result['upload'] = upload['detail']
+        result['detail'] = (
+            f'Error: ChartMuseum upload failed for '
+            f'{chart_name}-{chart_version}: {upload["detail"]}'
+        )
         return result
 
     # ── stage 5: render the CR from the deterministic template ───────────
-    result['stage'] = 'render'
+    await _set_stage('render')
     cr_name = (
         f'{_sanitize_cr_name_segment(chart_name)}-'
         f'{_sanitize_cr_name_segment(chart_version)}-{int(time.time() * 1000)}'
@@ -2969,7 +2993,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
     result['ezappconfig'] = cr_name
 
     # ── stage 6: apply (same pipeline as apply_ezappconfig) ──────────────
-    result['stage'] = 'apply'
+    await _set_stage('apply')
     print(
         f'AUDIT store install decision=allowed repo={owner}/{repo}'
         + (f'@{ref}' if ref else '')
@@ -3569,17 +3593,36 @@ async def _store_catalog_http(scope, receive, send):
                 'more_body': False})
 
 
+def _install_response_body(result: dict) -> dict:
+    """JSON body for an install result (shared by the plain and streaming
+    endpoints). The rendered CR rides along for transparency/audit when
+    modest-sized."""
+    body = {k: result[k] for k in (
+        'status', 'stage', 'chart', 'version', 'namespace', 'ezappconfig',
+        'upload', 'apply', 'warnings', 'detail', 'logo_file', 'chartmuseum',
+    ) if k in result}
+    if len(result.get('manifest', '')) <= 65_536:
+        body['manifest'] = result['manifest']
+    return body
+
+
 async def _store_install_http(scope, receive, send):
-    """POST /api/store/install — one-click deploy of a store tile.
+    """POST /api/store/install[?stream=1] — one-click deploy of a store tile.
 
     Body: JSON {repo, dir, ref?, namespace?, category?, label?,
     description?, values?, logo?}. `logo` (a data: URI or base64 of a
     png/svg image <= 256 KB) is REQUIRED when the packaged chart ships no
-    logo of its own, and overrides it when provided. The whole flow runs
-    server-side (GitHub download, ChartMuseum upload through the
+    logo of its own, and overrides it when provided. A chart version that
+    already exists in ChartMuseum is REUSED for the apply. The whole flow
+    runs server-side (GitHub download, ChartMuseum upload through the
     ledger-gated pipeline, deterministic EzAppConfig render, kubectl apply)
     and the response carries the receipts:
     {status, ezappconfig, chart, version, namespace, upload, apply, manifest}.
+
+    With stream=1 the answer is application/x-ndjson: one
+    {"type": "stage", "stage": …} line per phase (github, chart, metadata,
+    chartmuseum, render, apply) and a final {"type": "done", …} line with
+    the full result — the UI shows the phases live.
     """
     if (scope.get('method') or '').upper() != 'POST':
         for message in _json_asgi_response(
@@ -3639,29 +3682,75 @@ async def _store_install_http(scope, receive, send):
         ):
             await send(message)
         return
+
+    query = scope.get('query_string') or b''
+    params = parse_qs(query.decode('latin-1'))
+    streaming = params.get('stream', [''])[0].strip().lower() == '1'
+
+    if not streaming:
+        async with _install_slots:
+            result = await _store_install(
+                request['repo'], request['dir'], ref=request['ref'],
+                namespace=request['namespace'], category=request['category'],
+                label=request['label'], description=request['description'],
+                values=request['values'], logo=request['logo'],
+            )
+        status_to_code = {
+            'installed': 200, 'invalid': 400, 'refused': 409, 'error': 502,
+        }
+        for message in _json_asgi_response(
+            send, status_to_code.get(result['status'], 502),
+            json.dumps(_install_response_body(result), indent=2).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+
+    # streaming mode: one NDJSON line per phase, then the full result
+    await send({
+        'type': 'http.response.start', 'status': 200,
+        'headers': [
+            (b'content-type', b'application/x-ndjson'),
+            (b'cache-control', b'no-store'),
+        ],
+    })
+
+    async def send_event(event: dict):
+        line = json.dumps(event).encode('utf-8') + b'\n'
+        await send({'type': 'http.response.body', 'body': line,
+                    'more_body': True})
+
+    async def progress(event: dict):
+        # a disconnected browser must never abort the install
+        try:
+            await send_event(event)
+        except Exception:
+            pass
+
+    install_error = None
     async with _install_slots:
-        result = await _store_install(
-            request['repo'], request['dir'], ref=request['ref'],
-            namespace=request['namespace'], category=request['category'],
-            label=request['label'], description=request['description'],
-            values=request['values'], logo=request['logo'],
-        )
-    status_to_code = {
-        'installed': 200, 'invalid': 400, 'refused': 409, 'error': 502,
-    }
-    body = {k: result[k] for k in (
-        'status', 'stage', 'chart', 'version', 'namespace', 'ezappconfig',
-        'upload', 'apply', 'warnings', 'detail', 'logo_file',
-    )}
-    # The rendered CR rides along for transparency/audit when modest-sized.
-    if len(result['manifest']) <= 65_536:
-        body['manifest'] = result['manifest']
-    for message in _json_asgi_response(
-        send, status_to_code.get(result['status'], 502),
-        json.dumps(body, indent=2).encode('utf-8'),
-        [(b'cache-control', b'no-store')],
-    ):
-        await send(message)
+        try:
+            result = await _store_install(
+                request['repo'], request['dir'], ref=request['ref'],
+                namespace=request['namespace'], category=request['category'],
+                label=request['label'], description=request['description'],
+                values=request['values'], logo=request['logo'],
+                progress=progress,
+            )
+        except Exception as e:  # noqa: BLE001 — the stream must always close
+            install_error = str(e)
+    if install_error:
+        try:
+            await send_event({'type': 'error', 'error': install_error})
+        except Exception:
+            pass
+    else:
+        try:
+            await send_event({'type': 'done', **_install_response_body(result)})
+        except Exception:
+            pass
+    await send({'type': 'http.response.body', 'body': b'',
+                'more_body': False})
 
 
 class _ApiOrMcpApp:

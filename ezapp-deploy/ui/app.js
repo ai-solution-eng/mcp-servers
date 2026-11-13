@@ -533,6 +533,109 @@ function showDlgError(text) {
   el.classList.remove("hidden");
 }
 
+const INSTALL_PHASES = [
+  ["github", "Downloading repo from GitHub"],
+  ["chart", "Extracting packaged chart"],
+  ["metadata", "Preparing install settings"],
+  ["chartmuseum", "Uploading to ChartMuseum"],
+  ["render", "Generating EzAppConfig"],
+  ["apply", "Applying EzAppConfig (kubectl)"],
+];
+let installTimer = null;
+
+function showInstallPhases() {
+  // transition: values form → live phase list
+  $("dlg-form").classList.add("hidden");
+  $("dlg-progress").classList.remove("hidden");
+  $("dlg-result").classList.add("hidden");
+  $("dlg-progress-buttons").classList.add("hidden");
+  const list = $("dlg-phases");
+  list.textContent = "";
+  for (const [stage, label] of INSTALL_PHASES) {
+    const li = document.createElement("li");
+    li.dataset.stage = stage;
+    li.className = "phase pending";
+    li.textContent = label;
+    list.appendChild(li);
+  }
+  progressStarted = Date.now();
+  if (installTimer) clearInterval(installTimer);
+  installTimer = setInterval(() => {
+    const secs = Math.round((Date.now() - progressStarted) / 1000);
+    const active = list.querySelector(".phase.active");
+    const label = active ? active.textContent : "Installing";
+    $("dlg-sub").textContent = label.replace(/^▸\s*/, "") + " — " + secs + "s elapsed";
+  }, 1000);
+}
+
+function markInstallStage(stage) {
+  const rows = $("dlg-phases").children;
+  let seen = false;
+  for (const row of rows) {
+    if (row.dataset.stage === stage) {
+      row.className = "phase active";
+      row.textContent = "▸ " + row.textContent.replace(/^[▸✓✗] /, "");
+      seen = true;
+    } else if (!seen) {
+      row.className = "phase done";
+      row.textContent = "✓ " + row.textContent.replace(/^[▸✓✗] /, "");
+    }
+  }
+}
+
+function finishInstall(result) {
+  if (installTimer) { clearInterval(installTimer); installTimer = null; }
+  const failedStage = result.status === "installed" ? null : (result.stage || null);
+  const rows = $("dlg-phases").children;
+  let seen = failedStage === null;
+  for (const row of rows) {
+    if (failedStage && row.dataset.stage === failedStage) {
+      row.className = "phase failed";
+      row.textContent = "✗ " + row.textContent.replace(/^[▸✓✗] /, "");
+      seen = true;
+    } else if (!seen) {
+      row.className = "phase done";
+      row.textContent = "✓ " + row.textContent.replace(/^[▸✓✗] /, "");
+    }
+  }
+  const resultEl = $("dlg-result");
+  resultEl.classList.remove("hidden");
+  resultEl.classList.toggle("errortext", result.status !== "installed");
+  if (result.status === "installed") {
+    const reused = result.chartmuseum === "reused";
+    resultEl.textContent = "Installed ✓ — chart " + (result.chart || "") + " " +
+      (result.version || "") + (reused ? " (already in ChartMuseum — reused)" : "") +
+      " → EzAppConfig " + (result.ezappconfig || "?") +
+      " in namespace " + (result.namespace || "?") + ".";
+    setStatus("Installed " + (result.chart || "chart") + " " + (result.version || "") +
+      " → EzAppConfig " + (result.ezappconfig || "?") +
+      " (namespace " + (result.namespace || "?") + "). Watch the rollout below.");
+    setTimeout(() => {
+      if ($("installdialog").open) $("installdialog").close();
+      showView("apps");
+      load();
+    }, 1400);
+  } else {
+    resultEl.textContent = (result.detail || "Install failed") +
+      (result.upload && failedStage !== "chartmuseum" ? " — upload: " + result.upload : "");
+  }
+  $("dlg-progress-buttons").classList.remove("hidden");
+  installing = false;
+}
+
+function failInstall(message, stage) {
+  if (installTimer) { clearInterval(installTimer); installTimer = null; }
+  finishInstall({ status: "error", stage: stage || null, detail: message, upload: "" });
+}
+
+function backToSettings() {
+  $("dlg-progress").classList.add("hidden");
+  $("dlg-form").classList.remove("hidden");
+  $("dlg-error").classList.add("hidden");
+  installing = false;
+  $("dlg-install").disabled = false;
+}
+
 async function confirmInstall() {
   if (installing) return;
   const key = getKey();
@@ -556,10 +659,11 @@ async function confirmInstall() {
   }
   installing = true;
   $("dlg-install").disabled = true;
-  showDlgError("Installing… (download → ChartMuseum upload → apply; this can take a minute)");
+  $("dlg-error").classList.add("hidden");
+  showInstallPhases();
   let resp;
   try {
-    resp = await fetch("/api/store/install", {
+    resp = await fetch("/api/store/install?stream=1", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + key,
@@ -568,30 +672,49 @@ async function confirmInstall() {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    installing = false;
-    $("dlg-install").disabled = false;
-    showDlgError("Network error: " + err);
+    failInstall("Network error: " + err);
     return;
   }
-  const body = await resp.json().catch(() => ({}));
-  installing = false;
-  $("dlg-install").disabled = false;
-  if (resp.ok && body.status === "installed") {
-    $("installdialog").close();
-    showView("apps");
-    load();
-    setStatus("Installed " + (body.chart || "chart") + " " + (body.version || "") +
-      " → EzAppConfig " + (body.ezappconfig || "?") +
-      " (namespace " + (body.namespace || "?") + "). Watch the rollout below.");
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    failInstall(body.error || "HTTP " + resp.status);
     return;
   }
-  const lines = [];
-  if (body.detail) lines.push(body.detail);
-  else if (body.error) lines.push(body.error);
-  else lines.push("HTTP " + resp.status);
-  if (body.stage) lines.push("(failed at stage: " + body.stage + ")");
-  if (body.upload && body.stage !== "chartmuseum") lines.push("upload: " + body.upload);
-  showDlgError(lines.join(" "));
+  const ctype = (resp.headers.get("content-type") || "");
+  if (!ctype.includes("x-ndjson")) {
+    finishInstall(await resp.json().catch(() => ({ status: "error", detail: "bad response" })));
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let event;
+        try { event = JSON.parse(line); } catch (e) { continue; }
+        if (event.type === "stage") {
+          markInstallStage(event.stage);
+        } else if (event.type === "done") {
+          finishInstall(event);
+          return;
+        } else if (event.type === "error") {
+          failInstall(event.error || "install failed");
+          return;
+        }
+      }
+    }
+    failInstall("Install stream ended without a result.");
+  } catch (err) {
+    failInstall("Stream error: " + err);
+  }
 }
 
 /* ── View switching + wiring ──────────────────────────────────────────── */
@@ -664,6 +787,8 @@ $("repobox").addEventListener("keydown", (event) => {
 });
 $("dlg-cancel").addEventListener("click", () => $("installdialog").close());
 $("dlg-install").addEventListener("click", confirmInstall);
+$("dlg-back").addEventListener("click", backToSettings);
+$("dlg-close").addEventListener("click", () => $("installdialog").close());
 
 $("dlg-logo").addEventListener("change", () => {
   const file = $("dlg-logo").files[0];

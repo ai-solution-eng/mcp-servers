@@ -2281,19 +2281,55 @@ async def _store_endpoint_scenarios():
     out["install_kube_system_cm"] = list(stub_cm.state["requests"])
     stub_cm.stop()
 
-    # install: ChartMuseum 409 for an unmanaged version → 409 refused
+    # install: ChartMuseum 409 for an unmanaged version → REUSE it for the
+    # apply (no overwrite, no ledger entry for the chart itself)
     stub_cm = _StubChartMuseum([409])
     set_env(CHARTMUSEUM_URL=stub_cm.url)
-    server._ledger_instance = FakeLedger()
-    sub = CapturingSubprocess([]).install()
+    ledger = FakeLedger()
+    server._ledger_instance = ledger
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000006 created", ""),
+    ]).install()
     payload4 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
                 "values": "x: 1\n"}
-    out["install_conflict"] = (await _drive_body(
+    out["install_conflict"] = await _drive_body(
         server._store_install_http, install_scope(),
-        json.dumps(payload4).encode()))
-    out["install_conflict_calls"] = len(sub.calls)
+        json.dumps(payload4).encode())
+    out["install_conflict_ledger"] = dict(ledger.apps)
+    out["install_conflict_ledger_charts"] = dict(ledger.charts)
+    out["install_conflict_calls"] = [c[:2] for c in sub.calls]
     sub.restore()
     stub_cm.stop()
+
+    # install: STREAMING mode — stage events then the done event
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000007 created", ""),
+    ]).install()
+    stream_scope = install_scope()
+    stream_scope["query_string"] = b"stream=1"
+    out["install_stream"] = await _drive_body(
+        server._store_install_http, stream_scope,
+        json.dumps({"repo": repo_url, "dir": "foo/foo-1.0.0.tgz",
+                    "ref": "main", "values": "x: 1\n"}).encode())
+    stream_lines = [m.get("body", b"") for m in out["install_stream"]
+                    if m.get("type") == "http.response.body"]
+    out["install_stream_events"] = [
+        json.loads(l) for l in b"".join(stream_lines).decode().splitlines()
+        if l.strip()]
+    sub.restore()
+    stub_cm.stop()
+
+    # install: streaming keeps static errors as proper HTTP statuses
+    stream_scope2 = install_scope()
+    stream_scope2["query_string"] = b"stream=1"
+    out["install_stream_bad"] = await _drive_body(
+        server._store_install_http, stream_scope2, b"this is not json")
+
 
     # install: defaults-only request — label/description/category resolve on
     # the server (humanized label, chart-name description, dataScience)
@@ -2688,11 +2724,33 @@ check("kube-system target is refused before any upload",
       and b"never a valid deploy target" in store["install_kube_system"][1]["body"]
       and store["install_kube_system_cm"] == [],
       str(store["install_kube_system"][0]))
-check("unmanaged existing chart version → 409 refused, nothing applied",
-      store["install_conflict"][0]["status"] == 409
-      and b"cannot overwrite" in store["install_conflict"][1]["body"]
-      and store["install_conflict_calls"] == 0,
-      f"{store['install_conflict'][0]['status']} / calls={store['install_conflict_calls']}")
+conflict_resp = json.loads(store["install_conflict"][1]["body"])
+check("existing unmanaged chart version is REUSED for the apply",
+      store["install_conflict"][0]["status"] == 200
+      and conflict_resp["status"] == "installed"
+      and conflict_resp["chartmuseum"] == "reused"
+      and "reusing the existing package" in conflict_resp["upload"]
+      and conflict_resp["ezappconfig"] in store["install_conflict_ledger"]
+      and store["install_conflict_calls"] == [["kubectl", "get"], ["kubectl", "apply"]],
+      store["install_conflict"][1]["body"][:400].decode())
+check("reused charts are NOT recorded in the chart ledger (overwrite rights stay put)",
+      "foo/1.0.0" not in store["install_conflict_ledger_charts"]
+      and conflict_resp["ezappconfig"] in store["install_conflict_ledger"],
+      str(store["install_conflict_ledger_charts"]))
+stream_events = store["install_stream_events"]
+stream_stages = [e.get("stage") for e in stream_events if e.get("type") == "stage"]
+stream_done = next((e for e in stream_events if e.get("type") == "done"), None)
+check("streaming install reports every phase then the result",
+      stream_stages == ["github", "chart", "metadata", "chartmuseum",
+                        "render", "apply"]
+      and stream_done is not None
+      and stream_done["type"] == "done"
+      and stream_done["status"] == "installed"
+      and stream_done["chartmuseum"] == "uploaded",
+      str(stream_stages))
+check("streaming install keeps static errors as proper HTTP statuses",
+      store["install_stream_bad"][0]["status"] == 400,
+      str(store["install_stream_bad"][0]))
 check("install request hygiene (bad json / traversal dir / missing repo)",
       store["install_bad_body"][0]["status"] == 400
       and store["install_bad_dir"][0]["status"] == 400
