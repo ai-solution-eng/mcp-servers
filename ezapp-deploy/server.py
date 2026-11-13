@@ -132,7 +132,7 @@ import secrets
 import tarfile
 import tempfile
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import yaml
 from mcp.server.caching import CacheHint
@@ -1758,6 +1758,14 @@ _catalog_cache: dict = {}
 _catalog_fetch_slots = asyncio.Semaphore(6)   # parallel package scans
 _install_slots = asyncio.Semaphore(STORE_INSTALL_MAX_CONCURRENT)
 
+# Package-byte reuse: the catalog scan downloads every packaged chart to
+# read its metadata; those exact bytes are kept here (bounded, in-memory,
+# same TTL as the catalog) so a subsequent INSTALL of the same version
+# reuses what the tile showed instead of re-downloading the repo.
+_PACKAGE_BYTES_CACHE: dict = {}   # (repo_key, file_path) → {"bytes", "at"}
+_PACKAGE_BYTES_CACHE_MAX_ENTRIES = 32
+_PACKAGE_BYTES_CACHE_MAX_BYTES = 128 * 1024 * 1024
+
 
 def _store_enabled() -> bool:
     return os.environ.get(STORE_ENABLED_ENV, '').strip().lower() != 'false'
@@ -2364,6 +2372,43 @@ def _sweep_store_cache():
             _catalog_cache.pop(key, None)
 
 
+def _sweep_package_bytes_cache():
+    """Drop expired entries, then enforce the entry-count and total-byte
+    caps (oldest first) — keeps the reuse cache bounded in pod memory."""
+    now = time.monotonic()
+    expired = [key for key, entry in _PACKAGE_BYTES_CACHE.items()
+               if now - entry['at'] > STORE_CATALOG_TTL_SECONDS]
+    for key in expired:
+        _PACKAGE_BYTES_CACHE.pop(key, None)
+    while len(_PACKAGE_BYTES_CACHE) > _PACKAGE_BYTES_CACHE_MAX_ENTRIES:
+        oldest = min(_PACKAGE_BYTES_CACHE,
+                     key=lambda k: _PACKAGE_BYTES_CACHE[k]['at'])
+        _PACKAGE_BYTES_CACHE.pop(oldest, None)
+    total = sum(len(entry['bytes']) for entry in _PACKAGE_BYTES_CACHE.values())
+    while total > _PACKAGE_BYTES_CACHE_MAX_BYTES and _PACKAGE_BYTES_CACHE:
+        oldest = min(_PACKAGE_BYTES_CACHE,
+                     key=lambda k: _PACKAGE_BYTES_CACHE[k]['at'])
+        total -= len(_PACKAGE_BYTES_CACHE[oldest]['bytes'])
+        _PACKAGE_BYTES_CACHE.pop(oldest, None)
+
+
+def _package_bytes_cache_put(repo_key: str, file_path: str, data: bytes):
+    _PACKAGE_BYTES_CACHE[(repo_key, file_path)] = {
+        'bytes': data, 'at': time.monotonic(),
+    }
+    _sweep_package_bytes_cache()
+
+
+def _package_bytes_cache_get(repo_key: str, file_path: str) -> 'bytes | None':
+    entry = _PACKAGE_BYTES_CACHE.get((repo_key, file_path))
+    if entry is None:
+        return None
+    if time.monotonic() - entry['at'] > STORE_CATALOG_TTL_SECONDS:
+        _PACKAGE_BYTES_CACHE.pop((repo_key, file_path), None)
+        return None
+    return entry['bytes']
+
+
 async def _build_store_catalog(repo_str: str, ref_override: str = '',
                                force_refresh: bool = False,
                                progress=None) -> dict:
@@ -2472,6 +2517,7 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
 
     async def _scan_package(file_path: str) -> dict:
         nonlocal done_count
+        repo_key = f'{owner}/{repo}@{ref}'
         try:
             async with _catalog_fetch_slots:
                 pcode, pkg_bytes = await _github_fetch_bytes(
@@ -2482,6 +2528,9 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
                 return {'skip': {'dir': file_path,
                                  'reason': f'packaged chart fetch returned '
                                            f'HTTP {pcode}'}}
+            # keep the exact package bytes so a subsequent INSTALL of this
+            # version reuses them instead of re-downloading the repo
+            _package_bytes_cache_put(repo_key, file_path, pkg_bytes)
             try:
                 pkg_name, pkg_version = _inspect_chart_tarball(pkg_bytes)
             except ValueError as e:
@@ -2590,6 +2639,31 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
 
 
 
+def _package_from_bytes(packaged_bytes: bytes) -> dict:
+    """Validate + read one packaged chart's bytes (a `helm package`
+    tarball). Same result shape as
+    _extract_packaged_chart_from_repo_tarball minus the extraction."""
+    try:
+        name, version = _inspect_chart_tarball(packaged_bytes)
+    except ValueError as e:
+        raise ValueError(f'not a packaged helm chart: {e}') from e
+    extras = _packaged_chart_extras(packaged_bytes)
+    meta = extras['meta'] or {}
+    warnings = []
+    if extras.get('logo_note'):
+        warnings.append(f"{extras['logo_note']} (inside the package)")
+    return {
+        'tgz': packaged_bytes,
+        'name': name,
+        'version': version,
+        'description': str(meta.get('description') or '').strip(),
+        'values_text': extras['values'],
+        'logo': extras['logo'],
+        'logo_file': extras['logo_file'],
+        'warnings': warnings,
+    }
+
+
 def _extract_packaged_chart_from_repo_tarball(data: bytes,
                                               file_path: str) -> dict:
     """Pull one packaged chart (.tgz/.tar.gz) out of a repo tarball.
@@ -2630,17 +2704,8 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
             f'packaged chart {file_path!r} was not found in the repo tarball '
             '— pass the file exactly as shown in the store tile'
         )
-    try:
-        name, version = _inspect_chart_tarball(packaged_bytes)
-    except ValueError as e:
-        raise ValueError(f'not a packaged helm chart: {e}') from e
-    extras = _packaged_chart_extras(packaged_bytes)
-    meta = extras['meta'] or {}
-    logo_value, logo_file = extras['logo'], extras['logo_file']
-    warnings = []
-    if extras.get('logo_note'):
-        warnings.append(f"{extras['logo_note']} (inside the package)")
-    if not logo_value and app_logo_files:
+    packaged = _package_from_bytes(packaged_bytes)
+    if not packaged['logo'] and app_logo_files:
         # fall back to a scored scan of the app directory (logo* > icon* >
         # <appname>.* > *logo* > *icon* > the SMALLEST top-level .png).
         # Ranked on app-RELATIVE names so tier-5's top-level check works.
@@ -2651,18 +2716,10 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
                 sizes={rel: len(data) for rel, data in app_rel_files.items()}):
             logo_value = _cr_logo_image(app_rel_files.get(rel) or b'') or ''
             if logo_value:
-                logo_file = f'{app}/{rel}'
+                packaged['logo'] = logo_value
+                packaged['logo_file'] = f'{app}/{rel}'
                 break
-    return {
-        'tgz': packaged_bytes,
-        'name': name,
-        'version': version,
-        'description': str(meta.get('description') or '').strip(),
-        'values_text': extras['values'],
-        'logo': logo_value,
-        'logo_file': logo_file,
-        'warnings': warnings,
-    }
+    return packaged
 
 
 def _sanitize_cr_name_segment(text: str) -> str:
@@ -2864,47 +2921,68 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
         return result
     ref = ref or ref_from_url or ''
 
-    # ── stage 1: download the repo tarball (capped) ──────────────────────
+    # ── stage 1: get the packaged chart bytes ────────────────────────────
+    # Fast path: the catalog scan already downloaded this exact package —
+    # reuse those bytes (WYSIWYG: you install what the tile showed).
+    # Slow path: download the repo tarball at the pinned ref and extract.
     await _set_stage('github')
-    tarball_url = (
-        f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball/{ref}" if ref
-        else f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball"
-    )
-    fd, tarball_path = tempfile.mkstemp(prefix='store-repo-', suffix='.tar.gz',
-                                        dir='/tmp')
-    repo_bytes = b''
-    try:
-        os.close(fd)
-        code, message = await _github_download(tarball_url, tarball_path)
-        if code != 200:
-            result['detail'] = (
-                f'Error: could not download {owner}/{repo}'
-                + (f' at ref {ref}' if ref else '')
-                + f' from GitHub ({message or f"HTTP {code}"}).'
-            )
-            return result
-        with open(tarball_path, 'rb') as fh:
-            repo_bytes = fh.read()
-        if len(repo_bytes) > _max_repo_bytes():
-            result['detail'] = (
-                f'Error: repo tarball is {len(repo_bytes)} bytes, above the '
-                f'{_max_repo_bytes()} byte cap ({MAX_REPO_MB_ENV}).'
-            )
-            return result
-    finally:
+    repo_key = f'{owner}/{repo}@{ref}' if ref else f'{owner}/{repo}'
+    cached_pkg = _package_bytes_cache_get(repo_key, chart_dir)
+    repo_bytes = None
+    if cached_pkg is None:
+        tarball_url = (
+            f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball/{ref}" if ref
+            else f"{endpoints['api_base']}/repos/{owner}/{repo}/tarball"
+        )
+        fd, tarball_path = tempfile.mkstemp(prefix='store-repo-',
+                                            suffix='.tar.gz', dir='/tmp')
+        repo_bytes = b''
         try:
-            os.unlink(tarball_path)
-        except OSError:
-            pass
+            os.close(fd)
+            code, message = await _github_download(tarball_url, tarball_path)
+            if code != 200:
+                result['detail'] = (
+                    f'Error: could not download {owner}/{repo}'
+                    + (f' at ref {ref}' if ref else '')
+                    + f' from GitHub ({message or f"HTTP {code}"}).'
+                )
+                return result
+            with open(tarball_path, 'rb') as fh:
+                repo_bytes = fh.read()
+            if len(repo_bytes) > _max_repo_bytes():
+                result['detail'] = (
+                    f'Error: repo tarball is {len(repo_bytes)} bytes, above the '
+                    f'{_max_repo_bytes()} byte cap ({MAX_REPO_MB_ENV}).'
+                )
+                return result
+        finally:
+            try:
+                os.unlink(tarball_path)
+            except OSError:
+                pass
 
     # ── stage 2: extract the packaged chart in memory ────────────────────
     # Charts are always packaged (.tgz/.tar.gz): the file is pulled out of
-    # the repo tarball and passed to ChartMuseum unmodified — it already is
-    # a `helm package` tarball, validated by the standard sniffer.
+    # the repo tarball (or taken from the scan cache) and passed to
+    # ChartMuseum unmodified — it already is a `helm package` tarball,
+    # validated by the standard sniffer.
     await _set_stage('chart')
     try:
-        packaged = _extract_packaged_chart_from_repo_tarball(repo_bytes,
-                                                             chart_dir)
+        if cached_pkg is not None:
+            packaged = _package_from_bytes(cached_pkg)
+        elif _is_packaged_chart_path(chart_dir):
+            packaged = _extract_packaged_chart_from_repo_tarball(
+                repo_bytes, chart_dir)
+            # keep the extracted bytes so later installs reuse them too
+            _package_bytes_cache_put(repo_key, chart_dir, packaged['tgz'])
+        else:
+            result['status'] = 'invalid'
+            result['detail'] = (
+                'Error: charts are always packaged — dir must be a '
+                '.tgz/.tar.gz `helm package` file from the store tile '
+                f'(got {chart_dir!r}).'
+            )
+            return result
     except ValueError as e:
         result['detail'] = f'Error: {e}'
         return result
@@ -3206,6 +3284,7 @@ async def _managed_snapshot() -> dict:
     return {
         "generated_at": _now_iso(),
         "ledger_configmap": ledger.name,
+        "delete_enabled": _delete_enabled(),
         "apps": app_rows,
         "charts": chart_rows,
     }
@@ -3228,6 +3307,49 @@ async def _managed_api(scope, receive, send):
         return
     for message in _json_asgi_response(
         send, 200, body, [(b"cache-control", b"no-store")]
+    ):
+        await send(message)
+
+
+async def _managed_delete_http(scope, receive, send, name: str):
+    """DELETE /api/managed/<name> — the UI's delete button (API-key gated
+    upstream).
+
+    Runs the SAME ledger-gated pipeline as the delete_ezappconfig MCP tool:
+    ownership check → kubectl delete --wait=false → ledger entry removed →
+    background teardown watch. Honors EZAPP_MCP_DELETE_ENABLED=false (404).
+    """
+    if (scope.get('method') or '').upper() != 'DELETE':
+        for message in _json_asgi_response(
+            send, 405,
+            b'{"error": "DELETE the EzAppConfig here", "method": "DELETE"}',
+            [(b'allow', b'DELETE')],
+        ):
+            await send(message)
+        return
+    if not _delete_enabled():
+        for message in _json_asgi_response(
+            send, 404,
+            json.dumps({'error': 'deletes are disabled on this server '
+                        '(EZAPP_MCP_DELETE_ENABLED=false)'}).encode('utf-8'),
+            [(b'cache-control', b'no-store')],
+        ):
+            await send(message)
+        return
+    result = await delete_ezappconfig(name)
+    if result.startswith('Error: refusing'):
+        status = 403
+    elif result.startswith('Error: invalid'):
+        status = 400
+    elif result.startswith('Error:'):
+        status = 502
+    else:
+        status = 200
+    for message in _json_asgi_response(
+        send, status,
+        json.dumps({'status': 'ok' if status == 200 else 'error',
+                    'detail': result}, indent=2).encode('utf-8'),
+        [(b'cache-control', b'no-store')],
     ):
         await send(message)
 
@@ -3788,6 +3910,10 @@ class _ApiOrMcpApp:
             path = scope.get("path", "")
             if path == "/api/managed":
                 await _managed_api(scope, receive, send)
+                return
+            if path.startswith("/api/managed/"):
+                name = unquote(path[len("/api/managed/"):])
+                await _managed_delete_http(scope, receive, send, name)
                 return
             if path == "/upload":
                 await _upload_http(scope, receive, send)

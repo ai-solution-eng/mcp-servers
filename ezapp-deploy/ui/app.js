@@ -43,7 +43,7 @@ function renderApps(rows) {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 7;
+    td.colSpan = 8;
     td.className = "dim";
     td.textContent = "Nothing managed yet — install something from the app store, or use upload_chart + apply_ezappconfig.";
     tr.appendChild(td);
@@ -83,8 +83,50 @@ function renderApps(rows) {
     }
     tr.appendChild(details);
 
+    const actions = document.createElement("td");
+    if (deleteEnabled) {
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "delbtn";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", () => deleteApp(row.name));
+      actions.appendChild(delBtn);
+    }
+    tr.appendChild(actions);
+
     tbody.appendChild(tr);
   }
+}
+
+async function deleteApp(name) {
+  const key = getKey();
+  if (!key) {
+    setStatus("Enter the MCP API key and press “Save key” first.", true);
+    return;
+  }
+  if (!window.confirm("Delete EzAppConfig " + name + "?\n\nThis removes the app " +
+      "from the cluster (the operator uninstalls the helm release) and clears " +
+      "this server's ledger entry. This cannot be undone.")) {
+    return;
+  }
+  setStatus("Deleting " + name + "…");
+  let resp;
+  try {
+    resp = await fetch("/api/managed/" + encodeURIComponent(name), {
+      method: "DELETE",
+      headers: { "Authorization": "Bearer " + key },
+    });
+  } catch (err) {
+    setStatus("Network error: " + err, true);
+    return;
+  }
+  const body = await resp.json().catch(() => ({}));
+  if (resp.ok && body.status === "ok") {
+    setStatus(body.detail || (name + " deletion accepted."));
+  } else {
+    setStatus("Delete failed: " + (body.detail || body.error || ("HTTP " + resp.status)), true);
+  }
+  load();   // refresh the table either way
 }
 
 function renderCharts(rows) {
@@ -110,7 +152,10 @@ function renderCharts(rows) {
   }
 }
 
+let deleteEnabled = false;
+
 function render(data) {
+  deleteEnabled = Boolean(data.delete_enabled);
   renderApps(data.apps || []);
   renderCharts(data.charts || []);
   $("meta").textContent =
@@ -627,6 +672,12 @@ function openInstallDialog(chart) {
   }
   dlgChart = chart;
   dlgLogoUpload = "";
+  // always open on the settings view (a previous install's progress/result
+  // must never bleed into a fresh dialog)
+  $("dlg-form").classList.remove("hidden");
+  $("dlg-progress").classList.add("hidden");
+  $("dlg-result").classList.add("hidden");
+  $("dlg-progress-buttons").classList.add("hidden");
   $("dlg-title").textContent = "Install " + (chart.name || "chart") + " " + (chart.version || "");
   $("dlg-sub").textContent =
     "Uploads the chart to ChartMuseum and applies a generated EzAppConfig " +
@@ -671,7 +722,12 @@ function showInstallPhases() {
   $("dlg-form").classList.add("hidden");
   $("dlg-progress").classList.remove("hidden");
   $("dlg-result").classList.add("hidden");
-  $("dlg-progress-buttons").classList.add("hidden");
+  // during the run only Close is offered (the install continues in the
+  // background if dismissed); Back appears after a failure, if retrying
+  // makes sense
+  $("dlg-back").classList.add("hidden");
+  $("dlg-close").classList.remove("hidden");
+  $("dlg-progress-buttons").classList.remove("hidden");
   const list = $("dlg-phases");
   list.textContent = "";
   for (const [stage, label] of INSTALL_PHASES) {
@@ -729,19 +785,19 @@ function finishInstall(result) {
     resultEl.textContent = "Installed ✓ — chart " + (result.chart || "") + " " +
       (result.version || "") + (reused ? " (already in ChartMuseum — reused)" : "") +
       " → EzAppConfig " + (result.ezappconfig || "?") +
-      " in namespace " + (result.namespace || "?") + ".";
+      " in namespace " + (result.namespace || "?") +
+      ". Hit Close when you're ready.";
     setStatus("Installed " + (result.chart || "chart") + " " + (result.version || "") +
       " → EzAppConfig " + (result.ezappconfig || "?") +
-      " (namespace " + (result.namespace || "?") + "). Watch the rollout below.");
-    setTimeout(() => {
-      if ($("installdialog").open) $("installdialog").close();
-      showView("apps");
-      load();
-    }, 1400);
+      " (namespace " + (result.namespace || "?") + ").");
+    load();   // refresh the managed-apps table in the background
   } else {
     resultEl.textContent = (result.detail || "Install failed") +
       (result.upload && failedStage !== "chartmuseum" ? " — upload: " + result.upload : "");
   }
+  // STAY on the dialog — the user dismisses it with Close
+  $("dlg-back").classList.toggle("hidden", result.status === "installed");
+  $("dlg-close").classList.remove("hidden");
   $("dlg-progress-buttons").classList.remove("hidden");
   installing = false;
 }
@@ -923,7 +979,14 @@ $("repobox").addEventListener("keydown", (event) => {
 $("dlg-cancel").addEventListener("click", () => $("installdialog").close());
 $("dlg-install").addEventListener("click", confirmInstall);
 $("dlg-back").addEventListener("click", backToSettings);
-$("dlg-close").addEventListener("click", () => $("installdialog").close());
+$("dlg-close").addEventListener("click", () => {
+  if (installing) {
+    // dismissed mid-install: the request keeps running server-side and the
+    // result will appear in Managed apps
+    setStatus("Install continues in the background — the result will appear in Managed apps.");
+  }
+  $("installdialog").close();
+});
 
 $("dlg-release-tick").addEventListener("change", (event) => {
   $("dlg-releasename").disabled = !event.target.checked;

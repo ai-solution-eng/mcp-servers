@@ -2362,6 +2362,28 @@ async def _store_endpoint_scenarios():
     out["install_stream_bad"] = await _drive_body(
         server._store_install_http, stream_scope2, b"this is not json")
 
+    # install: fresh-download fallback — with the byte cache CLEARED the
+    # install re-downloads the repo tarball and still resolves the app-level
+    # logo next to the package (plain has no embedded logo)
+    server._PACKAGE_BYTES_CACHE.clear()
+    stub_gh.requests.clear()
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/plain-2.0.0-1700000000009 created", ""),
+    ]).install()
+    payload_fallback = {"repo": repo_url, "dir": "plain/plain-2.0.0.tgz",
+                        "ref": "main", "values": "x: 1\n"}
+    out["install_fallback"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_fallback).encode())
+    out["install_fallback_gh"] = list(stub_gh.requests)
+    out["install_fallback_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
 
     # install: defaults-only request — label/description/category resolve on
     # the server (humanized label, chart-name description, dataScience)
@@ -2662,8 +2684,8 @@ check("install endpoint runs the full pipeline (200 installed)",
       and inst["chart"] == "foo" and inst["version"] == "1.0.0"
       and inst["namespace"] == "foo-ns",
       str(store["install"][0]) + store["install"][1]["body"][:400].decode())
-check("install only touches the GitHub tarball endpoint",
-      store["install_gh_requests"] == ["/repos/owner/repo/tarball/main"],
+check("install reuses the scan's cached package bytes (zero GitHub requests)",
+      store["install_gh_requests"] == [],
       str(store["install_gh_requests"]))
 check("install creates an epoch-ms-named EzAppConfig",
       bool(re.fullmatch(r"foo-1\.0\.0-\d{13}", inst["ezappconfig"] or "")),
@@ -2810,6 +2832,17 @@ check("streaming install reports every phase then the result",
 check("streaming install keeps static errors as proper HTTP statuses",
       store["install_stream_bad"][0]["status"] == 400,
       str(store["install_stream_bad"][0]))
+fallback_resp = json.loads(store["install_fallback"][1]["body"])
+fallback_doc = (yaml.safe_load(store["install_fallback_manifest"])
+                if store["install_fallback_manifest"] else {})
+check("cache-cleared install re-downloads and keeps the app-level logo",
+      store["install_fallback"][0]["status"] == 200
+      and fallback_resp["status"] == "installed"
+      and fallback_doc.get("spec", {}).get("logoImage")
+          == base64.b64encode(png).decode()
+      and fallback_resp["logo_file"] == "plain/logo.png"
+      and any("tarball/main" in p for p in store["install_fallback_gh"]),
+      store["install_fallback_manifest"][:300])
 check("install request hygiene (bad json / traversal dir / missing repo)",
       store["install_bad_body"][0]["status"] == 400
       and store["install_bad_dir"][0]["status"] == 400
@@ -2877,6 +2910,115 @@ check("no configured repos → default null, empty list",
       repos["repos_empty"][1]["body"].decode())
 check("repos endpoint is API-key gated",
       repos["repos_no_auth"][0]["status"] == 401, str(repos["repos_no_auth"][0]))
+
+
+# ─── 15. managed-apps delete endpoint ────────────────────────────────────
+
+print("15. Managed-apps delete endpoint")
+
+set_env(EZAPP_MCP_API_KEY="s3cret",
+        EZAPP_MCP_DELETE_ENABLED=None,
+        EZAPP_MCP_STORE_REPOS=None)
+
+router = server._UiRouterApp(
+    server._ApiKeyAuthMiddleware(server._ApiOrMcpApp(_dummy_mcp_app())),
+    server._UiApp(os.path.join(os.path.dirname(server.__file__), "ui")))
+
+
+def delete_scope(name, method="DELETE", auth=True):
+    return {"type": "http", "method": method,
+            "path": "/api/managed/" + urllib.parse.quote(name, safe=""),
+            "query_string": b"",
+            "headers": AUTH_HEADERS if auth else []}
+
+
+async def _delete_endpoint_scenarios():
+    out = {}
+
+    # success: ledger-known app, kubectl delete accepted
+    server._ledger_instance = FakeLedger(
+        apps={"ezappconfig-test-app": {"chart": "test-app", "chart_version": "0.2.6"}})
+    sub = ScriptedSubprocess([
+        (0, "ezappconfig.ezconfig.hpe.ezaf.com/ezappconfig-test-app deleted", ""),
+    ]).install()
+    out["delete_ok"] = await _drive(
+        router, delete_scope("ezappconfig-test-app"))
+    out["delete_ok_ledger"] = dict(server._ledger_instance.apps)
+    sub.restore()
+
+    # refusal: not in the ledger
+    server._ledger_instance = FakeLedger()
+    out["delete_refused"] = await _drive(
+        router, delete_scope("ezappconfig-other"))
+
+    # invalid name → 400
+    out["delete_invalid"] = await _drive(
+        router, delete_scope("Bad_Name!"))
+
+    # stale ledger entry: kubectl says NotFound → ledger cleaned, 200
+    server._ledger_instance = FakeLedger(
+        apps={"ezappconfig-gone": {"chart": "gone", "chart_version": "1.0.0"}})
+    sub = ScriptedSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."ezappconfig-gone" not found'),
+    ]).install()
+    out["delete_gone"] = await _drive(
+        router, delete_scope("ezappconfig-gone"))
+    out["delete_gone_ledger"] = dict(server._ledger_instance.apps)
+    sub.restore()
+
+    # kubectl hard failure → 502
+    server._ledger_instance = FakeLedger(
+        apps={"ezappconfig-x": {"chart": "x", "chart_version": "1.0.0"}})
+    sub = ScriptedSubprocess([(1, "", "connection refused")]).install()
+    out["delete_kubectl_fail"] = await _drive(
+        router, delete_scope("ezappconfig-x"))
+    sub.restore()
+
+    # disabled → 404; GET → 405; no-auth → 401
+    set_env(EZAPP_MCP_DELETE_ENABLED="false")
+    out["delete_disabled"] = await _drive(
+        router, delete_scope("ezappconfig-test-app"))
+    set_env(EZAPP_MCP_DELETE_ENABLED=None)
+    out["delete_get"] = await _drive(
+        router, delete_scope("ezappconfig-test-app", method="GET"))
+    out["delete_no_auth"] = await _drive(
+        router, delete_scope("ezappconfig-test-app", auth=False))
+    return out
+
+
+del_eps = asyncio.run(_delete_endpoint_scenarios())
+
+del_ok = json.loads(del_eps["delete_ok"][1]["body"])
+check("DELETE /api/managed/<name> runs the ledger-gated delete",
+      del_eps["delete_ok"][0]["status"] == 200
+      and del_ok["status"] == "ok"
+      and "deleted" in del_ok["detail"]
+      and "Ledger entry removed" in del_ok["detail"]
+      and "ezappconfig-test-app" not in del_eps["delete_ok_ledger"],
+      del_ok["detail"][:200])
+check("delete refusal (not in ledger) → 403",
+      del_eps["delete_refused"][0]["status"] == 403
+      and b"not deployed by this server" in del_eps["delete_refused"][1]["body"],
+      str(del_eps["delete_refused"][0]))
+check("invalid EzAppConfig name → 400",
+      del_eps["delete_invalid"][0]["status"] == 400,
+      str(del_eps["delete_invalid"][0]))
+check("stale ledger entry cleaned on NotFound (200)",
+      del_eps["delete_gone"][0]["status"] == 200
+      and "already gone" in del_eps["delete_gone"][1]["body"].decode()
+      and "ezappconfig-gone" not in del_eps["delete_gone_ledger"],
+      del_eps["delete_gone"][1]["body"].decode()[:160])
+check("kubectl hard failure → 502",
+      del_eps["delete_kubectl_fail"][0]["status"] == 502,
+      str(del_eps["delete_kubectl_fail"][0]))
+check("disabled deletes → 404 on the endpoint",
+      del_eps["delete_disabled"][0]["status"] == 404,
+      str(del_eps["delete_disabled"][0]))
+check("GET /api/managed/<name> → 405",
+      del_eps["delete_get"][0]["status"] == 405, str(del_eps["delete_get"][0]))
+check("unauthenticated delete → 401 (same gate as /mcp)",
+      del_eps["delete_no_auth"][0]["status"] == 401,
+      str(del_eps["delete_no_auth"][0]))
 
 
 # ─── Summary ─────────────────────────────────────────────────────────────

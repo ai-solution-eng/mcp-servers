@@ -182,6 +182,17 @@ progress::-moz-progress-bar { background: var(--info); border-radius: 999px; }
   cursor: pointer;
 }
 .linklike:hover { text-decoration: underline; }
+.delbtn {
+  background: none;
+  border: 1px solid var(--err);
+  color: var(--err);
+  padding: 0.15rem 0.5rem;
+  font: inherit;
+  font-size: 0.75rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.delbtn:hover { background: var(--err); color: var(--bg); }
 .tmeta { color: var(--dim); font-size: 0.75rem; overflow-wrap: anywhere; }
 .warnnote { color: var(--warn); }
 .tile .install { align-self: flex-start; margin-top: 0.2rem; }
