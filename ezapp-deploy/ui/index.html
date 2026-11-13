@@ -51,6 +51,10 @@
         <button id="loadstore" type="button">Load catalog</button>
       </div>
       <p id="storestatus" class="dim">Tiles appear for every app directory in the repository that holds packaged Helm charts (.tgz / .tar.gz).</p>
+      <div id="storeprogress" class="hidden">
+        <progress id="storeprogressbar" max="100" value="0"></progress>
+        <span id="storeprogresslabel" class="tmeta"></span>
+      </div>
       <div id="tiles"></div>
     </section>
   </div>

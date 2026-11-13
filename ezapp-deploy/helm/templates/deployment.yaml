@@ -160,6 +160,13 @@ spec:
             - name: EZAPP_MCP_DELETE_ENABLED
               value: "false"
             {{- end }}
+            {{- with .Values.deployment.extraEnv }}
+            # Operator-supplied extra env (e.g. egress proxy for the store's
+            # outbound GitHub fetches). Rendered verbatim. In-cluster
+            # subprocess calls (kubectl, ChartMuseum) always run with proxy
+            # vars stripped regardless of what is set here.
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

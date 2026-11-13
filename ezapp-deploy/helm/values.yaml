@@ -11,6 +11,19 @@ deployment:
   name: ezapp-deploy
   appName: ezapp-deploy
   replicaCount: 1
+  # Extra env vars rendered verbatim into the container (a list of env
+  # entries). Intended for egress proxy settings needed by the app store's
+  # outbound GitHub fetches. Safe to set globally: in-cluster subprocess
+  # calls (kubectl, ChartMuseum) always run with proxy vars stripped
+  # regardless. Example:
+  #   extraEnv:
+  #     - name: HTTPS_PROXY
+  #       value: "http://proxy.corp.example:3128"
+  #     - name: HTTP_PROXY
+  #       value: "http://proxy.corp.example:3128"
+  #     - name: NO_PROXY
+  #       value: "localhost,127.0.0.1,.svc,.svc.cluster.local,10.0.0.0/8"
+  extraEnv: []
 
 # -- Image ------------------------------------------------------------------------
 image:

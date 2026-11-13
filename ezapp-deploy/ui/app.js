@@ -284,6 +284,38 @@ function appTile(app) {
   return box;
 }
 
+let progressTimer = null;
+let progressStarted = 0;
+
+function stopProgress() {
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = null;
+  }
+  $("storeprogress").classList.add("hidden");
+}
+
+function startProgress() {
+  progressStarted = Date.now();
+  $("storeprogressbar").value = 0;
+  $("storeprogress").classList.remove("hidden");
+  if (progressTimer) clearInterval(progressTimer);
+  progressTimer = setInterval(() => {
+    const label = $("storeprogresslabel").dataset.label || "Scanning repository";
+    const secs = Math.round((Date.now() - progressStarted) / 1000);
+    $("storeprogresslabel").textContent = label + " — " + secs + "s elapsed";
+  }, 1000);
+}
+
+function updateProgress(done, total, current) {
+  const pct = total ? Math.round((done * 100) / total) : 0;
+  $("storeprogressbar").value = pct;
+  const short = String(current || "").split("/").pop();
+  $("storeprogresslabel").dataset.label =
+    "Scanning packages: " + done + "/" + total +
+    (short ? " — last: " + short : "");
+}
+
 async function loadCatalog(refresh) {
   const key = getKey();
   if (!key) {
@@ -296,7 +328,7 @@ async function loadCatalog(refresh) {
     return;
   }
   storeStatus("Loading catalog…");
-  const params = new URLSearchParams({ repo: repo });
+  const params = new URLSearchParams({ repo: repo, stream: "1" });
   if (refresh) params.set("refresh", "true");
   let resp;
   try {
@@ -307,15 +339,59 @@ async function loadCatalog(refresh) {
     storeStatus("Network error: " + err, true);
     return;
   }
-  const body = await resp.json().catch(() => ({}));
   if (resp.status === 401) {
     storeStatus("401 — wrong or missing API key.", true);
     return;
   }
   if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
     storeStatus("HTTP " + resp.status + (body.error ? " — " + body.error : ""), true);
     return;
   }
+  const ctype = (resp.headers.get("content-type") || "");
+  if (!ctype.includes("x-ndjson")) {
+    // non-streaming server (or proxy stripped the stream): single JSON
+    finishCatalog(await resp.json().catch(() => ({})), refresh);
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  startProgress();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let event;
+        try { event = JSON.parse(line); } catch (e) { continue; }
+        if (event.type === "progress") {
+          updateProgress(event.done, event.total, event.current);
+        } else if (event.type === "error") {
+          stopProgress();
+          storeStatus("Catalog failed: " + event.error, true);
+          return;
+        } else if (event.type === "catalog") {
+          stopProgress();
+          finishCatalog(event, refresh);
+          return;
+        }
+      }
+    }
+    stopProgress();
+    storeStatus("Catalog stream ended without a result — try again or use refresh.", true);
+  } catch (err) {
+    stopProgress();
+    storeStatus("Stream error: " + err, true);
+  }
+}
+
+function finishCatalog(body, refresh) {
   renderTiles(body);
   const apps = body.apps || [];
   const versionCount = apps.reduce((n, a) => n + (a.versions || []).length, 0);

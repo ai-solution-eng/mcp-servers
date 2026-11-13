@@ -1761,6 +1761,7 @@ _STORE_GITHUB_REPO_RE = re.compile(
 )
 
 _catalog_cache: dict = {}
+_catalog_fetch_slots = asyncio.Semaphore(6)   # parallel package scans
 _install_slots = asyncio.Semaphore(STORE_INSTALL_MAX_CONCURRENT)
 
 
@@ -2108,15 +2109,19 @@ def _is_packaged_chart_path(path: str) -> bool:
 # ─── packaged charts: (meta, values_text, logo, logo_file) ───────────────
 
 def _packaged_chart_extras(data: bytes) -> dict:
-    """(meta, values_text, logo, icon, logo_file) read from a packaged chart.
+    """(meta, values_text, logo, icon, logo_file, logo_note) from a package.
 
-    A `helm package` tarball holds everything under one <chart-name>/ root;
-    the logo lookup reuses the same candidate order as unpacked charts.
-    `logo` is the CR logoImage value (raw base64 png / svg data: uri) and
-    `icon` the tile-display data: URI.
+    A `helm package` tarball holds everything under one <chart-name>/ root.
+    The logo is looked up at the package root first (explicit candidate
+    names: icon.png / logo.png / …), then any accepted image anywhere under
+    the package root whose name mentions icon/logo (shallower first).
+    Files are matched by CONTENT, never by extension. `logo` is the CR
+    logoImage value, `icon` the tile-display data: URI, and `logo_note`
+    explains why a present-looking logo was rejected (oversized, unknown
+    format) — empty when the lookup is clean.
     """
     empty = {'meta': None, 'values': '', 'logo': '', 'icon': '',
-             'logo_file': ''}
+             'logo_file': '', 'logo_note': ''}
     meta = None
     files = {}
     try:
@@ -2125,19 +2130,22 @@ def _packaged_chart_extras(data: bytes) -> dict:
                 if not m.isfile():
                     continue
                 parts = m.name.split('/')
-                if len(parts) != 2 or not parts[0]:
+                if len(parts) < 2 or not parts[0]:
+                    continue
+                rel = '/'.join(parts[1:])
+                if '..' in rel.split('/'):
                     continue
                 payload_file = tar.extractfile(m)
                 if payload_file is None:
                     continue
                 payload = payload_file.read()
-                if parts[1].lower() == 'chart.yaml':
+                if len(parts) == 2 and parts[1].lower() == 'chart.yaml':
                     try:
                         meta = yaml.safe_load(payload.decode('utf-8'))
                     except (yaml.YAMLError, UnicodeDecodeError):
                         meta = None
                 else:
-                    files[parts[1]] = payload
+                    files[rel] = payload
     except tarfile.TarError:
         return empty
     values = ''
@@ -2147,7 +2155,42 @@ def _packaged_chart_extras(data: bytes) -> dict:
             values = raw_values.decode('utf-8')
         except UnicodeDecodeError:
             values = ''
-    logo_value, logo_file = _logo_from_chart_files(files)
+
+    # logo lookup: explicit candidates at the package root first, then the
+    # chart's own name as a filename (<chartname>.png …), then any accepted
+    # image anywhere under the package root whose name mentions icon/logo —
+    # shallower paths first, then alphabetical.
+    logo_value, logo_file = '', ''
+    logo_note = ''
+    rejected = []
+    ordered = [c for c in _STORE_LOGO_CANDIDATES if c in files]
+    chart_stem = str((meta or {}).get('name') or '').strip().lower()
+    for cand in _logo_name_candidates(chart_stem):
+        if cand in files and cand not in ordered:
+            ordered.append(cand)
+    scan = sorted(
+        (rel for rel in files
+         if rel not in _STORE_LOGO_CANDIDATES
+         and rel not in ordered
+         and ('icon' in rel.lower() or 'logo' in rel.lower())),
+        key=lambda r: (r.count('/'), r),
+    )
+    for rel in ordered + scan:
+        data = files.get(rel)
+        fmt = _sniff_chart_logo(data or b'')
+        if fmt is None:
+            rejected.append(rel)
+            continue
+        logo_value = _cr_logo_image(data)
+        logo_file = rel
+        break
+    if not logo_value and rejected:
+        logo_note = (
+            'logo-like file(s) present but unusable: '
+            + ', '.join(sorted(set(rejected))[:3])
+            + ' (not a supported image format or larger than '
+              f'{STORE_LOGO_MAX_BYTES // 1024} KB)'
+        )
     icon_uri = _logo_data_uri(files.get(logo_file) or b'') if logo_file else None
     return {
         'meta': meta if isinstance(meta, dict) else None,
@@ -2155,6 +2198,7 @@ def _packaged_chart_extras(data: bytes) -> dict:
         'logo': logo_value,
         'icon': icon_uri or '',
         'logo_file': logo_file,
+        'logo_note': logo_note,
     }
 
 
@@ -2166,14 +2210,47 @@ def _sniff_svg(data: bytes) -> bool:
     return head.startswith(b'<svg')
 
 
+def _logo_name_candidates(*stems) -> list:
+    """Image filenames derived from name stems: `logo` → logo.png, logo.svg,
+    … (png first — the dominant convention). Used for app-name-based logos
+    (`<appname>.png`) and chart-name-based logos inside packages."""
+    out = []
+    for stem in stems:
+        stem = (stem or '').strip().strip('/').lower()
+        if not stem or '/' in stem:
+            continue
+        for ext in ('png', 'svg', 'jpeg', 'jpg', 'webp', 'gif'):
+            candidate = f'{stem}.{ext}'
+            if candidate not in out:
+                out.append(candidate)
+    return out
+
+
+_LOGO_MIME = {
+    'png': 'image/png',
+    'svg': 'image/svg+xml',
+    'jpeg': 'image/jpeg',
+    'webp': 'image/webp',
+    'gif': 'image/gif',
+}
+
+
 def _sniff_chart_logo(data: bytes):
-    """Image format of a chart-logo file: 'png', 'svg', or None."""
+    """Image format of a chart-logo file, judged by CONTENT (magic bytes),
+    never by name — files named .png are routinely JPEG/WebP in the wild.
+    Returns 'png' | 'svg' | 'jpeg' | 'webp' | 'gif' | None."""
     if not data or len(data) > STORE_LOGO_MAX_BYTES:
         return None
     if data.startswith(_STORE_PNG_MAGIC):
         return 'png'
     if _sniff_svg(data):
         return 'svg'
+    if data[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    if data[:4] == b'GIF8':
+        return 'gif'
     return None
 
 
@@ -2182,44 +2259,22 @@ def _logo_data_uri(data: bytes):
     fmt = _sniff_chart_logo(data)
     if fmt is None:
         return None
-    mime = 'image/png' if fmt == 'png' else 'image/svg+xml'
-    return f'data:{mime};base64,' + base64.b64encode(data).decode('ascii')
+    return f'data:{_LOGO_MIME[fmt]};base64,' + base64.b64encode(data).decode('ascii')
 
 
 def _cr_logo_image(data: bytes):
     """logoImage payload for the EzAppConfig CR: raw base64 for PNG (the
-    platform template's documented shape), a self-describing data: URI for
-    SVG; None when the bytes are not a usable logo."""
+    platform template's documented shape), a self-describing data: URI (with
+    the correct mime) for every other accepted format; None when the bytes
+    are not a usable logo."""
     fmt = _sniff_chart_logo(data)
+    if fmt is None:
+        return None
     if fmt == 'png':
         return base64.b64encode(data).decode('ascii')
-    if fmt == 'svg':
-        return 'data:image/svg+xml;base64,' + base64.b64encode(data).decode('ascii')
-    return None
+    return f'data:{_LOGO_MIME[fmt]};base64,' + base64.b64encode(data).decode('ascii')
 
 
-def _logo_from_chart_files(files: dict) -> tuple:
-    """Pick the chart logo out of the extracted chart files.
-
-    Returns (logoImage value, file name inside the chart dir) — ('', '')
-    when the chart ships no usable logo.
-    """
-    scan = []
-    for rel in files:
-        stem, _, ext = rel.rsplit('/', 1)[-1].lower().rpartition('.')
-        if ext in ('png', 'svg') and ('icon' in stem or 'logo' in stem):
-            scan.append(rel)
-    scan.sort(key=lambda r: (r.count('/'), r))
-    ordered = list(_STORE_LOGO_CANDIDATES) + [r for r in scan
-                                              if r not in _STORE_LOGO_CANDIDATES]
-    for rel in ordered:
-        data = files.get(rel)
-        if not data:
-            continue
-        value = _cr_logo_image(data)
-        if value is not None:
-            return value, rel
-    return '', ''
 
 
 def _decode_uploaded_logo(logo_str: str) -> bytes:
@@ -2268,12 +2323,18 @@ def _sweep_store_cache():
 
 
 async def _build_store_catalog(repo_str: str, ref_override: str = '',
-                               force_refresh: bool = False) -> dict:
-    """Fetch the repo listing; one tile per directory holding a Chart.yaml.
+                               force_refresh: bool = False,
+                               progress=None) -> dict:
+    """Build the app catalog for one repo; one tile per app directory.
 
     Cached per repo@ref for STORE_CATALOG_TTL_SECONDS. Chart content fetched
     here is display data (defaults for the install dialog); the install
     pipeline always re-downloads fresh tarball content at the same ref.
+
+    `progress` (optional) is an async callable receiving dict events — used
+    by the streaming catalog endpoint to report live progress: {'stage':
+    'listing'} while the repo listing is fetched, then {'type': 'progress',
+    'done', 'total', 'current'} per scanned package.
     """
     owner, repo, ref_from_url = parse_store_repo(repo_str)
     try:
@@ -2345,63 +2406,114 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
     tree = tree_doc.get('tree') or []
     tree_paths = {str(entry.get('path')) for entry in tree
                   if isinstance(entry, dict) and entry.get('type') == 'blob'}
+    if progress:
+        await progress({'type': 'stage', 'stage': 'listing'})
 
     chart_entries, skipped = [], []
     # Charts are always PACKAGED: every .tgz / .tar.gz `helm package` file
     # under the app directories is an installable version. Name, version,
     # description, values and logo are read from the package itself — one
-    # raw fetch per file, capped at the chart-size cap.
-    for file_path in sorted(p for p in tree_paths
+    # raw fetch per file, capped at the chart-size cap. Scans run with
+    # bounded concurrency (a big catalog would otherwise take minutes of
+    # sequential downloads) and report progress per finished package.
+    packaged_paths = sorted(p for p in tree_paths
                             if _is_packaged_chart_path(p)
-                            and _clean_chart_dir(p)):
+                            and _clean_chart_dir(p))
+    if progress:
+        await progress({'type': 'stage', 'stage': 'packages',
+                        'total': len(packaged_paths), 'done': 0})
+    done_count = 0
+
+    async def _scan_package(file_path: str) -> dict:
+        nonlocal done_count
         try:
-            pcode, pkg_bytes = await _github_fetch_bytes(
-                _github_raw_url(endpoints, owner, repo, ref, file_path),
-                _max_chart_bytes(),
-            )
+            async with _catalog_fetch_slots:
+                pcode, pkg_bytes = await _github_fetch_bytes(
+                    _github_raw_url(endpoints, owner, repo, ref, file_path),
+                    _max_chart_bytes(),
+                )
+            if pcode != 200:
+                return {'skip': {'dir': file_path,
+                                 'reason': f'packaged chart fetch returned '
+                                           f'HTTP {pcode}'}}
+            try:
+                pkg_name, pkg_version = _inspect_chart_tarball(pkg_bytes)
+            except ValueError as e:
+                return {'skip': {'dir': file_path,
+                                 'reason': f'not a packaged helm chart: {e}'}}
+            extras = _packaged_chart_extras(pkg_bytes)
+            meta_doc = extras['meta'] or {}
+            return {'entry': {
+                'dir': file_path,
+                'name': pkg_name,
+                'version': pkg_version,
+                'description': str(meta_doc.get('description') or '').strip(),
+                'app_version': str(meta_doc.get('appVersion') or '').strip(),
+                'kube_version': str(meta_doc.get('kubeVersion') or '').strip(),
+                'values': extras['values'],
+                'icon': extras['icon'],
+                'logo_file': extras['logo_file'],
+            }}
         except RuntimeError as e:
-            skipped.append({'dir': file_path, 'reason': str(e)})
-            continue
-        if pcode != 200:
-            skipped.append({'dir': file_path,
-                            'reason': f'packaged chart fetch returned '
-                                      f'HTTP {pcode}'})
-            continue
-        try:
-            pkg_name, pkg_version = _inspect_chart_tarball(pkg_bytes)
-        except ValueError as e:
-            skipped.append({'dir': file_path,
-                            'reason': f'not a packaged helm chart: {e}'})
-            continue
-        extras = _packaged_chart_extras(pkg_bytes)
-        meta_doc = extras['meta'] or {}
-        chart_entries.append({
-            'dir': file_path,
-            'name': pkg_name,
-            'version': pkg_version,
-            'description': str(meta_doc.get('description') or '').strip(),
-            'app_version': str(meta_doc.get('appVersion') or '').strip(),
-            'kube_version': str(meta_doc.get('kubeVersion') or '').strip(),
-            'values': extras['values'],
-            'icon': extras['icon'],
-            'logo_file': extras['logo_file'],
-        })
+            return {'skip': {'dir': file_path, 'reason': str(e)}}
+        finally:
+            done_count += 1
+            if progress:
+                try:
+                    await progress({'type': 'progress', 'done': done_count,
+                                    'total': len(packaged_paths),
+                                    'current': file_path})
+                except Exception:
+                    pass  # a dead stream must not abort the scan
+
+    results = await asyncio.gather(
+        *(_scan_package(p) for p in packaged_paths))
+    for result in results:
+        if result.get('entry'):
+            chart_entries.append(result['entry'])
+        elif result.get('skip'):
+            skipped.append(result['skip'])
 
     # ── group into app tiles and resolve each tile's logo ────────────────
-    # One tile per app (repo top-level dir). The tile logo is the newest
-    # version's own package logo (already extracted during the metadata
-    # fetch — no extra requests); packages without one fall through to the
-    # next-newest version that ships a logo.
+    # One tile per app (repo top-level dir). Tile logo priority: the newest
+    # version's own package logo (extracted during the metadata fetch — no
+    # extra requests), then an app-level logo file sitting NEXT TO the
+    # packages in the repo — the conventional logo.png / icon.png names plus
+    # the app's own name as a filename (<app>/arize-phoenix.png …). Only
+    # paths present in the repo listing are fetched (no 404 probing).
     apps = []
     for group in _group_catalog_apps(chart_entries):
+        app_name = group['app']
         app_logo_uri, app_logo_file = '', ''
         for version in group['versions']:
             if version.get('icon'):
                 app_logo_uri = version['icon']
                 app_logo_file = version.get('logo_file') or ''
                 break
+        if not app_logo_uri and app_name != '(repo root)':
+            app_prefix = f'{app_name}/'
+            app_candidates = list(_STORE_LOGO_CANDIDATES)
+            for cand in (_logo_name_candidates(app_name)
+                         + _logo_name_candidates(app_name.lower())):
+                if cand not in app_candidates:
+                    app_candidates.append(cand)
+            present = [c for c in app_candidates
+                       if app_prefix + c in tree_paths]
+            for candidate in present:
+                logo_path = app_prefix + candidate
+                try:
+                    lcode, logo_bytes = await _github_fetch_bytes(
+                        _github_raw_url(endpoints, owner, repo, ref, logo_path),
+                        STORE_LOGO_MAX_BYTES,
+                    )
+                except RuntimeError:
+                    continue
+                uri = _logo_data_uri(logo_bytes) if lcode == 200 else None
+                if uri:
+                    app_logo_uri, app_logo_file = uri, candidate
+                    break
         apps.append({
-            'app': group['app'],
+            'app': app_name,
             'label': group['label'],
             'icon': app_logo_uri,
             'logo_file': app_logo_file,
@@ -2436,10 +2548,25 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
     """Pull one packaged chart (.tgz/.tar.gz) out of a repo tarball.
 
     The extracted file already IS a `helm package` tarball — validated with
-    the standard sniffer and passed to ChartMuseum unmodified; the CR logo
-    and default values come from the files inside the package.
+    the standard sniffer and passed to ChartMuseum unmodified. The CR logo
+    comes from inside the package first; packages that ship none fall back
+    to an app-level logo file sitting NEXT TO the package in the repo
+    (<app>/logo.png … — the common one-logo-per-app-directory convention).
     """
     packaged_bytes = None
+    app_logo_bytes = None
+    app_logo_path = ''
+    app = _app_name_of(file_path)
+    app_wanted = {}
+    if app != '(repo root)':
+        app_stems = [app]
+        if app.lower() != app:
+            app_stems.append(app.lower())
+        for cand in _logo_name_candidates(*app_stems) + list(_STORE_LOGO_CANDIDATES):
+            app_wanted[f'{app}/{cand}'] = cand
+    else:
+        for cand in _STORE_LOGO_CANDIDATES:
+            app_wanted[cand] = cand
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
             for m in tar.getmembers():
@@ -2450,6 +2577,14 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
                     payload = tar.extractfile(m)
                     if payload is not None:
                         packaged_bytes = payload.read()
+                elif not app_logo_bytes and rel in app_wanted:
+                    payload = tar.extractfile(m)
+                    if payload is not None:
+                        candidate_bytes = payload.read()
+                        if _sniff_chart_logo(candidate_bytes):
+                            app_logo_bytes = candidate_bytes
+                            app_logo_path = rel
+                if packaged_bytes is not None and app_logo_bytes is not None:
                     break
     except tarfile.TarError as e:
         raise ValueError(
@@ -2466,15 +2601,22 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
         raise ValueError(f'not a packaged helm chart: {e}') from e
     extras = _packaged_chart_extras(packaged_bytes)
     meta = extras['meta'] or {}
+    logo_value, logo_file = extras['logo'], extras['logo_file']
+    warnings = []
+    if extras.get('logo_note'):
+        warnings.append(f"{extras['logo_note']} (inside the package)")
+    if not logo_value and app_logo_bytes is not None:
+        logo_value = _cr_logo_image(app_logo_bytes) or ''
+        logo_file = app_logo_path
     return {
         'tgz': packaged_bytes,
         'name': name,
         'version': version,
         'description': str(meta.get('description') or '').strip(),
         'values_text': extras['values'],
-        'logo': extras['logo'],
-        'logo_file': extras['logo_file'],
-        'warnings': [],
+        'logo': logo_value,
+        'logo_file': logo_file,
+        'warnings': warnings,
     }
 
 
@@ -3230,11 +3372,17 @@ async def _manifest_http(scope, receive, send):
 
 async def _store_catalog_http(scope, receive, send):
     """GET /api/store/catalog?repo=<github-url>[&ref=<ref>][&refresh=true]
+    [&stream=1]
 
     One tile per APP (the repo's top-level directories), each carrying its
     installable PACKAGED chart versions (every .tgz / .tar.gz `helm package`
     file under it) sorted newest-first for a version dropdown. API-key gated
     upstream; disabled with EZAPP_MCP_STORE_ENABLED=false (404).
+
+    With stream=1 the answer is application/x-ndjson: progress lines
+    ({"type": "progress", "done", "total", "current"}) followed by one
+    final {"type": "catalog", …} line — the UI renders live progress while
+    the packages are scanned. Without it: a single JSON document, as before.
     """
     if (scope.get('method') or '').upper() != 'GET':
         for message in _json_asgi_response(
@@ -3253,6 +3401,7 @@ async def _store_catalog_http(scope, receive, send):
     repo = params.get('repo', [''])[0].strip()
     ref = params.get('ref', [''])[0].strip()
     refresh = params.get('refresh', [''])[0].strip().lower() == 'true'
+    streaming = params.get('stream', [''])[0].strip().lower() == '1'
     if not repo:
         for message in _json_asgi_response(
             send, 400,
@@ -3262,27 +3411,87 @@ async def _store_catalog_http(scope, receive, send):
         ):
             await send(message)
         return
+
+    # static request errors must stay proper HTTP status codes (even in
+    # streaming mode) — validate what can be validated before the stream
+    # opens; only runtime failures (GitHub down, rate limit) become events.
+    pre_error = None
     try:
-        catalog = await _build_store_catalog(repo, ref, force_refresh=refresh)
+        parse_store_repo(repo)
     except ValueError as e:
+        pre_error = str(e)
+    if pre_error:
         for message in _json_asgi_response(
-            send, 400, json.dumps({'error': str(e)}).encode('utf-8'),
+            send, 400, json.dumps({'error': pre_error}).encode('utf-8'),
             [(b'cache-control', b'no-store')],
         ):
             await send(message)
         return
-    except (RuntimeError, LedgerError) as e:
+
+    if not streaming:
+        try:
+            catalog = await _build_store_catalog(repo, ref, force_refresh=refresh)
+        except ValueError as e:
+            for message in _json_asgi_response(
+                send, 400, json.dumps({'error': str(e)}).encode('utf-8'),
+                [(b'cache-control', b'no-store')],
+            ):
+                await send(message)
+            return
+        except (RuntimeError, LedgerError) as e:
+            for message in _json_asgi_response(
+                send, 502, json.dumps({'error': str(e)}).encode('utf-8'),
+                [(b'cache-control', b'no-store')],
+            ):
+                await send(message)
+            return
         for message in _json_asgi_response(
-            send, 502, json.dumps({'error': str(e)}).encode('utf-8'),
+            send, 200, json.dumps(catalog, indent=2).encode('utf-8'),
             [(b'cache-control', b'no-store')],
         ):
             await send(message)
         return
-    for message in _json_asgi_response(
-        send, 200, json.dumps(catalog, indent=2).encode('utf-8'),
-        [(b'cache-control', b'no-store')],
-    ):
-        await send(message)
+
+    # streaming mode: NDJSON progress lines, then the catalog
+    async def send_event(event: dict):
+        line = json.dumps(event).encode('utf-8') + b'\n'
+        await send({'type': 'http.response.body', 'body': line,
+                    'more_body': True})
+
+    await send({
+        'type': 'http.response.start', 'status': 200,
+        'headers': [
+            (b'content-type', b'application/x-ndjson'),
+            (b'cache-control', b'no-store'),
+        ],
+    })
+
+    async def progress(event: dict):
+        # a disconnected browser must never abort the scan — the result is
+        # cached either way, so the next Load gets it instantly
+        try:
+            await send_event(event)
+        except Exception:
+            pass
+
+    build_error = None
+    try:
+        catalog = await _build_store_catalog(repo, ref, force_refresh=refresh,
+                                             progress=progress)
+    except (ValueError, RuntimeError, LedgerError) as e:
+        build_error = str(e)
+    if build_error:
+        try:
+            await send_event({'type': 'error', 'error': build_error})
+        except Exception:
+            pass
+    else:
+        try:
+            await send_event({'type': 'catalog', **catalog})
+        except Exception:
+            pass
+    await send({'type': 'http.response.body', 'body': b'',
+                'more_body': False})
 
 
 async def _store_install_http(scope, receive, send):

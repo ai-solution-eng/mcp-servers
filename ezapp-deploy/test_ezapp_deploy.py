@@ -1766,8 +1766,18 @@ REPO_FILES = {
         chart_name="nested-two", version="0.4.0"),
     "plain/plain-2.0.0.tgz": make_chart_tgz(
         chart_name="plain", version="2.0.0"),
+    # app-level logo sitting NEXT TO the packages in the app dir (the
+    # common repo convention) — feeds the tile and the CR default
+    "plain/logo.png": png,
     # a non-chart tgz in an app dir must be skipped, not fatal
     "plain/junk.tgz": b"definitely not a gzip archive",
+    # an app with NO logo anywhere (package + app dir) — install needs an upload
+    "logoless/logoless-1.0.0.tgz": make_chart_tgz(
+        chart_name="logoless", version="1.0.0"),
+    # an app whose logo is named after the APP (appname.png), not logo.png
+    "named/named-1.0.0.tgz": make_chart_tgz(
+        chart_name="named", version="1.0.0"),
+    "named/named.png": png,
     "broken/broken-9.9.9.tgz": make_chart_tgz(
         chart_name="broken", version="9.9.9",
         chart_yaml="name: [unclosed"),
@@ -1797,9 +1807,63 @@ check("svg logo file is recorded",
 
 plain_extracted = server._extract_packaged_chart_from_repo_tarball(
     make_repo_tarball(REPO_FILES), "plain/plain-2.0.0.tgz")
-check("logo-less packages get an empty CR logo",
-      plain_extracted["logo"] == "" and plain_extracted["logo_file"] == "",
+check("app-level logo NEXT TO the package becomes the CR default",
+      plain_extracted["logo"] == base64.b64encode(png).decode()
+      and plain_extracted["logo_file"] == "plain/logo.png",
       str((plain_extracted["logo"], plain_extracted["logo_file"])))
+
+logoless_extracted = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "logoless/logoless-1.0.0.tgz")
+check("packages with no logo anywhere extract with an empty logo",
+      logoless_extracted["logo"] == "" and logoless_extracted["logo_file"] == "",
+      str((logoless_extracted["logo"], logoless_extracted["logo_file"])))
+
+# an app-name logo (appname.png) next to the package feeds the CR too
+named_extracted = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "named/named-1.0.0.tgz")
+check("appname.png next to the package becomes the CR default",
+      named_extracted["logo"] == base64.b64encode(png).decode()
+      and named_extracted["logo_file"] == "named/named.png",
+      str((named_extracted["logo"], named_extracted["logo_file"])))
+
+# a chartname.png INSIDE the package (no fixed-name logo present)
+chartname_pkg = make_chart_tgz(
+    chart_name="chartname", version="1.0.0",
+    extra_members=[("chartname/chartname.png", png)])
+chartname_extras = server._packaged_chart_extras(chartname_pkg)
+check("chartname.png inside the package is found by the chart's own name",
+      chartname_extras["logo"] == base64.b64encode(png).decode()
+      and chartname_extras["logo_file"] == "chartname.png",
+      str((chartname_extras["logo_file"], chartname_extras["logo_note"])))
+
+# nested + mislabeled logos inside the package
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"jpegdata" * 6
+nested_pkg = make_chart_tgz(
+    chart_name="deep", version="1.0.0",
+    extra_members=[("deep/assets/logo.png", png)])
+deep_extras = server._packaged_chart_extras(nested_pkg)
+check("package logo nested in a subfolder is found",
+      deep_extras["logo"] == base64.b64encode(png).decode()
+      and deep_extras["logo_file"] == "assets/logo.png",
+      str((deep_extras["logo_file"], deep_extras["logo_note"])))
+jpeg_pkg = make_chart_tgz(
+    chart_name="jpeggy", version="1.0.0",
+    extra_members=[("jpeggy/logo.png", JPEG_BYTES)])
+jpeg_extras = server._packaged_chart_extras(jpeg_pkg)
+check("a logo.png that is really a JPEG is accepted by content",
+      jpeg_extras["logo"] == "data:image/jpeg;base64,"
+      + base64.b64encode(JPEG_BYTES).decode()
+      and jpeg_extras["icon"].startswith("data:image/jpeg;base64,"),
+      str(jpeg_extras["logo"])[:50])
+garbage_pkg = make_chart_tgz(
+    chart_name="garbage", version="1.0.0",
+    extra_members=[("garbage/logo.png", b"\x00\x01not-an-image")])
+garbage_extras = server._packaged_chart_extras(garbage_pkg)
+check("unusable logo-like files surface a diagnostic note",
+      garbage_extras["logo"] == ""
+      and "logo-like file(s) present but unusable" in garbage_extras["logo_note"]
+      and "logo.png" in garbage_extras["logo_note"],
+      str(garbage_extras["logo_note"]))
 
 check_raises("unknown packaged file is refused", "not found in the repo tarball",
              server._extract_packaged_chart_from_repo_tarball,
@@ -2007,12 +2071,14 @@ async def _store_endpoint_scenarios():
         server._ApiKeyAuthMiddleware(server._ApiOrMcpApp(_dummy_mcp_app())),
         server._UiApp(os.path.join(os.path.dirname(server.__file__), "ui")))
 
-    def catalog_scope(repo, ref="", refresh=False, auth=True):
+    def catalog_scope(repo, ref="", refresh=False, auth=True, stream=False):
         params = f"repo={urllib.parse.quote(repo, safe='')}"
         if ref:
             params += f"&ref={urllib.parse.quote(ref, safe='')}"
         if refresh:
             params += "&refresh=true"
+        if stream:
+            params += "&stream=1"
         return {"type": "http", "method": "GET", "path": "/api/store/catalog",
                 "query_string": params.encode(),
                 "headers": AUTH_HEADERS if auth else []}
@@ -2064,6 +2130,26 @@ async def _store_endpoint_scenarios():
     # catalog: disallowed repo host → 400
     out["catalog_bad_repo"] = await _drive(
         router, catalog_scope("https://gitlab.com/a/b"))
+
+    # catalog: STREAMING mode — NDJSON progress lines, then the catalog
+    stub_gh.requests.clear()
+    out["catalog_stream"] = await _drive(
+        router, catalog_scope(repo_url, ref="main", stream=True))
+    stream_lines = [m.get("body", b"") for m in out["catalog_stream"]
+                    if m.get("type") == "http.response.body"]
+    stream_text = b"".join(stream_lines).decode()
+    stream_events = [json.loads(l) for l in stream_text.splitlines() if l.strip()]
+    out["stream_events"] = stream_events
+
+    # streaming: static errors stay proper HTTP errors (pre-validated)
+    out["stream_bad_repo"] = await _drive(
+        router, catalog_scope("https://gitlab.com/a/b", stream=True))
+
+    # streaming: runtime failure (rate limit) becomes an error EVENT
+    stub_gh.mode = "rate_limited"
+    out["stream_ratelimited"] = await _drive(
+        router, catalog_scope(repo_url, ref="main", refresh=True, stream=True))
+    stub_gh.mode = "normal"
 
     # wrong methods → 405 (handlers driven directly, as in the /upload tests)
     out["catalog_post"] = await _drive_body(
@@ -2194,7 +2280,7 @@ async def _store_endpoint_scenarios():
     set_env(CHARTMUSEUM_URL=stub_cm.url)
     server._ledger_instance = FakeLedger()
     sub = CapturingSubprocess([]).install()
-    payload_nologo = {"repo": repo_url, "dir": "plain/plain-2.0.0.tgz",
+    payload_nologo = {"repo": repo_url, "dir": "logoless/logoless-1.0.0.tgz",
                       "ref": "main", "values": "x: 1\n"}
     out["install_no_logo"] = await _drive_body(
         server._store_install_http, install_scope(),
@@ -2273,7 +2359,8 @@ store = asyncio.run(_store_endpoint_scenarios())
 cat = json.loads(store["catalog"][1]["body"])
 check("catalog endpoint lists one tile per app",
       store["catalog"][0]["status"] == 200
-      and [a["app"] for a in cat["apps"]] == ["foo", "nested-two", "plain"]
+      and [a["app"] for a in cat["apps"]]
+          == ["foo", "logoless", "named", "nested-two", "plain"]
       and cat["ref"] == "main"
       and cat["cached"] is False,
       str(store["catalog"][0]) + store["catalog"][1]["body"][:300].decode())
@@ -2303,10 +2390,22 @@ check("packaged versions sort newest; tile falls back to the svg package",
       and nested_tile["logo_file"] == "logo.svg"
       and nested_tile["label"] == "Nested Two",
       json.dumps(nested_tile)[:300])
-check("logo-less packages leave the tile flagged (no logo anywhere)",
+check("app-level logo NEXT TO the packages feeds the tile",
       plain_tile is not None
-      and plain_tile["icon"] == "" and plain_tile["logo_file"] == "",
+      and plain_tile["icon"].startswith("data:image/png;base64,")
+      and plain_tile["logo_file"] == "logo.png",
       str((plain_tile or {}).get("logo_file")))
+named_tile = next((a for a in cat["apps"] if a["app"] == "named"), None)
+check("appname.png (named after the app) feeds the tile",
+      named_tile is not None
+      and named_tile["icon"].startswith("data:image/png;base64,")
+      and named_tile["logo_file"] == "named.png",
+      str((named_tile or {}).get("logo_file")))
+logoless_tile = next((a for a in cat["apps"] if a["app"] == "logoless"), None)
+check("apps with no logo anywhere keep the tile flagged",
+      logoless_tile is not None
+      and logoless_tile["icon"] == "" and logoless_tile["logo_file"] == "",
+      str((logoless_tile or {}).get("logo_file")))
 check("apps without a valid version disappear (reported as skipped)",
       all(a["app"] != "broken" for a in cat["apps"])
       and {s["dir"] for s in cat["skipped"]} == {"broken/broken-9.9.9.tgz",
@@ -2314,6 +2413,35 @@ check("apps without a valid version disappear (reported as skipped)",
       and any("not a packaged helm chart" in s["reason"]
               for s in cat["skipped"] if s["dir"] == "plain/junk.tgz"),
       json.dumps(cat["skipped"]))
+
+events = store["stream_events"]
+progress_events = [e for e in events if e.get("type") == "progress"]
+final_event = next((e for e in events if e.get("type") == "catalog"), None)
+check("streaming catalog reports live progress per package",
+      bool(progress_events)
+      and progress_events[0]["total"] == 10         # 10 packaged chart files
+      and progress_events[-1]["done"] == progress_events[-1]["total"]
+      and any("current" in e for e in progress_events),
+      f"{len(progress_events)} progress events")
+check("streaming catalog ends with the full catalog event",
+      final_event is not None
+      and final_event.get("type") == "catalog"
+      and [a["app"] for a in final_event["apps"]]
+          == [a["app"] for a in cat["apps"]]
+      and final_event["cached"] is False,
+      str(final_event)[:200] if final_event else "no catalog event")
+check("streaming mode keeps static errors as proper HTTP statuses",
+      store["stream_bad_repo"][0]["status"] == 400,
+      str(store["stream_bad_repo"][0]))
+stream_error_event = next(
+    (json.loads(m["body"].decode()) for m in store["stream_ratelimited"]
+     if m.get("type") == "http.response.body" and m.get("body", b"").strip()
+     and json.loads(m["body"].decode()).get("type") == "error"), None)
+check("streaming runtime failure becomes an error event",
+      store["stream_ratelimited"][0]["status"] == 200   # stream opened fine
+      and stream_error_event is not None
+      and "403" in stream_error_event.get("error", ""),
+      str(store["stream_ratelimited"][0]))
 check("catalog went through meta + tree + raws",
       sum(1 for p in store["catalog_requests"] if "git/trees" in p) == 1
       and "/repos/owner/repo" in store["catalog_requests"],
