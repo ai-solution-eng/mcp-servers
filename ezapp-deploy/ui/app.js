@@ -200,6 +200,46 @@ function renderTiles(data) {
   }
 }
 
+const DESC_LIMIT = 160;   // characters shown before a More/Less expander
+
+function setTileDescription(container, text) {
+  container.textContent = "";
+  const full = String(text || "").trim();
+  if (!full) {
+    container.textContent = "No description in Chart.yaml.";
+    return;
+  }
+  if (full.length <= DESC_LIMIT) {
+    container.textContent = full;
+    return;
+  }
+  // trim at a word boundary so the cut reads naturally
+  let short = full.slice(0, DESC_LIMIT);
+  const lastSpace = short.lastIndexOf(" ");
+  if (lastSpace > DESC_LIMIT * 0.6) short = short.slice(0, lastSpace);
+  const head = document.createElement("span");
+  head.className = "desc-short";
+  head.textContent = short.trimEnd() + "\u2026 ";
+  container.appendChild(head);
+  const rest = document.createElement("span");
+  rest.className = "desc-full hidden";
+  rest.textContent = full;
+  container.appendChild(rest);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "linklike";
+  toggle.textContent = "More";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.addEventListener("click", () => {
+    const expanded = toggle.getAttribute("aria-expanded") === "true";
+    rest.classList.toggle("hidden", expanded);
+    head.classList.toggle("hidden", expanded);
+    toggle.textContent = expanded ? "More" : "Less";
+    toggle.setAttribute("aria-expanded", String(!expanded));
+  });
+  container.appendChild(toggle);
+}
+
 function appTile(app) {
   const box = document.createElement("div");
   box.className = "tile";
@@ -233,7 +273,7 @@ function appTile(app) {
 
   const desc = document.createElement("div");
   desc.className = "tdesc";
-  desc.textContent = defaultVersion.description || "No description in Chart.yaml.";
+  setTileDescription(desc, defaultVersion.description);
   box.appendChild(desc);
 
   if (!app.icon) {
@@ -319,6 +359,76 @@ function updateProgress(done, total, current) {
 const USER_REPOS_KEY = "ezappStoreRepos";
 let configuredRepos = [];   // server-configured repo list (from /api/store/repos)
 let storeBootstrapped = false;
+
+/* ── YAML syntax highlighting for the values editor ──────────────────── */
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function highlightYamlValue(text) {
+  // tokenize quoted strings, numbers and booleans/null within one chunk
+  let out = "";
+  let last = 0;
+  const re = /('(?:[^']|'')*'|"(?:[^"\\]|\\.)*")|(-?\b\d+(?:\.\d+)?\b)|(\b(?:true|false|null|yes|no|on|off|~)\b)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out += escapeHtml(text.slice(last, m.index));
+    if (m[1] !== undefined) out += '<span class="tok-str">' + escapeHtml(m[1]) + '</span>';
+    else if (m[2] !== undefined) out += '<span class="tok-num">' + escapeHtml(m[2]) + '</span>';
+    else out += '<span class="tok-bool">' + escapeHtml(m[3]) + '</span>';
+    last = m.index + m[0].length;
+  }
+  out += escapeHtml(text.slice(last));
+  return out;
+}
+
+function highlightYamlLine(line) {
+  // split a trailing comment: the first # outside quotes, preceded by
+  // start-of-line or whitespace
+  let quote = "";   // '"' or "'" while inside a quoted string
+  let cut = -1;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) {
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === "#" && (i === 0 || /\s/.test(line[i - 1]))) { cut = i; break; }
+  }
+  let code = line, comment = "";
+  if (cut >= 0) { code = line.slice(0, cut); comment = line.slice(cut); }
+  let out = "";
+  const keyMatch = code.match(/^(\s*)(-\s+)?([\w.\-]+)(:)(\s+|$)/);
+  if (keyMatch) {
+    out += keyMatch[1];
+    if (keyMatch[2]) out += '<span class="tok-punc">' + escapeHtml(keyMatch[2]) + '</span>';
+    out += '<span class="tok-key">' + escapeHtml(keyMatch[3]) + '</span>';
+    out += '<span class="tok-punc">:</span>';
+    out += escapeHtml(keyMatch[5]);   // keep the space after the colon
+    out += highlightYamlValue(code.slice(keyMatch[0].length));
+  } else {
+    out += highlightYamlValue(code);
+  }
+  if (comment) out += '<span class="tok-com">' + escapeHtml(comment) + '</span>';
+  return out;
+}
+
+function highlightYaml(text) {
+  // the trailing newline keeps the highlight layer's height in sync with
+  // the textarea when the values end with an empty line
+  return text.split("\n").map(highlightYamlLine).join("\n") + "\n";
+}
+
+function syncValuesHighlight() {
+  const ta = $("dlg-values");
+  const hl = $("dlg-values-hl");
+  if (!ta || !hl) return;
+  hl.innerHTML = highlightYaml(ta.value);
+  hl.scrollTop = ta.scrollTop;
+  hl.scrollLeft = ta.scrollLeft;
+}
 
 function userRepos() {
   try { return JSON.parse(localStorage.getItem(USER_REPOS_KEY) || "[]"); }
@@ -521,6 +631,7 @@ function openInstallDialog(chart) {
   $("dlg-label").value = humanizeChartName(chart.name);
   $("dlg-description").value = chart.name || "";
   $("dlg-values").value = chart.values || "";
+  syncValuesHighlight();
   $("dlg-logo").value = "";
   setDialogLogo(chart);
   $("dlg-error").classList.add("hidden");
@@ -528,6 +639,7 @@ function openInstallDialog(chart) {
   $("installdialog").dataset.dir = chart.dir || "";
   $("installdialog").dataset.ref = currentRef || "";
   $("installdialog").showModal();
+  syncValuesHighlight();   // once visible: match the textarea's scroll state
 }
 
 function showDlgError(text) {
@@ -810,6 +922,14 @@ $("dlg-release-tick").addEventListener("change", (event) => {
   if (event.target.checked) {
     $("dlg-releasename").focus();
   }
+});
+
+$("dlg-values").addEventListener("input", syncValuesHighlight);
+$("dlg-values").addEventListener("scroll", () => {
+  const hl = $("dlg-values-hl");
+  const ta = $("dlg-values");
+  hl.scrollTop = ta.scrollTop;
+  hl.scrollLeft = ta.scrollLeft;
 });
 
 $("dlg-logo").addEventListener("change", () => {

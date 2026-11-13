@@ -172,6 +172,16 @@ progress::-moz-progress-bar { background: var(--info); border-radius: 999px; }
   white-space: normal;
   overflow-wrap: anywhere;
 }
+.linklike {
+  background: none;
+  border: none;
+  color: var(--info);
+  padding: 0;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.linklike:hover { text-decoration: underline; }
 .tmeta { color: var(--dim); font-size: 0.75rem; overflow-wrap: anywhere; }
 .warnnote { color: var(--warn); }
 .tile .install { align-self: flex-start; margin-top: 0.2rem; }
@@ -193,7 +203,7 @@ dialog {
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 8px;
-  width: min(44rem, 94vw);
+  width: min(60rem, 96vw);
   padding: 1rem 1.2rem;
 }
 dialog::backdrop { background: rgba(4, 6, 10, 0.65); }
@@ -218,6 +228,55 @@ dialog textarea {
   white-space: pre;
   resize: vertical;
 }
+
+/* values editor: transparent textarea over a syntax-highlighted <pre> */
+.code-wrap {
+  position: relative;
+  height: 320px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  overflow: hidden;
+}
+.code-hl,
+.code-wrap textarea {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+  word-wrap: normal;
+  overflow: auto;
+  tab-size: 2;
+}
+.code-hl {
+  color: var(--text);
+  pointer-events: none;
+  z-index: 1;
+  border: none;
+  overflow: hidden;
+}
+.code-wrap textarea {
+  z-index: 2;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text);
+  border: none;
+  resize: none;
+  width: 100%;
+  height: 100%;
+}
+.code-wrap textarea::selection {
+  background: rgba(74, 144, 217, 0.35);
+  color: transparent;
+}
+.tok-key { color: #7ab8ff; }
+.tok-str { color: #8fd694; }
+.tok-num { color: #f0b45c; }
+.tok-bool { color: #d98cf0; font-weight: bold; }
+.tok-com { color: var(--dim); font-style: italic; }
+.tok-punc { color: var(--dim); }
 #dlg-logo-row { display: flex; align-items: center; gap: 0.6rem; }
 .check-label {
   display: flex;

@@ -87,7 +87,10 @@
       </div>
       <input id="dlg-logo" type="file" accept="image/png,image/svg+xml">
       <label for="dlg-values">Helm values (editable — sent as spec.values)</label>
-      <textarea id="dlg-values" rows="14" spellcheck="false"></textarea>
+      <div class="code-wrap">
+        <pre id="dlg-values-hl" class="code-hl" aria-hidden="true"></pre>
+        <textarea id="dlg-values" rows="14" spellcheck="false" wrap="off"></textarea>
+      </div>
       <p id="dlg-error" class="errortext hidden"></p>
       <div id="dlg-buttons">
         <button id="dlg-cancel" type="button">Cancel</button>
