@@ -231,11 +231,13 @@ function setTileDescription(container, text) {
   toggle.textContent = "More";
   toggle.setAttribute("aria-expanded", "false");
   toggle.addEventListener("click", () => {
-    const expanded = toggle.getAttribute("aria-expanded") === "true";
-    rest.classList.toggle("hidden", expanded);
-    head.classList.toggle("hidden", expanded);
-    toggle.textContent = expanded ? "More" : "Less";
-    toggle.setAttribute("aria-expanded", String(!expanded));
+    // read the live DOM state: hidden = collapsed right now
+    const wasExpanded = !rest.classList.contains("hidden");
+    const nowExpanded = !wasExpanded;
+    rest.classList.toggle("hidden", wasExpanded);   // collapse hides the trim
+    head.classList.toggle("hidden", nowExpanded);   // and reveals the full text
+    toggle.textContent = nowExpanded ? "Less" : "More";
+    toggle.setAttribute("aria-expanded", String(nowExpanded));
   });
   container.appendChild(toggle);
 }
@@ -426,8 +428,14 @@ function syncValuesHighlight() {
   const hl = $("dlg-values-hl");
   if (!ta || !hl) return;
   hl.innerHTML = highlightYaml(ta.value);
-  hl.scrollTop = ta.scrollTop;
-  hl.scrollLeft = ta.scrollLeft;
+  autoSizeValuesEditor();   // textarea fills its content → never scrolls internally
+}
+
+function autoSizeValuesEditor() {
+  const ta = $("dlg-values");
+  if (!ta) return;
+  ta.style.height = "auto";
+  ta.style.height = ta.scrollHeight + "px";
 }
 
 function userRepos() {
@@ -924,12 +932,9 @@ $("dlg-release-tick").addEventListener("change", (event) => {
   }
 });
 
-$("dlg-values").addEventListener("input", syncValuesHighlight);
-$("dlg-values").addEventListener("scroll", () => {
-  const hl = $("dlg-values-hl");
-  const ta = $("dlg-values");
-  hl.scrollTop = ta.scrollTop;
-  hl.scrollLeft = ta.scrollLeft;
+$("dlg-values").addEventListener("input", () => {
+  syncValuesHighlight();
+  autoSizeValuesEditor();
 });
 
 $("dlg-logo").addEventListener("change", () => {

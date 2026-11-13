@@ -229,43 +229,40 @@ dialog textarea {
   resize: vertical;
 }
 
-/* values editor: transparent textarea over a syntax-highlighted <pre> */
+/* values editor: transparent textarea stacked over a syntax-highlighted
+   <pre> in the SAME grid cell — identical padding/font/line-height and
+   identical soft-wrapping, so the caret and the colors can never drift
+   out of alignment (no scroll-sync, no absolute positioning) */
 .code-wrap {
-  position: relative;
-  height: 320px;
+  display: grid;
+  max-height: 340px;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--bg);
-  overflow: hidden;
 }
 .code-hl,
 .code-wrap textarea {
-  position: absolute;
-  inset: 0;
+  grid-area: 1 / 1;
   margin: 0;
   padding: 0.45rem 0.55rem;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  white-space: pre;
-  word-wrap: normal;
-  overflow: auto;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  border: none;
   tab-size: 2;
 }
 .code-hl {
   color: var(--text);
   pointer-events: none;
-  z-index: 1;
-  border: none;
-  overflow: hidden;
 }
 .code-wrap textarea {
-  z-index: 2;
   background: transparent;
   color: transparent;
   caret-color: var(--text);
-  border: none;
   resize: none;
-  width: 100%;
-  height: 100%;
 }
 .code-wrap textarea::selection {
   background: rgba(74, 144, 217, 0.35);
