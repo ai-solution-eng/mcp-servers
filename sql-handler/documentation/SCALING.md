@@ -71,6 +71,13 @@ round-trips small results slower than recomputing them" (l2cache.py). The
 hits that matter most (the ~18–25 ms in-cluster warm floor; small results)
 are exactly the ones L2 would not serve.
 
+The shared L2 is a TRUST boundary, not a per-caller isolation mechanism:
+entries are separated by cache KEY (which carries the caller's policy hash),
+not by filesystem ACL, so any process that can read the PVC can read every
+cached artifact. Keep the volume pod-private; the pod creates its cache
+directories 0o700 and writes artifacts 0o600 (best-effort — a mounted
+volume may ignore the mode).
+
 ## 3. The GIL story — the heavy path is already parallel
 
 Each query runs on its own raw `threading.Thread` (`QueryJob.__init__`,
@@ -86,10 +93,13 @@ with `asyncio.to_thread(_dispatch_tool, ...)` (server.py:298), keeping the
 event loop responsive for other sessions and probes.
 
 The GIL-bound remainder is Python-bytecode glue — markdown/JSON rendering,
-transport framing — and it is shrinking: `fastrender.py` replaces the
-pandas DataFrame materialization with a pure-Arrow renderer and `orjson`
-(3–8× faster) on hot JSON payloads. Nothing measured shows GIL contention
-capping a single process today.
+transport framing. `fastrender.py` is a **candidate** pure-Arrow renderer
+(plus `orjson`) built for that path and covered by parity tests, but it is
+**not wired into the query path yet**: the tools still render through
+`arrow.to_pandas().to_markdown()` (server.py `_arrow_to_markdown`). Wiring it
+is a measurable optimization, not a current property — audit 2026-11-12
+corrected this paragraph, which previously described it as done. Nothing
+measured shows GIL contention capping a single process today.
 
 ## 4. When N workers WOULD help (the honest case)
 
@@ -131,9 +141,11 @@ a supervisor-set `SQLHANDLER_WORKER_TOTAL/_INDEX` (or equivalent) is
 required, then `memory_limit = fraction × limit / N` and
 `threads = max(1, floor(cpu / N))` — without this, OOM exposure (§1); (3)
 shared-or-divided state: `cache.l2` becomes required (RWX PVC), yet small
-results still bypass it (§2); the async job registry needs `query.jobsDir`
-on an RWX PVC or `query_status`/`query_result` fail across workers (the
-chart documents the identical cross-replica issue); saved queries and the
+results still bypass it (§2); the async job registry needs a shared `SQLHANDLER_JOBS_DIR`
+on an RWX PVC or `query_status`/`query_result` fail across workers — the same
+failure the multi-replica note in [MCP.md](MCP.md) describes; that directory is
+**not chart-exposed** today and must be set out of band
+([CONFIGURATION.md §9](CONFIGURATION.md#9-what-the-chart-does-not-wire)); saved queries and the
 catalog store are files — safe, racing benignly (last write wins); (4)
 re-bench warm qps per pod — the 2026-09-23 tables are the baseline, and
 pooled MCP connections must be counted per worker, not per pod.

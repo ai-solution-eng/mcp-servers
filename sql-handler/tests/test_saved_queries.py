@@ -634,10 +634,13 @@ def test_gate_designated_admin_fingerprint_rides_the_key_path(monkeypatch, tmp_p
     with pytest.raises(NotAuthorized):
         assert_write_allowed(FakeRequest({"x-api-key": "not-a-key"})),
 
-    # the helper itself answers the SESSION question only: a bare key header
-    # resolves anonymous on /api/* (no middleware recorded the fp), which is
-    # why credential_ok must — and does — run first.
-    assert saved_module.write_caller_is_admin(FakeRequest({"x-api-key": raw})) is False
+    # The helper now AGREES with the key path: since the 2026-11-12 audit the
+    # identity ladder resolves an explicitly presented key on /api (it used to
+    # return anonymous there because only the /mcp middleware recorded the fp),
+    # so a designated-admin key resolves to the admin identity on both paths.
+    # The write gate is unchanged in outcome — credential_ok still runs first —
+    # but the two answers are now consistent instead of contradictory.
+    assert saved_module.write_caller_is_admin(FakeRequest({"x-api-key": raw})) is True
 
 def test_gate_admin_path_ignores_a_stale_explicit_key(monkeypatch, tmp_path, _admins_reset):
     """PINNED DIVERGENCE: a designated admin whose request ALSO carries a

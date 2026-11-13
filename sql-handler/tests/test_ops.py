@@ -299,7 +299,12 @@ def test_token_matching():
     assert token_matches(" Bearer secret ", "secret")
     assert not token_matches("Bearer wrong", "secret")
     assert not token_matches("", "secret")
-    assert token_matches("anything", "")  # no token configured = allow
+    # audit 2026-11-12 (P3): FAIL CLOSED on an empty expectation. Both current
+    # callers pre-filter an unconfigured gate, so this is unreachable today —
+    # but "no expected token" must never compare equal to "token matched", or
+    # the next caller that forgets the pre-filter silently disables auth.
+    assert not token_matches("anything", "")
+    assert not token_matches("", "")
 
 
 def _run_middleware(app, path, headers):

@@ -66,7 +66,7 @@ kubectl -n <release-namespace> logs deploy/k8s-mcp | grep AUDIT
 
 ## Troubleshooting
 
-Quick hits — the full table (including exec-gate messages) is in [DEPLOYMENT.md](DEPLOYMENT.md#troubleshooting).
+Quick hits — the full table (including exec-gate messages) is in [DEPLOYMENT.md](DEPLOYMENT.md#6-troubleshooting).
 
 | Symptom | Cause / fix |
 | --- | --- |

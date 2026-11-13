@@ -61,9 +61,9 @@ _MARKDOWN = "text/markdown"
 # ---------------------------------------------------------------------------
 
 
-def _schema_text(engine: SqlEngine, table: str) -> str:
-    """Markdown schema (+ catalog docs) for one table."""
-    d = engine.describe_table(table)
+def _schema_text(engine: SqlEngine, table: str, *, caller=None) -> str:
+    """Markdown schema (+ catalog docs) for one table, per-caller policy."""
+    d = engine.describe_table(table, caller=caller)
     lines = [f"# Table: {d['table']}", "", f"URI: `{d['uri']}`", ""]
     if d.get("description"):
         lines += [d["description"], ""]
@@ -75,9 +75,13 @@ def _schema_text(engine: SqlEngine, table: str) -> str:
     return "\n".join(lines)
 
 
-def _catalog_text(engine: SqlEngine) -> str:
-    """Markdown overview of every table + its semantic-catalog description."""
-    tables = engine.list_tables()
+def _catalog_text(engine: SqlEngine, *, caller=None) -> str:
+    """Markdown overview of every table + its semantic-catalog description.
+
+    ``caller`` (identity spine): tables the caller's policy HIDES are omitted —
+    a resource must not advertise more than the tool surface does.
+    """
+    tables = engine.list_tables(caller=caller)
     lines = ["# Table catalog", ""]
     if not tables:
         lines.append("No tables found in the configured data source.")
@@ -98,9 +102,13 @@ def _catalog_text(engine: SqlEngine) -> str:
     return "\n".join(lines)
 
 
-def _query_memory_text(engine: SqlEngine) -> str:
-    """Markdown of recent query outcomes (the agent's own query history)."""
-    memory = engine.query_memory()
+def _query_memory_text(engine: SqlEngine, *, caller=None) -> str:
+    """Markdown of recent query outcomes (the agent's own query history).
+
+    ``caller`` (identity spine): under enforcement the resource is owner-scoped
+    (another caller's SQL text can reveal hidden tables/columns).
+    """
+    memory = engine.query_memory(caller=caller)
     lines = [
         "# Query memory",
         "",
@@ -140,9 +148,27 @@ def _parse_table_uri(uri: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _caller_from_ctx(ctx):
+    """The request's resolved Caller for a resource read (identity spine).
+
+    Resources are per-caller exactly like tools: the catalog must not list
+    tables the caller's policy hides, and query memory is owner-scoped under
+    enforcement. A stdio/test context with no request resolves to anonymous —
+    which still gets the DEFAULT policy group, never an unrestricted bypass.
+    """
+    from .identity import caller_from_request_state
+
+    try:
+        return caller_from_request_state(getattr(ctx, "request", None))
+    except Exception:
+        return None
+
+
 async def handle_list_resources(ctx, params) -> ListResourcesResult:
     """resources/list: static per-table schemas + the catalog + query memory."""
     from .server import _handler  # local import: avoids a server<->module cycle
+
+    caller = _caller_from_ctx(ctx)
 
     def _build():
         engine = _handler()
@@ -160,7 +186,7 @@ async def handle_list_resources(ctx, params) -> ListResourcesResult:
                 mime_type=_MARKDOWN,
             ),
         ]
-        for t in engine.list_tables():
+        for t in engine.list_tables(caller=caller):
             desc = engine.table_description(t) or None
             resources.append(
                 Resource(
@@ -197,15 +223,16 @@ async def handle_read_resource(ctx, params) -> ReadResourceResult:
 
     uri = str(params.uri)
     table = _parse_table_uri(uri)
+    caller = _caller_from_ctx(ctx)
 
     def _render() -> str:
         engine = _handler()
         if table is not None:
-            return _schema_text(engine, table)
+            return _schema_text(engine, table, caller=caller)
         if uri == _CATALOG_URI:
-            return _catalog_text(engine)
+            return _catalog_text(engine, caller=caller)
         if uri == _QUERY_MEMORY_URI:
-            return _query_memory_text(engine)
+            return _query_memory_text(engine, caller=caller)
         raise LookupError(f"Unknown resource: {uri}")
 
     try:

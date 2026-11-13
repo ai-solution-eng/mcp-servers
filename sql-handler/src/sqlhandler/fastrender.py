@@ -1,5 +1,12 @@
 """Fast rendering: pure-Arrow markdown, orjson for JSON payloads.
 
+STATUS (audit 2026-11-12): NOT WIRED into the query path. The tools still
+render through `arrow.to_pandas().to_markdown()` (server._arrow_to_markdown).
+This module is a tested, parity-checked candidate fast path — keep it, and
+wire it only behind a byte-identical-output test on the real result shapes
+(SCALING.md was corrected to say so; it previously claimed this replaced the
+pandas path).
+
 Rationale (bench/BENCHMARK.md): the in-cluster warm floor is ~20 ms and the
 engine is native (DuckDB/pyarrow/delta-rs) — Python-side formatting is the
 only hot path Python code owns. Two changes, both additive and guarded:

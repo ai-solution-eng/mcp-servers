@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlhandler"
-version = "4.0.0"
+version = "4.1.0"
 description = "Fast, direct SQL access to columnar data: OneLake/Delta Lake or S3/MinIO Parquet, exposed as an MCP server (an EzPresto replacement)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,14 +47,11 @@ packages = ["src/sqlhandler"]
 # serve /ui and / from any install (source checkout, editable, or wheel).
 include = ["ui/**"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.ruff.lint]
-# BLE001: broad `except Exception` is intentional at MCP tool boundaries
-# (errors are returned to the agent as strings, never crash the server).
-ignore = ["BLE001"]
+# Ruff config lives in ruff.toml (the fleet-shared file, hardlinked in).
+# A [tool.ruff] block here was DEAD: ruff resolves ruff.toml over
+# pyproject.toml in the same directory, so the two silently disagreed on
+# line-length (100 vs 120) and target-version (py311 vs py312). Removed in
+# the 2026-11-12 audit cleanup — edit ruff.toml, not this file.
 
 # Wave 2026-10-16: put the repo root on sys.path so tests can import
 # the tests package (tests/test_perf.py imports tests.test_virtual).
@@ -63,8 +60,14 @@ ignore = ["BLE001"]
 pythonpath = ["."]
 
 [tool.uv]
-# duckdb is pinned to the version the vendored scanner extensions are built for
-# (duckdb-ext/v1.5.5 — DuckDB requires an EXACT version match for extensions;
-# 1.5.6 refuses to LOAD them, breaking every external-catalog ATTACH type).
-# Bump BOTH together: re-bake duckdb-ext for a new DuckDB, then release this pin.
+# duckdb is pinned to 1.5.5 for two independent reasons:
+#   1. EXACT extension match — the vendored/baked scanner extensions are built
+#      per DuckDB version (duckdb-ext/v1.5.5); another version refuses to LOAD
+#      them, breaking every external-catalog ATTACH type.
+#   2. 2.0.0's new Python Arrow scan (PYTHON_ARROW_SCAN) no longer pushes
+#      filters into registered pyarrow datasets — and EVERY lake table here is
+#      one, so a filtered scan would read the whole table. Verified 2026-11:
+#      the plan shows FILTER above the scan and EXPLAIN ANALYZE reads all rows.
+#      Revisit when DuckDB restores Arrow filter pushdown.
+# Bump BOTH (extensions + this pin) and re-run the suite before releasing.
 constraint-dependencies = ["duckdb==1.5.5"]

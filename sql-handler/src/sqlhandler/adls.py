@@ -48,7 +48,7 @@ import os
 import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
-from .config import AdlsConfig
+from .config import AdlsConfig, listing_max_entries
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import (
     build_raw_dataset,
@@ -230,6 +230,16 @@ class AdlsProvider(DataProvider):
         try:
             selector = pafs.FileSelector(root, recursive=True)
             infos = fs.get_file_info(selector)
+            # Bounded discovery — same knob and rationale as the S3/GCS/NFS
+            # backends (audit 2026-11-12, P2).
+            cap = listing_max_entries()
+            if cap and len(infos) > cap:
+                raise LakehouseError(
+                    f"ADLS listing under '{root}' returned {len(infos)} entries, over the "
+                    f"SQLHANDLER_LISTING_MAX_ENTRIES cap ({cap}); narrow the prefix or raise the cap"
+                )
+        except LakehouseError:
+            raise
         except Exception as exc:
             raise LakehouseError(
                 f"Could not list ADLS path '{self.config.container}/{root.strip('/') if root else ''}': "

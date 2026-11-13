@@ -216,6 +216,20 @@ spec:
             - name: SEARXNG_FETCH_CACHE_TTL
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.fetch.cacheMaxBytes }}
+            # Cache byte/entry bounds — entries larger than the per-entry cap
+            # are returned but never cached (memory-growth guard).
+            - name: SEARXNG_FETCH_CACHE_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.cacheMaxEntries }}
+            - name: SEARXNG_FETCH_CACHE_MAX_ENTRIES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fetch.cacheMaxEntryBytes }}
+            - name: SEARXNG_FETCH_CACHE_MAX_ENTRY_BYTES
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.fetch.maxBodyBytes }}
             - name: SEARXNG_FETCH_MAX_BODY_BYTES
               value: {{ . | quote }}
@@ -226,6 +240,24 @@ spec:
             {{- end }}
             {{- with .Values.fetch.maxRedirects }}
             - name: SEARXNG_FETCH_MAX_REDIRECTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.search.cacheTtl }}
+            # Search result cache (TTL + bounds; same per-entry-cap semantics
+            # as the fetch cache above).
+            - name: SEARXNG_SEARCH_CACHE_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.search.cacheMaxBytes }}
+            - name: SEARXNG_SEARCH_CACHE_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.search.cacheMaxEntries }}
+            - name: SEARXNG_SEARCH_CACHE_MAX_ENTRIES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.search.cacheMaxEntryBytes }}
+            - name: SEARXNG_SEARCH_CACHE_MAX_ENTRY_BYTES
               value: {{ . | quote }}
             {{- end }}
             {{- if .Values.proxy.http }}

@@ -124,7 +124,10 @@ def test_sample_rows_advertised_in_tools_list(client):
 
 def test_table_typo_code_over_mcp(call_tool):
     err, text = call_tool("scan_table", {"table": "work_odr"})
-    assert err is False  # existing convention: tool functions return error TEXT
+    # audit 2026-11-12 (P1-7): a tool failure now flags isError=True over MCP
+    # (the text is unchanged; the old "error text with isError=False" convention
+    # violated the MCP error contract and made agents treat errors as data).
+    assert err is True
     assert text.startswith("Error scanning table: Table 'work_odr' not found in data source")
     assert _tail(text)["code"] == "E_TABLE_NOT_FOUND"
 

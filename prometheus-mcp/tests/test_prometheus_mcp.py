@@ -29,6 +29,16 @@ def make_client(handler, **overrides) -> PrometheusClient:
     return PrometheusClient(cfg, transport=httpx2.MockTransport(handler))
 
 
+async def _call_tool(server_mod, name, args):
+    """Drive one tool through the real in-memory MCP transport."""
+    from mcp.client._memory import InMemoryTransport
+    from mcp.client.session import ClientSession
+
+    async with InMemoryTransport(server_mod.mcp) as streams, ClientSession(streams[0], streams[1]) as session:
+        await session.initialize()
+        return await session.call_tool(name, args)
+
+
 # ---------------------------------------------------------------------------
 # Timestamp / step / value helpers
 # ---------------------------------------------------------------------------
@@ -140,6 +150,125 @@ def test_client_maps_http_and_prom_errors():
 
     c = make_client(handler_ok)
     assert asyncio.run(c.instant_query("up")) == {"resultType": "vector", "result": []}
+
+
+# ---------------------------------------------------------------------------
+# Discovery endpoints: there the "data" field is an ARRAY, not an object
+# ---------------------------------------------------------------------------
+# Regression pin for a shipped bug: series() and label_values() did
+# data.get("result", []) on a payload whose "data" is a LIST, so both died
+# with AttributeError: 'list' object has no attribute 'get' — while
+# prom_query (whose data IS an object) kept working, which hid it. Every mock
+# below is byte-faithful to Prometheus's documented wire shape.
+
+
+def _ok(payload):
+    """A success envelope around whatever Prometheus puts in "data"."""
+    return httpx2.Response(200, json={"status": "success", "data": payload})
+
+
+SERIES_WIRE = [
+    {"__name__": "up", "job": "kubelet", "namespace": "kube-system", "pod": "kubelet-abc"},
+    {"__name__": "up", "job": "node-exporter", "namespace": "prometheus", "pod": "node-exp-xyz"},
+]
+
+
+def test_client_series_parses_the_real_list_envelope():
+    def handler(request):
+        assert request.url.path == "/api/v1/series"
+        assert request.url.params["match[]"] == "up"
+        return _ok(SERIES_WIRE)
+
+    got = asyncio.run(make_client(handler).series("up", "1000", "2000"))
+    assert got == SERIES_WIRE
+
+
+def test_client_label_values_parses_the_real_list_envelope():
+    def handler(request):
+        assert request.url.path == "/api/v1/label/namespace/values"
+        return _ok(["kube-system", "prometheus"])
+
+    assert asyncio.run(make_client(handler).label_values("namespace")) == ["kube-system", "prometheus"]
+
+
+def test_client_alerts_and_rules_parse_their_object_envelopes():
+    """These two ARE object-shaped ({"alerts": [...]} / {"groups": [...]}) —
+    pinned so the shared _data_items helper cannot drift them onto the list
+    branch or lose their key."""
+
+    def handler(request):
+        if request.url.path == "/api/v1/alerts":
+            return _ok({"alerts": [{"state": "firing", "labels": {"alertname": "A"}}]})
+        return _ok({"groups": [{"name": "g1", "rules": []}]})
+
+    c = make_client(handler)
+    assert asyncio.run(c.alerts()) == [{"state": "firing", "labels": {"alertname": "A"}}]
+    assert asyncio.run(c.rules()) == [{"name": "g1", "rules": []}]
+
+
+def test_discovery_endpoints_also_accept_an_object_envelope():
+    """Both shapes parse — a gateway or compatible backend may answer in the
+    query-family object form. The point is that neither raises."""
+
+    def handler(request):
+        if request.url.path == "/api/v1/series":
+            return _ok({"result": [{"__name__": "up"}]})
+        return _ok({"result": ["ns1"]})
+
+    c = make_client(handler)
+    assert asyncio.run(c.series("up")) == [{"__name__": "up"}]
+    assert asyncio.run(c.label_values("namespace")) == ["ns1"]
+
+
+@pytest.mark.parametrize("data", [None, "scalar", 7, {"unexpected": "object"}])
+def test_discovery_endpoints_degrade_to_empty_instead_of_raising(data):
+    c = make_client(lambda request: _ok(data))
+    assert asyncio.run(c.series("up")) == []
+    assert asyncio.run(c.label_values("namespace")) == []
+
+
+def test_prom_series_end_to_end_over_the_real_envelope(monkeypatch):
+    """Wire bytes -> client -> tool text, with no stub in between."""
+    from prometheus_mcp import server
+
+    monkeypatch.setattr(server, "client", make_client(lambda request: _ok(SERIES_WIRE)))
+    result = asyncio.run(_call_tool(server, "prom_series", {"match": "up"}))
+
+    assert not result.is_error
+    text = result.content[0].text
+    assert text.startswith("2 series (showing up to")
+    assert "up{job=kubelet,namespace=kube-system,pod=kubelet-abc}" in text
+    assert "up{job=node-exporter,namespace=prometheus,pod=node-exp-xyz}" in text
+
+
+def test_prom_label_values_end_to_end_over_the_real_envelope(monkeypatch):
+    """Covers both branches: the /label/values path AND the series()
+    fallback used when a time window is requested alongside a selector."""
+    from prometheus_mcp import server
+
+    def handler(request):
+        if request.url.path == "/api/v1/series":
+            return _ok(SERIES_WIRE)
+        return _ok(["kube-system", "prometheus"])
+
+    monkeypatch.setattr(server, "client", make_client(handler))
+
+    bare = asyncio.run(_call_tool(server, "prom_label_values", {"label": "namespace"})).content[0].text
+    assert bare.startswith("2 values for 'namespace'")
+    assert "  kube-system" in bare and "  prometheus" in bare
+
+    windowed = (
+        asyncio.run(
+            _call_tool(
+                server,
+                "prom_label_values",
+                {"label": "namespace", "match": "up", "start": "now-1h", "end": "now"},
+            )
+        )
+        .content[0]
+        .text
+    )
+    assert "kube-system" in windowed and "prometheus" in windowed  # via series()
 
 
 # ---------------------------------------------------------------------------

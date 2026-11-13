@@ -194,17 +194,24 @@ def test_size_cap_skips_whole_table_with_log(tmp_path, monkeypatch, caplog):
     assert any("huge" in r.message and "SQLHANDLER_RAW_MAX_FILE_MB" in r.message for r in caplog.records)
 
 
-def test_gz_cap_applies_to_compressed_size(tmp_path, monkeypatch):
-    # 1 MB cap; the gz file's COMPRESSED size stays under it while the
-    # uncompressed content is far larger — the table is DISCOVERED (the cap
-    # is honest about being approximate for gzip, per the docstring).
+def test_gz_cap_applies_to_decompressed_size(tmp_path, monkeypatch):
+    """audit 2026-11-12 (P3): a decompression bomb is refused.
+
+    The gz file's COMPRESSED size is under the 1 MB cap while its content is
+    far larger; the cap now counts DECOMPRESSED bytes at open, so the table is
+    still discovered (listing is metadata-only) but reading it is refused.
+    """
+    import pytest as _pytest
+
     monkeypatch.setenv("SQLHANDLER_RAW_MAX_FILE_MB", "1")
     _write_gz(tmp_path, "big.csv.gz", "id,v\n" + "".join(f"{i},{'x' * 50}\n" for i in range(20000)))
     assert os.path.getsize(str(tmp_path / "big.csv.gz")) < 1024 * 1024
     provider = FileProvider(FileConfig(root_dir=str(tmp_path)))
     tables = provider.list_tables()
     assert [t.path for t in tables] == ["big"]
-    assert provider.open_dataset(tables[0]).to_table().num_rows == 20000
+    with _pytest.raises(Exception) as exc:
+        provider.open_dataset(tables[0])
+    assert "cap" in str(exc.value).lower() or "limit" in str(exc.value).lower() or "mb" in str(exc.value).lower()
 
 
 def test_raw_formats_off_hides_raw_tables(tmp_path, monkeypatch):
@@ -422,3 +429,34 @@ def test_s3_delta_log_json_never_becomes_a_raw_table(monkeypatch):
     assert "lake/delta_tbl" in paths
     assert not any("_delta_log" in p for p in paths)
     assert "landing" in paths  # real raw files still discover (folder-derivation rule)
+
+
+def test_gz_cap_counts_every_member(tmp_path, monkeypatch):
+    """A MULTI-MEMBER gzip bomb is refused too (cross-validation 2026-11-12).
+
+    A single decompressobj stops at the first member, so an 8-member file
+    slipped past the decompressed-size cap while the identical single-member
+    file was refused.
+    """
+    import gzip
+    import pytest as _pytest
+
+    monkeypatch.setenv("SQLHANDLER_RAW_MAX_FILE_MB", "1")
+    payload = ("id,v\n" + "".join(f"{i},{'x' * 50}\n" for i in range(20000))).encode()
+    chunk = len(payload) // 8 + 1
+    with gzip.open(tmp_path / "multi.csv.gz", "wb") as fh:
+        for i in range(0, len(payload), chunk):
+            # one gzip MEMBER per write: GzipFile starts a new member only on
+            # a fresh open, so build them with compress() and concatenate.
+            fh.write(payload[i : i + chunk])
+    raw = (tmp_path / "multi.csv.gz").read_bytes()
+    members = b"".join(
+        gzip.compress(payload[i : i + chunk]) for i in range(0, len(payload), chunk)
+    )
+    (tmp_path / "multi.csv.gz").write_bytes(members)
+    assert members != raw
+    provider = FileProvider(FileConfig(root_dir=str(tmp_path)))
+    tables = provider.list_tables()
+    assert [t.path for t in tables] == ["multi"]
+    with _pytest.raises(Exception):
+        provider.open_dataset(tables[0])

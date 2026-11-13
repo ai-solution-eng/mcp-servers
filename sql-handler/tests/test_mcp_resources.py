@@ -28,13 +28,13 @@ class CatalogStubEngine:
     def __init__(self, descriptions=None):
         self.descriptions = descriptions or {}
 
-    def list_tables(self):
+    def list_tables(self, *, caller=None):
         return TABLES
 
     def table_description(self, info):
         return self.descriptions.get(info.path, "")
 
-    def describe_table(self, table):
+    def describe_table(self, table, *, caller=None):
         if table in ("workorder/work_order", "work_order"):
             return {
                 "table": table,
@@ -48,7 +48,7 @@ class CatalogStubEngine:
             }
         raise LakehouseError(f"Table '{table}' not found")
 
-    def query_memory(self):
+    def query_memory(self, *, caller=None):
         return [
             {"ts": "t", "sql": "SELECT 1", "duration_ms": 1.0, "n_rows": 1, "error": None},
         ]

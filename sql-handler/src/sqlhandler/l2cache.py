@@ -69,6 +69,16 @@ DEFAULT_MIN_BYTES = 256 * 1024
 DEFAULT_MAX_BYTES = 2 * 1024**3
 DEFAULT_TTL = 3600.0
 SWEEP_INTERVAL_FRACTION = 0.5  # daemon sweeps at ttl/2 (min 30s)
+#: Age after which an artifact with no sidecar (or a stale .tmp) is abandoned
+#: and may be reclaimed; the publish window is milliseconds, so this is safe.
+ORPHAN_GRACE_S = 300.0
+#: On-disk LAYOUT version recorded in every sidecar. Bump it when a release
+#: changes what a cached artifact MEANS (result semantics, serialization): the
+#: shared directory outlives a rolling upgrade, so a new pod must not trust an
+#: artifact the previous binary published. A sidecar WITHOUT the field is a
+#: legacy entry and is still served (the upgrade itself stays warm); a sidecar
+#: with a DIFFERENT value is a miss and is removed.
+CACHE_LAYOUT_VERSION = "1"
 
 # Async write-out: bounded pending-store queue (ENTRIES, not bytes — every
 # queued entry is already capped by SQLHANDLER_L2_MAX_BYTES, so a full queue
@@ -101,6 +111,36 @@ def _env_float(name: str, default: float) -> float:
         return max(float(raw), 0.0) if raw else default
     except ValueError:
         return default
+
+
+def _ensure_private_dir(path) -> bool:
+    """``mkdir -p`` for a shared cache directory, POD-PRIVATE (best-effort).
+
+    The L2 result/metadata tiers and the virtual-materialization dir are
+    shared by every replica, and their artifacts are access-controlled ONLY
+    by the cache key (which carries the policy hash) — any process that can
+    read the directory can read every entry. 0o700 keeps the tree out of
+    other containers' reach when the volume is not already isolated; the
+    artifact writers use ``mkstemp`` (0600) and atomic rename, so files are
+    private too. Best-effort: a mounted volume may refuse chmod/mode and a
+    cache must never fail its caller over permissions. Returns True when the
+    directory exists/is usable.
+    """
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir(mode=) applies ONLY at creation: a directory left by a
+        # previous release, a chart initContainer or an operator keeps
+        # whatever mode it had, so the documented 0o700 was a no-op on
+        # exactly the shared-PVC deployment the L2 targets (audit
+        # 2026-11-12). chmod best-effort — a read-only mount may refuse it,
+        # and a cache must never fail its caller over permissions.
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
 
 
 def _normalize_table_ident(ident: str) -> str:
@@ -162,6 +202,9 @@ class L2ResultCache:
         # Entries removed by the SIZE cap (distinct from TTL expiry): the
         # operator-visible proof that max_bytes is doing something.
         self.evictions = 0
+        # (measured_at, bytes) published by refresh_bytes() for stats() — see
+        # the O(1) note on stats().
+        self._bytes_est: tuple[float, int] | None = None
         self._sweeper: threading.Thread | None = None
         # (key, table, referenced-table ids); ids None = the historical
         # no-tables call shape (see enqueue_write / _write_loop).
@@ -179,8 +222,16 @@ class L2ResultCache:
         return self._ttl
 
     def stats(self) -> dict:
-        """Counters + config snapshot for cache_stats()/metrics (additive)."""
+        """Counters + config snapshot for cache_stats()/metrics (additive).
+
+        ``bytes`` is the value the SWEEPER last measured, not a live walk: this
+        runs on every /metrics scrape (and the engine used to call it three
+        times per scrape), and a full stat-walk of a shared PVC inside the
+        cache lock blocked every L2 hit's counter update (audit 2026-11-12).
+        ``bytes_age_s`` tells a dashboard how stale the number is.
+        """
         with self._lock:
+            measured = self._bytes_est
             payload = {
                 "enabled": True,
                 "dir": self._dir,
@@ -189,7 +240,8 @@ class L2ResultCache:
                 "writes": self.writes,
                 "republishes": self.republishes,
                 "max_bytes": self._max_bytes,
-                "bytes": self._cached_bytes(),
+                "bytes": measured[1] if measured is not None else 0,
+                "bytes_age_s": round(time.time() - measured[0], 1) if measured is not None else None,
                 "evictions": self.evictions,
             }
             if self._write_queue is not None:
@@ -220,18 +272,27 @@ class L2ResultCache:
             meta = self._read_sidecar(key)
             if meta.get("key") != key:
                 return False
+            if meta.get("layout", CACHE_LAYOUT_VERSION) != CACHE_LAYOUT_VERSION:
+                return False
             return not (self._ttl > 0 and time.time() - float(meta.get("created", 0)) >= self._ttl)
         except Exception:
             return False
 
     # ------------------------------------------------------------ lookup
-    def lookup(self, key: str):
+    def lookup(self, key: str, max_bytes: int | None = None):
         """The cached table for ``key`` when fresh and readable, else None.
 
         A hit ALSO warms nothing here — the engine copies the table into its
         memory L1 (see ``SqlEngine._result_cache_lookup``). An entry past the
         TTL is deleted on sight (lazy GC): the daemon sweep is the backstop,
         this is the guaranteed path. Never raises.
+
+        ``max_bytes`` is the DECODE budget for this hit: the sidecar records the
+        result's uncompressed Arrow size at store time (``table.nbytes``), which
+        is what ``pq.read_table`` will allocate, so an entry over the budget is
+        declined as an ordinary miss BEFORE any bytes are read. That keeps a
+        cross-replica hit inside the same memory envelope as a query (the
+        engine charges the decode to the query gate — audit 2026-11-12 P1-10).
         """
         import pyarrow.parquet as pq
 
@@ -241,9 +302,29 @@ class L2ResultCache:
             return None  # missing/corrupt sidecar — an ordinary miss
         if meta.get("key") != key:
             return None  # foreign file at the same prefix — never trusted
+        if meta.get("layout", CACHE_LAYOUT_VERSION) != CACHE_LAYOUT_VERSION:
+            # Published by a binary with a different cache layout: its meaning
+            # is not ours to assume (rolling upgrade on a shared PVC).
+            self._remove(key)
+            return None
         if self._ttl > 0 and time.time() - float(meta.get("created", 0)) >= self._ttl:
             self._remove(key)
             return None
+        if max_bytes is not None and max_bytes > 0:
+            declared = meta.get("bytes")
+            if not isinstance(declared, int) or isinstance(declared, bool):
+                # A sidecar whose size is not an int cannot be checked against
+                # the decode budget, and an unchecked artifact is exactly the
+                # OOM the budget exists to prevent (cross-validation
+                # 2026-11-12: a garbage "bytes" field decoded a 10k-row table
+                # under a 1-byte cap). Treat it as a miss and drop the pair.
+                logger.warning("L2 result cache: sidecar for key %s has no usable size; dropping", key[:16])
+                self._remove(key)
+                return None
+            if declared > max_bytes:
+                # Over this replica's decode budget: an ordinary miss (the
+                # caller recomputes under its own gate slot + row cap).
+                return None
         path = str(self._artifact(key))
         try:
             table = pq.read_table(path)
@@ -471,7 +552,7 @@ class L2ResultCache:
         # reflects the state this store found, not what it left behind.
         overwrote_fresh = self.has_entry(key)
         try:
-            Path(self._dir).mkdir(parents=True, exist_ok=True)
+            _ensure_private_dir(self._dir)
             fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
             os.close(fd)
             pq.write_table(table, tmp_path, compression="zstd")
@@ -482,6 +563,8 @@ class L2ResultCache:
                 "created": time.time(),
                 "rows": table.num_rows,
                 "bytes": table.nbytes,
+                # See CACHE_LAYOUT_VERSION (rolling-upgrade safety).
+                "layout": CACHE_LAYOUT_VERSION,
             }
             if tables:
                 # Dedup + sorted for stable sidecars; only truthy entries.
@@ -546,6 +629,17 @@ class L2ResultCache:
                     pass
                 removed += 1
         return removed
+
+    def refresh_bytes(self) -> int:
+        """Measure the directory size and publish it for :meth:`stats`.
+
+        Called by the sweeper (and once at startup) — never from the metrics
+        path, which must stay O(1) (audit 2026-11-12).
+        """
+        total = self._cached_bytes()
+        with self._lock:
+            self._bytes_est = (time.time(), total)
+        return total
 
     def _cached_bytes(self) -> int:
         """Bytes currently held by this cache dir (sidecars + parquet).
@@ -633,6 +727,39 @@ class L2ResultCache:
             )
         return removed
 
+    def reclaim_orphans(self) -> int:
+        """Delete abandoned artifacts the TTL pass and the cap can never free.
+
+        An artifact whose sidecar never landed (a pod killed between the two
+        renames) or a leftover ``mkstemp`` file is invisible to ``sweep`` (which
+        walks sidecars) and to ``enforce_size_cap`` (same) — so it is
+        permanent, and a crash loop can push the directory past ``max_bytes``
+        with the cap evicting every LIVE entry and still being over
+        (audit 2026-11-12). The grace is generous because the publish window
+        is milliseconds: anything older cannot be a live writer's file.
+        Never raises; returns the number of files removed.
+        """
+        removed = 0
+        now = time.time()
+        grace = max(self._ttl, ORPHAN_GRACE_S)
+        try:
+            candidates = list(Path(self._dir).glob("*.parquet")) + list(Path(self._dir).glob("*.tmp"))
+        except OSError:
+            return 0
+        for path in candidates:
+            try:
+                if now - path.stat().st_mtime < grace:
+                    continue
+                if path.suffix == ".parquet" and (path.parent / f"{path.stem}.json").exists():
+                    continue  # a live entry, not an orphan
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info("L2 result cache: reclaimed %d orphaned artifact(s)", removed)
+        return removed
+
     def _read_sidecar_key(self, sidecar: Path) -> str:
         return str(json.loads(sidecar.read_text(encoding="utf-8"))["key"])
 
@@ -646,6 +773,12 @@ class L2ResultCache:
         """
         if (self._ttl <= 0 and self._max_bytes <= 0) or self._sweeper is not None:
             return
+        # Publish the size ONCE here so the first /metrics scrape reports a
+        # real number without paying a walk on the metrics path.
+        try:
+            self.refresh_bytes()
+        except Exception:
+            logger.debug("L2 initial byte measurement failed", exc_info=True)
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
             daemon=True,
@@ -671,6 +804,11 @@ class L2ResultCache:
                 # Age first, then space: expiring stale entries frees room
                 # before the cap has to evict anything still fresh.
                 self.enforce_size_cap()
+                # Then the bytes no sidecar-walk can see (abandoned artifacts
+                # would otherwise make the cap unenforceable), and republish
+                # the measured size for stats().
+                self.reclaim_orphans()
+                self.refresh_bytes()
             except Exception:
                 logger.debug("L2 result cache sweep skipped", exc_info=True)
 
@@ -776,9 +914,7 @@ class L2JsonCache:
         contract as the table tier's store); the profile/column_stats tier
         shares the CTAS-version-regression hole the result tier fixed.
         """
-        try:
-            self._dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        if not _ensure_private_dir(self._dir):
             return  # no shared dir — the tier is inert, never a failure
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), prefix=f"{key[:16]}.", suffix=".tmp")
         try:

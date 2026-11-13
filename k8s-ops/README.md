@@ -1,250 +1,241 @@
-# k8s-mcp — Read-Only Kubernetes Ops MCP Server
+# k8s-mcp
 
-k8s-mcp is a **read-only Kubernetes ops MCP (Model Context Protocol) server** on MCP 2.0 (protocol `2026-07-28`, official MCP Python SDK v2, server name `k8s-ops-server`) for HPE PCAI (Private Cloud AI / Ezmeral Unified Analytics). It exposes a read-only tool surface — pods, workloads, events, logs, services, Istio VirtualServices, ConfigMaps, Secrets (names only), PVCs, CRDs, RBAC, and a generic read-verb-only `kubectl` escape hatch — plus an opt-in **hardened exec tool** and a **built-in HPE ops console** (static web UI on the same pod). Every request passes an API-key middleware, a namespace policy, and a read-verb allowlist before anything touches the cluster. It ships two Helm charts — a fully configurable trusted-operator chart (`helm/`) and a structurally locked customer distribution (`helm-customer/`) — deployed the PCAI way: import the chart, edit values, apply.
+A **read-only Kubernetes ops MCP server** for HPE Private Cloud AI (PCAI /
+Ezmeral Unified Analytics), shipped as two Helm charts — `k8s-mcp` 1.3.0 for
+trusted operators and `k8s-mcp-customer` 1.3.0-customer, a structurally locked
+customer distribution. It gives LLM agents and humans one governed endpoint to
+inspect a cluster, and it deliberately cannot change it.
 
-## What problem(s) it solves
+## What it is
 
-- **"Is anything wrong in the cluster?" for agents and humans** — one MCP endpoint answers cluster health, pod/workload state, events, logs, services, VirtualServices, ConfigMaps, PVCs, CRD lookup, and `auth can-i` RBAC checks without handing anyone a kubeconfig or `cluster-admin`.
-- **Read-only by construction, not by convention.** kubectl runs as an argv list (no shell), a deny-by-default read-verb allowlist rejects every write path, connection-redirection flags are refused, and the RBAC role has no secret/RBAC/write verbs — `list_secrets` and `get secret …` fail with 403 from the API server itself.
-- **Governed blast radius.** Namespace whitelist/blacklist (glob patterns, blacklist always wins), per-user API keys with per-user exec assignments, and an `X-Exec-Namespaces` header that can only narrow — capabilities travel with the credential.
-- **Debugging power where it is earned.** Container exec (`exec_in_pod`) is opt-in and layered: RBAC via namespaced RoleBindings only, per-pod opt-in label, binary allowlist (no shells/interpreters/env/curl), self-pod guard, 30s timeout, output truncation, and an `AUDIT` log line for every allow *and* deny.
-- **A universal console in the same pod.** `https://<endpoint>/ui/` renders curated screens (pods → logs → exec, workloads, events, …) plus an "any tool" runner driven by each tool's `inputSchema` — screenshots lie, schemas don't — with no second backend or drift: the browser calls `/mcp` with the same key and the same guards.
-- **One image, two trust levels.** Internal operators get every knob as a value; customer PCAI catalogs get a chart whose security keys do not exist in values and whose templates never read them — nothing to bypass because there is no flag.
+An **MCP server** — a Model Context Protocol endpoint that exposes typed tools
+to LLM agents over JSON-RPC — speaking MCP 2.0 (protocol `2026-07-28`,
+stateless streamable-HTTP at `/mcp`, server name `k8s-ops-server`). It
+publishes 19 read-only tools (20 with exec enabled) over pods, workloads,
+events, logs, services, Istio VirtualServices, ConfigMaps, Secret *names*,
+PVCs, CRDs and RBAC, plus a read-verb-only `kubectl` escape hatch, an opt-in
+hardened `exec_in_pod`, and a built-in HPE ops console at `/ui/`. Every
+request passes an API-key middleware, a namespace policy and a read-verb
+allowlist before anything touches the cluster.
 
-## Tools
+## The problem it solves
 
-19 tools are always registered (20 with exec enabled); names and parameters below are from `server.py`:
+- **"Is anything wrong in the cluster?" needs a kubeconfig today.** One
+  endpoint answers it — `triage` returns an attention-first namespace summary
+  in a single call, and the drill-down tools go from pod to logs to events
+  without handing anyone credentials.
+- **Read-only by convention is not read-only.** kubectl runs as an argv list
+  (no shell), a deny-by-default **read-verb allowlist** rejects every write
+  path, connection-redirection and impersonation flags are refused, and the
+  RBAC role has no Secret/RBAC/write verbs — so `get secret -o yaml` fails
+  with 403 **from the API server**, not from tool formatting.
+- **A cluster-wide read tool is an exfiltration tool if it can see
+  everything.** Namespace allow/block policy (globs, blocklist always wins)
+  filters cluster-wide results, rejects denied namespaces, and rewrites
+  `-A` per allowed namespace — while RBAC stays the true boundary.
+- **Debugging power is sometimes worth the risk — but only where it is
+  earned.** `exec_in_pod` is opt-in, needs four independent gates to agree,
+  and audits every allow *and* deny.
+- **Two audiences, one image, opposite trust levels.** Internal operators
+  want every knob as a value; a customer catalog must not be able to
+  configure its way out of the security posture. Hence two charts, not a
+  `lockdown` flag.
 
-| Tool | Purpose |
-| --- | --- |
-| `triage` | One-call namespace health summary: attention list + pods + workloads + Warning events + PVCs (see below). |
-| `cluster_health` | Node status, component health, resource usage — the "first tool" triage call. |
-| `list_pods` / `list_workloads` / `list_services` / `list_pvcs` / `list_namespaces` | Cluster-wide or per-namespace listings with health/restarts/age. |
-| `get_pod_logs` | Logs from a pod's container (`container`, `tail`, `previous` for crashed containers). **`namespace` is required** — there is no implicit "default". |
-| `get_events` | Cluster/namespace events, filterable by resource and type (capped by `K8S_MCP_MAX_EVENTS`, default 100). |
-| `get_resource` / `describe_resource` | Any built-in or custom resource, by type/name/namespace; describe adds events and conditions. Un-named `get_resource` listings of in-process-resolvable kinds render compactly (one `namespace/name (Age: …)` line per item, capped by `K8S_MCP_MAX_LIST_ITEMS`, default 100); named gets and `jsonpath=`/`custom-columns=`/`wide`/`name` output keep kubectl's exact bytes. |
-| `list_api_resources` / `list_crds` / `get_custom_resource` | API/CRD discovery and dynamic-client reads of custom resources (e.g. InferenceServices). |
-| `get_configmap` | ConfigMap data keys and values. |
-| `list_secrets` | Secret names and types only — values are unreadable by design (no RBAC verbs). |
-| `list_virtual_services` | Istio VirtualServices — summaries or the full definition. |
-| `check_rbac` | Can the service account perform an action? (Surfaces "no" answers honestly.) |
-| `run_kubectl` | Read-verb kubectl escape hatch: `get, describe, logs, top, explain, api-resources, api-versions, cluster-info, version, auth, events` only. |
-| `exec_in_pod` *(opt-in)* | ONE read-only debugging command in a container — registered only when exec is enabled, hardened per the security model below. |
-
-## Fleet triage (`triage`) — one-call namespace summary
-
-`triage(namespace, app="")` answers "what needs attention in this namespace?" in one call. It is a **composite read**: it assembles its summary from this server's own governed read paths — the namespace policy is enforced up front exactly as `list_pods` enforces it (a denied namespace gets the identical refusal, before any underlying call), every Kubernetes read is one of the namespaced Python-API calls the individual tools already make (never kubectl, never a cluster-wide list), Warning events reuse `get_events`' filter/sort/cap (the shared `K8S_MCP_MAX_EVENTS` knob, default 100), and the whole render is bounded by **`K8S_MCP_TRIAGE_MAX_LINES`** (default 150; when the cap bites, a marker naming the env is appended — narrow with `app=` or raise it, so one triage call can never flood the context).
-
-Output shape (attention first, so the cap can never hide the findings):
+## How it fits in PCAI
 
 ```
-TRIAGE team-a: pods=4 workloads=2 warnings=1 pvcs=1 attention=2
-ATTENTION (2):
-  api-7d9f: CrashLoopBackOff — not Ready — 12 restarts
-  indexer-c9d8: Pending
-PODS (4): … name / phase / restarts / age / node …
-WORKLOADS: … Deployment/StatefulSet/DaemonSet ready vs desired …
-EVENTS (Warning) (1): …
-PVCs (1): …
+agent / ops console ──▶ PCAI Istio gateway (ezaf-gateway)
+                          │  https://<endpoint>/mcp   (API key)
+                          ▼
+                        k8s-mcp pod  :9090   /mcp + /ui/
+                          │  namespace policy · read-verb allowlist · RBAC
+                          ▼
+                        Kubernetes API (read-only ClusterRole; no Secrets)
 ```
 
-The **attention list** flags: any container waiting reason (CrashLoopBackOff, OOMKilled, ImagePullBackOff, …), Pending/Failed/Unknown phase, `Ready=False` on a Running pod, any restarts, and probe failures (Warning events with reason `Unhealthy`) — Succeeded pods (completed Jobs) are normal and stay unflagged. The optional `app` argument narrows the PODS and WORKLOADS sections (and the attention list) with a label-first, substring-fallback match (`app` / `app.kubernetes.io/name` labels, else the pod/workload name — the `list_pods` label-selector convention); events and PVCs stay namespace-wide context. Log correlation is deliberately **not** wired in: triage summarizes state, and the prometheus→k8s-mcp→logsearch drill-down stays agent-orchestrated (fleet audit §3.5). Composite-only failure semantics: if one non-core read fails, its section renders an honest `Error - …` line while the rest of the summary still renders; a failed pod read fails the whole triage exactly like `list_pods`.
+| Depends on | What it needs |
+|---|---|
+| Kubernetes API | the pod's ServiceAccount; a read-only ClusterRole (chart) or Role (namespace clamp) |
+| PCAI Istio gateway | `ezua.enabled: true` + a unique `ezua.virtualService.endpoint` |
+| Kyverno | the chart's pre-install `ClusterPolicy` stamps the `hpe-ezua/*` vendor labels PCAI expects |
+| Operator Secret | the API-key Secret, created out of band |
 
-### Design note: write-path identity pass-through (k8s-mcp ↔ applygate) — deferred to Wave 6
+**Depended on by** the ops agents: prometheus-mcp says *what* is degraded,
+this server says *where* and *why*, and applygate (a separate server) is the
+only sanctioned way to change anything.
 
-Fleet audit wiring item (c): cluster writes made through applygate should inherit the **per-client identity** k8s-mcp already resolves. Design, intentionally not built yet (no code, no chart change in this wave):
+## Capabilities, by theme
 
-- k8s-mcp's `_ApiKeyAuthMiddleware` resolves each request to a `_Caller` (client name from `K8S_MCP_CLIENTS`, or the shared key) and stores it in a contextvar.
-- When an agent's workflow chains a k8s-mcp read into an applygate write, applygate today records only *its* key fingerprint — the originating k8s-mcp client name is lost.
-- Proposed pass-through: the shared middleware (Wave-6 `mcp-fleet-common` consolidation, which already plans to move caller identity into `mcp_auth.py` — see audit Wave-3 note "applygate mirrors K8S-MCP's contextvar pattern locally") gains one forwarded identity header (e.g. `X-MCP-Caller: <name>`), set by k8s-mcp's middleware and honored by applygate **only as attribution, never as authorization**: applygate's own API-key check still applies, and the header can only widen the audit record, never the permission. Hash-chained applygate audit then reads `caller=<applygate-key-fp> via k8s-mcp:<client-name>`.
-- Build it in W6 so both servers consume the one shared middleware instead of growing another point-to-point shim now.
+Each bullet is a design decision, not just a feature. Depth:
+[documentation/FEATURES.md](documentation/FEATURES.md).
 
-## Architecture
+**Read surface — the cluster, honestly.**
+- **19 always-on tools / 20 with exec**: `triage`, `cluster_health`, pod /
+  workload / service / PVC / namespace listings, `get_pod_logs`,
+  `get_events`, `get_resource` / `describe_resource`, API-resource and CRD
+  discovery, `get_custom_resource`, `get_configmap`, `list_secrets` (names
+  only), `list_virtual_services`, `check_rbac`, `run_kubectl`, and the
+  opt-in `exec_in_pod`. The full table with parameters is in
+  [FEATURES §1](documentation/FEATURES.md#1-the-tool-surface).
+- **`triage(namespace, app="")`** answers "what needs attention here?" in one
+  composite call, assembled **only** from this server's own governed read
+  paths — so the refusal for a denied namespace is byte-identical to
+  `list_pods`', and one triage call can never flood the context (bounded by
+  `K8S_MCP_TRIAGE_MAX_LINES`, default 150). Attention first, so the cap can
+  never hide the findings. [Why it is built that way](documentation/FEATURES.md#3-fleet-triage-one-call-one-governed-path)
+- **`namespace` is required on `get_pod_logs`** — the old silent `default`
+  fallback was removed because reading the wrong pod is worse than an error.
+- **Listings are capped and say so**: `K8S_MCP_MAX_LIST_ITEMS` (100) and
+  `K8S_MCP_MAX_EVENTS` (100) end output with a marker naming the env rather
+  than silently truncating. [Performance model](documentation/FEATURES.md#7-reliability-performance-and-cost-control)
 
-- **One hardened container.** Non-root (uid/gid 10001), read-only root filesystem, all capabilities dropped, RuntimeDefault seccomp, `/tmp` as emptyDir; kubectl pinned and checksum-verified at image build. In-cluster it uses the pod's service-account token automatically.
-- **Exposure.** The chart's Istio VirtualService (ezaf-gateway) routes `/mcp` (long timeout) and `/` → `/ui/` (the console) to one Service on 9090. The endpoint also becomes `MCP_HOSTNAME` in the container, pinning the Host header (DNS-rebinding protection). The Kyverno pre-install policy stamps the `hpe-ezua/*` vendor labels PCAI expects.
-- **Protocol.** Stateless streamable-HTTP at `/mcp` — no handshake/session for modern clients, so any replica behind a plain round-robin LB serves any request; legacy 2025-era clients are still answered (same process, nothing to configure). `tools/list` is cacheable (`ttlMs=300000`). Verified live: stateless `tools/list`/`tools/call`, `server/discover`, strict envelope rejection (`-32602` naming the missing `_meta` key), header/body routing validation.
+**Security — deny by default, at every layer.**
+- **No shell, ever.** kubectl is invoked with `asyncio.create_subprocess_exec`
+  and an argv list, so `&&`, `;`, backticks, `$()` and newlines arrive as
+  inert tokens.
+- **Read-verb allowlist** (`get, describe, logs, top, explain, api-resources,
+  api-versions, cluster-info, version, auth, events`). The denylist era
+  missed `run`, `exec`, `attach`, `cp`, `port-forward`, `proxy`, `debug`,
+  `set`; an allowlist only has to be right once.
+- **Least-privilege RBAC** — a custom read-only role, never `cluster-admin`;
+  Secrets and RBAC objects excluded by design; CRD apiGroups extendable per
+  operator and **never `["*"]`** (refused at render, because it would
+  re-grant Secret reads).
+- **API key on every request** (`Authorization: Bearer` or `X-API-Key`),
+  constant-time compared, 401 before the MCP app. The key lives in a Secret
+  you create — the chart never creates or inlines it.
+- **Optional gateway identity** — an Istio `AuthorizationPolicy` (oauth2-proxy)
+  adds PCAI tokens **on top of** the API key. A shared key authenticates the
+  *key*, never a user.
+  [Full security model](documentation/FEATURES.md#2-read-only-by-construction)
 
-## Security model
+**Exec — power where it is earned.** `exec_in_pod` is not registered unless
+`exec.enabled: true`, and then four gates must agree: exec namespace list →
+general namespace policy → namespaced RoleBinding → per-pod label
+`k8s-mcp.io/exec: "true"`. The binary allowlist is read-only introspection
+(no shells, interpreters, `env`, or `curl`), the server's own pod is
+off-limits, output is truncated, and every decision is audited.
+[The eight layers](documentation/FEATURES.md#5-hardened-container-exec-opt-in)
 
-The audit that shipped with v1 fixed the following; do not regress them (details and history in [documentation/FEATURES.md](documentation/FEATURES.md)):
+**Governance — capabilities travel with the credential.**
+- **Namespace policy**: `namespaces.allowed` / `namespaces.blocked`
+  (comma-separated fnmatch globs, blocklist wins). The allowlist is the
+  recommended posture; an empty allowlist is a blacklist-only policy that the
+  server warns about at startup.
+- **Per-user keys**: `clients.value` / `clients.existingSecret` maps keys to
+  assignments (`name:key[:exec-ns-patterns];…`), so a user cannot widen their
+  own scope. The shared key remains the deployment-wide ceiling, and the
+  `X-Exec-Namespaces` request header can only narrow.
+  [Governance detail](documentation/FEATURES.md#4-namespace-governance)
 
-1. **No shell.** kubectl is invoked as an argv list via `asyncio.create_subprocess_exec` — denylist-era bypasses (`&&`, `;`, backticks, `$()`, `>`, newlines) arrive as inert tokens.
-2. **Read-verb allowlist.** The escape hatch accepts only `get, describe, logs, top, explain, api-resources, api-versions, cluster-info, version, auth, events` — the old denylist missed `run`, `exec`, `attach`, `cp`, `port-forward`, `proxy`, `debug`, `set`, …
-3. **Connection + impersonation flags rejected.** `--server`, `--token`, `--kubeconfig`, `--client-certificate`, `--client-key`, `--username`, `--password`, `--certificate-authority`, `--insecure-skip-tls-verify` — they could redirect the API connection or swap credentials — plus the impersonation flags `--as`, `--as-group`, `--as-uid` in every `=`-joined form too (defense in depth: the shipped ClusterRole grants no `impersonate`, so the attempt dies at parse time instead of at the API server).
-4. **Parameter validation.** Namespace (DNS label), names, types, and output formats are regex-validated before reaching kubectl or the API.
-5. **Least-privilege RBAC.** A custom read-only role — **not** `cluster-admin`. Secrets and RBAC objects are deliberately excluded; `networking.istio.io/virtualservices` is granted for `list_virtual_services`; extend CRD apiGroups per operator, never with `["*"]` (refused at render time — it would re-grant secrets read).
-6. **Pod hardening.** Non-root 10001, read-only rootfs, all capabilities dropped, RuntimeDefault seccomp, `/tmp` emptyDir — fixed in both charts, not values-overridable.
-7. **Pinned toolchain.** kubectl pinned and sha256-verified at build.
-8. **API-key auth.** Every request must present the key (`Authorization: Bearer <key>` or `X-API-Key: <key>`); constant-time comparison, 401 before the MCP app is reached. The key lives in an out-of-band Secret — the chart never creates or inlines it (an envsubst apply once emptied a live Secret) and the Deployment fails loud until it exists.
-9. **Optional mesh identity.** The chart can render an Istio AuthorizationPolicy (oauth2-proxy) for the host — a shared API key authenticates the *key*, not a user; layer JWT when you need identity.
+**Operations — the console and the metrics.**
+- **Built-in ops console at `/ui/`** — a universal MCP client with curated
+  screens. The shell is inert (no data, no key to load it) and every data
+  request is a browser call to the same `/mcp` with the same key and the same
+  guards, so **the console cannot do anything a client cannot**.
+  [Console](documentation/FEATURES.md#10-built-in-ops-console)
+- **Opt-in `/metrics`** (counters only, nothing cluster-derived) plus a
+  Prometheus Operator `ServiceMonitor`; default off, so the default render is
+  byte-identical to the pre-metrics baseline.
+  [Observability](documentation/FEATURES.md#9-observability)
+- **Optional network zone** — a default-off ingress allowlist that stops
+  random in-cluster access while the browser path stays open.
+  [Enable it](documentation/DEPLOYMENT.md#enabling-the-network-zone)
 
-### API key authentication
+**Two charts, one image.** `helm/` exposes every knob as a value for trusted
+operators. `helm-customer/` is the **structurally locked** twin: exec,
+namespace policy, per-user keys and RBAC scope **do not exist in its values**
+and its templates never read them, so pasting `exec: {enabled: true}` into the
+PCAI frontend is inert. A values-controlled `lockdown` flag existed in chart
+v0.2.0 and was removed in v0.2.2 — the customer owned the flag, so the guard
+was advisory. [Which chart, and why](documentation/DEPLOYMENT.md#two-charts-one-image)
 
-The server requires a static API key on every request (item 8). Operators create it out of band and rotate via Secret replacement + rollout restart — the exact commands are in [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md#api-key-rotation--audit-trail). MCP clients configure it as a plain HTTP header:
+## Deploy on PCAI (one screen)
 
-```json
-{
-  "mcpServers": {
-    "k8s-ops": {
-      "url": "https://k8s-mcp.<your-domain>/mcp",
-      "headers": { "Authorization": "Bearer <API_KEY>" }
-    }
-  }
-}
-```
+1. **Create the API-key Secret** in the target namespace (out of band — the
+   chart never creates it):
+   `kubectl -n <ns> create secret generic k8s-mcp-apikey --from-literal="api-key=$(openssl rand -hex 32)"`
+2. **Import the packaged chart** — `k8s-mcp-1.3.0.tgz`, or
+   `k8s-mcp-customer-1.3.0-customer.tgz` for a customer catalog — into PCAI
+   once per chart version.
+3. **Create the deployment from the chart** in the target namespace.
+4. **Set values** in the chart's **Helm Values** editor: at minimum
+   `ezua.virtualService.endpoint` (unique per release on the shared gateway).
+   Paste a shipped example from [`helm/values-examples/`](helm/values-examples/README.md)
+   or [`helm-customer/values-examples/`](helm-customer/values-examples/README.md)
+   and adjust the `# SITE:` lines.
+5. **Apply, then verify** — unauthenticated `/mcp` must return 401 and an
+   authenticated `tools/list` must return 19 tools (20 with exec).
+   Checklist: [documentation/VERIFICATION.md](documentation/VERIFICATION.md).
 
-`{"X-API-Key": "<API_KEY>"}` is accepted as an alternative header name. The key gates *who can call the tools*, not *which namespaces* — combine with the namespace policy below. Local development: `export K8S_MCP_API_KEY=dev-secret` before `python -m k8s_mcp.server` (unset = endpoint open, with a loud startup warning — never deploy that way).
+Full procedure, values walkthrough and failure modes:
+**[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)**.
 
-### Namespace governance (optional whitelist/blacklist)
+## Prerequisites at a glance
 
-Values: `namespaces.allowed` / `namespaces.blocked` (comma-separated fnmatch globs such as `team-*`; blacklist always wins; empty = every namespace). Underlying env vars: `K8S_MCP_ALLOWED_NAMESPACES` / `K8S_MCP_BLOCKED_NAMESPACES`. When a policy is active: namespace-taking tools reject denied namespaces with an explanatory error; Python-API-backed tools **filter** denied namespaces from cluster-wide results; kubectl-backed tools enforce through the escape hatch (explicit `-n` checked, namespaced queries without `-n` rejected with a hint, `-A` rewritten per whitelisted namespace or rejected under blacklist-only policy). Cluster-scoped resources and `auth can-i` are unaffected.
+Full purpose / failure-mode / verify detail is in
+[DEPLOYMENT §2](documentation/DEPLOYMENT.md#2-prerequisites).
 
-### Per-user exec assignments (optional)
+| Prerequisite | Kind | Why it exists | Fails how without it |
+|---|---|---|---|
+| `k8s-mcp-apikey` Secret, key `api-key` (default name; `apiKey.existingSecret` overrides) | Secret you create | Every request must authenticate; the chart never creates or inlines the key | Pod `CreateContainerConfigError` (`couldn't find key api-key in Secret`); no endpoint at all |
+| `ezua.virtualService.endpoint` | Value (required when `ezua.enabled`) | Public host **and** `MCP_HOSTNAME` — the DNS-rebinding pin; must be unique per release | Render aborts (`Valid .Values.ezua.virtualService.endpoint is required !`); two releases on one host split traffic |
+| `clients.existingSecret` (optional) | Secret you create | Per-user keys and per-user exec assignments | Unset = only the shared key works; a wrong key name fails the pod |
+| `audit.persistence.existingClaim` (optional) | PVC you create | The exec audit trail must outlive the pod | Default `emptyDir`: the trail is lost on pod rescheduling |
+| Kyverno CRDs | Cluster capability | The chart's pre-install `ClusterPolicy` stamps `hpe-ezua/*` vendor labels | Pre-install hook fails → the release does not install |
+| Prometheus Operator CRDs (only if `metrics.enabled`) | Cluster capability | Renders the `ServiceMonitor` | Apply fails on an unknown kind `monitoring.coreos.com/v1` |
+| Exec RBAC (only if `exec.enabled`) | Cluster object | `pods/exec` is granted only by namespaced RoleBindings | `exec_in_pod` answers 403 — check the startup provisioning summary |
 
-`clients.value` / `clients.existingSecret` maps keys to assignments (`name:key[:exec-ns-patterns];…`) so users cannot widen their own scope; each client connects with their own key; the shared key keeps working as the deployment-wide ceiling; RBAC provisioning covers the union; every exec AUDIT line names the calling client. The optional `X-Exec-Namespaces` request header narrows (never widens) a request's exec scope.
+## Day-2
 
-### Hardened kubectl exec (opt-in)
+- **Upgrade**: import the new chart version, keep the values document,
+  re-apply. Exec RBAC re-provisions at startup.
+- **Health check**: `kubectl -n <ns> rollout status deploy/<name>`; the logs
+  print `Loaded In-Cluster Service Account Config` and no API-key warning.
+- **Logs and audit**: `kubectl -n <ns> logs deploy/<name>`; every exec
+  allow/deny and RBAC provisioning action is an `AUDIT` line
+  (`| grep AUDIT`).
+- **Rotate the key**: update the Secret, then `kubectl rollout restart`.
+  [Procedure](documentation/DEPLOYMENT.md#api-key-rotation--audit-trail)
+- **Change posture** (namespace policy, exec, per-user keys): values re-apply
+  on the trusted chart; on the locked customer chart these are `kubectl set env`
+  / manual RBAC actions, printed by the chart's `NOTES.txt`.
+- **Uninstall**: delete the PCAI deployment; the API-key Secret and any audit
+  PVC are yours and are not removed. Delete leftover exec RoleBindings if exec
+  was enabled.
+- **Troubleshooting**: [DEPLOYMENT §6](documentation/DEPLOYMENT.md#6-troubleshooting)
+  — 401s, `CreateContainerConfigError`, 421 through the gateway, 403 on
+  `list_virtual_services`, and every exec refusal.
 
-Exec is arbitrary code execution inside a workload container — it can never be made read-only. The design goal: keep the debugging power, shrink the blast radius with eight independent layers, each enforceable on its own:
+## Documentation map
 
-| Layer | Mechanism | Enforced by |
-| --- | --- | --- |
-| 1. Opt-in | Tool not registered unless `exec.enabled: true` (`K8S_MCP_EXEC_ENABLED`) | server |
-| 2. RBAC | `pods/exec` `create` granted only by **namespaced** RoleBindings (never a ClusterRole) | API server — the real boundary |
-| 3. Per-pod opt-in | Target pod must carry label `k8s-mcp.io/exec: "true"` (`exec.requireLabel`, env `K8S_MCP_EXEC_REQUIRE_LABEL`) | server |
-| 4. Argv-typed tool | `command: list[str]`, one command, passed after kubectl's `--` | server + kubectl flag parsing |
-| 5. Binary allowlist | Basename of `command[0]` in a read-only set (`ps`, `ls`, `cat`, `tail`, `head`, `grep`, `df`, `du`, `free`, `ss`, `netstat`, `ip`, `stat`, `id`, …), extendable via `exec.allowedCommands` | server |
-| 6. Hard denies | Shells, interpreters, `su`/`sudo`, `nsenter`/`unshare`; `find -exec` / `ip netns` tokens rejected — never overridable | server |
-| 7. Self-pod guard | Exec into the MCP server's own pod refused (its SA token is the crown jewels) | server |
-| 8. Bounded + audited | No TTY/stdin, 30s timeout, 50k output truncation, `AUDIT exec decision=…` for every allow and deny | server / log collection |
+| Document | The question it answers |
+|---|---|
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | How do I deploy this on PCAI, what must exist first, and what breaks if it does not? |
+| [documentation/FEATURES.md](documentation/FEATURES.md) | What can it do, and why is it built this way? (tools, security model, triage, exec, console, performance) |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | Is my deployment actually serving MCP? |
+| [helm/values-examples/](helm/values-examples/README.md) | Paste-ready values for the trusted chart (G2 lab, hardened G2) |
+| [helm-customer/values-examples/](helm-customer/values-examples/README.md) | Paste-ready values for the locked customer chart (hosted trial) |
+| [helm/values.yaml](helm/values.yaml) · [helm-customer/values.yaml](helm-customer/values.yaml) | The authoritative list of every knob |
+| [../README.md](../README.md) | The fleet this server belongs to, and the shared pattern |
 
-With exec enabled and a namespace list set, the server provisions its own pods/exec RoleBindings at startup (`exec.autoRbac`, default on) — escalation-proof by construction (template-role-scoped `bind`, no role-content writes, no ClusterRoleBindings, skips blocked/nonexistent namespaces); `run_kubectl` NEVER gains `exec`. Honest limits: an allowlisted binary still runs with the container's privileges (`cat` reads everything that container mounts) — treat every exec-able pod as readable-by-the-key-holder and use the label as the per-workload decision; for stronger isolation run a second, separate deployment with an exec-only ServiceAccount and keep an API-server audit policy on `pods/exec`.
+## Developing locally
 
-## Deployment (PCAI way)
-
-Users never run `helm install` or `kubectl apply` to deploy on PCAI: the packaged chart is imported into the PCAI catalog once, then the deployment is created from the PCAI UI (or PCAI API), and its **Helm Values** editor is where every knob is set. PCAI resolves `${DOMAIN_NAME}` in the `ezua` values before rendering.
-
-| Chart | When | Notes |
-| --- | --- | --- |
-| `helm/` (k8s-mcp) | HPE / trusted operators | Every knob below is values-configurable |
-| `helm-customer/` (k8s-mcp-customer) | Customer PCAI catalogs | Structurally locked: exec/policy/clients/RBAC keys don't exist in values; pasting them is inert |
-
-### Required values (both charts)
-
-```yaml
-apiKey:
-  existingSecret: ""    # pre-created out of band (the chart never creates it)
-ezua:
-  domainName: "${DOMAIN_NAME}"
-  virtualService:
-    endpoint: "k8s-mcp.${DOMAIN_NAME}"   # unique per release on the gateway
-```
-
-**Pre-deploy the key Secret before the first apply** — the Deployment fails
-loud (`CreateContainerConfigError`) until it exists, and the chart never
-creates or inlines the key:
+**Not the deployment path.** PCAI deploys the packaged chart through its
+values editor; the commands below are for working on the server itself.
 
 ```bash
-kubectl -n <namespace> create secret generic k8s-mcp-apikey \
-  --from-literal="api-key=$(openssl rand -hex 32)"
-# apiKey.existingSecret: ""  → the chart looks for <deployment.name>-apikey;
-# point existingSecret at another name if you prefer.
+export K8S_MCP_API_KEY=dev-secret        # unset = open endpoint + loud warning
+python3 -m k8s_mcp.server                # streamable-http on :9090
+python3 -m pytest -q                     # the whole tree, no cluster required
+python3 smoke_console.py                 # real ASGI wiring, HTTP-level
+python3 audit_forms.py                   # schema <-> console-form contract
 ```
 
-`ezua.virtualService.endpoint` is **required whenever `ezua.enabled: true`**:
-both templates call Helm's `required` on it, so an empty endpoint aborts the
-render before anything is created — `Valid .Values.ezua.virtualService.endpoint
-is required !` (the VirtualService template) and `… is required when ezua is
-enabled !` (the AuthorizationPolicy template). It is not just a route: the
-Deployment injects it as `MCP_HOSTNAME`, pinning the Host header for the SDK's
-DNS-rebinding protection — it **must be unique per release** on the shared
-ezaf-gateway (two VirtualServices claiming one host split traffic between
-their backends). It is empty in neither chart's defaults (`k8s-mcp.${DOMAIN_NAME}`
-/ `k8s-mcp-customer.${DOMAIN_NAME}`); the failure above only bites an operator
-who blanks it. With `ezua.enabled: false` no VirtualService or AuthorizationPolicy
-is rendered and the endpoint is never read (in-cluster Service access only).
-
-### Optional values (trusted chart)
-
-`console.enabled`, `rbac.scope` + `rbac.extraResourceGroups`,
-`namespaces.allowed`/`blocked`, `exec.*`, `clients.*`, `listing.*`,
-`metrics.*`, `imagePullSecrets`, `resources`, `ezua.authorizationPolicy.*`.
-Full walkthrough: [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md); paste-ready examples: [`helm/values-examples/`](helm/values-examples/README.md) and [`helm-customer/values-examples/`](helm-customer/values-examples/README.md).
-
-### Connectivity & pod-wiring knobs (both charts)
-
-Standard Kubernetes knobs — defaults fit the fleet baseline; overridable per
-deployment. The security-sensitive plumbing (non-root 10001, read-only rootfs,
-dropped capabilities, RuntimeDefault seccomp, `/tmp` emptyDir) is **baked into
-the templates and deliberately NOT values-overridable** — the audited baseline.
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `deployment.appName` | `k8s-mcp` / `k8s-mcp-customer` | Label/selector + container name on Deployment, Service, VirtualService — not the release name (`deployment.name` is). Leave at the default; mismatched selectors break the Service/VS wiring. |
-| `deployment.replicaCount` | `1` | Stateless MCP 2.0 — any replica serves any request; scale up freely if needed. |
-| `image.pullPolicy` | `IfNotPresent` | Standard. Tags are immutable per release convention (unlike prometheus-mcp). |
-| `service.targetPort` | `9090` | Container port (also drives `containerPort` and both probes). Move it only with the server's listen port. |
-| `resources.requests.cpu` / `resources.limits.cpu` | `100m` / `500m` | CPU requests/limits (memory: `128Mi` / `2Gi` — 512Mi OOMKilled ×4 under heavy `get_resource` listing bursts, raised 2026-10-05; steady-state is only ~136Mi, the burst is what counts). |
-| `podAnnotations.sidecar.istio.io/inject` | `"false"` | String form is deliberate. Keep `false`: the server already enforces auth + namespace policy itself, a mesh sidecar adds mTLS between pods but would also add a second auth hop for MCP clients. Flip only with a deliberate mesh-identity design. |
-| `extraAllowedHosts` | `[]` | **Meaningful.** Extra `Host` header values the MCP SDK's DNS-rebinding protection accepts for **in-cluster callers** addressing the server by service DNS (`http://<name>-service.<ns>.svc.cluster.local:9090/mcp` — e.g. Open WebUI). Rendered as `MCP_EXTRA_ALLOWED_HOSTS` (comma-joined) only when non-empty; entries match verbatim or as `host:*` (any port). The pinned public FQDN (`ezua.virtualService.endpoint`) and loopback are always allowed; empty = behavior unchanged. Never bypasses the API-key gate. |
-| `ezua.authorizationPolicy.providerName` | `oauth2-proxy` | Extension provider the rendered Istio AuthorizationPolicy delegates to (with `ezua.authorizationPolicy.enabled: true`, `namespace: istio-system`). Only meaningful when the gate is on. |
-
-## Built-in ops console (`/ui/`)
-
-A static, HPE-branded single-page console served by the server itself (`/` redirects to `/ui/`) — a **universal MCP client with curated dressing**:
-
-- **Same endpoint, same guards.** The browser calls `/mcp` with your API key — the identical auth middleware, namespace policy, read-verb allowlist, exec gates and RBAC that MCP clients get. The console cannot do anything a client cannot.
-- **Curated screens:** cluster health · namespaces · pods (click a row → logs, or straight into hardened exec when enabled) · workloads · events · services · VirtualServices · ConfigMaps · PVCs · secrets (names only) · CRD lookup · RBAC can-I · any-resource get/describe · a read-only kubectl console — with searchable comboboxes for namespaces/pods/containers and a full-screen output panel.
-- **"Any tool" runner:** every registered tool, with a form generated from its `inputSchema` — future server tools appear without UI changes.
-- **Exec screen only when the server has it:** the tool is gated by `K8S_MCP_EXEC_ENABLED` server-side; the UI mirrors the binary allowlist and offers the `X-Exec-Namespaces` narrowing header (it can only narrow).
-- **Hygiene:** the shell carries no data (no key needed to load it); the key lives in memory/sessionStorage (never localStorage); all cluster output is rendered as text, never HTML; CSP `default-src 'none'` + nosniff + no-referrer on the shell; traversal-guarded static handler. `console.enabled: false` removes the shell entirely.
-
-## Performance notes
-
-- kubectl runs under `asyncio.create_subprocess_exec` and all Kubernetes Python client calls run under `asyncio.to_thread` — neither blocks the event loop, so concurrent tool calls don't serialize; every kubectl call is bounded by a 30s timeout.
-- `cluster_health` and `list_workloads` issue their independent API calls concurrently; `get_custom_resource` uses the dynamic client and only falls back to kubectl on discovery/schema errors.
-- **In-process `get_resource` listings.** An un-named listing (`get_resource("pods")`) no longer spawns kubectl and renders one full YAML document per item: kinds the dynamic client resolves in-process return one compact `namespace/name (Age: …)` line per item — policy-filtered, capped by `K8S_MCP_MAX_LIST_ITEMS` (default 100), with the same truncation marker as the other Python-API listings. Named gets and `jsonpath=`/`custom-columns=`/`wide`/`name` output modes keep kubectl's byte-exact output (tests and the console parse them; PyYAML and Go also disagree on timestamp quoting and `< > &` JSON escaping, so a Python-rendered named get would not be byte-identical). Unknown kinds, group-qualified tokens, and any dynamic-path exception fall back to the kubectl path unchanged. Under a whitelist the compact listing is policy-FILTERED (like `list_pods` cluster-wide) rather than rewritten per namespace; under a blacklist-only policy it answers with filtered data where the kubectl `-A` path refuses.
-- **Namespace-glob expansion is cached (30s TTL).** A whitelist `-A` rewrite expands its globs against one live `list_namespace` result per 30-second window instead of one live lookup per query. Staleness ≤30s is intentional (a namespace created/deleted in the window may be missing from / present in one rewrite plan — per-namespace results are still policy-filtered); API errors bypass the cache and behave exactly as before. Exact whitelists (no globs) never hit the cluster, as before.
-- **Parallel cluster-wide rewrites.** When a namespace whitelist rewrites one `-A` query into up to `K8S_MCP_MAX_NS_REWRITE` (default 20) per-namespace kubectl spawns, they run concurrently under a bounded semaphore — `K8S_MCP_LIST_CONCURRENCY` (default 8) bounds the width. The merged output is byte-identical to the old sequential loop (same sections, namespace-sorted order), proven by a mocked-kubectl test comparing widths 1 and 8.
-- **Cluster-wide list caps.** Listings without a namespace are capped at `K8S_MCP_MAX_LIST_ITEMS` items (default 100): the Python-API-backed tools (`list_pods`, `list_services`, `list_workloads`, `list_pvcs`, `list_virtual_services`, `get_custom_resource`) and the in-process `get_resource` fast path above; when the cap bites, the output ends with a truncation marker naming the env — page per-namespace with `-n` or raise it. Namespaced listings and kubectl-backed output elsewhere (already bounded by the 50k-char truncation) are unchanged.
-- **Event cap.** `get_events` and `triage`'s Warning section cap at `K8S_MCP_MAX_EVENTS` items (default 100; the same knob raises both consistently).
-
-## Observability (`/metrics`, opt-in)
-
-`K8S_MCP_METRICS_ENABLED=true` makes the same pod serve `GET /metrics` (Prometheus text exposition 0.0.4). Counters only, nothing cluster-derived: `k8s_mcp_server_events_total{kind,outcome}` — HTTP auth outcomes (`ok`/`unauthorized`/`bad_header`/`open`), kubectl batch outcomes, exec allow/deny decisions, and cluster-wide list truncations. When `prometheus-client` is importable it renders the exposition; otherwise a dependency-free fallback registry emits the same counter family (no install required, and metrics can never affect a tool call). The endpoint is unauthenticated like the console shell — enable it only where the scrape path is trusted. In the chart, set `metrics.enabled: true` to also render the Prometheus Operator `ServiceMonitor` (scrape port `mcp`, path `/metrics`, `metrics.interval`, default 30s); both are default-off, so the default chart render is byte-identical to the pre-metrics baseline.
-
-## Requirements & development
-
-`mcp>=2.0.0,<3`, `kubernetes>=31.0.0` (see `requirements.txt`). The adversarial suite runs without a cluster under pytest — `python3 -m pytest -q` from this directory collects the whole tree (`tests/`, per `pytest.ini`): the 168-check namespace-policy/command-guard suite (one test per original check, `tests/test_namespace_policy.py` — also still runnable standalone), the 26-check console smoke (`tests/test_smoke_console.py`), the schema↔form contract audit (`tests/test_audit_forms.py`), the Wave-3 hardening matrix (`tests/test_wave3_hardening.py`: impersonation denylist incl. `=` forms, fan-out parity, list caps, `/metrics`), and the Wave-5 triage matrix (`tests/test_triage.py`: exact mixed-health attention list, app narrowing, composite cap, policy refusals byte-identical to `list_pods`, governed-paths-only proof). `python3 smoke_console.py` and `python3 audit_forms.py` remain available as standalone scripts. To build the image: `docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v<ver> . --push`.
-
-## Documentation
-
-| Document | Contents |
-|---|---|
-| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | Values walkthrough (required vs optional), out-of-band API key, namespace policy/exec/per-user keys day-2 ops, ezua/Istio, customer chart, upgrading, MCP fleet context, troubleshooting |
-| [documentation/FEATURES.md](documentation/FEATURES.md) | Hardening & capability changelog (v0.0.1 → v0.2.13) — what was fixed and why |
-| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | Auth gate check, MCP 2.0 handshake, one-tool test, optional operator kubectl, troubleshooting |
-| [helm/values-examples/](helm/values-examples/README.md) | Paste-ready, secret-free full-values examples (trusted chart) |
-| [helm-customer/values-examples/](helm-customer/values-examples/README.md) | Paste-ready, secret-free examples (locked customer chart) |
-| [helm/values.yaml](helm/values.yaml) / [helm-customer/values.yaml](helm-customer/values.yaml) | Chart defaults — the authoritative list of every knob |
-
-## Enabling the network zone
-
-The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
-default **false** — the default render is byte-identical to the baseline).
-When on, only the allowlisted callers reach the MCP: the authorized client
-namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
-probes, and — only if you flip `allowEzafGatewayIngress` — the gateway pods).
-Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
-any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
-(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
-unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
-into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
-(4) the browser path stays OPEN by fleet doctrine — do NOT set
-`ezua.virtualService.enabled: false` (closing a console is an explicit
-per-chart, per-site decision, never a default);
-(5) apply via the PCAI values editor (`helm upgrade` for operators); (6)
-verify — an allowed namespace gets HTTP 200 from `service:port/mcp`, any
-other namespace times out. See `values-examples/values-hardened-g2.yaml`
-for the full hardened profile.
+Requires `mcp>=2.0.0,<3` and `kubernetes>=31.0.0` (see
+[`requirements.txt`](requirements.txt)). To build the image:
+`docker buildx build -t ghcr.io/ai-solution-eng/k8s-mcp:v<ver> . --push`.
+Release tooling: `./automation.sh <version>` bumps both charts and their
+`image.tag`, builds/pushes, packages and prunes.
+Test and file inventory: [FEATURES §12](documentation/FEATURES.md#12-verification)
+and [§15](documentation/FEATURES.md#15-files).

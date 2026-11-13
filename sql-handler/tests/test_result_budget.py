@@ -242,7 +242,7 @@ def test_call_tool_applies_the_generic_guard(monkeypatch):
     from mcp_types import CallToolRequestParams
 
     monkeypatch.setenv("SQLHANDLER_MAX_RESULT_BYTES", "2000")
-    monkeypatch.setattr(server, "list_tables", lambda: "\n".join(f"  - table_{i}" for i in range(400)))
+    monkeypatch.setattr(server, "list_tables", lambda **kwargs: "\n".join(f"  - table_{i}" for i in range(400)))
     result = asyncio.run(server._handle_call_tool(None, CallToolRequestParams(name="list_tables", arguments={})))
     text = result.content[0].text
     assert len(text.encode("utf-8")) <= 2000

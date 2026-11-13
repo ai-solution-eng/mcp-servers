@@ -561,10 +561,13 @@ def test_static_key_bearer_resolves_key_rung_never_jwt(jwks_server, monkeypatch)
     scope state); the OIDC rung's own static-key check reads the same env
     list directly, so it must NOT claim a value the key ladder owns."""
     monkeypatch.setenv("MCP_API_KEYS", "aaa.bbb.ccc")
-    # A /mcp scope: the key middleware would match and record the fp, so the
-    # JWT rung must defer to the key ladder.
+    # A scope with no /mcp key middleware (the /api surface): the explicit-key
+    # rung added in the 2026-11-12 cross-validation resolves it, so it must
+    # never be handed to the JWT verifier.
     caller = _identity.caller_from_scope(_scope(headers=_bearer("aaa.bbb.ccc")))
-    assert caller.cls == "anonymous", "the JWT rung itself must not fire (no fp recorded in this raw scope)"
+    assert caller.cls == "key", "an explicitly presented static key must resolve via the key rung"
+    assert caller.via == "key"
+    assert caller.key_fp == _identity.key_fp("aaa.bbb.ccc")
     # But it must also NOT have verified the value as a JWT (it would raise/
     # decline regardless — the assertion is that no jwt Caller comes back).
     state = {"sqlhandler.key_fp": _identity.key_fp("aaa.bbb.ccc")}

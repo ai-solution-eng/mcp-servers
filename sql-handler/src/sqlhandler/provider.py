@@ -161,8 +161,17 @@ class MultiProvider(DataProvider):
             raise ValueError("MultiProvider needs at least one provider")
         if len(providers) != len(sources):
             raise ValueError("providers and sources must be the same length")
+        labels = [str(s) for s in sources]
+        # Enforce the class's OWN invariant (audit 2026-11-12, P3): duplicate
+        # labels silently collapse _by_source (last one wins) while
+        # list_tables still emits both sets, so routing and listing disagree.
+        # SQLHANDLER_SOURCES already refuses duplicates, but this class is
+        # constructible directly and must not depend on its caller.
+        dupes = {s for s in labels if labels.count(s) > 1}
+        if dupes:
+            raise ValueError(f"MultiProvider source labels must be unique; duplicated: {sorted(dupes)}")
         self.providers = list(providers)
-        self.sources = [str(s) for s in sources]
+        self.sources = labels
         self._by_source = dict(zip(self.sources, self.providers))
 
     @property

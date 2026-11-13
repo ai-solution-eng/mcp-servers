@@ -17,16 +17,18 @@ v2.1.4/2.2.0 source):
   - ``read`` — exactly sqlguard's rule (SELECT / WITH / VALUES / SHOW /
     DESCRIBE / SUMMARIZE, EXPLAIN-of-SELECT only; PRAGMA/``pragma_*()``
     refused).
-  - ``write_scratch`` — CREATE TABLE AS / INSERT INTO / COPY INTO / MERGE
-    INTO **whose target resolves under an allowlisted scratch root AND
-    inside the caller's subject-scoped namespace**. v1 executes these via
-    delta-rs (``write_deltalake``) / pyiceberg from the parsed SQL — the
+  - ``write_scratch`` — CREATE TABLE AS / INSERT INTO **whose target
+    resolves under an allowlisted scratch root AND inside the caller's
+    subject-scoped namespace**. v1 executes these via delta-rs
+    (``write_deltalake``) / pyiceberg from the parsed SELECT payload — the
     DuckDB connection itself stays read-only end to end.
-  - ``write_other`` — everything else (UPDATE/DELETE/DDL/ATTACH/COPY FROM/
+  - ``write_other`` — everything else (UPDATE/DELETE/DDL/ATTACH/COPY/
     anonymous targets): refused in v1. UPDATE/DELETE have no delta-rs
-    surface here, and DuckDB MERGE cannot run on a locked-down connection —
-    MERGE-classified statements are recognized (so the error names them)
-    but refused until a dedicated writer connection exists.
+    surface here, DuckDB MERGE cannot run on a locked-down connection, and
+    COPY writes the FILE ITSELF (its payload is the COPY statement, run on a
+    connection whose local filesystem is disabled) — COPY is recognized and
+    refused with a rewrite hint (audit 2026-11-12 P2) until a payload-
+    extracting executor exists.
 
 * **Flag discipline — the default posture is unchanged twice over.**
   ``SQLHANDLER_WRITES_ENABLED`` (default absent/0) gates the NEW capability
@@ -282,7 +284,7 @@ class WriteError(Exception):
             if self.retryable
             else (
                 "Rewrite the statement so its target is a scratch table "
-                "(CREATE TABLE / INSERT INTO / COPY INTO / MERGE INTO under your scratch root)."
+                "(CREATE TABLE ... AS SELECT / INSERT INTO ... SELECT under your scratch root)."
             ),
             (
                 "Write targets must be <scratch-root>/<your-subject-slug>/... — "
@@ -773,7 +775,23 @@ def _classify_one(stmt_type: str, statement: str) -> StatementClass:
                     stmt_type,
                     reason="COPY without a TO target",
                 )
-            return StatementClass(CLASS_WRITE_SCRATCH, statement, stmt_type, target=target, source_sql=statement)
+            # REFUSED as a scratch write (audit 2026-11-12 P2): COPY's payload
+            # IS the COPY - it writes the file itself, and the executor runs
+            # that payload on a connection whose local filesystem is disabled
+            # (_duckdb_fs_lockdown), so the write can never happen. With the
+            # lockdown opted out it would write the file and then persist the
+            # COPY's COUNT result as the Delta table. The honest v1 shape is a
+            # query result written by the backend: CREATE TABLE ... AS SELECT.
+            return StatementClass(
+                CLASS_WRITE_OTHER,
+                statement,
+                stmt_type,
+                target=target,
+                reason=(
+                    "COPY writes the file itself; the v1 write tier persists QUERY RESULTS only — "
+                    "rewrite it as CREATE TABLE <target> AS SELECT ... (or INSERT INTO ... SELECT)"
+                ),
+            )
         if stmt_type == "MERGE_INTO":
             # Recognized and NAMED: v1 refuses (delta-rs has no MERGE; the
             # DuckDB planner route needs the writer-connection follow-up).

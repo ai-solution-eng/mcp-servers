@@ -140,3 +140,23 @@ def test_audit_query_without_caller_keeps_shape(tmp_path, monkeypatch):
     observability.audit_query("SELECT 1", "ok", 1.0, 1, None)
     line = json.loads((tmp_path / "audit.jsonl").read_text().strip())
     assert "caller" not in line
+
+
+def test_label_values_are_escaped():
+    """A quote/newline in a label value must not break the exposition
+    (cross-validation 2026-11-12: the escaping helper existed but only the
+    histograms used it)."""
+    from sqlhandler import observability
+
+    m = observability.Metrics()
+    m.record_query("ok", 0.01, 3, table=chr(34) + "x" + chr(10) + "y")
+    m.record_caller_query("user")
+    body = m.render()
+    lines = [ln for ln in body.splitlines() if ln.startswith("sqlhandler_query_rows_total")]
+    assert lines, body
+    line = lines[0]
+    # the quote is BACKSLASH-escaped and the newline was flattened to a space,
+    # so the sample stays on one line and the exposition still parses
+    assert chr(92) + chr(34) in line, line
+    assert chr(10) not in line
+    assert 'table="' in line

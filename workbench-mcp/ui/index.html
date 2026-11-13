@@ -1,25 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <script>
   // Resolve the theme before first paint to avoid a flash of the wrong theme.
-  // Precedence: saved choice > OS preference > dark (the historical default).
+  // Precedence: saved choice > auto (Auto follows the OS via prefers-color-scheme).
   (function () {
-    var t = null;
-    try { t = localStorage.getItem("workbench-theme"); } catch (e) {}
-    if (t !== "light" && t !== "dark") {
-      t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
-        ? "light" : "dark";
-    }
-    document.documentElement.dataset.theme = t;
+    var t = "auto";
+    try { t = localStorage.getItem("workbench-theme") || "auto"; } catch (e) {}
+    if (t !== "light" && t !== "dark") t = "auto";
+    document.documentElement.setAttribute("data-theme", t);
   })();
 </script>
 <title>Workbench MCP · Scratch Pad</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2301A982'/%3E%3Ctext x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='%23101820' text-anchor='middle'%3EW%3C/text%3E%3C/svg%3E">
 <style>
-  :root {
+  :root,
+  :root[data-theme="dark"] {
     color-scheme: dark;
     --bg: #0f1420;
     --panel: #161d2e;
@@ -44,9 +42,37 @@
     --shadow: rgba(0, 0, 0, 0.4);
     --mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
   }
-  /* Light theme: opt in via <html data-theme="light">, set before first paint
-     by the head script (OS preference) and toggled from the header. */
-  [data-theme="light"] {
+  /* Light theme: the OS-preference block below serves Auto; a pinned Light
+     uses the identical block after the media query. */
+  @media (prefers-color-scheme: light) {
+  /* KEEP IN SYNC with the block below */
+  :root[data-theme="auto"] {
+    color-scheme: light;
+    --bg: #f3f5fa;
+    --panel: #ffffff;
+    --panel-2: #edf0f7;
+    --border: #d4dae7;
+    --text: #1c2537;
+    --muted: #5c6a85;
+    --accent: #01a982;
+    --accent-2: #02c99a;
+    --hpe: #01a982;
+    --green: #0f9a6a;
+    --red: #dc2626;
+    --yellow: #b45309;
+    --header-grad-1: #e8edf8;
+    --header-grad-2: #dde5f2;
+    --row-hover: #eef2fa;
+    --row-border: #e2e8f2;
+    --editor-bg: #ffffff;
+    --err-bg: #fdecec;
+    --err-border: #f3c1c1;
+    --err-text: #b91c1c;
+    --shadow: rgba(15, 23, 42, 0.15);
+  }
+  }
+  /* KEEP IN SYNC with the block above */
+  :root[data-theme="light"] {
     color-scheme: light;
     --bg: #f3f5fa;
     --panel: #ffffff;
@@ -302,16 +328,26 @@
   button.copy-btn { font-family: var(--mono); font-size: 11px; padding: 3px 8px; font-weight: 400; }
   button.mini-del { color: var(--muted); background: none; border: none; padding: 0 4px; font-size: 12px; font-weight: 400; }
   button.mini-del:hover { color: var(--red); background: none; }
-  button.theme-toggle {
-    background: var(--panel-2);
+  .theme-seg {
+    display: inline-flex;
     border: 1px solid var(--border);
-    color: var(--text);
-    font-size: 14px;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .theme-seg button {
+    background: var(--panel-2);
+    border: none;
+    border-radius: 0;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
     line-height: 1;
     padding: 6px 9px;
-    border-radius: 6px;
+    font-weight: 400;
   }
-  button.theme-toggle:hover { background: var(--panel-2); border-color: var(--accent); }
+  .theme-seg button:hover { background: var(--panel-2); color: var(--text); }
+  .theme-seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+  .theme-seg button.on:hover { background: var(--accent-2); }
   input.inline {
     background: var(--panel-2);
     border: 1px solid var(--border);
@@ -408,7 +444,11 @@
     <span class="pill" style="color:var(--yellow)">read/write</span>
   </div>
   <div class="spacer"></div>
-  <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+  <div class="theme-seg" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="auto">Auto</button>
+    <button type="button" data-theme-btn="light">Light</button>
+    <button type="button" data-theme-btn="dark">Dark</button>
+  </div>
 </header>
 
 <div class="banner">
@@ -1007,24 +1047,29 @@ function switchTab(tab) {
 }
 document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
 
-function initThemeToggle() {
-  const btn = $("theme-toggle");
-  const sync = () => {
-    const dark = document.documentElement.dataset.theme !== "light";
-    btn.textContent = dark ? "☀️" : "🌙";
-    btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
-  };
-  btn.onclick = () => {
-    const t = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = t;
-    try { localStorage.setItem("workbench-theme", t); } catch (e) { /* ignore */ }
-    sync();
-    toast(t === "light" ? "light mode ☀️" : "dark mode 🌙");
-  };
-  sync();
+const THEME_KEY = "workbench-theme";
+function applyTheme(t) {
+  if (t !== "light" && t !== "dark") t = "auto";
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* ignore */ }
+  const btns = document.querySelectorAll("[data-theme-btn]");
+  for (let i = 0; i < btns.length; i++) {
+    const on = btns[i].getAttribute("data-theme-btn") === t;
+    btns[i].classList.toggle("on", on);
+    btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+  }
 }
+document.querySelectorAll("[data-theme-btn]").forEach((b) => {
+  b.onclick = () => {
+    applyTheme(b.getAttribute("data-theme-btn"));
+    const cur = document.documentElement.getAttribute("data-theme");
+    toast(cur === "light" ? "light mode ☀️" : cur === "dark" ? "dark mode 🌙" : "auto mode — follows the OS");
+  };
+});
 
-initThemeToggle();
+let savedTheme = "auto";
+try { savedTheme = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) { /* ignore */ }
+applyTheme(savedTheme);
 renderArgvPreview();
 refreshStatus();
 loadWorkspaces(false).catch(showError);

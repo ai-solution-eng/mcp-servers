@@ -116,39 +116,51 @@ def test_key_holding_request_passes(app, monkeypatch):
     assert _ping(app, {"Authorization": "Bearer svc-key"}).status_code == 200
 
 
-def test_key_holding_api_request_passes(app, monkeypatch):
-    """The /api surface has its own token middleware; with requireIdentity
-    ON and the API token presented, the call must pass the identity gate.
-    Layering note: _ApiTokenMiddleware was registered BEFORE the identity
-    middlewares, so LIFO puts it INSIDE them — its token presentation alone
-    does not populate a Caller. The shared API token is the single-user
-    local mode (an intentionally unattributed credential), so the identity
-    gate still requires an attributable identity here — the deployment that
-    wants attributed /api callers sets MCP_API_KEYS/SQLHANDLER_API_KEYS and
-    presents a key, or OIDC. This test pins the gate's honest refusal; the
-    key-attributed /api pass is covered by the MCP-surface test above."""
+def test_api_token_request_passes_the_identity_gate(app, monkeypatch):
+    """A presented SQLHANDLER_API_TOKEN satisfies requireIdentity.
+
+    It used to NOT: _ApiTokenMiddleware was registered before the identity
+    middlewares (LIFO puts it inside them), so the token gate accepted the
+    request while the identity gate — which resolves BEFORE it — saw an
+    anonymous caller and 401'd. A deployment that configured only
+    SQLHANDLER_API_TOKEN was therefore locked out of /api entirely.
+
+    Fixed 2026-11-12: the identity ladder resolves the shared token
+    (via="api-token", fingerprint only). The token gate stays as defense in
+    depth for deployments that leave requireIdentity off.
+    """
     monkeypatch.setenv("SQLHANDLER_API_TOKEN", "api-tok")
     monkeypatch.setenv("SQLHANDLER_REQUIRE_IDENTITY", "1")
     r = app.get("/api/status", headers={"X-API-Token": "api-tok"})
-    assert r.status_code == 401
-    assert "identity required" in r.json()["error"]
+    assert r.status_code == 200, r.text
+    # a wrong token is still refused by the token middleware itself
+    assert app.get("/api/status", headers={"X-API-Token": "wrong"}).status_code == 401
+    # and no token at all is refused by the identity gate
+    anon = app.get("/api/status")
+    assert anon.status_code == 401
+    assert "identity required" in anon.json()["error"]
 
 
-def test_key_attributed_api_request_via_gateway_headers(app, monkeypatch):
-    """The gateway topology on /api: a key-valid caller is a /mcp concept —
-    the key middleware only guards /mcp, so an /api caller's attribution
-    comes from the GATEWAY relay headers over... a path where no key gate
-    ran. Honest outcome: the relay rung is key-valid-GATED (attribution-
-    never-authorization), the caller stays anonymous, and the identity gate
-    refuses. /api callers authenticate via SQLHANDLER_API_TOKEN (single-user
-    local mode — pinned above as honestly refused when requireIdentity is
-    on) or ride the gateway's own identity enforcement. This pins that the
-    gate does NOT let bare relay headers self-attribute on /api."""
+def test_api_key_authenticates_but_relay_headers_cannot_self_attribute(app, monkeypatch):
+    """On /api an explicit key authenticates; a relay SUBJECT header does not.
+
+    audit 2026-11-12 cross-validation (P1): the /api surface had no key rung
+    at all, so a caller holding a valid key was anonymous and every /api read
+    401'd under the chart's requireIdentity default — while /api/whoami
+    reported "authenticated". The explicit-key rung now resolves the key.
+
+    The relay rung stays key-valid-GATED (attribution is an authorization
+    input), and the explicit-key rung deliberately carries NO subject, so a
+    bare X-MCP-Caller-Subject still cannot self-attribute here.
+    """
     monkeypatch.setenv("MCP_API_KEYS", "svc-key")
     monkeypatch.setenv("SQLHANDLER_REQUIRE_IDENTITY", "1")
     r = app.get("/api/status", headers={"X-API-Key": "svc-key", "X-MCP-Caller-Subject": "alice"})
-    assert r.status_code == 401
-    assert "identity required" in r.json()["error"]
+    assert r.status_code == 200, r.text
+    who = app.get("/api/whoami", headers={"X-API-Key": "svc-key", "X-MCP-Caller-Subject": "alice"})
+    body = who.json()
+    assert body["via"] == "key"
+    assert body["caller"]["subject"] is None, "a relay subject must not ride an explicit key on /api"
 
 
 # ---------------------------------------------------------------------------

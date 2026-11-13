@@ -1,249 +1,416 @@
-# SQLhandler — Features
+# SQLhandler — features and the thinking behind them
 
-Fast, direct SQL access to columnar lake data — OneLake/Delta Lake, S3/MinIO Parquet, Delta-on-S3, Iceberg catalogs, and NFS/local directories — exposed as an **MCP server** (MCP 2.0, stateless streamable-http at `/mcp`) with a bundled read-only web UI and JSON API. This document describes the features of the **current stack** (chart/image **1.6.1**; the 0.9.0→1.0.0 feature wave plus the subsequent 1.1–1.6 additions unless marked otherwise).
+SQLhandler is an **MCP server**: a Model Context Protocol endpoint that exposes
+tools an LLM agent can call. Its tools are SQL and schema discovery, and they
+answer from columnar lake data **in place** — no copy, no load step, no second
+database. This document is the feature reference for a reader who has never
+seen the package: what each capability does, and the design decision that made
+it that way.
 
----
-
-## Backends & data sources
-
-One engine, four backends (selected by `SQLHANDLER_BACKEND` / the chart's `backend:` value) — they share the same SQL engine, caches, MCP tools, and backend-aware readiness probe; only the `DataProvider` differs:
-
-| Backend | Reads |
-|---|---|
-| `onelake` | Microsoft Fabric OneLake — Delta Lake over ABFS, Entra service principal |
-| `s3` / `minio` | S3-compatible object storage (MinIO/AWS) — Parquet, plus Delta tables via `S3_FORMAT=auto` (`_delta_log` detection, time travel) |
-| `iceberg` | Apache Iceberg tables through a REST or SQL catalog, Parquet data files |
-| `nfs` / `file` | Mounted directory (NFS/PVC/hostPath) — Delta **and** Parquet |
-
-Plus two composition mechanisms:
-
-- **Federated multi-source** — `SQLHANDLER_SOURCES` / the chart's `sources:` list federates several buckets/sources (any mix of backends) behind one endpoint: source-qualified tables, one shared cache, cross-source `JOIN`s in a single `run_sql`.
-- **External databases (read-only attach)** — `SQLHANDLER_ATTACH` / the chart's `databases:` list attaches Postgres/MySQL servers read-only (`ATTACH ... READ_ONLY` — writes are rejected by DuckDB itself); their tables join with lake tables in the same query as `<db-alias>.<schema>.<table>`.
+Deployed as the `sqlhandler` Helm chart **4.0.0** (image `v4.0.0`) on HPE
+Private Cloud AI (PCAI / Ezmeral Unified Analytics). Endpoint, tool schemas and
+client setup: [MCP.md](MCP.md). Every knob: [CONFIGURATION.md](CONFIGURATION.md).
+Deployment: [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ---
 
-## Current stack
+## 1. What it is, in one paragraph
 
-| Layer | Technology |
-|---|---|
-| Language | Python ≥ 3.11, fully type-checked (mypy) and linted (ruff) |
-| MCP | `mcp>=2.0` SDK — low-level `MCPServer`, stateless streamable-HTTP at `/mcp` |
-| SQL engine | DuckDB ≥ 1.0 (per-process connection; aggregations/joins push down to the lake) |
-| Data access | pyarrow ≥ 17 (S3/Azure filesystems + dataset engine), `deltalake` ≥ 1.0 (native Delta reader incl. OneLake ABFS), optional `pyiceberg[pyarrow]` (+ SQLAlchemy for SQL catalogs) |
-| HTTP | uvicorn + Starlette ASGI app hosting `/mcp`, the JSON API, `/ui`, `/health`, `/ready`, `/metrics` |
-| Web UI | one self-contained `index.html` — no build step, no CDN, no framework |
-| Deploy | Helm chart for Kubernetes / PCAI (oauth2-proxy gateway, non-root hardened image, health/startup probes, HPA + PDB + topology spread for scale-out, optional shared catalog PVC) |
-| Ops | zero extra dependencies — Prometheus text exposition and JSONL audit log are hand-rolled |
+An agent asks a question in SQL; SQLhandler plans it with **DuckDB** (an
+in-process analytical SQL engine) over **pyarrow datasets** (Arrow's columnar
+scan layer) pointed at the customer's existing storage — Microsoft Fabric
+OneLake, an S3-compatible store, an Iceberg catalog, or a mounted directory.
+Predicate and column-projection pushdown means only the bytes the query needs
+leave the store. The same process serves the MCP endpoint, a read-only web
+explorer, a JSON API, health probes and Prometheus metrics. It replaces
+EzPresto/PrestoDB for the agent path: no JDBC round-trip, no row
+re-serialisation, no full scan to filter.
 
-The `DataProvider` interface is the only extension point for a new source: each backend (onelake, s3, iceberg, nfs/file) is a subclass plus one `make_provider` branch.
+## 2. Backends: read the lake where it lives
 
----
+One engine, four backends, selected by the chart's `backend:` value. They share
+the SQL engine, the caches, the tool surface and the backend-aware readiness
+probe; only the `DataProvider` differs. **The philosophy is that the storage
+layout is the customer's decision, not a migration project** — pointing a
+provider at existing data is the whole product, and a new source is a subclass
+plus one branch, not a new service.
 
-## 1. Agent ergonomics (MCP surface)
+| Backend | Reads | Credential | Pick it when |
+|---|---|---|---|
+| `onelake` | Microsoft Fabric OneLake — **Delta Lake** (Parquet data files plus a `_delta_log` transaction log) over ABFS | Entra service principal | The data already lives in Fabric; Delta gives you transactions and time travel for free |
+| `s3` / `minio` | Parquet objects (plain or Hive-partitioned), plus Delta tables detected by `_delta_log` | S3 access/secret key, or anonymous | The data is Parquet in object storage, on-prem MinIO or AWS, or any tool can drop files there |
+| `iceberg` | **Apache Iceberg** tables through a REST or SQL catalog, Parquet data files | REST token and/or S3 keys | A real lakehouse catalog already owns the metadata — schemas, snapshots, concurrent writers, cross-engine reads |
+| `nfs` / `file` / `local` | A mounted directory — Delta **and** Parquet | none | The data is on a filer or a PVC, or you are proving the engine locally |
 
-Features that make LLM agents effective against the lake on the first try.
+The image also accepts `adls`, `gcs` and `sharing` (Delta Sharing) as backend
+values, but the chart exposes only the four above — see
+[CONFIGURATION.md §9](CONFIGURATION.md#9-what-the-chart-does-not-wire).
 
-### Tools
-- `list_tables` — enumerate tables (any backend), annotated with catalog descriptions when configured; source-qualified names in federated mode.
-- `search_tables` — keyword search over table/column names **and** semantic catalog docs, ranked best-first (exact/substring scoring, then a fuzzy layer so typo'd names still match); each hit carries its `matched_on` reasons. For when the table list is long.
-- `describe_table` — columns/types/URI + catalog docs.
-- `profile_table` — column-level statistics **before** writing SQL: min/max, approx distinct count, null %, avg/std, q25/q50/q75, exact row count from Parquet/Delta metadata. Optional comma-separated `columns` subset. Scans a bounded sample (`SQLHANDLER_PROFILE_MAX_ROWS`, default 1M; 0 = full) and is cached like describe.
-- `column_stats` — the same statistics for ONE column, plus top values with counts: distinct count, null count/%, min/max, q25/q50/q75, top-5 values — over the same bounded sample (never a full-table scan beyond the profile cap).
-- `run_sql` — DuckDB SQL with `output_format` (**markdown** default / json / csv), bind `params`, and `version_as_of` time travel.
-- `scan_table` — pyarrow column/row pull with row limit; same formats and time travel.
-- `query_submit` / `query_status` / `query_result` / `query_cancel` — **async query jobs**: submit returns a `job_id` immediately (read-only guard applied at SUBMIT), status polls state/columns/n_rows, the result is handed over **once** and then freed from memory, cancel interrupts via DuckDB. Same engine path as `run_sql` (timeout watchdog-enforced, `SQLHANDLER_MAX_ROWS`-bounded, audit-logged); in-memory registry capped by `SQLHANDLER_MAX_JOBS` (default 8; a restart clears it). REST twins under `/api/jobs/*`.
-- `query_save` / `query_list` / `query_delete` / `query_saved` — **saved parameterized queries**: a name → SQL + default bind params store (`SQLHANDLER_SAVED_QUERIES_PATH` JSON file; atomic writes; a corrupt file degrades to empty). Save-time validation parses the SQL and applies the read-only guard, re-applied at run time; call-time params override stored ones as **bind** parameters (never string-interpolated). Writes are auth-gated: with `SQLHANDLER_API_TOKEN` / `MCP_API_KEYS` / `SQLHANDLER_API_KEYS` configured, an unauthenticated save/delete is refused; with none configured (single-user-local mode) writes are open with a loud startup note. REST twins under `/api/saved-queries/*`.
+Two composition mechanisms sit on top:
 
-### Resources & prompts (the other MCP primitives)
-- `sqlhandler://catalog` — every table + its business description (data dictionary).
-- `sqlhandler://table/<name>/schema` — one table's schema + column docs (also exposed as the resource template `sqlhandler://table/{table}/schema`).
-- `sqlhandler://query-memory` — the last 50 query outcomes (`SQLHANDLER_QUERY_MEMORY_SIZE`), so later agent sessions reuse proven SQL patterns instead of rediscovering them.
-- Prompts: `explore-data` (list → catalog → profile → SQL) and `analyze-table` (profile-first deep dive on one table).
+- **Federated multi-source** (`sources:` / `SQLHANDLER_SOURCES`) — several
+  buckets or sources of any backend mix behind **one endpoint**, with
+  cross-source `JOIN`s in a single `run_sql`. Every table is source-qualified
+  (`sales_orders`, `inventory_raw_customers`); a bare name resolves only when it
+  is unique across all sources, and an ambiguous bare name is deliberately **not**
+  registered, so it fails loudly instead of silently reading the wrong source.
+- **External databases, read-only** (`databases:` / `SQLHANDLER_ATTACH`) —
+  Postgres/MySQL systems of record become `<alias>.<schema>.<table>` and join
+  with lake tables in the same query. Read-only is enforced by DuckDB itself
+  (`ATTACH … READ_ONLY`), not by convention, and the config carries env-var
+  *names* for passwords, never values. A database that is down does not fail the
+  lake: `list_tables` reports it unavailable and lake-only queries never attach.
 
-### Semantic catalog
-`SQLHANDLER_CATALOG=<file.json|file.yaml>` merges human-written table/column documentation into `list_tables` / `describe_table` / resources. Hot-reloaded on change (cached describes invalidated); a missing/broken file never breaks queries.
+### How tables are discovered
 
-- **Virtual tables** — a catalog entry keyed by a clean bare identifier with a
-  `definition` (a single read-only `SELECT`/`WITH`) becomes a queryable virtual
-  table: listed with a `VIRTUAL` badge, schema derived from the definition,
-  user filters still push down into the physical scans, definitions compose.
-  Materialized results are clustered and reused across queries and replicas
-  (see Performance). Spec: [`../docs/semantic-catalog.md`](../docs/semantic-catalog.md).
-- **Browser editing (1.4.0)** — a global **Edit YAML…** editor in the lower-left *Semantic catalog* panel (whole live catalog as YAML, JSON toggle) plus a per-dataset **Semantic** tab on every table (that table's breakout; skeletons prefilled from the real column list; per-entry upsert/remove). Both write through the same validated upload store — YAML default, JSON swap, `pygmentize -g`-style server-side highlighting (graceful plain-text fallback without pygments), `SQLHANDLER_CATALOG_UPLOAD=0` disables applying.
+- **S3 / Iceberg / NFS Parquet:** every Parquet file or folder of Parquet files
+  becomes a table. `<prefix>/orders.parquet` → `orders`;
+  `<prefix>/sales/customers/*.parquet` → schema `sales`, table `customers`,
+  addressable as `customers` or `sales_customers`. Hive partition folders
+  (`key=value`) fold into their table; hidden (`.`) paths are skipped. On S3,
+  `S3_FORMAT=auto` (the default) treats any folder carrying a `_delta_log` as a
+  Delta table and everything else as plain Parquet, so one bucket can mix both.
+- **OneLake:** discovery uses the DFS REST API (`?resource=filesystem`) because
+  OneLake does not implement the ADLS Gen2 *blob* list API that pyarrow's Azure
+  filesystem uses — that listing fails with `501 Not Implemented`. Tables live
+  under `Tables/<schema>/<table>`.
+- **NFS:** both formats auto-detected; Parquet files inside a Delta folder are
+  folded into that Delta table, never exposed twice.
 
-### Self-correction loops
-- **Did-you-mean errors** — a bad table name in SQL returns the nearest real table names, so the agent self-corrects in one round-trip.
-- **Usage-driven prewarm** — with `SQLHANDLER_PREWARM_TABLES` unset, the busiest tables of the previous run (usage counts persisted with the disk-warm cache) are prewarmed on restart.
+## 3. The query engine, and its safety posture
 
----
+The engine is one `SqlEngine` per process, shared by the MCP tools and the web
+API, so a cache or a guard cannot drift between surfaces. Its capabilities:
 
-## 2. Query engine capabilities
+- **Parameterized queries.** `run_sql` takes bind `params` — an object for
+  named `$placeholders`, an array for positional `?`. Values never enter the
+  SQL text, so a reusable template stays injection-safe.
+- **Time travel.** `version_as_of` reads a historical snapshot: a Delta
+  snapshot version (nfs / onelake / Delta-on-S3) or an Iceberg snapshot id. It
+  applies to every versionable table in the query; a plain-Parquet table in the
+  same query is a clear error. Historical datasets are cached per version — a
+  snapshot never changes.
+- **Output formats.** markdown (default, agent-readable), JSON, CSV, and Arrow
+  IPC (base64) for exact dtypes.
+- **Count fast path.** A bare `SELECT COUNT(*) FROM t` reads Parquet/Delta
+  metadata instead of scanning: ~125 ms → ~0.1 ms on a 20M-row table.
 
-- **Parameterized queries** — `run_sql` accepts bind `params`: an object for named `$placeholders` or an array for positional `?`. Reusable templates stay injection-safe — and the saved-query tools (`query_save`/`query_saved`) store those templates with their default bind params so they can be rerun by name, values still bound (never interpolated).
-- **Time travel** — `version_as_of` on `run_sql` / `scan_table`: a Delta snapshot version (nfs / onelake / Delta-on-S3) or an Iceberg snapshot id. Applies to every versionable table the query touches; plain-Parquet tables in the same query are a clear error. Historical datasets are cached per version (a snapshot never changes).
-- **Query timeout** — `SQLHANDLER_QUERY_TIMEOUT` (seconds; **default 600** — decision D5: a runaway query used to hold a concurrency slot forever; `0` = off) interrupts a query inside DuckDB: no leaked threads, clean error to the caller. Applies to MCP tools and the web API alike.
-- **Concurrency cap** — `SQLHANDLER_MAX_CONCURRENT_QUERIES` (default 8, 0 = unlimited) bounds simultaneous DuckDB queries per pod; excess queries queue up to `SQLHANDLER_QUEUE_TIMEOUT` (default 30 s) then fail with a clear error instead of piling up on the container.
-- **Output formats** — every result-returning tool/endpoint renders markdown (human/LLM-friendly), compact JSON (`{columns, rows}`), or CSV.
-- **Delta tables on S3** — `S3_FORMAT=auto|parquet|delta` on the s3 backend: `auto` (default) detects Delta tables by their `_delta_log` and reads the rest as plain Parquet, so one bucket can mix formats with time travel where a Delta log exists.
+Four guards bound what a query can do. Each exists because the failure it
+prevents was observed, and each fails **closed**:
 
----
+| Guard | What it stops | Why it is designed this way |
+|---|---|---|
+| **Read-only parser guard** (decision D2) | DDL/DML, `ATTACH`, `COPY`, `PRAGMA`/`SET`, multi-statement scripts on `run_sql` | The MCP surface is one prompt-injection away from a destructive statement. Statements are parsed with DuckDB's own grammar, not a regex. Attached external catalogs stay SELECT-only in **both** modes, enforced on the connection itself, so `INSERT INTO sink SELECT * FROM attached` cannot exfiltrate even with the guard off |
+| **DuckDB filesystem lockdown** | `read_csv('/etc/passwd')`, `COPY … TO`, URL fetches | All legitimate object-store IO is done by pyarrow *outside* DuckDB, so nothing is lost. If the engine cannot disable local filesystem access on a connection it **refuses the query** rather than silently degrading (`SQLHANDLER_ALLOW_LOCAL_FS` is the explicit escape hatch) |
+| **Timeout** (decision D5) | A runaway query holding a concurrency slot forever | 600 s default, enforced by interrupting inside DuckDB — no leaked threads — and by a watchdog for async jobs, which fires even when nobody is polling |
+| **Concurrency gate + queue timeout** | The container being buried by parallel queries | 8 concurrent queries per pod, excess queues up to 30 s and then fails with a clean error instead of piling up |
 
-## 3. Web API & UI (read-only data explorer)
+**Per-caller fairness** (`limits.py`) is the second, identity-keyed layer on top
+of the process-global caps. The global cap is the OUTER bound, not the whole
+story: before this layer, one agent loop could take every concurrency slot and
+every job slot on the pod. The design rules are deliberate:
 
-Same engine, caches, and read-only guard as the MCP tools — no extra deployment.
+- The caller identity is resolved **once**, by the identity layer, and travels
+  explicitly into the engine and the job registry — nothing re-parses a request
+  or trusts a header.
+- **No identity = the global bucket**, so stdio, dev and unauthenticated
+  deployments behave byte-for-byte as before.
+- The per-caller knobs **default to the global caps**: an existing deployment
+  keeps its behaviour until an operator opts into a fairness bound.
+- Bucket labels are the bounded, non-secret scope vocabulary (subject, key
+  fingerprint, `anonymous`, `other`) and are hard-capped, so a creative
+  identity source cannot mint unbounded metric series or semaphores.
 
-### Async query jobs (long-running queries)
-| Endpoint | Purpose |
-|---|---|
-| `POST /api/query/async` | validate + start; returns `{"query_id", "state"}` |
-| `GET /api/query/{id}` | status: `running`/`done`/`error`/`cancelled`, columns, n_rows |
-| `GET /api/query/{id}/rows?offset=&limit=` | paginated rows (page cap 1000) |
-| `DELETE /api/query/{id}` | cancel a running job (DuckDB interrupt) |
-| `POST /api/jobs` | the MCP `query_submit` twin: submit-time read-only guard, `SQLHANDLER_MAX_JOBS` cap, watchdog-enforced timeout |
-| `GET /api/jobs/{id}` | job status (+ `result_fetched`) |
-| `GET /api/jobs/{id}/result` | the result, handed over **once** then freed (second fetch → 409) |
-| `DELETE /api/jobs/{id}` | cancel a running job |
+**Result budget** (`limits.py`) bounds one tool result in *bytes*, not just
+rows. Over the ceiling (100 000 B ≈ 25k tokens by default) the result is cut at
+a complete-row or complete-line boundary and ends with one deterministic
+marker: total, returned, `offset`, `next_offset` and a resume recipe. **Rows are
+never dropped silently** — the agent is always told what it did not get and how
+to ask for it. `run_sql`, `scan_table` and `query_saved` accept `offset` to
+page; `query_result` is fetch-once and reports the cap with no continuation.
 
-The MCP tools (`query_submit`/`query_status`/`query_result`/`query_cancel`) share the `/api/jobs` registry.
+## 4. Async query jobs — long queries without blocking the agent
 
-Finished jobs are kept for `SQLHANDLER_ASYNC_JOB_TTL` seconds (default 900), up to 100 tracked jobs; the registry refuses with HTTP 429 when full of running jobs.
+An MCP tool call has a client-side timeout; a lake query can outlive it. The
+`QueryJob` primitive (own thread, DuckDB `interrupt()` for cancellation) has
+powered the web async API since 0.9; `jobs.py` exposes the *same* primitive to
+MCP callers as `query_submit` / `query_status` / `query_result` /
+`query_cancel`, plus REST twins under `/api/jobs/*`.
 
-Jobs, the synchronous query path, and the query timeout all run on the **same `QueryJob` primitive** (own thread, DuckDB `con.interrupt()` for cancellation) — one implementation serving the MCP tools, the JSON API, and the async registry, so cancel/timeout semantics cannot drift between surfaces.
+The philosophy is **one implementation, so semantics cannot drift**:
 
-### Profile & export endpoints
-- `POST /api/profile` — column statistics (min/max, null %, distinct, quartiles).
-- `POST /api/export` — download a query or table as **CSV or Parquet** (attachment), capped by `SQLHANDLER_EXPORT_MAX_ROWS` (default 100 000; 0 = hard 1M ceiling).
+- **Same engine path.** A job *is* a `QueryJob`, so it honours the timeout, the
+  row caps, the concurrency gate, the memory budget and the audit log.
+- **The read-only guard runs at SUBMIT**, before any job exists — DDL is refused
+  synchronously with the same error text `run_sql` produces, and nothing is
+  started.
+- **The timeout watchdog is armed at submit**, so a job that outlives the
+  timeout is interrupted even if no one ever polls. A runaway job can never hold
+  a gate slot forever.
+- **Results are fetch-once.** `query_result` hands the spooled Arrow table over
+  once and frees it; a second fetch is refused (HTTP 409) and `query_status`
+  reports `"result_fetched": true`. Memory is bounded by design, not by luck.
+- **The registry is bounded and in-memory.** At most `SQLHANDLER_MAX_JOBS`
+  (8) tracked; beyond that a submit is refused with a clear message. A restart
+  clears it — jobs are **not durable**, resubmit after a restart.
+- **Owner-scoped under policy enforcement.** When policy is on and a submitter
+  was resolved, the job records its owner and other callers get the same
+  unknown-id 404 a bogus id gets — a wrong guess never confirms that a job
+  exists.
+- **Replica scope is the non-obvious one.** Each replica keeps its **own**
+  registry. Submitting on one pod and polling on another is the classic
+  "Unknown job id" outage on a scaled-out deployment (live-seen: a 4-replica
+  release where three of four status calls 404'd). The fix is opt-in and
+  additive: point `SQLHANDLER_JOBS_DIR` at a directory every replica can
+  read-write (an RWX PVC) and finished jobs publish state and result there, so
+  any replica can serve any job and the fetch-once claim holds cluster-wide via
+  an atomic claim file. Unset, behaviour is exactly the historical one.
 
-### UI features
-- Searchable table list with format badges and `source/schema/name` labels in federated mode; per-table schema view.
-- **Column stats panel** — lazy "Profile table" button per table.
-- SQL editor (Ctrl+Enter) with row limit; results table with timing and copy-CSV.
-- **Export buttons** — CSV and Parquet download of the current query.
-- **Charts** — one-click inline SVG bar chart of the first numeric column (dependency-free).
-- **Saved queries + history** — per-browser (localStorage): save/reload/delete queries; history keeps the last 30 successful runs.
-- Light/dark theme (OS-aware, persisted) with HPE branding.
-- **Read-only guarantee** — every statement is parsed with DuckDB's own grammar; only plain `SELECT` (plus `EXPLAIN SELECT`) is accepted. Writes, `PRAGMA`/`SET`, and `COPY` are rejected. Results are clamped to `SQLHANDLER_MAX_ROWS` (default 1000).
+## 5. Agent ergonomics
 
----
+Agents fail differently from humans: they do not scroll, they do not guess
+twice, and they pay a full round-trip for every mistake. These features exist to
+make the first attempt correct.
 
-## 4. Observability & ops
+- **Discovery before SQL** — `list_tables`, `search_tables` (keyword search over
+  table names, column names *and* catalog docs, ranked exact/substring then
+  fuzzy, each hit carrying `matched_on`), `describe_table`, `sample_rows` (a
+  bounded look at actual rows with per-column fill rates), `profile_table` and
+  `column_stats` (min/max, approximate distinct, null %, quartiles, top values —
+  over a bounded sample, never a full-table scan beyond the cap).
+- **Plan without executing** — `explain_query` returns referenced tables with
+  metadata row counts and bytes-to-scan, each labeled `exact` / `approx` /
+  `none`, keyed to the snapshot version it describes, plus a warm/cold band
+  (is this exact query already in the result cache?). `ask_data` turns a plain
+  question into a drafted SELECT and a suggested follow-up, and **never
+  executes** — execution is always a separate, explicit call.
+- **Structured, self-correcting errors** (`errors.py`). An agent self-corrects
+  far faster when an error carries a machine-parseable tail as well as the human
+  message. With structured errors on (the default), every error message keeps
+  its existing text **byte-identically** and gains one final line:
+  `{"error": {"code": "E_TABLE_NOT_FOUND", "fix_hints": ["call list_tables", …]}}`.
+  Codes are stable identifiers (`E_TABLE_NOT_FOUND`, `E_COLUMN_NOT_FOUND`,
+  `E_READONLY`, `E_TIMEOUT`, `E_CONCURRENCY_GATE`, `E_ROWS_CAPPED`,
+  `E_PARAM_INVALID`), so logs are greppable and policy surfaces can reference
+  them. Three rules keep it boring and safe: the human message stays primary and
+  unchanged, an unrecognised error gets **no** tail rather than a guessed code,
+  and a caller can pin a code explicitly. Fix hints name the *actual* knob —
+  a per-caller refusal points at the per-caller limit, not the global one.
+- **Did-you-mean** — a typo'd table name comes back with the nearest real names,
+  so the agent fixes it in one round-trip instead of re-discovering.
+- **Query memory** — the last 50 outcomes are exposed as the
+  `sqlhandler://query-memory` MCP resource, so a later session reuses proven SQL
+  instead of rediscovering it.
+- **Usage-driven prewarm** — with no explicit prewarm list, the busiest tables
+  of the previous run (usage counts persisted with the disk-warm cache) are
+  warmed on restart. The server teaches itself what to warm.
+- **MCP primitives beyond tools** — resources `sqlhandler://catalog`,
+  `sqlhandler://table/<name>/schema` and `sqlhandler://query-memory`; prompts
+  `explore-data` and `analyze-table`; and explicit tool annotations
+  (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so a
+  client that defaults pessimistically never presents a reader as destructive.
+  Details: [MCP.md](MCP.md).
 
-- **Prometheus metrics** — `GET /metrics` renders the text exposition (0.0.4) with no extra dependency: `sqlhandler_queries_total{outcome}` (ok/error/timeout/cancelled), `sqlhandler_query_duration_seconds` histogram, `sqlhandler_query_rows_total`, `sqlhandler_cache_{hits,misses}_total{cache}` (describe/profile/dataset), and gauges for table count, process RSS, and the container memory limit.
-- **Audit log** — `SQLHANDLER_AUDIT_LOG=/path/audit.jsonl` appends one JSON line per query outcome (`ts`, `event`, `sql`, `state`, `duration_ms`, `n_rows`, `error`) — compliance-grade, SIEM-friendly. Best-effort writes never break a query.
-- **API token** — `SQLHANDLER_API_TOKEN` requires `Authorization: Bearer` or `X-API-Token` (constant-time compared) on every `/api/*` request, for deployments not already behind the oauth2-proxy gateway. `/mcp`, `/ui`, `/health`, `/ready` are unaffected (and `/metrics` + `/ready` too, unless `SQLHANDLER_METRICS_AUTH=1`).
-- **`/mcp` API-key gate — MANDATORY in the chart (breaking change, 2026-11)** — `SQLHANDLER_API_KEYS` (or the fleet-universal `MCP_API_KEYS`): when either is set, every `/mcp` request needs `X-API-Key` or `Authorization: Bearer` (constant-time compared). The chart wires `MCP_API_KEYS` from an operator-created Secret **unconditionally** (`security.apiKey.existingSecret`, empty = `<fullname>-apikey`), so the pod fails loudly (`CreateContainerConfigError`) until the Secret exists — the applygate/k8s-mcp posture, because SQLhandler reads the whole data lake. The only open mode is the documented local-dev escape `security.apiKey.openMode=true` (loud startup warning). The server re-reads its env per request, but a `secretKeyRef` env var is NOT updated in a running pod, so a key rotation needs a **rollout restart** to take effect.
-- **Resilience (carried from 0.8.0)** — cgroup-proportional DuckDB memory budgets with spill-to-disk, disk-warm metadata cache, and health/readiness/startup probes.
+## 6. The semantic layer — telling the model what the data means
 
-### Deployment note (partial chart gap)
+A schema alone is not meaning. A column called `woh_ord_typ` with values `a`/`b`
+is a guess, and guesses cost round-trips. The semantic catalog is a
+human-authored document merged into `list_tables`, `describe_table` and the MCP
+resources:
 
-The semantic-catalog file is chart-configurable (`semanticCatalog.*` values — ConfigMap + read-only mount + `SQLHANDLER_CATALOG`, validated + hot-reloaded; see README "Semantic catalog") — and, new in 1.4.0, catalogs can also be **uploaded as JSON or YAML straight from the web UI / `POST /api/semantic-catalog`** (engine accepts both formats; `pyyaml` is now a base dependency), with an optional
-shared PVC store (`semanticCatalog.store.enabled`) making uploads durable and cross-pod. The remaining fixed-env gaps: the audit log needs a writable volume (emptyDir, or PVC if it must survive restarts), and `/metrics` needs optional scrape annotations. Until a chart follow-up lands, configure those via `docker run -e` — an image-only rollout is **default-safe** (timeout, audit, and token off;
-`S3_FORMAT=auto`; export cap 100k; the one new *active* default is the concurrency cap of 8).
+- **Three attach routes, one document format.** In values (most auditable:
+  native YAML under `semanticCatalog.tables`, rendered to a ConfigMap mounted
+  read-only); an existing ConfigMap you own; or an **upload** from the web UI /
+  `POST /api/semantic-catalog` (JSON or YAML), effective immediately.
+- **Hot-reloaded on mtime**, so a catalog edit plus a re-apply updates the docs
+  without a pod restart and without disturbing in-flight tool calls. A missing
+  or broken catalog **never** breaks queries — it degrades to empty.
+- **Virtual tables.** A catalog entry keyed by a clean bare identifier with a
+  `definition` (a single read-only `SELECT`/`WITH`) becomes a queryable table:
+  listed with a `VIRTUAL` badge, schema derived from the definition, filters
+  still pushed down into the physical scans, and definitions compose. Nothing is
+  stored in the lake and no DDL is issued — the semantic layer adds meaning and
+  reuse without a write path.
+- **Browser editing.** A global *Edit YAML…* editor (whole live catalog, JSON
+  toggle) plus a per-table **Semantic** tab whose skeleton is prefilled from the
+  real column list. Both write through the same validated upload store, so an
+  edit never forks a duplicate entry.
+- **dbt import.** `POST /api/semantic-catalog/import-dbt` seeds the catalog from
+  a dbt manifest, so the docs a data team already wrote become agent context.
 
----
+Spec, key forms and troubleshooting: [../docs/semantic-catalog.md](../docs/semantic-catalog.md).
 
-## 5. Performance (measured on G2, 2026-09-12)
+## 7. Human access — the read-only data explorer
 
-Measured with the repo's own harness (`bench/ezpresto_vs_sqlhandler.py`,
-stdlib-only, persistent-connection transport with per-thread pooling) against
-the G2 deployment — v1.6.0, 4 replicas × 8 vCPU/16Gi, MinIO-backed workload of
-10 queries from 50K to 3M rows. Full methodology, tables, and the in-cluster
-variant: [`../bench/BENCHMARK.md`](../bench/BENCHMARK.md), with the scale-out
-(HPA) campaign summarized in [BENCHMARKS.md](BENCHMARKS.md).
+The same process serves a dependency-free web UI (one self-contained
+`index.html`, no build step, no CDN) and a JSON API. It exists because
+"the agent can see it" is not the same as "a human can check it", and debugging
+an agent's SQL needs the same data through the same engine and caches.
 
-- **Query result cache** (new) — identical queries served from memory, keyed
-  by sql/params/limits + base-snapshot versions (ETL commits invalidate
-  instantly; TTL backstop). Measured speedup **1.8×–21× over cold execution**,
-  scaling with query cost: counts/filters 1.8–2.5×, aggregations
-  **6.9–19.2×**. The Snowflake result-cache analog, and the honest
-  agent-facing experience — agents retry, loop, and re-ask.
-- **Disk block cache for object stores** (opt-in) — parquet footers and
-  column chunks are fetched once into pod-local disk and re-served on every
-  later read; the OneLake/Delta path routes its data files through it with
-  snapshot-version-scoped keys (Delta-log IO stays inside delta-rs). Wins
-  repeat/filtered/preview-style scans — the agent-shaped access pattern.
-- **Virtual-table materialization cache** (new) — a virtual table's full
-  result is written to parquet once and reused across queries and replicas
-  (`cache.virtualCacheDir` on a shared PVC = one materialization per
-  deployment per data change). Closes the multi-second cost of unfiltered
-  previews on definitions with blocking aggregations (LIMIT cannot
-  short-circuit a DISTINCT/GROUP BY pipeline).
-- **count(\*) metadata fast-path** (new) — bare `SELECT COUNT(*) FROM t`
-  reads parquet/Delta metadata instead of scanning: ~125 ms → ~0.1 ms on a
-  20M-row table; visible in-cluster as 3M-row counts in ~23 ms.
-- **Cold engine numbers** (result cache busted — pure DuckDB): 3M-row scans
-  1.0–2.0 s p50 (4.3–5.1M rows/s counts/projections), 200–350K queries
-  0.19–2.0 s. Warm floor ~104–120 ms through the gateway for every query size
-  (cache hit + round-trip), ~18–25 ms in-cluster.
-- **Concurrency**: warm queries scale to ~75–81 qps at L8 with flat p50;
-  all-cold bursts saturate per-pod CPU (flat ~11–12 qps, p95 to 4.2 s) — the
-  capacity-planning number for cold agent storms.
-- **Clustered virtual materializations** (new) — materialized results are
-  auto-sorted by their lowest-cardinality columns so parquet row-group
-  statistics prune filtered reads.
+- Searchable table list with format badges and `source/schema/name` labels;
+  per-table schema view; lazy column-stats panel.
+- SQL editor (Ctrl+Enter) with a row limit; results table with timing and
+  copy-CSV; one-click inline SVG bar chart of the first numeric column.
+- CSV/Parquet export of a query or a preview.
+- Saved queries and history **per browser** (localStorage).
+- **Inspector tab** — a browser-side MCP inspector that lists the same 23 tools
+  and input schemas as `tools/list` (one source of truth, served from
+  `/api/inspector/tools`) and dispatches calls through the server's own
+  `tools/call` path, so identity, policy, caching and audit behave exactly as
+  over `/mcp`.
+- **Read-only guarantee** — every statement is parsed with DuckDB's grammar;
+  only plain `SELECT` (plus `EXPLAIN SELECT`) is accepted, and results clamp to
+  the row cap even when the server cap is unlimited, to keep the JSON payload
+  bounded.
 
-### Environment findings during the benchmark (upstream/ops, not sqlhandler)
+Endpoints: [MCP.md](MCP.md) and the API table in [../README.md](../README.md).
 
-Recorded with repro evidence in `bench/BENCHMARK.md` §"Environment findings":
-the EzPresto locator routes `nextUri` GETs to its web app (404 "Query not
-found", 10/10 repro), the EzPresto MCP pod flaps between MCP and health-echo
-states (4 restarts, dev image), EzPresto's OPA policy denies table access for
-non-platform principals (`AccessDeniedException`), and the ezaf-gateway tier
-alternates MCP routes on a minutes cadence for external clients. In-cluster
-traffic is unaffected on all counts.
+## 8. Identity, policy and the write tier
 
----
+The package reads a whole data lake, so its access model is layered rather than
+a single switch. All four layers resolve to **one** `Caller` object; no path
+creates a second identity or a privilege shortcut.
 
-## Feature → code → tests map
+| Layer | What it answers | Where |
+|---|---|---|
+| **API keys** (`MCP_API_KEYS`) | May this caller reach `/mcp` at all? | Mandatory in the chart: the key Secret must exist before the pod starts |
+| **Gateway** (oauth2-proxy AuthorizationPolicy) | Is this a PCAI-authenticated caller? | Rendered by the chart at the ezaf gateway |
+| **OIDC resource server** (`security.oidc`) | Who is this bearer token's subject? | Verifies a JWT against the issuer's JWKS — no client secret, no redirect URI |
+| **Policy-as-code** (`security.policy`) | What may this caller *see*? | Per-caller row filters, column masks, hidden tables, dataset ACLs; hot-reloaded, and a present-but-invalid file fails **closed** |
+
+Two consequences worth stating because they are easy to get wrong: every cache
+key carries a hash of the caller's effective policy, so masked and unmasked
+callers never share a cached result; and the policy file's `admins` list decides
+who may call the admin routes, which is orthogonal to what anyone may see.
+
+**The write tier** (`writes.enabled`) is the one place SQLhandler can write, and
+it is confined by construction: CTAS / INSERT / COPY INTO are allowed only under
+an allowlisted scratch root, in a subject-scoped namespace
+(`<scratch-root>/<subject-slug>/…`), with an advisory single-writer lease. It
+fails closed — an empty root list classifies nothing. Operationally this is
+covered in [ADMIN-WRITES.md](ADMIN-WRITES.md); the identity ladder and its
+rationale in [DECISIONS.md](DECISIONS.md).
+
+## 9. Observability
+
+Two outputs, both dependency-free (hand-rolled Prometheus text exposition and a
+JSONL file), because a SQL endpoint that needs an agent to be observable is not
+observable. **Everything here is best-effort: a metrics or audit failure must
+never affect a query.**
+
+`GET /metrics` (exposition 0.0.4):
+
+| Family | Type | Meaning |
+|---|---|---|
+| `sqlhandler_queries_total{outcome}` | counter | ok / error / timeout / cancelled |
+| `sqlhandler_query_duration_seconds` | histogram | per-query wall time |
+| `sqlhandler_query_rows_total` | counter | rows returned by successful queries |
+| `sqlhandler_cache_{hits,misses}_total{cache}` | counter | describe / profile / dataset / l2 |
+| `sqlhandler_caller_queries_total{caller_class}` | counter | queries by caller class |
+| `sqlhandler_caller_query_duration_seconds` | histogram | wall time **by caller scope** |
+| `sqlhandler_caller_queue_wait_seconds` | histogram | gate queue wait **by caller scope** |
+| `sqlhandler_tables`, `sqlhandler_process_rss_bytes`, `sqlhandler_container_memory_limit_bytes` | gauge | table count, RSS, container limit (0 = unlimited) |
+
+The caller-scope families answer "how slow or expensive is *this* caller". Their
+labels are the bounded scope vocabulary (subject / key fingerprint / anonymous /
+other — never a raw key, hard-capped), and each family appears only after its
+first observation, so an idle deployment does not carry empty series.
+
+`SQLHANDLER_AUDIT_LOG` appends one JSON line per query outcome — `ts`, `event`,
+`sql`, `state`, `duration_ms`, `n_rows`, `error` — a reviewable record of every
+statement executed against the lake, SIEM-friendly by construction. The chart
+does not wire it yet ([CONFIGURATION.md §9](CONFIGURATION.md#9-what-the-chart-does-not-wire)).
+
+**Probes** are three, and they answer different questions: `/health` is the
+process, `/ready` performs a cheap backend connectivity check (OneLake token and
+listing, S3 list, Iceberg catalog, NFS root) and returns 503 when the data
+source is unreachable, so broken-credential pods are drained from the Service
+instead of serving errors; the startup probe gates both while prewarm runs.
+A failing check reports **DEGRADED** for a grace period before **NOT READY**, so
+one flaky storage call does not drain every replica at once. `/metrics` and
+`/ready` can be gated behind a credential (`security.metricsAuth`) — with the
+gate on and no credential configured they 401 for everyone, fail-closed.
+
+## 10. Performance and the cache hierarchy
+
+Every layer exists to remove one specific cost, and each is keyed so that
+freshness is never traded away silently.
+
+| Cache | Removes | Invalidated by |
+|---|---|---|
+| **Metadata** (list/describe, `cache.ttl`) | The DFS/S3/catalog listing and Parquet-footer read on every call | TTL; `list_tables` refreshes in the background so callers never block |
+| **Dataset handle** (`SQLHANDLER_DATASET_CACHE_TTL`) | Re-opening the Delta log per query (the serialised part of every call) | TTL, plus snapshot-version re-check every 10 s |
+| **Result L1** (`cache.resultCacheTtl`) | Re-executing an identical query | Snapshot-version key + TTL; `policy=<sha256>` of the resolved rules separates different rule sets while callers with identical rules share |
+| **Result L2** (`cache.l2`) | The same re-execution **on another replica** | Shared RWX directory; off by default |
+| **Single-flight** | N identical **cold** executions (a cache stampede) | Result-cache key; waiters fall through on leader failure |
+| **Virtual materialization** (`cache.virtualCacheTtl`) | Recomputing an unfiltered virtual table | Definition + base snapshot versions; clustered so row-group stats prune filtered reads |
+| **Block cache** (`cache.blockCache`) | Re-fetching parquet footers and column chunks | Opt-in, pod-local disk; Delta data files are cached snapshot-version-scoped |
+
+Measured on PCAI G2 (2026-09-12, v1.6.0, 4 replicas × 8 vCPU/16Gi,
+MinIO-backed, 10 queries from 50K to 3M rows — full methodology in
+[../bench/BENCHMARK.md](../bench/BENCHMARK.md), scale-out campaign in
+[BENCHMARKS.md](BENCHMARKS.md)):
+
+- **Result cache: 1.8×–21× over cold execution**, scaling with query cost —
+  counts/filters 1.8–2.5×, aggregations 6.9–19.2×.
+- **Cold engine** (cache busted, pure DuckDB): 3M-row scans 1.0–2.0 s p50
+  (4.3–5.1M rows/s for counts/projections), 200–350K-row queries 0.19–2.0 s.
+- **Warm floor**: ~104–120 ms through the gateway for every query size, ~18–25 ms
+  in-cluster.
+- **Concurrency**: warm queries scale to ~75–81 qps at 8-way parallelism with
+  flat p50; all-cold bursts saturate per-pod CPU (flat ~11–12 qps fleet-wide,
+  p95 4.2 s) — the capacity-planning number for cold agent storms.
+
+### Environment findings during the benchmark (upstream/ops, not SQLhandler)
+
+Recorded with repro evidence in [../bench/BENCHMARK.md](../bench/BENCHMARK.md)
+§"Environment findings": the EzPresto locator routes `nextUri` GETs to its web
+app (404 "Query not found", 10/10 repro), the EzPresto MCP pod flaps between MCP
+and health-echo states (4 restarts, dev image), EzPresto's OPA policy denies
+table access for non-platform principals (`AccessDeniedException`), and the
+ezaf-gateway tier alternates MCP routes on a minutes cadence for external
+clients. In-cluster traffic is unaffected on all counts.
+
+## 11. Scale-out
+
+The HTTP layer is stateless per request (no session state), so any replica can
+serve any call. What does *not* scale for free is the in-process state, and the
+chart keys exist for exactly those:
+
+| Concern | Chart key | Note |
+|---|---|---|
+| Replica count | `replicaCount`, `autoscaling` | One replica collapses under concurrency; 4 held flat throughput in the benchmark. The HPA's CPU target is burst/runaway protection, not load-following |
+| Disruption | `podDisruptionBudget`, `topologySpread` | Keep serving through node drains; spread across nodes |
+| Drain | `terminationGracePeriodSeconds` (90) | In-flight MCP tool calls finish |
+| Catalog uploads + saved queries | `semanticCatalog.store` | **RWX required** — the render fails on an RWO claim for a scale-out deployment, because a per-pod volume would look shared and share nothing |
+| Policy file | `security.policy.claim` | Same RWX rule, same reason: replicas must not disagree about the ACL |
+| Shared result cache | `cache.l2` | Needs a genuinely shared directory |
+| Async jobs | — | **Per-replica registry**; a shared jobs dir is not chart-wired yet, so keep jobs and scale-out apart ([CONFIGURATION.md §9](CONFIGURATION.md#9-what-the-chart-does-not-wire)) |
+
+Process-per-pod vs multiple uvicorn workers inside one pod is analysed with
+measurements in [SCALING.md](SCALING.md): the answer is one process, because the
+heavy path already parallelises and the L1 cache would be diluted per worker.
+
+## 12. Feature, code and test map
 
 | Feature | Module(s) | Tests |
 |---|---|---|
-| `profile_table` / `search_tables` tools, params, time travel, timeout, concurrency gate, query memory | `engine.py`, `server.py` | `test_engine.py` |
-| `column_stats` tool, fuzzy `search_tables` ranking | `engine.py`, `server.py` | `test_column_stats.py`, `test_search_fuzzy.py` |
-| Async MCP query jobs (`query_submit`/`status`/`result`/`cancel`, `/api/jobs/*`) | `jobs.py`, `engine.py`, `server.py`, `webui.py` | `test_query_jobs.py` |
+| Backends (onelake / s3 / iceberg / nfs), federated, attach | `onelake.py`, `s3.py`, `iceberg.py`, `file.py`, `provider.py`, `external.py` | `test_engine.py`, `test_s3_delta.py`, `test_iceberg_integration.py` |
+| `profile_table` / `search_tables` / params / time travel / timeout / concurrency gate / query memory | `engine.py`, `server.py` | `test_engine.py` |
+| `column_stats`, fuzzy ranking, `sample_rows`, `explain_query`, `ask_data` | `engine.py`, `server.py` | `test_column_stats.py`, `test_search_fuzzy.py` |
+| Async MCP jobs, fetch-once, shared jobs dir | `jobs.py`, `engine.py`, `server.py`, `webui.py` | `test_query_jobs.py`, `test_shared_jobs.py` |
+| Per-caller fairness + result budget + truncation marker | `limits.py` | `test_per_caller_limits.py` |
+| Structured self-correcting errors | `errors.py` | `test_structured_errors.py` |
 | Saved parameterized queries (store, bind params, auth gating) | `saved.py`, `server.py`, `webui.py` | `test_saved_queries.py` |
 | MCP resources + prompts | `mcp_resources.py`, `server.py` | `test_mcp_resources.py` |
-| Semantic catalog merge/hot-reload | `engine.py` | `test_engine.py` |
-| Output formats (markdown/json/csv) | `engine.py`, `webui.py` | `test_tools_output.py` |
-| Async query jobs (submit/poll/rows/cancel) | `webui.py`, `engine.py` | `test_async_query.py`, `test_webui.py` |
-| `/api/profile`, `/api/export` | `webui.py` | `test_webui.py` |
-| Delta on S3 (`S3_FORMAT`) | `s3.py`, `config.py` | `test_s3_delta.py` |
-| Metrics, audit log, API token | `observability.py`, `server.py` | `test_ops.py` |
-| UI: stats panel, charts, export, saved queries | `ui/index.html` | `test_webui.py` |
+| Semantic catalog merge / hot-reload / virtual tables | `engine.py` | `test_engine.py` |
+| Metrics, audit log, readiness drift | `observability.py`, `server.py` | `test_ops.py`, `test_metrics_render.py` |
+| Identity ladder, policy, admin keys, OIDC rung | `identity.py`, `policy.py`, `admin_keys.py`, `oidc_identity.py`, `oidc_sso.py` | `test_identity.py`, `test_require_identity.py`, `test_oidc_rung.py`, `test_acl_policy.py`, `test_policy_leaks.py`, `test_policy_seed.py`, `test_policy_write_posture.py`, `test_admin_keys.py`, `test_admin_api.py` |
+| dbt manifest import (propose-not-overwrite) | `dbt_import.py`, `webui.py` | `test_dbt_import.py` |
+| Write tier (scratch CTAS/INSERT/COPY) | `writes.py` | `test_writes.py` |
+| Caches (L2, block) | `l2cache.py`, `blockcache.py` | `test_l2cache.py`, `test_l2_crossreplica.py`, `test_perf.py` |
+| UI: stats panel, charts, export, saved queries, inspector | `ui/index.html`, `webui.py` | `test_webui.py` |
 
-All tests in the files above pass on the current tree (run with `pytest tests/ -p no:cacheprovider`; the optional s3/iceberg integration files need their documented local setup — see their module docstrings).
-
-## Key configuration knobs
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `SQLHANDLER_CATALOG` | — | Semantic catalog JSON file (hot-reloaded) |
-| `SQLHANDLER_QUERY_MEMORY_SIZE` | 50 | Query-memory ring size behind `sqlhandler://query-memory` |
-| `SQLHANDLER_PROFILE_MAX_ROWS` | 1000000 | Sample cap for profiling (0 = full table) |
-| `SQLHANDLER_MCP_READONLY` | `1` | MCP `run_sql` is SELECT-only (decision D2); `0` restores multi-statement/DDL for trusted callers. Attached external catalogs stay read-only in both modes |
-| `SQLHANDLER_ALLOWED_ORIGINS` | none (same-origin) | Extra browser origins allowed on `/api/*`, `/ui`, `/mcp` (CORS + Origin validation, decision D3) |
-| `SQLHANDLER_METRICS_AUTH` | off | `1` gates `/metrics` + `/ready` behind the API token / MCP API keys (default off = today's behavior) |
-| `SQLHANDLER_QUERY_TIMEOUT` | 600 (decision D5) | DuckDB interrupt after N seconds (0 = off) |
-| `SQLHANDLER_MAX_CONCURRENT_QUERIES` | 8 | Per-pod concurrency cap (0 = unlimited) |
-| `SQLHANDLER_QUEUE_TIMEOUT` | 30 | Seconds a query may wait for a slot |
-| `SQLHANDLER_ASYNC_JOB_TTL` | 900 | Seconds finished async jobs are kept (shared by the web registry and the MCP/jobs registry) |
-| `SQLHANDLER_MAX_JOBS` | 8 | Cap on tracked async query jobs (`query_submit` + `/api/jobs`); beyond it submits are refused; garbage/non-positive values fall back to the default |
-| `SQLHANDLER_SAVED_QUERIES_PATH` | next to the cache dir | JSON file for the saved-parameterized-queries store (`query_save`/`query_list`/`query_delete`/`query_saved`; writes are auth-gated when a credential env is configured) |
-| `SQLHANDLER_EXPORT_MAX_ROWS` | 100000 | Row cap for CSV/Parquet exports (0 = 1M ceiling) |
-| `SQLHANDLER_AUDIT_LOG` | — | JSONL audit file path |
-| `SQLHANDLER_API_TOKEN` | — | Bearer/X-API-Token gate for `/api/*` |
-| `S3_FORMAT` | auto | `auto` \| `parquet` \| `delta` for the s3 backend |
-| `SQLHANDLER_ATTACH` / `SQLHANDLER_ATTACH_FILE` | — | Read-only Postgres/MySQL attach config (JSON; `password_env` names only) |
-| `SQLHANDLER_BLOCK_CACHE` / `_DIR` / `_BLOCK_SIZE` / `_MAX_BYTES` / `_INCLUDE_LOCAL` | off | Disk block cache for object-store parquet reads (s3 / iceberg / onelake backends; OneLake Delta data files are read through it snapshot-version-scoped, so a new ETL commit or a time-travel read never serves another snapshot's cached bytes) |
-| `SQLHANDLER_RESULT_CACHE_TTL` / `_MAX_BYTES` | 3600 / 256MiB | In-memory result cache for identical queries (snapshot-version-keyed) |
-| `SQLHANDLER_VIRTUAL_CACHE_TTL` / `_DIR` / `_MAX_BYTES` / `_SORT` | 3600 / cacheDir / 2GiB / on | Virtual-table materialization cache (point `_DIR` at an RWX PVC to share across replicas) |
-
-### Scale-out deployment (chart keys)
-
-`autoscaling` (HPA, autoscaling/v2, needs metrics-server), `podDisruptionBudget`,
-`topologySpread`, `terminationGracePeriodSeconds`, and
-`semanticCatalog.store` (shared RWX PVC for uploads + virtual-table
-materializations) — the G2 benchmark showed a single replica collapses under
-concurrency while 4 replicas hold flat throughput; the HPA's CPU target is
-burst/runaway protection, not load-following. Numbers:
-[BENCHMARKS.md](BENCHMARKS.md).
+All tests in those files pass on the current tree (`pytest tests/ -p
+no:cacheprovider`); the optional S3/Iceberg integration files need their
+documented local setup (see their module docstrings).

@@ -708,7 +708,11 @@ def parse_attach_config(environ: dict[str, str] | None = None) -> list[AttachSpe
                 if db_type == "postgres":
                     user = "postgres"
                 elif db_type in ("mysql", "mariadb"):
-                    user = "root"
+                    raise ValueError(
+                        f"{where}: type {db_type!r} requires an explicit 'user' or 'user_env' "
+                        "— there is no safe default (refusing to fall back to 'root': "
+                        "least-privilege read-only accounts only)"
+                    )
                 elif db_type == "mongodb":
                     user = ""  # no safe default — unauthenticated local/dev or explicit user
                 else:  # sqlserver
@@ -804,6 +808,16 @@ def _entries_from_json(raw: str, source: str) -> list[dict]:
 def _sql_quote(value: str) -> str:
     """Quote one DSN value (libpq/ODBC style: single quotes, doubled inside)."""
     return "'" + value.replace("'", "''") + "'"
+
+
+def _odbc_quote(value: str) -> str:
+    """ODBC/ADO.NET brace quoting: {...} makes every char literal; '}' doubles.
+
+    A password like 'a;b}c' would otherwise terminate the Pwd token at the
+    ';' and inject connstring keys (audit 2026-11-12 P2). Applied to the
+    free-text credential fields (Uid/Pwd) of the sqlserver DSN.
+    """
+    return "{" + value.replace("}", "}}") + "}"
 
 
 def _merge_params(
@@ -914,8 +928,8 @@ def build_attach_sql(spec: AttachSpec, password: str | None) -> str:
         pairs = [
             ("Server", f"{spec.host},{spec.port}"),
             ("Database", spec.database),
-            ("Uid", spec.user),
-            ("Pwd", password or ""),
+            ("Uid", _odbc_quote(spec.user)),
+            ("Pwd", _odbc_quote(password or "")),
             ("Encrypt", "yes"),
             ("TrustServerCertificate", "yes"),
         ]

@@ -8,6 +8,8 @@ credential is a `<ROLE_NAME>` placeholder (see *Placeholder convention* below).
 |---|---|
 | [`values.g2.yaml`](values.g2.yaml) | **SE G2** site (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`, `project-user-*` namespace, in-cluster MinIO). Sanitized from the real site file; carries the benchmark-derived 4-replica + HPA scaling settings. |
 | [`values.hosted-trial.yaml`](values.hosted-trial.yaml) | **Hosted trial** on a customer PCAI: `${DOMAIN_NAME}` endpoint, oauth2-proxy gateway `AuthorizationPolicy` on, credential fillers. |
+| [`values-hardened-g2.yaml`](values-hardened-g2.yaml) | The **production posture** overlay: hardened workload, NetworkPolicy on with an explicit caller allowlist, metrics auth, pinned caches. |
+| [`secrets.example.yaml`](secrets.example.yaml) | **Secret template** (sanitized twin of `helm/local/secrets.g2.yaml`): the mandatory `/mcp` key Secret plus the backend credential Secret, with the policy-ConfigMap ordering note. Copy, fill, apply. |
 
 ## Why this folder exists (and why it is secret-free)
 
@@ -38,6 +40,12 @@ Credentials: prefer creating the Kubernetes Secret out-of-band and leaving
 `values.g2.yaml`'s dev pattern uses `create: true`, which renders the Secret
 from the values file — acceptable for throwaway test clusters, never for
 shared ones.
+
+**The `/mcp` API-key Secret is not optional.** The chart wires `MCP_API_KEYS`
+from an operator-created Secret unconditionally, so a deployment whose Secret is
+missing never starts (`CreateContainerConfigError`). `secrets.example.yaml` is
+the template; the prerequisite tables and failure modes are in
+[DEPLOYMENT.md §2.1](../../documentation/DEPLOYMENT.md#21-secrets-the-operator-creates).
 
 ## Placeholder convention
 

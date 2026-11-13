@@ -141,12 +141,40 @@ def test_parse_inline_config_happy_path(monkeypatch):
 def test_parse_file_config_with_defaults(monkeypatch, tmp_path):
     cfg = tmp_path / "attach.json"
     cfg.write_text(
-        json.dumps({"databases": [{"name": "mx", "type": "mysql", "host": "db", "database": "d", "password_env": ""}]})
+        json.dumps(
+            {
+                "databases": [
+                    {
+                        "name": "mx",
+                        "type": "mysql",
+                        "host": "db",
+                        "database": "d",
+                        "user": "readonly",  # explicit since 2026-11-12: no root default
+                        "password_env": "",
+                    }
+                ]
+            }
+        )
     )
     monkeypatch.setenv("SQLHANDLER_ATTACH_FILE", str(cfg))
     specs = parse_attach_config()
     assert specs[0].port == 3306  # type default
     assert specs[0].password() is None  # trust auth
+
+
+def test_mysql_attach_requires_an_explicit_user(monkeypatch, tmp_path):
+    """audit 2026-11-12 (P3): no implicit 'root' default for mysql/mariadb —
+    a read-only attach must name a least-privilege account."""
+    import pytest as _pytest
+
+    cfg = tmp_path / "attach.json"
+    cfg.write_text(
+        json.dumps({"databases": [{"name": "mx", "type": "mysql", "host": "db", "database": "d", "password_env": ""}]})
+    )
+    monkeypatch.setenv("SQLHANDLER_ATTACH_FILE", str(cfg))
+    with _pytest.raises(ValueError) as exc:
+        parse_attach_config()
+    assert "user" in str(exc.value).lower()
 
 
 def test_rejects_literal_password_key(monkeypatch):

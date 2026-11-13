@@ -1,0 +1,36 @@
+{{- if and .Values.security.audit.enabled .Values.security.audit.pvc.create }}
+{{- /* Persistent volume backing the audit trail (SQLHANDLER_AUDIT_LOG).
+       Audit 2026-11-12: the image has always supported the trail; the chart
+       wired nothing, so every deployment ran without one.
+
+       Same discipline as the catalog store: an audit trail on an ephemeral
+       volume is not a compliance trail, so enabling audit REQUIRES a claim
+       source (existingClaim or this one), and ReadWriteMany is REQUIRED
+       whenever replicas can exceed 1 — a RWO claim would let each replica
+       write its own file while looking shared. */}}
+{{- $audit := .Values.security.audit }}
+{{- $multi := or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1) }}
+{{- if and $multi (not (has "ReadWriteMany" ($audit.pvc.accessModes | default list))) }}
+{{- fail "security.audit.pvc: ReadWriteMany access is required when replicas can exceed 1 (autoscaling.enabled or replicaCount > 1) — a ReadWriteOnce audit claim strands the extra pods Pending. Use an RWX StorageClass, or set accessModes: [ReadWriteOnce] ONLY for single-replica deployments." }}
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sqlhandler.fullname" . }}-audit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sqlhandler.labels" . | nindent 4 }}
+  annotations:
+    # The trail is evidence: never delete it as a side effect of a values
+    # change or a helm uninstall. Deletion must be deliberate.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml ($audit.pvc.accessModes | default (list "ReadWriteMany")) | nindent 4 }}
+  {{- if $audit.pvc.storageClass }}
+  storageClassName: {{ $audit.pvc.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $audit.pvc.size | default "10Gi" }}
+{{- end }}

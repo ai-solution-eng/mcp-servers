@@ -329,9 +329,12 @@ def write_caller_is_admin(request) -> bool:
     ``_admin_resolve_caller`` additionally treats an EXPLICIT
     ``X-API-Key``/``X-API-Token`` claim that matches nothing as a hard
     refusal ("a wrong key is never redeemed as the browser user behind it"),
-    and this helper does not: it never inspects key headers, so a
-    designated-admin session that ALSO carries a stale/rotated explicit key
-    is admitted here while ``/api/admin/*`` would 401 it. Nothing is elevated
+    and this helper does not: an UNRECOGNIZED explicit key is ignored here and
+    the ladder continues to the session rungs, so a designated-admin session
+    that ALSO carries a stale/rotated explicit key is admitted here while
+    ``/api/admin/*`` would 401 it. (A RECOGNIZED key does resolve — the
+    identity ladder's explicit-key rung, audit 2026-11-12 — so for a valid
+    designated-admin key both surfaces agree.) Nothing is elevated
     by the difference — the caller must still resolve to a subject or
     fingerprint in the policy's ``admins`` list, the same designation the
     admin surface checks — but the two surfaces disagree for that one request

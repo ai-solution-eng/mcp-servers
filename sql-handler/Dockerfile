@@ -1,11 +1,13 @@
 # SQLhandler MCP server — direct SQL access to columnar data (MCP server).
-# TODO(digest-pin): pin this base BY DIGEST for production builds — the tag
-# moves. Resolve with: docker buildx imagetools inspect
-# ghcr.io/astral-sh/uv:python3.14-trixie-slim — then replace the FROM line.
-# (Kept on python3.14-trixie during the 2026-10-16 port: the dev venv and
-# the whole test suite run 3.14; the sibling's 3.12 digest was not adopted
-# to avoid a runtime change inside an audit-remediation release.)
-FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim
+# BASE IMAGE — PIN BY DIGEST FOR PRODUCTION (audit 2026-11-12, P2).
+# A tag moves; a digest does not. Resolve once with:
+#   docker buildx imagetools inspect ghcr.io/astral-sh/uv:python3.14-trixie-slim
+# then build with the digest, no file edit required:
+#   docker build --build-arg BASE_IMAGE=ghcr.io/astral-sh/uv@sha256:<digest> .
+# The default stays on the tag so a fresh clone builds without ceremony.
+# (Kept on python3.14-trixie: the dev venv and the whole test suite run 3.14.)
+ARG BASE_IMAGE=ghcr.io/astral-sh/uv:python3.14-trixie-slim
+FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -50,7 +52,10 @@ WORKDIR ${APP_HOME}
 #       a drift-guard test refuses a manifest that diverges.
 COPY requirements-deps.lock.txt ./
 
-RUN uv pip install --system -r requirements-deps.lock.txt
+# --require-hashes (audit 2026-11-12, P2): every wheel/sdist is pinned by
+# sha256 from uv.lock, so a compromised or MITM'd index response cannot
+# substitute code. bump_version.sh regenerates this lock WITH hashes.
+RUN uv pip install --system --require-hashes -r requirements-deps.lock.txt
 
 COPY pyproject.toml README.md ./
 COPY src ./src
@@ -93,6 +98,15 @@ RUN python -c "import sqlhandler; print('sqlhandler', sqlhandler.__version__, 'i
 # above to bake the two community attach extensions):
 # RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community', 'INSTALL ducklake', 'INSTALL mongo FROM community', 'INSTALL bigquery FROM community')]" \
 #     && chmod -R a+rX /opt/duckdb-ext
+# RESIDUAL RISK (accepted, audit 2026-11-12 P2): DuckDB extensions are
+# downloaded from extensions.duckdb.org / community-extensions.duckdb.org at
+# BUILD time and are not signature-verified here, so the image is only as
+# trustworthy as those hosts on build day. Two mitigations, in order of
+# preference: (1) build on a trusted/egress-controlled runner, or (2) vendor
+# the extension files into duckdb-ext/v<version>/<platform>/ (the directory
+# layout DuckDB itself uses) and COPY it in place of this RUN — the repo
+# already produces that tree locally via .venv runs. Do NOT add
+# autoinstall/autoload back at runtime: the pod must never fetch extensions.
 RUN python -c "import duckdb; con = duckdb.connect(); con.execute(\"SET extension_directory='/opt/duckdb-ext'\"); [con.execute(stmt) for stmt in ('INSTALL postgres_scanner', 'INSTALL mysql_scanner', 'INSTALL sqlite_scanner', 'INSTALL mssql FROM community', 'INSTALL ducklake')]" \
     && chmod -R a+rX /opt/duckdb-ext
 ENV SQLHANDLER_DUCKDB_EXTENSION_DIR=/opt/duckdb-ext

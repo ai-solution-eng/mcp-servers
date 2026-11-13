@@ -17,6 +17,12 @@ layer and the result budget, in the repo's default-safe idiom:
   (``SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER`` /
   ``SQLHANDLER_MAX_JOBS_PER_CALLER``). The global cap always stays the outer
   bound, whatever the per-caller value.
+* The bucket KEY is the caller's identity by default (one quota per subject /
+  key fingerprint). ``SQLHANDLER_FAIRNESS_SCOPE=rules`` keys it on the
+  caller's effective-policy hash instead, so users who share a rule set (a
+  credential group) share ONE concurrency/job budget. It falls back to the
+  identity when enforcement is off or the caller resolves to no rules. Cache
+  scoping is unaffected — caches are ALWAYS keyed on the effective rules.
 * Every number is re-read per call (the fleet env convention) and a garbage
   value degrades to the default, never to "unlimited".
 
@@ -38,11 +44,14 @@ Three concerns live here:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from collections.abc import Callable
 
 from . import policy as _policy
+
+logger = logging.getLogger("sqlhandler.limits")
 
 #: The label used when no identity was resolved (stdio / dev / no gate).
 ANONYMOUS = "anonymous"
@@ -52,10 +61,34 @@ ANONYMOUS = "anonymous"
 #: semaphores — the fleet rule for any label derived from a request).
 OTHER = "other"
 
-#: Maximum number of distinct caller scopes tracked with their own bucket /
-#: metric series. Comfortably above any real deployment's provisioned
-#: identities (policy subjects + minted keys).
+#: DEFAULT maximum number of distinct caller scopes tracked with their own
+#: bucket / metric series (SQLHANDLER_MAX_SCOPES overrides). Comfortably above
+#: any real deployment's provisioned identities (policy subjects + minted keys).
 MAX_SCOPES = 256
+
+
+def max_scopes() -> int:
+    """Max distinct caller scopes with their own bucket/series.
+
+    ``SQLHANDLER_MAX_SCOPES`` (default 256). Beyond the cap new identities
+    collapse onto :data:`OTHER` — a bounded label vocabulary is a fleet rule,
+    and an operator with thousands of provisioned identities can raise it.
+    """
+    return _env_int("SQLHANDLER_MAX_SCOPES", MAX_SCOPES)
+
+
+def fairness_scope() -> str:
+    """Whether concurrency/job buckets key on identity or effective rules.
+
+    ``SQLHANDLER_FAIRNESS_SCOPE``: ``identity`` (default) gives every
+    caller its own quota; ``rules`` keys the bucket on the caller's
+    effective-policy hash, so users who share a rule set (a credential group)
+    share ONE concurrency/job budget. Garbage/unknown values fall back to
+    ``identity`` — the pre-change behavior, never to an unbounded bucket.
+    """
+    raw = os.environ.get("SQLHANDLER_FAIRNESS_SCOPE", "").strip().lower()
+    return "rules" if raw == "rules" else "identity"
+
 
 _scope_lock = threading.Lock()
 _seen_scopes: set[str] = set()
@@ -81,6 +114,32 @@ def caller_scope(caller) -> str | None:
     return key
 
 
+def rules_scope(caller) -> str | None:
+    """The effective-RULE bucket key (SQLHANDLER_FAIRNESS_SCOPE=rules).
+
+    The caller's effective-policy hash — the SAME identity the cache uses —
+    prefixed and truncated to a stable label. None when enforcement is off,
+    the policy defines no groups, the caller resolves to no rules (an empty
+    hash means "effectively unrestricted"), or resolution fails: the caller
+    then falls back to its identity bucket, so a rule-less caller never shares
+    a quota with every other rule-less caller by accident.
+    """
+    if caller is None:
+        return None
+    try:
+        if not _policy.policy_enabled():
+            return None
+        pol = _policy.policy_store().get()
+        if pol is None or not pol.groups:
+            return None
+        subject = getattr(caller, "subject", None)
+        key_fp = getattr(caller, "key_fp", None)
+        effective = pol.effective_hash(subject, key_fp)
+        return f"rules:{effective[:16]}" if effective else None
+    except Exception:  # a malformed caller / policy must never break a query
+        return None
+
+
 def bounded_scope(scope: str | None) -> str:
     """The bounded metric label for a caller scope (:data:`MAX_SCOPES` cap).
 
@@ -94,7 +153,7 @@ def bounded_scope(scope: str | None) -> str:
     with _scope_lock:
         if scope in _seen_scopes:
             return scope
-        if len(_seen_scopes) >= MAX_SCOPES:
+        if len(_seen_scopes) >= max_scopes():
             return OTHER
         _seen_scopes.add(scope)
         return scope
@@ -103,13 +162,19 @@ def bounded_scope(scope: str | None) -> str:
 def gate_scope(caller) -> str | None:
     """The BOUNDED bucket key for the concurrency gate; None = the global bucket.
 
-    :func:`caller_scope` gives the stable key; this maps it through
-    :func:`bounded_scope` so the semaphore table (and the job-cap buckets) are
-    capped at :data:`MAX_SCOPES` entries too — past the cap, new identities
-    share the ``other`` bucket (more restrictive, never unbounded). No identity
-    stays ``None`` (the global bucket: the historical behavior).
+    Default (``SQLHANDLER_FAIRNESS_SCOPE=identity``): :func:`caller_scope`
+    gives the stable per-caller key. ``rules`` switches to
+    :func:`rules_scope` so callers with the same effective rules share one
+    bucket — with an identity fallback whenever the rule key is unavailable.
+    :func:`bounded_scope` caps the vocabulary at :data:`MAX_SCOPES` entries
+    either way (past the cap, new buckets share ``other`` — more restrictive,
+    never unbounded). No identity stays ``None`` (the global bucket: the
+    historical behavior). Cache scoping is unaffected: caches are ALWAYS
+    keyed on the effective rules, whatever this returns.
     """
-    scope = caller_scope(caller)
+    scope = rules_scope(caller) if fairness_scope() == "rules" else None
+    if scope is None:
+        scope = caller_scope(caller)
     return None if scope is None else bounded_scope(scope)
 
 
@@ -128,7 +193,14 @@ def _env_int(name: str, default: int) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return max(value, 0)
+    if value < 0:
+        # A negative value is INVALID, not zero: 0 has a real meaning for
+        # several of these knobs (0 = unlimited/disabled), so silently
+        # clamping -1 to 0 would turn a typo into "no limit" (audit
+        # 2026-11-12). Fall back to the default and say so.
+        logger.warning("invalid %s=%r (negative); using the default %d", name, raw, default)
+        return default
+    return value
 
 
 def max_concurrent_per_caller(global_cap: int) -> int:

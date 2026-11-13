@@ -247,7 +247,7 @@ class Metrics:
             self.queries.name,
             self.queries.help,
             "counter",
-            [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(q.items())],
+            [(f'{{outcome="{self._label_value(lbl)}"}}', val) for lbl, val in sorted(q.items())],
         )
         # The duration histogram's family headers render ONCE, above the
         # per-outcome series (the per-outcome loop only emits _bucket/_sum/
@@ -276,7 +276,13 @@ class Metrics:
                 self.rows.name,
                 self.rows.help,
                 "counter",
-                [(f'{{table="{lbl}"}}', val) for lbl, val in sorted(r.items())],
+                # _label_value: a table name is backend-controlled (an S3 prefix
+                # or Delta directory may contain a quote or a newline) and an
+                # unescaped one produces an INVALID exposition that Prometheus
+                # rejects wholesale — the same failure class as the P1-5
+                # duplicate-header bug. Histograms already escape; counters
+                # did not (audit 2026-11-12, P3).
+                [(f'{{table="{self._label_value(lbl)}"}}', val) for lbl, val in sorted(r.items())],
             )
         # ADDITIVE (identity spine): the caller-class series renders after the
         # historical families so every pre-existing line keeps its byte
@@ -289,7 +295,7 @@ class Metrics:
                 self.caller_queries.name,
                 self.caller_queries.help,
                 "counter",
-                [(f'{{caller_class="{lbl}"}}', val) for lbl, val in sorted(cq.items())],
+                [(f'{{caller_class="{self._label_value(lbl)}"}}', val) for lbl, val in sorted(cq.items())],
             )
         # ADDITIVE (write tier): {backend} and {outcome} views of the write
         # counter - rendered only once a write has been observed (dashboards
@@ -300,7 +306,7 @@ class Metrics:
                 self.writes.name,
                 self.writes.help,
                 "counter",
-                [(f'{{backend="{lbl}"}}', val) for lbl, val in sorted(w.items())],
+                [(f'{{backend="{self._label_value(lbl)}"}}', val) for lbl, val in sorted(w.items())],
             )
         wo = self.write_outcomes.snapshot()
         if wo:
@@ -308,7 +314,7 @@ class Metrics:
                 self.write_outcomes.name,
                 self.write_outcomes.help,
                 "counter",
-                [(f'{{outcome="{lbl}"}}', val) for lbl, val in sorted(wo.items())],
+                [(f'{{outcome="{self._label_value(lbl)}"}}', val) for lbl, val in sorted(wo.items())],
             )
         # ADDITIVE (per-caller budgets): the caller-scope histograms render
         # after every pre-existing family, so all historical lines keep their
@@ -546,7 +552,13 @@ def token_matches(provided: str, expected: str) -> bool:
     (X-API-Token header).
     """
     if not expected:
-        return True
+        # FAIL CLOSED (audit 2026-11-12, P3). Both current callers pre-filter
+        # an empty configuration, so this is unreachable today — but the old
+        # `return True` made "no expected token" indistinguishable from "token
+        # matched", so the next caller that forgets the pre-filter would
+        # silently disable authentication. Callers that mean "no token
+        # configured" must decide that explicitly, not inherit a match.
+        return False
     provided = (provided or "").strip()
     if provided.lower().startswith("bearer "):
         provided = provided[7:].strip()

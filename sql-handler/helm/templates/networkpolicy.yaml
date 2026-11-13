@@ -23,6 +23,9 @@ spec:
       {{- include "sqlhandler.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
+    {{- if .Values.security.networkPolicy.egress.enabled }}
+    - Egress
+    {{- end }}
   ingress:
     - from:
         - podSelector: {}
@@ -44,4 +47,33 @@ spec:
     {{- with .Values.security.networkPolicy.additionalIngress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+  {{- if .Values.security.networkPolicy.egress.enabled }}
+  {{- $eg := .Values.security.networkPolicy.egress }}
+  {{- /* Egress default-deny (audit 2026-11-12, P2). The pod holds the
+         Fabric service-principal secret / S3 keys and, with no egress rule,
+         can reach ANY host — including the cloud metadata endpoint, which
+         turns any code-execution or SSRF-class bug into credential theft.
+         Allowed by default: cluster DNS, then whatever the operator lists.
+         FQDN egress requires a CNI that understands it (Cilium); plain
+         NetworkPolicy needs CIDRs — hence allowCidrs, not hostnames. */}}
+  egress:
+    {{- if $eg.allowDns }}
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- /* A listed CIDR is the trust boundary: do NOT also pin ports, or the
+           chart's own MinIO example (endpoint :9000) is silently blocked while
+           443 is open — cross-validation 2026-11-12 found exactly that. */}}
+    {{- range $eg.allowCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+    {{- end }}
+    {{- with $eg.additional }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
 {{- end }}

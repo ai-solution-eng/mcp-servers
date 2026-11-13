@@ -39,7 +39,7 @@ import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
 from .blockcache import maybe_block_cache
-from .config import S3Config
+from .config import S3Config, listing_max_entries
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import (
     build_raw_dataset,
@@ -239,6 +239,13 @@ class S3Provider(DataProvider):
             infos = fs.get_file_info(selector)
         except Exception as exc:
             raise LakehouseError(f"Could not list S3 path '{root}': {_scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)}") from exc
+        cap = listing_max_entries()
+        if cap and len(infos) > cap:
+            raise LakehouseError(
+                f"S3 listing of '{root}' found {len(infos)} entries, past "
+                f"SQLHANDLER_LISTING_MAX_ENTRIES={cap} (refusing rather than silently truncating — "
+                "narrow S3_PREFIX or raise the knob)"
+            )
 
         seen: dict[str, TableInfo] = {}
         # Delta detection: a data-file path with a _delta_log segment marks
@@ -425,7 +432,9 @@ class S3Provider(DataProvider):
             self._s3fs().get_file_info(pafs.FileSelector(root, recursive=False))
             return None
         except Exception as exc:
-            return str(exc)
+            # Scrub like every other error edge in this module — this string
+            # reaches the readiness surface (audit 2026-11-12 P3).
+            return _scrub(str(exc), self.config.access_key, self.config.secret_key, self.config.session_token)
 
     def open_dataset(self, info: TableInfo, version: int | None = None):
         """Open a table as a pyarrow Dataset (cached by engine).

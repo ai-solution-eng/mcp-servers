@@ -8,8 +8,10 @@ byte-for-byte in behavior:
 * RS256 ONLY — ``none`` and the ``HS*`` family are refused outright (the
   classic alg-confusion guard: a JWKS public key must never be abused as an
   HMAC secret);
-* ``iss`` equality, ``exp``/``nbf`` with clock-skew leeway, and
-  ``azp``/``aud`` audience validation;
+* ``iss`` equality, ``exp``/``nbf`` with clock-skew leeway, and audience
+  validation: ``aud`` must contain the configured audience and, when
+  present, ``azp`` must equal it too (``azp`` is additional, never a
+  substitute - audit 2026-11-12 P3);
 * the JWKS is fetched with stdlib urllib, TLS verification ALWAYS ON
   (``REMOTE_CA_BUNDLE`` may point at a platform CA bundle — a dedicated SSL
   context trusts it, never disables verification), cached under a lock with
@@ -371,17 +373,65 @@ def _verify_rs256(signing_input: bytes, signature: bytes, key: tuple[int, int]) 
     return True
 
 
+def _configured_audiences() -> tuple[str, ...]:
+    """The accepted audiences: SQLHANDLER_OIDC_AUDIENCE (comma-separated).
+
+    Defaults to DEFAULT_AUDIENCE ("ua") when unset. A list lets a Keycloak
+    deployment accept both its client id and the realm's default "account"
+    audience without weakening the check to "any audience".
+    """
+    raw = _env_str(AUDIENCE_ENV) or DEFAULT_AUDIENCE
+    return tuple(a.strip() for a in raw.split(",") if a.strip()) or (DEFAULT_AUDIENCE,)
+
+
 def _audience_matches(claims: dict) -> bool:
-    audience = _env_str(AUDIENCE_ENV) or DEFAULT_AUDIENCE
-    azp = claims.get("azp")
-    if azp is not None:
-        return azp == audience
+    """``aud`` MUST contain the expected audience; ``azp`` is ADDITIONAL.
+
+    Audit 2026-11-12 P3: the previous shape returned on ``azp`` alone, so a
+    token minted for another service (``aud: ["other"]``) passed whenever its
+    authorized party happened to be this client. Now:
+
+    * ``aud`` (string or list) must contain one of the configured audiences;
+    * when ``azp`` is present it must ALSO be one of them (the authorized
+      party is us, not merely one of the token's audiences).
+
+    SQLHANDLER_OIDC_AUDIENCE is a COMMA-SEPARATED list, because a real
+    Keycloak deployment needs two: the app's own client id AND the realm's
+    default "account" audience that access tokens carry. Requiring exactly one
+    value made every Keycloak token fail with a bare 401 (cross-validation
+    2026-11-12 flagged the discovery trap); listing both stays strict.
+    """
+    audiences = _configured_audiences()
     aud = claims.get("aud")
     if isinstance(aud, str):
-        return aud == audience
-    if isinstance(aud, list):
-        return audience in [a for a in aud if isinstance(a, str)]
-    return False
+        presented = [aud]
+    elif isinstance(aud, list):
+        presented = [a for a in aud if isinstance(a, str)]
+    else:
+        presented = []
+    if not any(a in audiences for a in presented):
+        return False
+    azp = claims.get("azp")
+    return azp is None or azp in audiences
+
+
+_AUDIENCE_WARNED = False
+
+
+def _warn_audience_once(presented: str, configured: tuple[str, ...]) -> None:
+    """One loud, actionable line per process when an audience check fails."""
+    global _AUDIENCE_WARNED
+    if _AUDIENCE_WARNED:
+        return
+    _AUDIENCE_WARNED = True
+    logger.warning(
+        "OIDC audience mismatch: token aud=%s, accepted=%s - set "
+        "SQLHANDLER_OIDC_AUDIENCE to a comma-separated list that includes the "
+        "token's audience (Keycloak access tokens usually carry 'account'), or "
+        "add an audience mapper for this client",
+        presented,
+        ",".join(configured),
+    )
 
 
 def _claims_valid(claims: dict) -> bool:
@@ -400,6 +450,11 @@ def _claims_valid(claims: dict) -> bool:
         _fail("nbf", "nbf in the future (clock-skew leeway applied)")
         return False
     if not _audience_matches(claims):
+        # The one decline an operator can ACT on is logged at WARNING (once per
+        # process): a Keycloak token with aud=["account"] against a single
+        # configured audience otherwise produces bare 401s with nothing in the
+        # log. No token material is logged - only the audience names.
+        _warn_audience_once(str(claims.get("aud")), _configured_audiences())
         _fail("audience")
         return False
     return True

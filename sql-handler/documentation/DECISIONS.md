@@ -32,8 +32,10 @@
 - **Identity channels (unchanged ladder, now with SSO):** minted static keys
   (fingerprint-bound, `sha256:<12hex>` via audit.key_fingerprint — the raw key
   never enters a policy file or audit trail), gateway relay attribution
-  (`X-MCP-Caller-Subject` over a key-valid request — attribution-never-
-  authorization), SSO bearer JWT (JWKS rung above), oauth2-proxy browser
+  (`X-MCP-Caller-Subject` over a key-valid request — attribution IS an
+  authorization input, so it is signed by default and unsigned only under
+  `SQLHANDLER_TRUST_RELAY_HEADERS`; audit 2026-11-12 P1-5), SSO bearer JWT
+  (JWKS rung above), oauth2-proxy browser
   headers (existing trustBrowserHeaders pin — only with the workload
   AuthorizationPolicy enabled).
 - **Admin keys keep working unchanged** under a `datasets` document: full

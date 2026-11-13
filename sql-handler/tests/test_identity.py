@@ -65,7 +65,13 @@ def _resolve_through_stack(
     This is the ladder exactly as production runs it.
 
     ``secret`` pins SQLHANDLER_RELAY_HMAC_SECRET for the request (None = the
-    legacy, signature-less posture every pre-existing test asserts).
+    legacy, signature-less posture).
+
+    Since the 2026-11-12 audit (P1-5) an UNSIGNED relay subject header is
+    REFUSED by default — it feeds authorization (policy admins, subject
+    grants, owner scopes). The legacy posture these tests pin therefore needs
+    the explicit SQLHANDLER_TRUST_RELAY_HEADERS opt-in; the default-refusal
+    path is pinned by tests/test_relay_attribution.py.
     """
 
     if keys is not None:
@@ -75,8 +81,11 @@ def _resolve_through_stack(
         monkeypatch.delenv("SQLHANDLER_API_KEYS", raising=False)
     if secret is not None:
         monkeypatch.setenv(RELAY_HMAC_SECRET_ENV, secret)
+        monkeypatch.delenv("SQLHANDLER_TRUST_RELAY_HEADERS", raising=False)
     else:
         monkeypatch.delenv(RELAY_HMAC_SECRET_ENV, raising=False)
+        # Legacy posture: unsigned attribution is opt-in since 2026-11-12.
+        monkeypatch.setenv("SQLHANDLER_TRUST_RELAY_HEADERS", "1")
     captured: list = []
 
     async def inner(scope, receive, send):

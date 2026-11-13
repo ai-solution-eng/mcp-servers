@@ -62,6 +62,39 @@ curl -sS http://searxng-mcp-service.<release-namespace>.svc.cluster.local:9090/m
 curl -sS http://searxng-mcp-service.<release-namespace>.svc.cluster.local:8080/config | head -c 400
 ```
 
+## 5. Memory bound (1.7.1 — anonymous-heap fix)
+
+Before 1.7.1 the fetch result cache was bounded by entry COUNT only (64) and
+TTL-expired entries were dropped only when their own key was requested again,
+so a handful of large pages could pin hundreds of MB until the container hit
+its limit (live: 269 MB -> 481 MB on day 10 of a 512 Mi limit; OOMKilled
+2026-10-27). 1.7.1 bounds both caches by BYTES, sweeps expired entries on
+insert, and refuses to cache an outcome larger than its per-entry cap (the
+outcome is still returned to the caller).
+
+| Env | Default | Meaning |
+|---|---|---|
+| `SEARXNG_FETCH_CACHE_MAX_BYTES` | 33554432 (32 MiB) | fetch cache payload budget |
+| `SEARXNG_FETCH_CACHE_MAX_ENTRIES` | 64 | fetch cache entry cap |
+| `SEARXNG_FETCH_CACHE_MAX_ENTRY_BYTES` | 2097152 (2 MiB) | largest fetch outcome cached |
+| `SEARXNG_SEARCH_CACHE_MAX_BYTES` | 8388608 (8 MiB) | search cache payload budget |
+| `SEARXNG_SEARCH_CACHE_MAX_ENTRIES` | 64 | search cache entry cap |
+| `SEARXNG_SEARCH_CACHE_MAX_ENTRY_BYTES` | 262144 (256 KiB) | largest search response cached |
+
+Verify the running pod: `kubectl -n <ns> get deploy searxng-mcp -o yaml`
+(expect `memory: 1Gi` for the MCP container) and watch the CURVE, not one
+sample:
+
+```promql
+container_memory_working_set_bytes{namespace="<ns>", container="searxng-mcp"}
+```
+
+Expected after 1.7.1: working set plateaus at roughly the ~80 MB import
+baseline + at most 32 MiB of cached payload + transient parse spikes. It must
+NOT keep climbing ~20 MB/day; a sustained climb means a bound is set too high,
+not that the limit is too low. Unit-level proof:
+`cd searxng_mcp && .venv/bin/python -m pytest tests/test_cache_bounds.py`.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

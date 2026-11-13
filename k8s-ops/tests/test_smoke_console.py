@@ -198,6 +198,13 @@ class TestConsoleAndMcpNoAuth:
             "app.js served with javascript content type"
         )
 
+    def test_theme_js_served_as_javascript(self):
+        st, hdrs, body = get("/ui/theme.js")
+        assert st == 200 and "javascript" in hdrs.get("Content-Type", hdrs.get("content-type", "")), (
+            "theme.js served with javascript content type"
+        )
+        assert b"k8s-mcp-theme" in body, "theme.js carries the k8s-mcp-theme storage key"
+
     def test_path_traversal_404(self):
         st, _, _ = get("/ui/../server.py")
         assert st == 404, "path traversal /ui/../server.py -> 404"
@@ -267,6 +274,13 @@ class TestConsoleAndMcpApiKeyEnforced:
         assert st == 200 and "javascript" in hdrs.get("Content-Type", hdrs.get("content-type", "")), (
             "app.js served with javascript content type"
         )
+
+    def test_theme_js_served_as_javascript(self):
+        st, hdrs, body = get("/ui/theme.js")
+        assert st == 200 and "javascript" in hdrs.get("Content-Type", hdrs.get("content-type", "")), (
+            "theme.js served with javascript content type"
+        )
+        assert b"k8s-mcp-theme" in body, "theme.js carries the k8s-mcp-theme storage key"
 
     def test_path_traversal_404(self):
         st, _, _ = get("/ui/../server.py")

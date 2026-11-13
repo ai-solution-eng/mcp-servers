@@ -64,6 +64,7 @@ import json
 import os
 import re
 import ssl
+import sys
 import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin
@@ -251,48 +252,130 @@ class FetchOutcome:
     browser_note: str | None = None
 
 
+def _outcome_bytes(outcome: FetchOutcome) -> int:
+    """Resident bytes of one cached outcome, for the cache byte budget.
+
+    sys.getsizeof on each payload string counts the object header plus the
+    exact character buffer WITHOUT materializing a second copy of a
+    multi-megabyte page (len(text.encode()) would). A cached outcome is held
+    for its whole TTL, so this is the number a byte budget must bound.
+    """
+    total = sys.getsizeof(outcome)
+    for field_name in (
+        "text",
+        "source",
+        "screenshot_b64",
+        "screenshot_omitted",
+        "policy_error",
+        "tls_note",
+        "browser_note",
+    ):
+        value = getattr(outcome, field_name, None)
+        if value:
+            total += sys.getsizeof(value)
+    return total
+
+
 class FetchResultCache:
     """Tiny TTL cache + single-flight coalescer for fetch ladder outcomes.
 
-    * TTL: entries expire after ``ttl_seconds`` (0 disables caching entirely).
+    * TTL: entries expire after ttl_seconds (0 disables caching entirely).
+      Expired entries are swept on every insert, so a page that is never
+      requested again still leaves the cache when its TTL lapses (the old
+      lazy-only expiry left up to max_entries stale pages resident
+      indefinitely - the 2026-11 anonymous-heap growth).
     * Single flight: concurrent calls with the same key share ONE upstream
-      run — later callers await the same task instead of racing the ladder.
+      run - later callers await the same task instead of racing the ladder.
     * Unbounded outcomes are never stored; the caller passes a
-      ``cacheable`` predicate (failures/policy errors may coalesce but a
+      cacheable predicate (failures/policy errors may coalesce but a
       plain failure is not memoized).
-    * Bounded to ``max_entries`` (oldest evicted) so a long-lived process
-      cannot accumulate response bodies.
+    * Bounded by BYTES, not just entry count: each outcome is measured at
+      insert and the cache evicts least-recently-used entries until both
+      max_bytes and max_entries hold. An outcome larger than
+      max_entry_bytes is returned to the caller but never cached - one
+      5 MB page must not pin the whole budget. max_bytes=0 disables the
+      byte bound (entry-count only; tests and legacy callers).
+    * LRU: a hit refreshes recency, so a hot page survives a burst of
+      one-shot fetches.
+
+    Immutability contract: a cache hit returns the STORED outcome object (no
+    copy) — callers must treat FetchOutcome as read-only. Every mutation today
+    happens inside the factory before the outcome is published; a future
+    caller that mutates a returned outcome would alias the cache.
     """
 
-    def __init__(self, ttl_seconds: float, max_entries: int = 64):
+    def __init__(
+        self,
+        ttl_seconds: float,
+        max_entries: int = 64,
+        max_bytes: int = 32 * 1024 * 1024,
+        max_entry_bytes: int = 2 * 1024 * 1024,
+    ):
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.max_entries = max(1, int(max_entries))
-        self._store: dict[tuple, tuple[float, FetchOutcome]] = {}
+        self.max_bytes = max(0, int(max_bytes))
+        self.max_entry_bytes = max(0, int(max_entry_bytes))
+        self._store: dict[tuple, tuple[float, int, FetchOutcome]] = {}
+        self._bytes = 0
         self._inflight: dict[tuple, asyncio.Future] = {}
         self._lock = asyncio.Lock()
         self.hits = 0
         self.misses = 0
 
+    @property
+    def bytes(self) -> int:
+        """Payload bytes currently held by cached outcomes."""
+        return self._bytes
+
+    def _drop(self, key) -> None:
+        entry = self._store.pop(key, None)
+        if entry is not None:
+            self._bytes = max(0, self._bytes - entry[1])
+
+    def _purge_expired(self, now: float) -> None:
+        for key in [k for k, (expiry, _size, _outcome) in self._store.items() if expiry <= now]:
+            self._drop(key)
+
     def _peek(self, key) -> FetchOutcome | None:
         entry = self._store.get(key)
         if entry is None:
             return None
-        expiry, outcome = entry
+        expiry, _size, outcome = entry
         if expiry <= time.monotonic():
-            self._store.pop(key, None)
+            self._drop(key)
             return None
+        # LRU: refresh recency so a hot key is evicted last.
+        self._store[key] = self._store.pop(key)
         return outcome
 
+    def _insert(self, key, outcome) -> None:
+        if self.ttl_seconds <= 0:
+            return  # caching disabled
+        size = _outcome_bytes(outcome)
+        if self.max_entry_bytes and size > self.max_entry_bytes:
+            return  # too big to cache - still returned to every caller
+        if self.max_bytes and size > self.max_bytes:
+            return
+        now = time.monotonic()
+        self._purge_expired(now)
+        self._drop(key)
+        self._store[key] = (now + self.ttl_seconds, size, outcome)
+        self._bytes += size
+        while self._store and (
+            len(self._store) > self.max_entries or (self.max_bytes and self._bytes > self.max_bytes)
+        ):
+            self._drop(next(iter(self._store)))
+
     async def run(self, key, factory, cacheable=None) -> tuple[FetchOutcome, bool]:
-        """Run ``factory()`` once per key within the TTL window; returns
-        ``(outcome, cache_hit)``."""
+        """Run factory() once per key within the TTL window; returns
+        (outcome, cache_hit)."""
         hit = self._peek(key)
         if hit is not None:
             self.hits += 1
             return hit, True
         loop = asyncio.get_running_loop()
         # Coalesce: one shared task per key. All logic (publish + cleanup +
-        # memoize) lives in the task's done-callback so it happens even if
+        # memoize) lives in the task done-callback so it happens even if
         # the owner caller is cancelled mid-flight; asyncio.shield lets
         # individual waiters go away without killing the upstream run.
         async with self._lock:
@@ -314,12 +397,7 @@ class FetchResultCache:
                         return  # failures are coalesced but never memoized
                     outcome = done.result()
                     if cacheable is None or cacheable(outcome):
-                        self._store[key] = (
-                            time.monotonic() + self.ttl_seconds,
-                            outcome,
-                        )
-                        while len(self._store) > self.max_entries:
-                            self._store.pop(next(iter(self._store)))
+                        self._insert(key, outcome)
 
                 task.add_done_callback(_publish)
         self.misses += 1
@@ -392,7 +470,12 @@ class WebContentFetcher:
                 ttl = float(os.getenv("SEARXNG_FETCH_CACHE_TTL", "300"))
             except ValueError:
                 ttl = 300.0
-        self.result_cache = FetchResultCache(ttl_seconds=ttl)
+        self.result_cache = FetchResultCache(
+            ttl_seconds=ttl,
+            max_entries=_env_int("SEARXNG_FETCH_CACHE_MAX_ENTRIES", 64),
+            max_bytes=_env_int("SEARXNG_FETCH_CACHE_MAX_BYTES", 32 * 1024 * 1024),
+            max_entry_bytes=_env_int("SEARXNG_FETCH_CACHE_MAX_ENTRY_BYTES", 2 * 1024 * 1024),
+        )
 
     def _make_client(self, *, pinned: bool, verify: bool | str | None = None) -> httpx2.AsyncClient:
         """One short-lived client per logical fetch.

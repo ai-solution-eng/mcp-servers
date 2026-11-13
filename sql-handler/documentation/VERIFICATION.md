@@ -21,17 +21,23 @@ it fails.
 ## 2. MCP handshake at `/mcp`
 
 The endpoint speaks standard MCP (stateless streamable-http — no session id to
-manage, requests are self-contained). The `Accept` header must include both
-`application/json` and `text/event-stream`:
+manage, requests are self-contained). Two headers are required: the `Accept`
+header must include both `application/json` and `text/event-stream`, and
+`/mcp` is API-key-gated (mandatory in the chart), so every request carries
+`X-API-Key: <key>` (or `Authorization: Bearer <key>`):
 
 ```bash
 curl -s https://<endpoint>/mcp \
+  -H "X-API-Key: $SQLHANDLER_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
        "params":{"protocolVersion":"2025-03-26","capabilities":{},
                  "clientInfo":{"name":"verify","version":"0"}}}'
 ```
+
+A `401` here means the key is missing or not in the Secret's comma-separated
+list — not that the server is down.
 
 Expect a result with `serverInfo.name = "sqlhandler"` (plus protocolVersion and
 capabilities). Follow with `tools/list` — expect `list_tables`,
@@ -64,8 +70,9 @@ curl -s https://<endpoint>/api/query \
 |---|---|
 | `https://<endpoint>/ui` (browser) | Data explorer loads; table list renders (search, schema view, SQL editor) |
 | `https://<endpoint>/metrics` | Prometheus text exposition: `sqlhandler_queries_total{outcome}`, query-duration histogram, cache hit/miss counters |
+| `/mcp` API-key gate | No key → `401`; a key from the `sqlhandler-apikey` Secret → the handshake in §2 succeeds |
 | Gateway auth (oauth2-proxy enabled) | Unauthenticated external calls are redirected/challenged; with a valid PCAI token everything above works |
-| In-cluster direct call | `curl http://<service>.<namespace>.svc.cluster.local:9097/ready` needs no auth while the ingress NetworkPolicy is off (default) |
+| In-cluster direct call | `/ready` needs no auth (probe path). `/api/*` and `/mcp` **do**: since the 2026-11-12 audit the chart sets `SQLHANDLER_REQUIRE_IDENTITY=1`, so an anonymous `curl http://<service>.<namespace>.svc.cluster.local:9097/api/tables` returns 401 — add `-H "X-API-Key: <key>"` (or set `security.identity.requireIdentity: false` for a gateway-only posture) |
 | Read-only guard | `POST /api/query` with `DELETE FROM ...` → rejected (only plain `SELECT` / `EXPLAIN SELECT` pass) |
 | Semantic catalog | `curl -s https://<endpoint>/api/semantic-catalog` → live catalog source + table count (empty until §6 of DEPLOYMENT.md is done) |
 
@@ -82,20 +89,20 @@ kubectl -n <namespace> get hpa <release>-sqlhandler -w                    # repl
 kubectl -n <namespace> top pods -l app.kubernetes.io/instance=<release>   # CPU/memory vs requests
 ```
 
-## 6. Troubleshooting
+## 6. Verification-time symptoms
+
+Prerequisite and install failures — missing Secret, PVC `Pending`, `403` at the
+gateway, Kyverno hook, `/ready` 503 — are catalogued once, with their causes, in
+[DEPLOYMENT.md §6](DEPLOYMENT.md#6-troubleshooting). The table below covers
+symptoms that only show up *while verifying a running deployment*.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `/ready` → 503 "not ready" + backend error | Wrong credentials/endpoint in the Secret; bucket/URL typo; NFS mount absent | Verify the Secret keys match `credentialsSecret.<x>Key` values; fix values + re-apply |
-| Pod never becomes Ready, startup probe kills it | Cold discovery/prewarm outliving the probe window | Keep `startupProbe` enabled (24 × 5s); check logs for slow listing |
+| `/mcp` returns `401` | Missing `X-API-Key` header, or the key is not in the Secret's comma-separated list | Add the header (§2); read the Secret back and compare |
 | MCP POST returns 405 through the gateway | Gateway tier flap window (transport-level, not the app) | Retry — clients drop the pooled connection and retry automatically |
-| 401/302 to login on every route | oauth2-proxy AuthorizationPolicy on, caller unauthenticated | Use a valid PCAI token, or (in-cluster only) call the ClusterIP service directly |
-| In-cluster caller suddenly gets 403 | Ingress NetworkPolicy was enabled without the caller's namespace | Add the namespace to `security.networkPolicy.allowedNamespaces` |
-| `list_tables` empty but pods healthy | Wrong `backend:` for the data (e.g. chart default `s3` while data is on OneLake) | Set `backend: onelake` explicitly — credential wiring is gated on it |
+| Pod never becomes Ready, startup probe kills it | Cold discovery/prewarm outliving the probe window | Keep `startupProbe` enabled (24 × 5s); check logs for slow listing |
+| `list_tables` empty but pods healthy | Wrong `backend:` for the data (e.g. chart default `s3` while the data is on OneLake) | Set `backend: onelake` explicitly — credential wiring is gated on it |
 | Federated table not found by bare name | Bare name ambiguous across sources | Use the source-qualified name (`sales_orders`) |
-| Catalog edits never appear | Uploaded store overriding values catalog, or upload disabled | Check `GET /api/semantic-catalog` for the live source; `SQLHANDLER_CATALOG_UPLOAD=0` disables applying |
-| Catalog PVC stuck Pending / render fails on access modes | RWO StorageClass for a scale-out deployment | `semanticCatalog.store.accessModes: [ReadWriteMany]` + an RWX-capable StorageClass |
-| Release apply fails on a Kyverno hook | `kyverno.io` CRD missing on the cluster | `ezua.kyverno.enabled: false` (labels are still set by the chart helpers) |
-| HPA shows `<unknown>/80%` | metrics-server absent/unreachable | Install metrics-server, or scale with `replicaCount` alone |
-| Slow first queries after a restart | Cold caches (metadata + result caches are in-process) | Expected; `cache.prewarmTables` + disk-warm cache soften it, warm floor is ~ms |
-| p95 latency collapses under many concurrent clients with one replica | Single replica serializes DuckDB queries per process | Scale out (HPA) — evidence and numbers in [BENCHMARKS.md](BENCHMARKS.md) |
+| Catalog edits never appear | Uploaded store overriding the values catalog, or uploads disabled | Check `GET /api/semantic-catalog` for the live source; `SQLHANDLER_CATALOG_UPLOAD=0` disables applying |
+| Slow first queries after a restart | Cold caches (metadata and result caches are in-process) | Expected; `cache.prewarmTables` + the disk-warm cache soften it |
+| p95 collapses under many concurrent clients with one replica | One replica serializes DuckDB queries per process | Scale out — evidence and numbers in [BENCHMARKS.md](BENCHMARKS.md) |

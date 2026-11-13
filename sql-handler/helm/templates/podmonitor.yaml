@@ -1,3 +1,6 @@
+{{- if and .Values.security.metricsAuth .Values.metrics.podMonitor.enabled (not .Values.metrics.podMonitor.bearerTokenSecret) }}
+{{- fail "security.metricsAuth is true but metrics.podMonitor.bearerTokenSecret is empty: Prometheus would scrape an authenticated /metrics without a credential and the target would fail silently. Set bearerTokenSecret to a Secret carrying SQLHANDLER_API_TOKEN or an /mcp key, or turn security.metricsAuth off." }}
+{{- end }}
 {{- if .Values.metrics.podMonitor.enabled }}
 {{- /* Prometheus PodMonitor: lets the prometheus-operator scrape /metrics
        (Prometheus text exposition, engine gauges included). Lives in THIS

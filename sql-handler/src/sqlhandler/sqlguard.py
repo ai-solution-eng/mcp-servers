@@ -31,7 +31,12 @@ _READONLY_OFF_VALUES = ("0", "false", "off", "no")
 # Any statement invoking a ``pragma_*`` table function is therefore treated
 # as a PRAGMA (the read-only surfaces have no use for them — and a
 # table-valued pragma is exactly what the keyword form compiles into).
-_PRAGMA_FUNCTION_RE = re.compile(r"\bpragma_[a-z0-9_]*\s*\(", re.IGNORECASE)
+# NOTE the missing \( : DuckDB rewrites `PRAGMA database_list` to
+# `SELECT * FROM pragma_database_list;` — NO parentheses — so a pattern that
+# required a call form let that PRAGMA through the read-only guard (audit
+# 2026-11-12). Any identifier in the reserved pragma_ namespace is treated as
+# a PRAGMA: no legitimate read-only query references one.
+_PRAGMA_FUNCTION_RE = re.compile(r"\bpragma_[a-z0-9_]*", re.IGNORECASE)
 
 _MCP_READONLY_ENV = "SQLHANDLER_MCP_READONLY"
 
@@ -39,6 +44,16 @@ _MCP_OPT_OUT_NOTE = (
     f" Set {_MCP_READONLY_ENV}=0 to restore multi-statement/DDL execution "
     "for trusted callers."
 )
+
+# Reserved prefix for SQLhandler's ENGINE-INTERNAL DuckDB relations (the
+# unmasked masking base that _register_schema builds each query, plus the
+# profile/column_stats scratch relations). Those relations are created on the
+# SAME connection the caller's query runs on and carry UNMASKED rows, so a
+# statement naming one is a policy bypass rather than a read. Every read-only
+# surface refuses the prefix here, and engine.py refuses it again before any
+# registration/execution (defense in depth: the engine owns the canonical
+# value, this module is the MCP/web boundary).
+INTERNAL_REL_PREFIX = "__sqlhandler_"
 
 
 def extract_statement_spans(sql: str) -> list[tuple[str, str]]:
@@ -194,6 +209,20 @@ def assert_readonly(sql: str, *, context: str = "Read-only", env_note: str = "")
                 "Only SELECT / WITH / VALUES / EXPLAIN SELECT queries are permitted."
                 f"{env_note}"
             )
+    # Internal relations (see INTERNAL_REL_PREFIX): the masking base holds
+    # UNMASKED rows and lives on the query connection, so naming it is a
+    # policy bypass, not a read. Case-insensitive containment is exact here —
+    # DuckDB identifiers are case-insensitive, and a quoted identifier still
+    # contains the literal prefix. Checked AFTER the statement-type loop so
+    # every pre-existing refusal keeps its exact message and code.
+    if INTERNAL_REL_PREFIX in text.lower():
+        raise ValueError(
+            f"{context}: SQL may not reference SQLhandler's internal relations "
+            f"(the '{INTERNAL_REL_PREFIX}' prefix is reserved — those relations hold "
+            "unmasked rows). Query the table by its own name; row filters and column "
+            "masks are applied for you."
+            f"{env_note}"
+        )
     return text
 
 

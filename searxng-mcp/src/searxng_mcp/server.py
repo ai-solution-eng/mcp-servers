@@ -40,8 +40,24 @@ Configuration (environment variables):
   SEARXNG_SEARCH_CACHE_TTL    search result cache TTL seconds (default 120,
                               0 disables) — dedupes the multi-tenant
                               duplicate-query fan-out
+  SEARXNG_SEARCH_CACHE_MAX_ENTRIES  search cache entry cap (default 64)
+  SEARXNG_SEARCH_CACHE_MAX_BYTES  search cache payload byte budget (default
+                              8388608); LRU-evicted, expired entries swept
+                              on insert
+  SEARXNG_SEARCH_CACHE_MAX_ENTRY_BYTES  largest response worth caching
+                              (default 262144); bigger responses are returned
+                              but never cached
   SEARXNG_FETCH_CACHE_TTL     fetch result cache TTL seconds (default 300,
                               0 disables)
+  SEARXNG_FETCH_CACHE_MAX_ENTRIES  fetch cache entry cap (default 64)
+  SEARXNG_FETCH_CACHE_MAX_BYTES  fetch cache payload byte budget (default
+                              33554432). The 2026-11 heap fix: retained page
+                              text is bounded by BYTES, and expired entries
+                              are swept on insert instead of lingering until
+                              their key is looked up again
+  SEARXNG_FETCH_CACHE_MAX_ENTRY_BYTES  largest outcome worth caching
+                              (default 2097152); bigger pages are returned
+                              but never cached
   SEARXNG_FETCH_MAX_BODY_BYTES  response-body cap bytes (default 5000000)
   SEARXNG_FETCH_MAX_SCREENSHOT_KB  screenshot data-URL cap KB (default 512)
   SEARXNG_FETCH_MAX_REDIRECTS  redirect-hop cap, per-hop re-validation

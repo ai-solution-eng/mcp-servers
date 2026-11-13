@@ -109,15 +109,28 @@ def test_table_uri_is_location():
     assert p.table_uri(TableInfo(name="sales", schema="db")) == "s3://wh/db/sales"
 
 
-def test_normalize_path_variants():
+def test_normalize_path_variants(monkeypatch):
+    """Remote schemes pass through; LOCAL paths are contained (audit P1-12).
+
+    Catalog-manifest paths are remote input. A file:// or absolute path used
+    to reach the pod's own filesystem through pyarrow, bypassing the DuckDB
+    lockdown; it now requires SQLHANDLER_ICEBERG_ALLOW_LOCAL_FILES=1 AND a
+    realpath containment check inside the warehouse.
+    """
     p = _provider(None, warehouse="s3://wh")
     assert p._normalize_path("s3://wh/db/t1/1.parquet") == "s3://wh/db/t1/1.parquet"
-    assert p._normalize_path("file:///tmp/a.parquet") == "/tmp/a.parquet"
-    assert p._normalize_path("/abs/p.parquet") == "/abs/p.parquet"
     assert p._normalize_path("db/t1/1.parquet") == "s3://wh/db/t1/1.parquet"
+    # local paths are refused by default (no local-files opt-in)
+    import pytest as _pytest
+
+    with _pytest.raises(Exception):
+        p._normalize_path("file:///tmp/a.parquet")
+    with _pytest.raises(Exception):
+        p._normalize_path("/abs/p.parquet")
 
 
-def test_open_dataset_local_paths(tmp_path):
+def test_open_dataset_local_paths(tmp_path, monkeypatch):
+    """A local warehouse works only under the explicit opt-in (audit P1-12)."""
     data_dir = tmp_path / "t"
     data_dir.mkdir(parents=True)
     pq.write_table(pa.table({"id": [1, 2], "name": ["a", "b"]}), data_dir / "part.parquet")
@@ -126,8 +139,16 @@ def test_open_dataset_local_paths(tmp_path):
         paths=[str(data_dir / "part.parquet")],
         schema=pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())]),
     )
+    # default: a local (file:///absolute) manifest path is refused
     p = _provider(_FakeCatalog({("db", "t"): table}))
-    ds = p.open_dataset(TableInfo(name="t", schema="db"))
+    import pytest as _pytest
+
+    with _pytest.raises(Exception):
+        p.open_dataset(TableInfo(name="t", schema="db"))
+    # explicit opt-in, warehouse = the temp root -> contained read succeeds
+    monkeypatch.setenv("SQLHANDLER_ICEBERG_ALLOW_LOCAL_FILES", "1")
+    p2 = _provider(_FakeCatalog({("db", "t"): table}), warehouse=str(tmp_path))
+    ds = p2.open_dataset(TableInfo(name="t", schema="db"))
     assert ds.to_table().num_rows == 2
 
 

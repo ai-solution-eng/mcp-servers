@@ -149,15 +149,31 @@ def test_admin_grants_401_anonymous_identity_required(app, monkeypatch):
     assert r.headers.get("www-authenticate") == "Bearer"
 
 
-def test_admin_grants_403_nonadmin_without_identity_gate(app, monkeypatch):
-    """requireIdentity OFF, but a key env IS configured: an unauthenticated
-    caller to a gated route is refused (401/403 — either is contract-true for
-    a non-admin/anonymous caller; the panel renders the message verbatim)."""
+def test_admin_grants_bootstrap_admin_without_policy(app, monkeypatch):
+    """No policy document is loaded, so the BOOTSTRAP fallback makes the
+    configured key the administrator (2026-11-12) — the panel's first call
+    succeeds on a fresh install instead of 403-ing forever."""
+    from sqlhandler import policy as _policy
+
+    _policy.reset_policy_store()
     r = _admin_posture(app, monkeypatch, admin_key="tok-admin", require_identity=False)
     if r.status_code == 404:
         pytest.skip("admin-api routes not landed yet (task-6)")
-    assert r.status_code in (401, 403)
-    assert r.json().get("error")
+    assert r.status_code == 200, r.text
+
+
+def test_admin_grants_403_when_bootstrap_disabled(app, monkeypatch):
+    """SQLHANDLER_BOOTSTRAP_ADMIN=0 restores the strict posture: with no
+    policy document nobody is designated, so even a valid key is refused."""
+    from sqlhandler import policy as _policy
+
+    _policy.reset_policy_store()
+    monkeypatch.setenv("SQLHANDLER_BOOTSTRAP_ADMIN", "0")
+    r = _admin_posture(app, monkeypatch, admin_key="tok-admin", require_identity=False)
+    if r.status_code == 404:
+        pytest.skip("admin-api routes not landed yet (task-6)")
+    assert r.status_code == 403
+    assert r.json()["error"].startswith("admin access required")
 
 
 def test_admin_grants_200_with_admin_key(app, monkeypatch):
@@ -171,7 +187,7 @@ def test_admin_grants_200_with_admin_key(app, monkeypatch):
         # The key authenticates (env) but the tmp policy designates nobody —
         # the fail-closed 403 IS the conforming answer here; the full 200
         # flow (policy fixture + designated admin) is test_admin_api's.
-        assert r.json() == {"error": "admin access required"}
+        assert r.json()["error"].startswith("admin access required")
         pytest.skip("no admins designated in this harness's policy (see test_admin_api for the full 200 flow)")
     assert r.status_code == 200, r.text
     body = r.json()

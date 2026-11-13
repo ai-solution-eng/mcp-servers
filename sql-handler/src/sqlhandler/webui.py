@@ -56,15 +56,23 @@ import json as _json
 import logging
 import math
 import os
+import re
+import threading
 import time as _time
 import uuid
 from collections import OrderedDict
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlparse
 
+from starlette.datastructures import MutableHeaders
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from . import identity as _identity
+from . import limits as _limits
+from . import oidc_identity as _oidc_identity
+from . import policy as _policy
 from .dbt_import import apply_import as _dbt_apply_import
 from .dbt_import import import_dbt_manifest as _dbt_import_dbt_manifest
 from .engine import LakehouseError, QueryJob, SqlEngine, _max_rows, _validate_params, _validate_snapshot_version
@@ -78,15 +86,13 @@ from .saved import (
     api_saved_save,
     assert_write_allowed,
 )
-logger = logging.getLogger("sqlhandler.webui")
-
-from . import identity as _identity
-from . import oidc_identity as _oidc_identity
-from . import policy as _policy
 from .sqlguard import assert_readonly as _guard_assert_readonly
 from .sqlguard import (
     extract_statement_spans,
+    mcp_readonly_enabled,
 )
+
+logger = logging.getLogger("sqlhandler.webui")
 
 _DEFAULT_LIMIT = 100
 # Fallback UI cap when SQLHANDLER_MAX_ROWS is unset or 0 (unlimited for the
@@ -221,6 +227,138 @@ class _ApiBodyLimitMiddleware:
         except _BodyTooLarge:
             pass  # the response was already sent by the wrapper
 
+
+# ---------------------------------------------------------------------------
+# response hardening (audit F8) + cross-site mutation guard (audit F15)
+# ---------------------------------------------------------------------------
+
+# The UI page is one self-contained file (no build step, no CDN — verified:
+# zero external script/style/font/img loads), so a strict default-deny CSP
+# with inline allowances keeps every feature working while blocking any
+# future injected resource load.
+_UI_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "font-src 'self' data:; "
+    "base-uri 'none'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
+
+
+class _SecurityHeadersMiddleware:
+    """Security headers on every response this app registers (audit F8).
+
+    The panel holds an admin credential in page memory and can mint/revoke
+    keys and replace the policy — it must not be framable (clickjacking), its
+    responses must not be MIME-sniffed, and a future XSS must not be able to
+    load resources from anywhere. Mounted via add_middleware in register_ui,
+    so every app that includes the UI gets the same posture.
+    """
+
+    _HTML_PATHS = ("/", "/ui", "/ui/index.html")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("x-content-type-options", "nosniff")
+                headers.setdefault("referrer-policy", "no-referrer")
+                headers.setdefault("x-frame-options", "DENY")
+                if path in self._HTML_PATHS:
+                    headers.setdefault("content-security-policy", _UI_CSP)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _cross_site_request(scope) -> bool:
+    """True when the request provably originates from another site.
+
+    Evidence comes only from headers a server-to-server client does not send:
+    'Sec-Fetch-Site: cross-site', or an 'Origin' whose host differs from the
+    request's Host. curl / MCP agents / tests send neither and are never
+    refused — only a browser request carrying cross-site evidence is.
+    """
+    host = ""
+    forwarded_host = ""
+    for k, v in scope.get("headers", []):
+        lk = k.lower() if isinstance(k, bytes) else k
+        if lk == b"sec-fetch-site":
+            if v.decode("latin-1").strip().lower() == "cross-site":
+                return True
+        elif lk == b"host":
+            host = v.decode("latin-1").strip().lower()
+        elif lk == b"x-forwarded-host":
+            # Behind a host-rewriting proxy the Host header is the PROXY's, so
+            # comparing Origin against it produced false 403s; the forwarded
+            # host is what the browser actually addressed.
+            forwarded_host = v.decode("latin-1").strip().lower().split(",")[0].strip()
+        elif lk == b"origin":
+            origin = v.decode("latin-1").strip()
+            if not origin:
+                continue
+            # 'Origin: null' is an OPAQUE origin (sandboxed iframe, data: URL,
+            # file://) — it can never equal our host, so it is cross-site
+            # evidence, not a bypass (cross-validation 2026-11-12, P3).
+            if origin.lower() == "null":
+                return True
+            try:
+                origin_host = urlparse(origin).netloc.lower()
+            except ValueError:
+                origin_host = origin.lower()
+            expected = forwarded_host or host
+            if expected and origin_host and origin_host != expected:
+                return True
+    return False
+
+
+def _csrf_origin_check_enabled() -> bool:
+    """The F15 cross-site mutation guard (env escape for odd topologies)."""
+    raw = os.environ.get("SQLHANDLER_CSRF_ORIGIN_CHECK", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+class _SameSiteMutationMiddleware:
+    """Refuse provably cross-site mutating /api requests (audit F15).
+
+    Key-borne mutations are already CSRF-safe (headers cannot be attached
+    cross-site); the ONE ambient credential is the D22 SSO session cookie,
+    whose SameSite=Lax was the whole defense. This adds the standard second
+    layer: a mutating request that CARRIES cross-site evidence (Sec-Fetch-Site:
+    cross-site, or a foreign Origin) is refused 403 before any handler runs.
+    Same-site / same-origin / no-evidence requests pass — server-to-server
+    callers (curl, agents, tests) send neither header.
+    """
+    _MUTATING = frozenset(("POST", "PUT", "DELETE", "PATCH"))
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] == "http"
+            and _csrf_origin_check_enabled()
+            and scope.get("method") in self._MUTATING
+            and scope.get("path", "").startswith("/api")
+            and _cross_site_request(scope)
+        ):
+            resp = JSONResponse({"error": "Cross-site request refused."}, status_code=403)
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
 _HTML = (Path(__file__).parent / "ui" / "index.html").read_text(encoding="utf-8")
 
 
@@ -335,6 +473,29 @@ def arrow_to_ipc_text(arrow) -> str:
     return header + "\n" + base64.b64encode(raw).decode("ascii")
 
 
+# Spreadsheet formula injection (audit F9): a CSV cell beginning with one of
+# these characters executes when the file opens in Excel/Sheets/LibreOffice
+# (DDE / HYPERLINK / silent URL fetch). String cells are neutralized with the
+# standard leading apostrophe — Excel treats it as a text marker and hides it;
+# numeric columns never carry the prefix and are untouched.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_neutralize_formulas(col):
+    """Prefix every formula-leading string cell with an apostrophe."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    mask = None
+    for prefix in _CSV_FORMULA_PREFIXES:
+        m = pc.starts_with(col, pattern=prefix)
+        mask = m if mask is None else pc.or_(mask, m)
+    # pa.scalar, NOT pc.scalar: pc.scalar builds a dataset Expression, which
+    # the if_else kernel rejects outright.
+    quote = pc.if_else(mask, pa.scalar("'"), pa.scalar(""))
+    return pc.binary_join_element_wise(quote, col, "")
+
+
 def _arrow_to_csv_bytes(arrow) -> bytes:
     """CSV-export an Arrow Table via pyarrow's native writer (no pandas).
 
@@ -366,6 +527,9 @@ def _arrow_to_csv_bytes(arrow) -> bytes:
         col = arrow.column(f.name)
         if pa.types.is_boolean(f.type):
             col = pc.if_else(col, "True", "False")
+        elif pa.types.is_string(f.type) or pa.types.is_large_string(f.type):
+            # audit F9: neutralize spreadsheet formula injection.
+            col = _csv_neutralize_formulas(col)
         elif pa.types.is_floating(f.type):
             # pandas' to_csv writes NaN as ''; Arrow writes 'nan' — replace
             # NaN with null so the writer emits '' like pandas did.
@@ -427,7 +591,7 @@ def api_status(engine: SqlEngine) -> dict:
     }
 
 
-def api_tables(engine: SqlEngine) -> dict:
+def api_tables(engine: SqlEngine, *, caller=None) -> dict:
     return {
         "tables": [
             {
@@ -438,13 +602,13 @@ def api_tables(engine: SqlEngine) -> dict:
                 "format": t.format,
                 "source": t.source,
             }
-            for t in engine.list_tables()
+            for t in engine.list_tables(caller=caller)
         ]
     }
 
 
-def api_describe(engine: SqlEngine, table: str) -> dict:
-    info = engine.describe_table(table)
+def api_describe(engine: SqlEngine, table: str, *, caller=None) -> dict:
+    info = engine.describe_table(table, caller=caller)
     out = {
         "table": table,
         "uri": info["uri"],
@@ -461,14 +625,22 @@ def api_describe(engine: SqlEngine, table: str) -> dict:
     return out
 
 
-def api_query(engine: SqlEngine, sql: str, limit: int | None = None, params: object | None = None, output_format: str = "json") -> dict | str:
+def api_query(
+    engine: SqlEngine,
+    sql: str,
+    limit: int | None = None,
+    params: object | None = None,
+    output_format: str = "json",
+    *,
+    caller=None,
+) -> dict | str:
     import time
 
     safe = assert_readonly(sql)
     params = _validate_params(params)  # raises ValueError-like LakehouseError early
     limit = _clamp_limit(limit)
     t0 = time.monotonic()
-    arrow = engine.query_duckdb(safe, limit=limit, params=params)
+    arrow = engine.query_duckdb(safe, limit=limit, params=params, caller=caller)
     duration_ms = round((time.monotonic() - t0) * 1000, 1)
     if str(output_format or "json").strip().lower() == "arrow":
         # Arrow IPC text payload: the duration meta rides as a second header
@@ -480,12 +652,12 @@ def api_query(engine: SqlEngine, sql: str, limit: int | None = None, params: obj
     return payload
 
 
-def api_preview(engine: SqlEngine, table: str, limit: int | None = None) -> dict:
+def api_preview(engine: SqlEngine, table: str, limit: int | None = None, *, caller=None) -> dict:
     import time
 
     limit = _clamp_limit(limit)
     t0 = time.monotonic()
-    arrow = engine.scan_arrow(table, limit=limit)
+    arrow = engine.scan_arrow(table, limit=limit, caller=caller)
     duration_ms = round((time.monotonic() - t0) * 1000, 1)
     payload = arrow_to_payload(arrow, limit=limit)
     payload.update({"table": table, "duration_ms": duration_ms})
@@ -505,12 +677,12 @@ def _json_safe_deep(value):
     return _json_safe(value)
 
 
-def api_profile(engine: SqlEngine, table: str, columns: list[str] | None = None) -> dict:
+def api_profile(engine: SqlEngine, table: str, columns: list[str] | None = None, *, caller=None) -> dict:
     """Column-level statistics (shares the engine's profile cache with MCP)."""
     import time
 
     t0 = time.monotonic()
-    profile = _json_safe_deep(engine.profile_table(table, columns=columns))
+    profile = _json_safe_deep(engine.profile_table(table, columns=columns, caller=caller))
     profile["duration_ms"] = round((time.monotonic() - t0) * 1000, 1)
     return profile
 
@@ -537,7 +709,34 @@ def _clamp_limit(limit: int | None) -> int:
 
 # Max rows per page from GET /api/query/{id}/rows — keeps any single page
 # response bounded regardless of what the client asks for.
-_MAX_PAGE_ROWS = 1000
+_MAX_PAGE_ROWS = 1000  # default; SQLHANDLER_MAX_PAGE_ROWS overrides
+
+
+def _max_page_rows() -> int:
+    """Max rows per /api/query/{id}/rows page (SQLHANDLER_MAX_PAGE_ROWS)."""
+    raw = os.environ.get("SQLHANDLER_MAX_PAGE_ROWS", "")
+    try:
+        return max(int(raw), 1) if raw else _MAX_PAGE_ROWS
+    except ValueError:
+        return _MAX_PAGE_ROWS
+
+
+def _max_async_queries() -> int:
+    """Tracked web async queries (SQLHANDLER_MAX_ASYNC_QUERIES, default 100)."""
+    raw = os.environ.get("SQLHANDLER_MAX_ASYNC_QUERIES", "")
+    try:
+        return max(int(raw), 1) if raw else 100
+    except ValueError:
+        return 100
+
+
+def _max_async_queries_per_caller(global_max: int) -> int:
+    """Per-caller web async-query cap (default = global; 0 disables)."""
+    raw = os.environ.get("SQLHANDLER_MAX_ASYNC_QUERIES_PER_CALLER", "")
+    try:
+        return max(int(raw), 0) if raw else global_max
+    except ValueError:
+        return global_max
 
 
 def _job_ttl() -> int:
@@ -560,34 +759,93 @@ class QueryJobManager:
     tables (already limited by SQLHANDLER_MAX_ROWS) and served paginated.
     """
 
-    def __init__(self, max_jobs: int = 100):
-        self._jobs: OrderedDict[str, tuple[QueryJob, float | None]] = OrderedDict()
-        self._max_jobs = max_jobs
+    def __init__(self, max_jobs: int | None = None):
+        # (job, owner, caller_scope, finished_at). ``owner`` is the
+        # policy-gated result-access scope; ``caller_scope`` is the
+        # identity-keyed fairness bucket (applies even with enforcement off).
+        self._jobs: OrderedDict[str, tuple[QueryJob, str | None, str | None, float | None]] = OrderedDict()
+        self._max_jobs = max_jobs if max_jobs is not None else _max_async_queries()
+        # audit F14: the manager is hit from one asyncio.to_thread worker per
+        # request — without a lock, _cleanup's live-iteration loop can observe
+        # a concurrent submit's insert and raise, and the submit cap check is
+        # a check-then-insert race. RLock: cancel() re-enters via get().
+        self._lock = threading.RLock()
 
-    def submit(self, engine: SqlEngine, sql: str, limit=None, params=None, version_as_of=None) -> dict:
+    def submit(
+        self,
+        engine: SqlEngine,
+        sql: str,
+        limit=None,
+        params=None,
+        version_as_of=None,
+        *,
+        caller=None,
+        owner: str | None = None,
+        caller_scope: str | None = None,
+    ) -> dict:
         """Validate + start a job; returns {"query_id", "state"}.
 
         Validation happens BEFORE the job starts, so a bad payload is a
-        synchronous error, not a job that immediately fails.
+        synchronous error, not a job that immediately fails. ``caller`` rides
+        the QueryJob (the raw thread cannot inherit a contextvar), so the
+        query runs through the caller's masking view and its result-cache
+        entries carry the policy hash.
+
+        ``owner`` scopes result access (policy enforcement on only);
+        ``caller_scope`` is the identity-keyed fairness bucket and is used
+        even with enforcement off (falling back to the owner, then unowned).
         """
         _validate_params(params)
         if version_as_of is not None:
             _validate_snapshot_version(version_as_of, "Time travel")
-        self._cleanup()
-        if len(self._jobs) >= self._max_jobs:
-            return {"error": "Too many tracked queries; retry later.", "status": 429}
-        job = QueryJob(engine, sql, limit=limit, params=params, version_as_of=version_as_of)
+        with self._lock:
+            self._cleanup()
+            if len(self._jobs) >= self._max_jobs:
+                return {
+                    "error": f"Too many tracked queries (limit {self._max_jobs}, SQLHANDLER_MAX_ASYNC_QUERIES); retry later.",
+                    "status": 429,
+                }
+        scope = caller_scope if caller_scope is not None else owner
+        per_caller = _max_async_queries_per_caller(self._max_jobs)
+        if scope and per_caller > 0:
+            with self._lock:
+                running = sum(
+                    1
+                    for job, _owner, entry_scope, _finished in self._jobs.values()
+                    if entry_scope == scope and job.state == "running"
+                )
+            if running >= per_caller:
+                return {
+                    "error": (
+                        f"Too many active query jobs for this caller ({running} of {per_caller}, "
+                        "SQLHANDLER_MAX_ASYNC_QUERIES_PER_CALLER); cancel or fetch results and retry later."
+                    ),
+                    "status": 429,
+                }
+        job = QueryJob(engine, sql, limit=limit, params=params, version_as_of=version_as_of, caller=caller)
         query_id = uuid.uuid4().hex
-        self._jobs[query_id] = (job, None)  # None finished_at = running
+        with self._lock:
+            self._jobs[query_id] = (job, owner or None, scope, None)  # None finished_at = running
         return {"query_id": query_id, "state": job.state}
 
-    def get(self, query_id: str) -> QueryJob | None:
-        self._cleanup()
-        entry = self._jobs.get(query_id)
-        return entry[0] if entry else None
+    def get(self, query_id: str, owner: str | None = None) -> QueryJob | None:
+        """The job for ``query_id``, or None when unknown or another owner's.
 
-    def cancel(self, query_id: str) -> dict | None:
-        job = self.get(query_id)
+        ``owner`` is the policy-gated result-access scope (None = enforcement
+        off / unowned, the historical shared posture).
+        """
+        with self._lock:
+            self._cleanup()
+            entry = self._jobs.get(query_id)
+        if entry is None:
+            return None
+        job, job_owner, _scope, _finished = entry
+        if job_owner is not None and owner != job_owner:
+            return None
+        return job
+
+    def cancel(self, query_id: str, owner: str | None = None) -> dict | None:
+        job = self.get(query_id, owner=owner)
         if job is None:
             return None
         interrupted = job.cancel()
@@ -595,20 +853,25 @@ class QueryJobManager:
 
     def _cleanup(self) -> None:
         """Evict finished jobs past the TTL, then enforce the size cap."""
+        with self._lock:
+            self._cleanup_locked()
+
+    def _cleanup_locked(self) -> None:
+        """The eviction pass; callers hold ``self._lock``."""
         ttl = _job_ttl()
         now = _time.monotonic()
-        for qid, (job, finished_at) in list(self._jobs.items()):
+        for qid, (job, owner, scope, finished_at) in list(self._jobs.items()):
             if finished_at is None and job.state != "running":
-                self._jobs[qid] = (job, now)
+                self._jobs[qid] = (job, owner, scope, now)
         if ttl > 0:
-            for qid, (job, finished_at) in list(self._jobs.items()):
+            for qid, (job, owner, scope, finished_at) in list(self._jobs.items()):
                 if finished_at is not None and now - finished_at > ttl:
                     del self._jobs[qid]
         # Make room for the submit that triggered cleanup: evict oldest
         # finished jobs until BELOW the cap (a full registry of RUNNING
         # jobs is refused at submit time, never evicted here).
         while len(self._jobs) >= self._max_jobs:
-            for qid, (job, finished_at) in self._jobs.items():
+            for qid, (job, owner, scope, finished_at) in self._jobs.items():
                 if finished_at is not None:
                     del self._jobs[qid]
                     break
@@ -616,7 +879,15 @@ class QueryJobManager:
                 break
 
 
-def api_async_query(engine: SqlEngine, manager: QueryJobManager, body: dict) -> dict:
+def api_async_query(
+    engine: SqlEngine,
+    manager: QueryJobManager,
+    body: dict,
+    *,
+    caller=None,
+    owner: str | None = None,
+    caller_scope: str | None = None,
+) -> dict:
     """POST /api/query/async — start a read-only query, return a job id."""
     sql = str(body.get("sql", ""))
     safe = assert_readonly(sql)  # ValueError -> 400 (route wrapper)
@@ -626,6 +897,9 @@ def api_async_query(engine: SqlEngine, manager: QueryJobManager, body: dict) -> 
         limit=body.get("limit"),
         params=body.get("params"),
         version_as_of=body.get("version_as_of"),
+        caller=caller,
+        owner=owner,
+        caller_scope=caller_scope,
     )
     if result.get("error"):
         return result  # carries its own "status" for the route wrapper
@@ -633,9 +907,9 @@ def api_async_query(engine: SqlEngine, manager: QueryJobManager, body: dict) -> 
     return result
 
 
-def api_query_status(manager: QueryJobManager, query_id: str) -> dict:
+def api_query_status(manager: QueryJobManager, query_id: str, *, owner: str | None = None) -> dict:
     """GET /api/query/{id} — job status (no row data)."""
-    job = manager.get(query_id)
+    job = manager.get(query_id, owner=owner)
     if job is None:
         return {"error": f"Unknown query id: {query_id}", "status": 404}
     payload = job.info()
@@ -648,9 +922,11 @@ def api_query_status(manager: QueryJobManager, query_id: str) -> dict:
     return payload
 
 
-def api_query_rows(manager: QueryJobManager, query_id: str, offset: int = 0, limit: int = 100) -> dict:
+def api_query_rows(
+    manager: QueryJobManager, query_id: str, offset: int = 0, limit: int = 100, *, owner: str | None = None
+) -> dict:
     """GET /api/query/{id}/rows — paginate the spooled result."""
-    job = manager.get(query_id)
+    job = manager.get(query_id, owner=owner)
     if job is None:
         return {"error": f"Unknown query id: {query_id}", "status": 404}
     if job.state == "running":
@@ -662,7 +938,7 @@ def api_query_rows(manager: QueryJobManager, query_id: str, offset: int = 0, lim
     arrow = job.result
     try:
         offset = max(int(offset), 0)
-        limit = min(max(int(limit), 0), _MAX_PAGE_ROWS)
+        limit = min(max(int(limit), 0), _max_page_rows())
     except (TypeError, ValueError):
         return {"error": "offset/limit must be integers.", "status": 400}
     page = arrow.slice(offset, limit)
@@ -679,9 +955,9 @@ def api_query_rows(manager: QueryJobManager, query_id: str, offset: int = 0, lim
     return payload
 
 
-def api_query_cancel(manager: QueryJobManager, query_id: str) -> dict:
+def api_query_cancel(manager: QueryJobManager, query_id: str, *, owner: str | None = None) -> dict:
     """DELETE /api/query/{id} — cancel a running job."""
-    result = manager.cancel(query_id)
+    result = manager.cancel(query_id, owner=owner)
     if result is None:
         return {"error": f"Unknown query id: {query_id}", "status": 404}
     return result
@@ -691,7 +967,16 @@ def api_query_cancel(manager: QueryJobManager, query_id: str) -> dict:
 # export (CSV / Parquet file downloads)
 # ---------------------------------------------------------------------------
 
-_EXPORT_DEFAULT_ROWS = 10_000
+_EXPORT_DEFAULT_ROWS = 10_000  # default; SQLHANDLER_EXPORT_DEFAULT_ROWS overrides
+
+
+def _export_default_rows() -> int:
+    """Default rows for /api/export (SQLHANDLER_EXPORT_DEFAULT_ROWS)."""
+    raw = os.environ.get("SQLHANDLER_EXPORT_DEFAULT_ROWS", "")
+    try:
+        return max(int(raw), 0) if raw else _EXPORT_DEFAULT_ROWS
+    except ValueError:
+        return _EXPORT_DEFAULT_ROWS
 
 
 def _export_max_rows() -> int:
@@ -712,7 +997,7 @@ def _export_max_rows() -> int:
     return value if value > 0 else 1_000_000
 
 
-def api_export(engine: SqlEngine, body: dict) -> dict:
+def api_export(engine: SqlEngine, body: dict, *, caller=None) -> dict:
     """POST /api/export — download a query or table result as CSV/Parquet.
 
     Accepts {"sql": ...} (read-only guard applies) or {"table": ...}
@@ -730,7 +1015,7 @@ def api_export(engine: SqlEngine, body: dict) -> dict:
         raise ValueError(f"Unsupported export format {fmt!r}; use 'csv', 'parquet' or 'arrow'.")
     try:
         raw_limit = body.get("limit")
-        limit = _EXPORT_DEFAULT_ROWS if raw_limit is None else max(int(raw_limit), 0)
+        limit = _export_default_rows() if raw_limit is None else max(int(raw_limit), 0)
     except (TypeError, ValueError):
         raise ValueError("limit must be an integer.")
     cap = min(limit, _export_max_rows()) if limit > 0 else _export_max_rows()
@@ -739,11 +1024,14 @@ def api_export(engine: SqlEngine, body: dict) -> dict:
     sql = body.get("sql")
     if sql:
         safe = assert_readonly(str(sql))  # ValueError -> 400
-        arrow = engine.query_duckdb(safe, limit=cap, row_cap=cap)
+        arrow = engine.query_duckdb(safe, limit=cap, row_cap=cap, caller=caller)
         name = "query"
     elif table:
-        arrow = engine.scan_arrow(str(table), limit=cap)
-        name = str(table).replace("/", "_")
+        arrow = engine.scan_arrow(str(table), limit=cap, caller=caller)
+        # audit F11: one sanitizer for the attachment filename — path
+        # separators, quotes and control characters (a double-quote would
+        # break the Content-Disposition quoting; CTLs are rejected outright).
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(table)).strip("._") or "table"
     else:
         raise ValueError("Provide either 'sql' or 'table' to export.")
 
@@ -841,7 +1129,7 @@ except ImportError:  # optional dependency; the editor just shows plain text
 
 # Cap what we are willing to lex per request (client debounces; this guards
 # the server from pathological pastes).
-_HIGHLIGHT_MAX_CHARS = 200_000
+_HIGHLIGHT_MAX_CHARS = 60_000
 
 # Theme-appropriate pygments styles, overridable like rcat's FV_PYG_STYLE.
 _PYG_STYLES = {
@@ -940,7 +1228,7 @@ except ImportError:  # optional dependency; the editor just shows plain text
 
 # Cap what we are willing to lex per request (client debounces; this guards
 # the server from pathological pastes).
-_HIGHLIGHT_MAX_CHARS = 200_000
+_HIGHLIGHT_MAX_CHARS = 60_000
 
 # Theme-appropriate pygments styles, overridable like rcat's FV_PYG_STYLE.
 _PYG_STYLES = {
@@ -949,23 +1237,31 @@ _PYG_STYLES = {
 }
 
 
-def api_catalog_content(engine: SqlEngine, fmt: str = "yaml") -> dict:
+def api_catalog_content(engine: SqlEngine, fmt: str = "yaml", *, caller=None) -> dict:
     """GET /api/semantic-catalog/content — the live catalog as editable text.
 
     YAML is the default user-facing format; ``?format=json`` swaps it.
+
+    ``caller`` rides to the engine (audit P1-9): the catalog documents
+    tables a policy may hide from this caller, so the engine filters the
+    entries to the visible set when enforcement is on.
     """
     if fmt not in ("yaml", "json"):
         raise ValueError("format must be 'yaml' or 'json'")
-    return engine.catalog_content(fmt)
+    return engine.catalog_content(fmt, caller=caller)
 
 
-def api_catalog_table(engine: SqlEngine, table: str, fmt: str = "yaml") -> dict:
-    """GET /api/semantic-catalog/table — one table's catalog breakout."""
+def api_catalog_table(engine: SqlEngine, table: str, fmt: str = "yaml", *, caller=None) -> dict:
+    """GET /api/semantic-catalog/table — one table's catalog breakout.
+
+    ``caller`` rides to the engine (audit P1-9): a policy-hidden table's
+    entry must not be served to a caller the policy hides it from.
+    """
     if fmt not in ("yaml", "json"):
         raise ValueError("format must be 'yaml' or 'json'")
     if not table or not table.strip():
         raise ValueError("Provide the table to document (?table=...).")
-    return engine.catalog_table_entry(table.strip(), fmt)
+    return engine.catalog_table_entry(table.strip(), fmt, caller=caller)
 
 
 def api_catalog_table_update(engine: SqlEngine, table: str, content: object) -> dict:
@@ -1021,7 +1317,10 @@ def api_highlight(body: dict) -> dict:
     try:
         try:
             # -g semantics: filename AND content, with a virtual filename.
-            lexer = _guess_lexer_for_filename("sv-edit." + fmt, text)
+            # audit F16: bound the guess cost too — lexer guessing is
+            # O(candidates x text); a 4 KB sample identifies the lexer just
+            # as reliably as the full pane text.
+            lexer = _guess_lexer_for_filename("sv-edit." + fmt, text[:4096])
         except Exception:
             lexer = _TextLexer()
         if isinstance(lexer, _TextLexer):
@@ -1047,12 +1346,57 @@ def api_highlight(body: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _internal_error_payload(exc: BaseException) -> dict:
+    """audit F12: unexpected exceptions never leak their text to callers.
+
+    Client errors (ValueError / LakehouseError) intentionally carry their
+    message — they are the API's UX. An UNEXPECTED exception may name
+    resolver internals, store paths or URLs, so the body is generic and the
+    detail goes to the server log.
+    """
+    logger.error("web API internal error: %s: %s", type(exc).__name__, exc)
+    return {"error": "Internal server error (details in the server logs)."}
+
+
+def _error_response(exc: BaseException) -> JSONResponse:
+    """Map one route exception to a response (cross-validation 2026-11-12, P2).
+
+    F12's generic-500 sweep over-reached: LakehouseError is a RuntimeError, so
+    a table-name typo in /api/describe or a concurrency-queue timeout became
+    "Internal server error (details in the server logs)" and the actionable
+    text — the API's UX — vanished. Expected CLIENT errors keep their message
+    with a 4xx; only genuinely unexpected exceptions are generic.
+
+    ONE deliberate exception to F12's rule: an OSError from a STORE WRITE keeps
+    its message ("Cannot write the saved-query store: /path: ...") — the
+    operator's path and errno ARE the actionable content, and the write
+    handlers catch it explicitly rather than routing it here.
+    """
+    from .provider import LakehouseError
+
+    if isinstance(exc, LakehouseError):
+        # Engine-level refusals (bad table, queue timeout, refused statement)
+        # are the caller's to fix or retry: 400 with the message, as before
+        # the sweep. The log keeps the full trace for operators.
+        logger.info("web API refused: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if isinstance(exc, ValueError):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(_internal_error_payload(exc), status_code=500)
+
+
 def register_ui(app, engine_getter) -> None:
     """Add the UI page + read-only JSON API routes to the Starlette app.
 
     ``engine_getter`` is a zero-arg callable returning the process-wide
     ``SqlEngine`` (so the same caches back the UI and the MCP tools).
     """
+
+    # Response hardening + cross-site mutation guard (audits F8/F15): both
+    # are additive (headers; a 403 only for provably cross-site mutations),
+    # so every app that mounts the UI gets the posture for free.
+    app.add_middleware(_SameSiteMutationMiddleware)
+    app.add_middleware(_SecurityHeadersMiddleware)
 
     def html_page(_request) -> HTMLResponse:
         return HTMLResponse(_HTML)
@@ -1062,8 +1406,6 @@ def register_ui(app, engine_getter) -> None:
     # synchronously, and without the offload a 30 s query would stall
     # /health, /metrics and every other route on the same event loop.
 
-    async def status(_request) -> JSONResponse:
-        return JSONResponse(await asyncio.to_thread(api_status, engine_getter()))
     async def status(_request) -> JSONResponse:
         return JSONResponse(await asyncio.to_thread(api_status, engine_getter()))
 
@@ -1085,8 +1427,11 @@ def register_ui(app, engine_getter) -> None:
             from .server import _whoami_rest_payload
 
             return JSONResponse(await asyncio.to_thread(_whoami_rest_payload, request))
-        except Exception as exc:  # never 500 the identity probe
-            return JSONResponse({"authenticated": False, "error": str(exc)})
+        except Exception:  # never 500 the identity probe
+            # audit F12: the probe is reachable unauthenticated — the raw
+            # exception text (resolver internals, URLs) must not reach it.
+            logger.exception("whoami probe failed")
+            return JSONResponse({"authenticated": False, "error": "identity probe unavailable"})
 
     def _caller_for(request):
         """The request's resolved Caller (identity spine); None-safe."""
@@ -1109,11 +1454,11 @@ def register_ui(app, engine_getter) -> None:
         return None
 
 
-    async def tables(_request) -> JSONResponse:
+    async def tables(request) -> JSONResponse:
         try:
-            return JSONResponse(await asyncio.to_thread(api_tables, engine_getter()))
+            return JSONResponse(await asyncio.to_thread(api_tables, engine_getter(), caller=_caller_for(request)))
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def describe(request) -> JSONResponse:
         try:
@@ -1122,10 +1467,12 @@ def register_ui(app, engine_getter) -> None:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
             return JSONResponse(
-                await asyncio.to_thread(api_describe, engine_getter(), str(body.get("table", "")))
+                await asyncio.to_thread(
+                    api_describe, engine_getter(), str(body.get("table", "")), caller=_caller_for(request)
+                )
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def query(request) -> JSONResponse:
         try:
@@ -1140,11 +1487,12 @@ def register_ui(app, engine_getter) -> None:
                 body.get("limit"),
                 body.get("params"),
                 body.get("format", "json"),
+                caller=_caller_for(request),
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         # format="arrow" renders to a plain-text IPC payload, not a dict.
         # (api_query returns `dict | str`; the arrow branch is the `str` one -
         # a plain Response, not a JSONResponse, is correct there.)
@@ -1160,11 +1508,15 @@ def register_ui(app, engine_getter) -> None:
         try:
             return JSONResponse(
                 await asyncio.to_thread(
-                    api_preview, engine_getter(), str(body.get("table", "")), body.get("limit")
+                    api_preview,
+                    engine_getter(),
+                    str(body.get("table", "")),
+                    body.get("limit"),
+                    caller=_caller_for(request),
                 )
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def profile(request) -> JSONResponse:
         try:
@@ -1176,11 +1528,15 @@ def register_ui(app, engine_getter) -> None:
             col_list = [str(c) for c in cols if str(c).strip()] if isinstance(cols, list) else None
             return JSONResponse(
                 await asyncio.to_thread(
-                    api_profile, engine_getter(), str(body.get("table", "")), col_list
+                    api_profile,
+                    engine_getter(),
+                    str(body.get("table", "")),
+                    col_list,
+                    caller=_caller_for(request),
                 )
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     # ---- async query jobs (long queries: submit, poll, paginate, cancel)
     manager = QueryJobManager()
@@ -1200,17 +1556,32 @@ def register_ui(app, engine_getter) -> None:
         try:
             # submit may block on the query-concurrency gate — never block
             # the event loop.
-            return _response(await asyncio.to_thread(api_async_query, engine_getter(), manager, body))
+            caller = _caller_for(request)
+            return _response(
+                await asyncio.to_thread(
+                    api_async_query,
+                    engine_getter(),
+                    manager,
+                    body,
+                    caller=caller,
+                    owner=_job_owner_for(request),
+                    caller_scope=_limits.gate_scope(caller),
+                )
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except LakehouseError as exc:
             # concurrency-gate refusals (queue wait expired) → 429
             return JSONResponse({"error": str(exc)}, status_code=429)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def query_job_status(request) -> JSONResponse:
-        return _response(await asyncio.to_thread(api_query_status, manager, request.path_params["query_id"]))
+        return _response(
+            await asyncio.to_thread(
+                api_query_status, manager, request.path_params["query_id"], owner=_job_owner_for(request)
+            )
+        )
 
     async def query_job_rows(request) -> JSONResponse:
         params = request.query_params
@@ -1221,11 +1592,16 @@ def register_ui(app, engine_getter) -> None:
                 request.path_params["query_id"],
                 params.get("offset", 0),
                 params.get("limit", 100),
+                owner=_job_owner_for(request),
             )
         )
 
     async def query_job_cancel(request) -> JSONResponse:
-        return _response(await asyncio.to_thread(api_query_cancel, manager, request.path_params["query_id"]))
+        return _response(
+            await asyncio.to_thread(
+                api_query_cancel, manager, request.path_params["query_id"], owner=_job_owner_for(request)
+            )
+        )
 
     # ---- Browser SSO (D22, the MM-RAG approach ported verbatim): the app is
     # an OIDC CLIENT — /oauth/login redirects to the realm, the callback
@@ -1245,12 +1621,17 @@ def register_ui(app, engine_getter) -> None:
 
         if not oidc_sso.sso_enabled():
             return JSONResponse({"error": "SSO is not enabled on this deployment"}, status_code=404)
-        url = await asyncio.to_thread(oidc_sso.build_authorization_url, oidc_sso.new_state())
+        # audit F13: generate the state FIRST and hand the SAME object to the
+        # URL builder and the cookie — the old `url.split("state=")[-1]`
+        # text-parse broke whenever another parameter carried state= (e.g. a
+        # redirect_uri with an embedded query), planting a cookie that could
+        # never match the callback.
+        state = oidc_sso.new_state()
+        url = await asyncio.to_thread(oidc_sso.build_authorization_url, state)
         if not url:
             return JSONResponse({"error": "OIDC provider discovery unavailable — try again shortly"}, status_code=503)
         # The state cookie value is "<state>|<safe-next>" — the callback
         # splits it back (never trusting the query string for the target).
-        state = url.split("state=")[-1]
         target = oidc_sso.safe_next_path(request.query_params.get("next", "/ui"))
         resp = RedirectResponse(url, status_code=302)
         secure = oidc_sso.cookie_secure()
@@ -1324,6 +1705,11 @@ def register_ui(app, engine_getter) -> None:
 
         from . import oidc_sso
 
+        # audit F15: the session-clearing GET is logout-CSRFable from an <img>
+        # tag. Server-to-server callers (curl, tests) send no fetch-metadata
+        # headers and pass; a provably cross-site browser request is refused.
+        if _cross_site_request(request.scope):
+            return JSONResponse({"error": "Cross-site request refused."}, status_code=403)
         resp = RedirectResponse("/ui", status_code=302)
         for name in (oidc_sso.cookie_name(), oidc_sso.state_cookie_name()):
             resp.headers.append(
@@ -1361,13 +1747,33 @@ def register_ui(app, engine_getter) -> None:
         if not isinstance(body, dict):
             return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
         try:
-            result = await asyncio.to_thread(api_job_submit, engine_getter(), body, owner=_job_owner_for(request))
+            # audit F3: the web surface never executes non-SELECT statements.
+            # With the MCP D2 knob ON, jobs.submit's own guard fires first and
+            # carries the D2 message (pinned by test_rest_jobs_ddl_refused_at_submit);
+            # with D2 OFF this route's always-on web guard is the line of defense
+            # (the OR of both guards — no mode executes a write from the web).
+            if not mcp_readonly_enabled():
+                assert_readonly(str(body.get("sql", "")))
+            # The caller must ride the JOB (the worker thread cannot inherit a
+            # contextvar): masking views, the policy-keyed cache space and the
+            # per-caller query gate all key off it. ``caller_scope`` is the
+            # identity-keyed job-cap bucket — separate from the policy-gated
+            # ``owner``, so the cap applies even with enforcement off.
+            caller = _caller_for(request)
+            result = await asyncio.to_thread(
+                api_job_submit,
+                engine_getter(),
+                body,
+                caller=caller,
+                owner=_job_owner_for(request),
+                caller_scope=_limits.gate_scope(caller),
+            )
         except ValueError as exc:  # read-only guard / payload validation
             return JSONResponse({"error": str(exc)}, status_code=400)
         except LakehouseError as exc:  # concurrency-gate queue wait expired
             return JSONResponse({"error": str(exc)}, status_code=429)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         if result.get("error"):
             return JSONResponse({"error": result["error"]}, status_code=result.get("status", 429))
         return JSONResponse(result)
@@ -1378,7 +1784,7 @@ def register_ui(app, engine_getter) -> None:
         except JobError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def jobs_result(request) -> JSONResponse:
         try:
@@ -1386,7 +1792,7 @@ def register_ui(app, engine_getter) -> None:
         except JobError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         payload = arrow_to_payload(arrow)  # the job's rows are already MAX_ROWS-bounded
         payload.update({"job_id": request.path_params["job_id"], "total_rows": arrow.num_rows, "result_fetched": True})
         return JSONResponse(payload)
@@ -1397,7 +1803,7 @@ def register_ui(app, engine_getter) -> None:
         except JobError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     app.add_route("/api/jobs", jobs_submit, methods=["POST"])
     app.add_route("/api/jobs/{job_id}", jobs_status, methods=["GET"])
@@ -1409,11 +1815,11 @@ def register_ui(app, engine_getter) -> None:
     # tools. WRITES (save/delete) verify the caller's credential per request
     # (mutation gate — see sqlhandler/saved.py); reads follow the /api
     # posture (SQLHANDLER_API_TOKEN middleware).
-    async def saved_list(_request) -> JSONResponse:
+    async def saved_list(request) -> JSONResponse:
         try:
-            return JSONResponse({"queries": await asyncio.to_thread(api_saved_list)})
+            return JSONResponse({"queries": await asyncio.to_thread(api_saved_list, caller=_caller_for(request))})
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def saved_create(request) -> JSONResponse:
         try:
@@ -1421,7 +1827,7 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            entry = await asyncio.to_thread(api_saved_save, body, request)
+            entry = await asyncio.to_thread(api_saved_save, body, request, caller=_caller_for(request))
         except NotAuthorized as exc:
             return JSONResponse({"error": str(exc)}, status_code=401)
         except ValueError as exc:
@@ -1429,18 +1835,20 @@ def register_ui(app, engine_getter) -> None:
         except OSError as exc:
             return JSONResponse({"error": f"Cannot write the saved-query store: {exc}"}, status_code=500)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         return JSONResponse({"saved": True, **entry})
 
     async def saved_delete(request) -> JSONResponse:
         try:
-            result = await asyncio.to_thread(api_saved_delete, request.path_params["name"], request)
+            result = await asyncio.to_thread(
+                api_saved_delete, request.path_params["name"], request, caller=_caller_for(request)
+            )
         except NotAuthorized as exc:
             return JSONResponse({"error": str(exc)}, status_code=401)
         except UnknownSavedQuery as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         return JSONResponse(result)
 
     async def saved_run(request) -> JSONResponse:
@@ -1452,10 +1860,26 @@ def register_ui(app, engine_getter) -> None:
         if not isinstance(body, dict):
             return JSONResponse({"error": "Request body must be a JSON object."}, status_code=400)
         limit = body.get("limit")
-        if limit is not None and not isinstance(limit, int):
+        # bool is an int SUBCLASS in Python: `"limit": true` used to pass this
+        # check and become limit=1 (one row). Reject it explicitly
+        # (cross-validation 2026-11-12, P3).
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
             return JSONResponse({"error": "limit must be an integer."}, status_code=400)
         try:
-            sql, params, _entry = await asyncio.to_thread(api_saved_run, name, body)
+            sql, params, _entry = await asyncio.to_thread(api_saved_run, name, body, caller=_caller_for(request))
+            # audit F3: the web surface applies its own ALWAYS-ON SELECT-only
+            # guard here, in addition to saved.py's D2-conditional re-check —
+            # with SQLHANDLER_MCP_READONLY=0 the stored template is still
+            # web-bound.
+            sql = assert_readonly(sql)
+            # audit F3: bound the payload like /api/query. An explicit limit
+            # clamps to the same cap; an omitted limit keeps the engine's
+            # MAX_ROWS default, but a DISABLED cap (SQLHANDLER_MAX_ROWS=0)
+            # falls back to the UI bound so no response is unbounded.
+            if limit is not None:
+                limit = _clamp_limit(limit)
+            elif _max_rows() <= 0:
+                limit = _FALLBACK_MAX_LIMIT
         except UnknownSavedQuery as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except ValueError as exc:
@@ -1463,11 +1887,18 @@ def register_ui(app, engine_getter) -> None:
         except LakehouseError as exc:  # concurrency-gate refusal
             return JSONResponse({"error": str(exc)}, status_code=429)
         try:
-            arrow = await asyncio.to_thread(engine_getter().query_duckdb, sql, limit, params, body.get("version_as_of"))
+            arrow = await asyncio.to_thread(
+                engine_getter().query_duckdb,
+                sql,
+                limit,
+                params,
+                body.get("version_as_of"),
+                caller=_caller_for(request),
+            )
         except (ValueError, LakehouseError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         payload = arrow_to_payload(arrow, limit=limit)
         payload.update({"query": name})
         return JSONResponse(payload)
@@ -1482,11 +1913,11 @@ def register_ui(app, engine_getter) -> None:
         except Exception:
             return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
         try:
-            result = await asyncio.to_thread(api_export, engine_getter(), body)
+            result = await asyncio.to_thread(api_export, engine_getter(), body, caller=_caller_for(request))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         return Response(
             content=result["content"],
             media_type=result["media_type"],
@@ -1502,7 +1933,7 @@ def register_ui(app, engine_getter) -> None:
         try:
             return JSONResponse(await asyncio.to_thread(api_catalog_status, engine_getter()))
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_upload(request) -> JSONResponse:
         # P1-4 (audit): a catalog write is a poisoning channel into every
@@ -1537,7 +1968,7 @@ def register_ui(app, engine_getter) -> None:
                 status_code=500,
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_delete(request) -> JSONResponse:
         # P1-4: same write gate as the upload (the DELETE wipes the whole
@@ -1551,19 +1982,22 @@ def register_ui(app, engine_getter) -> None:
         except OSError as exc:
             return JSONResponse({"error": f"Cannot remove the uploaded catalog: {exc}"}, status_code=500)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_content(request) -> JSONResponse:
         try:
             return JSONResponse(
                 await asyncio.to_thread(
-                    api_catalog_content, engine_getter(), request.query_params.get("format", "yaml")
+                    api_catalog_content,
+                    engine_getter(),
+                    request.query_params.get("format", "yaml"),
+                    caller=_caller_for(request),  # audit P1-9: policy-scoped read
                 )
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_table_get(request) -> JSONResponse:
         params = request.query_params
@@ -1574,12 +2008,13 @@ def register_ui(app, engine_getter) -> None:
                     engine_getter(),
                     params.get("table", ""),
                     params.get("format", "yaml"),
+                    caller=_caller_for(request),  # audit P1-9: policy-scoped read
                 )
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_table_update(request) -> JSONResponse:
         # P1-4: same write gate as the upload.
@@ -1612,7 +2047,7 @@ def register_ui(app, engine_getter) -> None:
                 status_code=500,
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         return JSONResponse({"ok": True, **result})
 
     async def semantic_catalog_table_delete(request) -> JSONResponse:
@@ -1630,7 +2065,7 @@ def register_ui(app, engine_getter) -> None:
         except OSError as exc:
             return JSONResponse({"error": f"Cannot write the catalog store: {exc}"}, status_code=500)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
         return JSONResponse({"ok": True, **result})
 
     async def highlight(request) -> JSONResponse:
@@ -1643,7 +2078,7 @@ def register_ui(app, engine_getter) -> None:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     app.add_route("/api/semantic-catalog", semantic_catalog_get, methods=["GET"])
     app.add_route("/api/semantic-catalog", semantic_catalog_upload, methods=["POST"])
@@ -1668,7 +2103,7 @@ def register_ui(app, engine_getter) -> None:
         except ValueError as exc:  # manifest / option validation
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def semantic_catalog_dbt_import_apply(request) -> JSONResponse:
         # P1-4 symmetry (audit 2026-10-20): /apply WRITES the catalog store
@@ -1710,7 +2145,7 @@ def register_ui(app, engine_getter) -> None:
                 status_code=500,
             )
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     app.add_route("/api/semantic-catalog/import-dbt", semantic_catalog_dbt_import, methods=["POST"])
     app.add_route("/api/semantic-catalog/import-dbt/apply", semantic_catalog_dbt_import_apply, methods=["POST"])
@@ -1728,11 +2163,11 @@ def register_ui(app, engine_getter) -> None:
     # arguments) is an HTTP 4xx. Auth is the shared /api posture
     # (SQLHANDLER_API_TOKEN middleware / gateway) — never the /mcp keys.
     #
-    # _tool_dispatcher is injected by server._build_http_app (the same
-    # engine_getter injection pattern); the default keeps register_ui's
-    # existing call sites and tests working by importing the dispatcher
-    # lazily (no import cycle at module load).
-    def _tool_dispatcher() -> ToolDispatcher | None:
+    # The dispatcher resolves lazily via a server import (no import cycle at
+    # module load). There is NO injection point — register_ui takes only
+    # engine_getter — so tests substitute by monkeypatching
+    # sqlhandler.server._dispatch_tool (the lookup re-resolves per call).
+    def _tool_dispatcher():
         try:
             from .server import _dispatch_tool  # lazy: avoids the import cycle
 
@@ -1746,7 +2181,7 @@ def register_ui(app, engine_getter) -> None:
 
             return JSONResponse({"tools": await asyncio.to_thread(mcp_tool_specs)})
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def inspector_call(request) -> JSONResponse:
         try:
@@ -1766,6 +2201,32 @@ def register_ui(app, engine_getter) -> None:
         dispatch = _tool_dispatcher()
         if dispatch is None:  # pragma: no cover - defensive
             return JSONResponse({"error": "Tool dispatcher unavailable."}, status_code=500)
+        # The inspector is the /api credential plane and must never become a
+        # second door into the MCP write capability (cross-validation
+        # 2026-11-12, P2: with SQLHANDLER_MCP_READONLY=0 this bridge executed
+        # `CREATE TABLE evil AS SELECT 1`). The web twins are ALWAYS
+        # read-only, so when the MCP plane is relaxed this bridge applies the
+        # same guard to the SQL argument — and refuses query_saved, whose SQL
+        # lives in the store (its guarded twin is
+        # POST /api/saved-queries/{name}/run).
+        tool_name = name.strip()
+        if not mcp_readonly_enabled():
+            if tool_name == "query_saved":
+                return JSONResponse(
+                    {
+                        "error": "query_saved is not available over /api while "
+                        "SQLHANDLER_MCP_READONLY=0 — use POST /api/saved-queries/{name}/run "
+                        "(always read-only)."
+                    },
+                    status_code=403,
+                )
+            if tool_name in ("run_sql", "query_submit", "explain_query"):
+                sql_arg = args.get("sql")
+                if isinstance(sql_arg, str) and sql_arg.strip():
+                    try:
+                        assert_readonly(sql_arg)
+                    except ValueError as exc:
+                        return JSONResponse({"error": str(exc)}, status_code=400)
         # The request rides along EXACTLY as the /mcp transport hands it to
         # tools/call: the dispatcher reads the caller identity off its scope
         # state (audit + policy) and query_save/query_delete verify the
@@ -1822,7 +2283,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def admin_policy_set(request) -> JSONResponse:
         try:
@@ -1856,7 +2317,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def admin_key_mint(request) -> JSONResponse:
         try:
@@ -1886,7 +2347,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def admin_key_revoke(request) -> JSONResponse:
         try:
@@ -1905,7 +2366,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     app.add_route("/api/admin/grants", admin_grants, methods=["GET"])
     app.add_route("/api/admin/policy", admin_policy_set, methods=["PUT"])
@@ -1930,7 +2391,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def selfservice_mint(request) -> JSONResponse:
         try:
@@ -1957,7 +2418,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def selfservice_revoke(request) -> JSONResponse:
         try:
@@ -1969,7 +2430,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def admin_users(request) -> JSONResponse:
         try:
@@ -1980,7 +2441,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     async def admin_user_grants(request) -> JSONResponse:
         try:
@@ -2008,7 +2469,7 @@ def register_ui(app, engine_getter) -> None:
         except _AdminHTTPError as exc:
             return _admin_response(exc)
         except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return _error_response(exc)
 
     app.add_route("/api/admin/keys/self", selfservice_keys, methods=["GET"])
     app.add_route("/api/admin/keys/self", selfservice_mint, methods=["POST"])

@@ -51,6 +51,10 @@ import pyarrow.fs as pafs
 
 logger = logging.getLogger("sqlhandler.blockcache")
 
+#: On-disk layout version of a block-cache entry (bump when the block format
+#: changes; it is part of the entry directory name so old entries never mix).
+_BLOCK_CACHE_LAYOUT = "1"
+
 
 def _cfg() -> dict:
     """Block-cache configuration from the environment (cheap, per call)."""
@@ -380,12 +384,17 @@ class _CachedStream:
         # Optional snapshot scope: keys are scoped (never aliased) across
         # scopes, while the empty scope keeps the historical derivation so
         # existing cache directories stay warm across upgrades.
+        self._bs = cfg["block_size"]
         if scope:
             key = hashlib.sha256(f"{scope}\x00{path}".encode()).hexdigest()[:24]
         else:
             key = hashlib.sha256(path.encode()).hexdigest()[:24]
-        self._dir = Path(cfg["dir"]) / f"{key}-{size}"
-        self._bs = cfg["block_size"]
+        # The BLOCK SIZE and the LAYOUT version are part of the on-disk format
+        # (block i covers [i*bs, (i+1)*bs)), so both belong in the directory
+        # name: without them a block-size change — or a release that changes
+        # the layout — makes every warm block be spliced in at the WRONG
+        # offset, i.e. silently wrong bytes (audit 2026-11-12).
+        self._dir = Path(cfg["dir"]) / f"{key}-{size}-b{self._bs}-v{_BLOCK_CACHE_LAYOUT}"
 
     def _base_stream(self):
         if self._closed:
@@ -402,16 +411,27 @@ class _CachedStream:
     def _fetch_block(self, i: int) -> bytes:
         """Read block ``i`` from the base stream (cache-aside, atomic publish)."""
         bp = self._block_path(i)
-        if bp.exists():  # warm: another reader (or an earlier stream) fetched it
-            try:
-                return bp.read_bytes()
-            except OSError:
-                pass  # raced a cache reset: fall through and refetch
         start = i * self._bs
         length = min(self._bs, self._size - start)
+        if bp.exists():  # warm: another reader (or an earlier stream) fetched it
+            try:
+                data = bp.read_bytes()
+                if len(data) == length:
+                    return data
+                # Wrong length = a block from another layout or a truncated
+                # file. Returning it would splice bytes from the wrong offset
+                # into this read (silent corruption), so drop it and refetch.
+                bp.unlink(missing_ok=True)
+            except OSError:
+                pass  # raced a cache reset: fall through and refetch
         stream = self._base_stream()
         stream.seek(start)
         data = stream.read(length)
+        if len(data) != length:
+            # Short read (a stream-only backend may return fewer bytes): serve
+            # what we got but never CACHE a partial block — a later warm read
+            # would splice it into the file as if it were complete.
+            return data
         self._on_bytes(len(data))
         try:
             self._dir.mkdir(parents=True, exist_ok=True)

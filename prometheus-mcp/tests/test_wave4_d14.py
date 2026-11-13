@@ -437,7 +437,8 @@ def test_client_label_values_valid_names_reach_the_server():
         name = parts[4]
         seen.append(name)
         assert LABEL_NAME_RE.match(name)
-        return httpx2.Response(200, json={"status": "success", "data": {"result": ["ns1"]}})
+        # REAL wire shape: /api/v1/label/<n>/values puts a LIST in "data".
+        return httpx2.Response(200, json={"status": "success", "data": ["ns1"]})
 
     c = make_prom_client(handler)
     assert asyncio.run(c.label_values("namespace")) == ["ns1"]
@@ -454,7 +455,7 @@ def test_mcp_prom_label_values_rejects_weird_and_accepts_valid(monkeypatch):
 
         def __init__(self):
             self._inner = make_prom_client(
-                lambda request: httpx2.Response(200, json={"status": "success", "data": {"result": ["ns1", "ns2"]}})
+                lambda request: httpx2.Response(200, json={"status": "success", "data": ["ns1", "ns2"]})
             )
 
         async def label_values(self, label, match=None):

@@ -32,7 +32,14 @@ data:
   # (X-API-Key / X-API-Token / Bearer); /health stays open for probes.
   SQLHANDLER_METRICS_AUTH: {{ ternary "1" "0" .Values.security.metricsAuth | quote }}
   # Backend: onelake (default), s3/minio, or iceberg.
+  # Rendered ONLY in single-backend mode (audit 2026-11-12, P0-2): the
+  # server resolves config as "passed mapping wins, os.environ is the
+  # fallback", so a global SQLHANDLER_BACKEND left set here would shadow
+  # every per-source `backend:` in SQLHANDLER_SOURCES below. Omitting it in
+  # federation mode removes the shadow at the source.
+  {{- if not .Values.sources }}
   SQLHANDLER_BACKEND: {{ .Values.backend | default "onelake" | quote }}
+  {{- end }}
   {{- if not .Values.sources }}
   {{- if eq .Values.backend "onelake" }}
   # OneLake connection details (non-secret). Credentials come from a Secret.
@@ -137,6 +144,8 @@ data:
   SQLHANDLER_VIRTUAL_CACHE_SORT: {{ .Values.cache.virtualCacheSort | quote }}
   SQLHANDLER_RESULT_CACHE_TTL: {{ .Values.cache.resultCacheTtl | quote }}
   SQLHANDLER_RESULT_CACHE_MAX_BYTES: {{ .Values.cache.resultCacheMaxBytes | quote }}
+  SQLHANDLER_PROFILE_MAX_ROWS: {{ .Values.cache.profileMaxRows | quote }}
+  SQLHANDLER_PROFILE_CACHE_SIZE: {{ .Values.cache.profileCacheSize | quote }}
   {{- with .Values.cache.virtualCacheDir }}
   SQLHANDLER_VIRTUAL_CACHE_DIR: {{ . | quote }}
   {{- end }}
@@ -177,6 +186,35 @@ data:
   # query used to hold one of the concurrency-gate slots forever; >10-minute
   # queries must opt in by raising this.
   SQLHANDLER_QUERY_TIMEOUT: {{ .Values.query.timeoutSeconds | quote }}
+  SQLHANDLER_MAX_CONCURRENT_QUERIES: {{ .Values.query.maxConcurrent | quote }}
+  {{- with .Values.query.maxConcurrentPerCaller }}
+  SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_QUEUE_TIMEOUT: {{ .Values.query.queueTimeoutSeconds | quote }}
+  SQLHANDLER_MAX_ROWS: {{ .Values.query.maxRows | quote }}
+  SQLHANDLER_MAX_OUTPUT_ROWS: {{ .Values.query.maxOutputRows | quote }}
+  SQLHANDLER_MAX_RESULT_BYTES: {{ .Values.query.maxResultBytes | quote }}
+  SQLHANDLER_MAX_JOBS: {{ .Values.query.maxJobs | quote }}
+  {{- with .Values.query.maxJobsPerCaller }}
+  SQLHANDLER_MAX_JOBS_PER_CALLER: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_MAX_ASYNC_QUERIES: {{ .Values.query.maxAsyncQueries | quote }}
+  {{- with .Values.query.maxAsyncQueriesPerCaller }}
+  SQLHANDLER_MAX_ASYNC_QUERIES_PER_CALLER: {{ . | quote }}
+  {{- end }}
+  SQLHANDLER_MAX_PAGE_ROWS: {{ .Values.query.maxPageRows | quote }}
+  SQLHANDLER_MAX_SCOPES: {{ .Values.query.maxScopes | quote }}
+  SQLHANDLER_CANCEL_GRACE_SECONDS: {{ .Values.query.cancelGraceSeconds | quote }}
+  SQLHANDLER_ASK_MAX_TABLES: {{ .Values.query.askMaxTables | quote }}
+  SQLHANDLER_ASK_MAX_COLUMNS: {{ .Values.query.askMaxColumns | quote }}
+  SQLHANDLER_ASK_MAX_PROFILE_COLUMNS: {{ .Values.query.askMaxProfileColumns | quote }}
+  SQLHANDLER_EXPORT_DEFAULT_ROWS: {{ .Values.query.exportDefaultRows | quote }}
+  SQLHANDLER_EXPORT_MAX_ROWS: {{ .Values.query.exportMaxRows | quote }}
+  SQLHANDLER_FAIRNESS_SCOPE: {{ .Values.query.fairnessScope | quote }}
+  SQLHANDLER_SINGLEFLIGHT: {{ ternary "1" "0" .Values.query.singleflight | quote }}
+  {{- with .Values.query.singleflightTimeout }}
+  SQLHANDLER_SINGLEFLIGHT_TIMEOUT: {{ . | quote }}
+  {{- end }}
   {{- /* Disk block cache: opt-in (s3/iceberg parquet IO; delta-rs IO on
          onelake is not wrappable). Empty strings mean "engine default". */}}
   SQLHANDLER_BLOCK_CACHE: {{ .Values.cache.blockCache.enabled | quote }}

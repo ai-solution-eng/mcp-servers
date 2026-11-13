@@ -40,11 +40,13 @@ Landing-zone semantics (the design contract):
 from __future__ import annotations
 
 import logging
+import zlib
 
 import pyarrow.csv as pacsv
 import pyarrow.dataset as pad
 
 from .config import RAW_GZ_SUFFIXES, RAW_TEXT_SUFFIXES, raw_formats_enabled, raw_max_file_mb
+from .provider import LakehouseError
 
 __all__ = [
     "build_raw_dataset",
@@ -172,6 +174,57 @@ def is_raw_format(fmt: str) -> bool:
     return fmt in RAW_FORMATS
 
 
+def _gz_within_cap(stream, cap_bytes: int, chunk: int = 1 << 20) -> bool:
+    """Count DECOMPRESSED output bytes of one .gz member; give up past cap.
+
+    The discovery-time cap sees only the COMPRESSED size (a decompression pass
+    per object at listing time was deliberately rejected) — so the decompressed
+    size is checked here, at open, with a byte counter that stops the moment
+    the cap is exceeded (audit 2026-11-12 P3: the decompression-bomb hole).
+
+    pyarrow filesystems may hand back the stream ALREADY decompressed (the
+    gzip codec is applied by extension), so the gzip magic is checked first:
+    raw gzip goes through zlib, anything else is counted as-is — either way
+    the counted bytes are the decompressed size.
+    """
+    dec = zlib.decompressobj(wbits=31)
+    head = stream.read(chunk)
+    if head[:2] != b"\x1f\x8b":
+        out = len(head)
+        if out > cap_bytes:
+            return False
+        while True:
+            data = stream.read(chunk)
+            if not data:
+                return True
+            out += len(data)
+            if out > cap_bytes:
+                return False
+    out = 0
+    data = head
+    # A gzip FILE may hold MULTIPLE members (concatenated streams): a single
+    # decompressobj stops at the first member's trailer and parks the rest in
+    # unused_data, so counting one object let an 8-member 4 MiB bomb through
+    # while the identical single-member file was refused (cross-validation
+    # 2026-11-12, P2). Restart the decompressor on the leftover bytes.
+    while True:
+        if not data:
+            data = stream.read(chunk)
+            if not data:
+                return True
+        while data:
+            out += len(dec.decompress(data))
+            if out > cap_bytes:
+                return False
+            if dec.eof:
+                data = dec.unused_data
+                dec = zlib.decompressobj(wbits=31)
+                if not data:
+                    break
+            else:
+                data = b""
+
+
 def build_raw_dataset(location: str, fmt: str, files: list[str], filesystem):
     """Open a raw table's EXPLICIT file list as one pyarrow Dataset.
 
@@ -184,6 +237,23 @@ def build_raw_dataset(location: str, fmt: str, files: list[str], filesystem):
     CSV, a single-line-array .json) surfaces here as pyarrow's ArrowInvalid
     and the caller wraps it into the standard LakehouseError shape.
     """
+    # Decompressed-size gate for .gz raw tables: the listing-time cap checked
+    # only the compressed bytes, so a gzip bomb would sail past it — count the
+    # decompressed stream here, once per open (the dataset cache amortizes it).
+    cap_mb = raw_max_file_mb()
+    if fmt.endswith(".gz") and cap_mb > 0:
+        cap_bytes = cap_mb * 1024 * 1024
+        for one in files:
+            stream = filesystem.open_input_stream(one)
+            try:
+                if not _gz_within_cap(stream, cap_bytes):
+                    raise LakehouseError(
+                        f"raw table {location}: {one} decompresses past "
+                        f"SQLHANDLER_RAW_MAX_FILE_MB={cap_mb} — gzip-bomb protection refuses the read "
+                        "(the cap applies to the DECOMPRESSED size at open; compressed size was checked at discovery)"
+                    )
+            finally:
+                stream.close()
     kind = raw_format_kind(fmt)
     if kind == "tsv":
         format_obj: object = pad.CsvFileFormat(pacsv.ParseOptions(delimiter="\t"))

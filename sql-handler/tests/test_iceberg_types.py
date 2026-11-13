@@ -25,11 +25,19 @@ except ImportError:
 # ---------------------------------------------------------------- config env
 
 
-def test_catalog_type_garbage_falls_back_to_rest():
-    """An unknown ICEBERG_CATALOG_TYPE falls back to rest (existing behavior)."""
-    cfg = load_iceberg_config({"ICEBERG_CATALOG_TYPE": "sponge", "ICEBERG_CATALOG_URI": "http://x"})
-    assert cfg.catalog_type == "rest"
-    assert cfg.is_configured
+def test_catalog_type_garbage_is_refused():
+    """An unknown ICEBERG_CATALOG_TYPE is REFUSED, naming the supported set.
+
+    audit 2026-11-12 (P3): it used to fall back to "rest" silently, which
+    contradicts the module's own fail-loud philosophy for malformed config —
+    a typo sent the server at a REST catalog that does not exist.
+    """
+    import pytest as _pytest
+
+    with _pytest.raises(Exception) as exc:
+        load_iceberg_config({"ICEBERG_CATALOG_TYPE": "sponge", "ICEBERG_CATALOG_URI": "http://x"})
+    assert "sponge" in str(exc.value)
+    assert "rest" in str(exc.value).lower()  # the message names the valid set
 
 
 def test_catalog_type_case_and_space_normalized():

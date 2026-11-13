@@ -37,8 +37,29 @@ sqlhandler {{ .Chart.Version }} deployed to namespace {{ $ns }}.
    default; never use it for a deployment anyone else can reach.
 
 ════════════════════════════════════════════════════════════════════
+1b. SECURITY POSTURE CHANGED (audit 2026-11-12) — read before upgrading.
+   * ANONYMOUS CALLERS ARE REFUSED by default: the chart now sets
+     SQLHANDLER_REQUIRE_IDENTITY=1, so /api/* (the REST twin of run_sql
+     that reaches the same lake) and /mcp return 401 without a credential.
+     /health, /ready, /ui, /api/whoami and /oauth/* stay open.
+     -> A browser user needs an SSO cookie or a pasted API key; a direct
+        in-cluster caller needs X-API-Key. Opt out ONLY if the gateway
+        authenticates every caller and nothing else can reach the pod:
+        --set security.identity.requireIdentity=false
+   * /metrics and /ready are still OPEN by default. Turning on
+     security.metricsAuth now REQUIRES metrics.podMonitor.bearerTokenSecret
+     (the render fails otherwise, because an unauthenticated scrape target
+     fails silently in Prometheus).
+   * The AUDIT TRAIL is chart-wired: security.audit.enabled=true needs a
+     durable claim (security.audit.existingClaim or .pvc.create); the render
+     refuses an ephemeral trail.
+   * Egress can now be restricted: security.networkPolicy.egress.enabled
+     (default off) renders default-deny egress + DNS + your CIDRs.
+
+════════════════════════════════════════════════════════════════════
 2. Endpoints — /mcp REQUIRES the key (X-API-Key or Authorization:
-   Bearer); /api/* keeps its separate SQLHANDLER_API_TOKEN middleware
+   Bearer); /api/* requires an identity (see 1b) and honours
+   SQLHANDLER_API_TOKEN when set
    (set it to enable), the read-only UI and the probes stay open.
   kubectl -n {{ $ns }} port-forward deploy/{{ $name }} 8001:9097
   Console : http://localhost:8001/        (read-only UI)

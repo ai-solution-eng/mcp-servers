@@ -110,8 +110,11 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
+import os
+import socket
 import ssl
 import threading
 import time
@@ -145,6 +148,26 @@ _ADD_ACTION = "add"
 # Blocks fetched from the sharing server during a query-response download
 # (ranged GET of each parquet file). 1 MiB is the classic http.client chunk.
 _DOWNLOAD_BLOCK = 1024 * 1024
+
+# Per-LINE cap on the JSONL action stream. _MAX_QUERY_LINES bounds how MANY
+# lines a broken/hostile server can send; this bounds how BIG one may be.
+# http.client's readline buffers a whole line in memory before we can reject
+# it, so without this a single unterminated 4 GB line is an OOM (audit
+# 2026-11-12 P2). A real metaData/add action is far under 1 MiB.
+_MAX_ACTION_BYTES = 1024 * 1024
+
+#: Presigned-URL schemes this client will fetch. The protocol's add actions
+#: name object-store URLs (https in every cloud; plain http for on-prem MinIO).
+_PRESIGNED_SCHEMES = ("http", "https")
+
+#: Opt-in for presigned URLs that resolve to loopback/link-local/private
+#: addresses (an on-prem MinIO on the private network). Default OFF: a share
+#: provider must not be able to point this pod at its own cluster internals.
+ALLOW_PRIVATE_SHARING_URLS_ENV = "SQLHANDLER_SHARING_ALLOW_PRIVATE_URLS"
+
+#: Hard ceiling for one staged file (see _stage_files_locally); the add
+#: action's declared size is used when it is smaller.
+_MAX_STAGE_FILE_BYTES = 8 * 1024 * 1024 * 1024
 
 
 def _redact(token: str, text: str) -> str:
@@ -199,6 +222,149 @@ def _fold_share_schema(share: str, schema: str) -> str:
         return naive
     digest = hashlib.sha256(f"{share}/{schema}".encode()).hexdigest()[:6]
     return f"{naive}_{digest}"
+
+# ---------------------------------------------------------------------------
+# presigned-URL fetch policy (SSRF guard, audit 2026-11-12 P2)
+# ---------------------------------------------------------------------------
+
+
+_HOST_VERDICT_TTL = 30.0  # seconds
+_HOST_VERDICTS: dict[tuple[str, bool], tuple[float, str]] = {}
+_HOST_VERDICTS_LOCK = threading.Lock()
+
+
+def _host_verdict(host: str, allow_private: bool) -> str:
+    """'' when *host* may be fetched, else a short human reason.
+
+    The presigned URL comes from the SHARING SERVER - a different trust
+    domain. Without this check a malicious/compromised provider turns this
+    pod into an SSRF proxy into its own network (cloud metadata at
+    169.254.169.254, the k8s API, internal admin ports): the recipient trusts
+    the sharer for DATA, not for a network position. Resolution happens here
+    while the connect still uses the hostname, so a DNS-rebinding window
+    remains: the TTL (30 s) bounds how long a verdict can outlive the record
+    it was computed from, instead of the unbounded lru_cache this used to be
+    (cross-validation 2026-11-12). Closing the window entirely needs an
+    IP-pinned connect (SNI preserved), which is a larger change.
+    """
+    if not host:
+        return "no host"
+    key = (host, allow_private)
+    now = time.time()
+    with _HOST_VERDICTS_LOCK:
+        cached = _HOST_VERDICTS.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    verdict = _resolve_host_verdict(host, allow_private)
+    with _HOST_VERDICTS_LOCK:
+        if len(_HOST_VERDICTS) > 512:  # bound the map; verdicts are cheap to redo
+            _HOST_VERDICTS.clear()
+        _HOST_VERDICTS[key] = (now + _HOST_VERDICT_TTL, verdict)
+    return verdict
+
+
+def _resolve_host_verdict(host: str, allow_private: bool) -> str:
+    """Resolve + classify one host (the uncached half of _host_verdict)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        return f"cannot resolve ({exc})"
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(str(info[4][0]))
+        except ValueError:
+            continue
+        if allow_private:
+            continue
+        if (
+            addr.is_loopback
+            or addr.is_link_local
+            or addr.is_private
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            return f"resolves to a non-public address ({addr})"
+    return ""
+
+
+def _origin_of(url: str) -> tuple[str, str, int | None]:
+    """(scheme, host, effective port) for an origin comparison."""
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    scheme = (parsed.scheme or "").lower()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else (80 if scheme == "http" else None)
+    return scheme, (parsed.hostname or "").lower(), port
+
+
+def _validate_presigned_url(url: str, allowed_origin: str | None = None) -> None:
+    """Refuse a presigned URL this client is not allowed to fetch.
+
+    Only http(s) is fetched, and private/loopback/link-local targets are
+    refused unless SQLHANDLER_SHARING_ALLOW_PRIVATE_URLS is set (the on-prem
+    MinIO case). ``allowed_origin`` (the configured sharing endpoint) is the
+    one exception: some on-prem servers hand out file URLs on THEMSELVES
+    (proxy downloads), and that origin is already the trusted endpoint - so
+    allowing it adds no new reachability. The error names the scheme/host
+    only, never the URL's query string (a presigned signature).
+    """
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _PRESIGNED_SCHEMES:
+        raise LakehouseError(
+            f"Delta Sharing file URL scheme {scheme or '(none)'!r} is not allowed "
+            f"(only {'/'.join(_PRESIGNED_SCHEMES)}); host {parsed.hostname or '(none)'!r}"
+        )
+    host = parsed.hostname or ""
+    if allowed_origin and _origin_of(url) == _origin_of(allowed_origin):
+        return  # the sharing server's own origin: already the trusted endpoint
+    allow_private = os.environ.get(ALLOW_PRIVATE_SHARING_URLS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    reason = _host_verdict(host, allow_private)
+    if reason:
+        raise LakehouseError(
+            f"Delta Sharing file URL host {host!r} is refused: {reason}. "
+            f"Set {ALLOW_PRIVATE_SHARING_URLS_ENV}=1 to allow a private/on-prem object store."
+        )
+
+
+def _iter_action_lines(resp: HTTPResponse, cap: int):
+    """Yield the action stream's lines, refusing any line longer than *cap*.
+
+    ``HTTPResponse.readline(limit)`` returns at most *limit* bytes and omits
+    the trailing newline when it truncated, which is how an over-cap line is
+    detected. The final line of a stream may legitimately lack a newline; only
+    a read that HIT the cap is refused.
+    """
+    readline = getattr(resp, "readline", None)
+    if readline is None:
+        # A non-http.client file-like (an in-memory buffer, a test double):
+        # iterate it as-is. Real network responses always have readline, and
+        # THAT is the path the cap protects.
+        yield from resp
+        return
+    while True:
+        raw = readline(cap + 1)
+        if not raw:
+            return
+        # Measure the LINE CONTENT, not the read length: readline(cap + 1)
+        # returns at most cap+1 bytes, so a line of exactly cap bytes plus its
+        # newline used to be yielded although the docstring promises a refusal
+        # above cap (cross-validation 2026-11-12, P3 boundary).
+        content_len = len(raw) - 1 if raw.endswith(b"\n") else len(raw)
+        if content_len > cap:
+            raise LakehouseError(
+                f"Delta Sharing query response carried a single action line longer than {cap} bytes "
+                "(misbehaving server or corrupt stream) - refusing to buffer it"
+            )
+        yield raw
+
+
 class SharingClient:
     """A minimal, dependency-free Delta Sharing protocol client.
 
@@ -424,7 +590,7 @@ class SharingClient:
         files: list[dict] = []
         seen_valid_action = False  # P1-11: malformed lines are tolerated only BEFORE the first valid action
         malformed_after_start = 0
-        for line_no, raw in enumerate(resp):
+        for line_no, raw in enumerate(_iter_action_lines(resp, _MAX_ACTION_BYTES)):
             if line_no >= _MAX_QUERY_LINES:
                 raise LakehouseError("Delta Sharing query response exceeded the action-stream cap")
             line = raw.strip()
@@ -445,9 +611,7 @@ class SharingClient:
                     continue
                 malformed_after_start += 1
                 continue
-            if wrapper.get(_METADATA_ACTION):
-                seen_valid_action = True
-            elif wrapper.get(_ADD_ACTION):
+            if wrapper.get(_METADATA_ACTION) or wrapper.get(_ADD_ACTION):
                 seen_valid_action = True
             if wrapper.get(_METADATA_ACTION):
                 schema_json = wrapper[_METADATA_ACTION]
@@ -585,12 +749,13 @@ class _PresignedHTTPHandler(pafs.FileSystemHandler):
     oversight.
     """
 
-    def __init__(self, files: list[dict], timeout: int = 30):
+    def __init__(self, files: list[dict], timeout: int = 30, allowed_origin: str | None = None):
         # Path -> (url, size): dataset paths are stable short keys ("id=<id>")
         # so dataset fragments print readably and the presigned query-string
         # signature never lands in a cache key or an error message.
         self._by_path: dict[str, tuple[str, int]] = {}
         self._timeout = timeout
+        self._allowed_origin = allowed_origin
         self._ssl_ctx = ssl.create_default_context()
         for idx, f in enumerate(files):
             path = f"id={f.get('id') or idx}"
@@ -632,7 +797,10 @@ class _PresignedHTTPHandler(pafs.FileSystemHandler):
         return self.get_file_info(list(self._by_path))
 
     def open_input_file(self, path: str):
-        return pa.PythonFile(_HTTPRandomAccessFile(self._url_for(path), self._timeout, self._ssl_ctx), mode="rb")
+        return pa.PythonFile(
+            _HTTPRandomAccessFile(self._url_for(path), self._timeout, self._ssl_ctx, self._allowed_origin),
+            mode="rb",
+        )
 
     def open_input_stream(self, path: str):
         return self.open_input_file(path)
@@ -678,10 +846,11 @@ class _HTTPRandomAccessFile:
     block cache's ``_RawStream``/PyFileSystem machinery uses).
     """
 
-    def __init__(self, url: str, timeout: int, ssl_ctx: ssl.SSLContext | None):
+    def __init__(self, url: str, timeout: int, ssl_ctx: ssl.SSLContext | None, allowed_origin: str | None = None):
         self._url = url
         self._timeout = timeout
         self._ssl_ctx = ssl_ctx
+        self._allowed_origin = allowed_origin
         self._pos = 0
         self._size: int | None = None
         self._conn: http.client.HTTPConnection | None = None
@@ -702,6 +871,9 @@ class _HTTPRandomAccessFile:
 
     def _connection(self):
         if self._conn is None:
+            # EVERY presigned fetch (HEAD size probe, ranged GET) goes through
+            # here: one choke point for the scheme/host policy.
+            _validate_presigned_url(self._url, self._allowed_origin)
             host, port, _path, https = self._host_port_path()
             if https:
                 self._conn = http.client.HTTPSConnection(host, port, context=self._ssl_ctx, timeout=self._timeout)
@@ -738,8 +910,10 @@ class _HTTPRandomAccessFile:
         conn.request("GET", path, headers={"Range": f"bytes={offset}-", "Accept": "*/*"})
         resp = conn.getresponse()
         if resp.status not in (200, 206):
-            body = resp.read(512)
-            raise OSError(f"GET {self._safe_url()} failed: HTTP {resp.status} {body!r}")
+            # NEVER echo the response body: a presigned URL is SHARER-chosen,
+            # so the body may be another service's data (audit 2026-11-12 P2).
+            withheld = len(resp.read(512))
+            raise OSError(f"GET {self._safe_url()} failed: HTTP {resp.status} ({withheld} response bytes withheld)")
         if resp.status == 200 and offset > 0:
             # A 200 to a Range request means the server ignored the header and
             # restarted the body at byte 0 — reading it as if it began at
@@ -747,22 +921,23 @@ class _HTTPRandomAccessFile:
             # Re-issue once with no Range (the plain full-body GET a 200
             # actually describes); a second 200 is then correct at offset 0,
             # and any offset>0 need is still unservable on this host.
-            if offset > 0:
-                self._close_resp()
-                conn = self._connection()
-                conn.request("GET", path, headers={"Accept": "*/*"})
-                resp = conn.getresponse()
-                if resp.status != 200:
-                    body = resp.read(512)
-                    raise OSError(f"GET {self._safe_url()} failed: HTTP {resp.status} {body!r}")
-                # Full body from 0 but the caller wanted offset>0 and the host
-                # does not honor Range at all: reject loudly rather than serve
-                # misaligned bytes.
-                resp.close()
+            self._close_resp()
+            conn = self._connection()
+            conn.request("GET", path, headers={"Accept": "*/*"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                withheld = len(resp.read(512))
                 raise OSError(
-                    f"GET {self._safe_url()} ignored Range (HTTP 200 to bytes={offset}-); "
-                    "the host does not support random access and offset>0 cannot be served"
+                    f"GET {self._safe_url()} failed: HTTP {resp.status} ({withheld} response bytes withheld)"
                 )
+            # Full body from 0 but the caller wanted offset>0 and the host
+            # does not support Range at all: reject loudly rather than serve
+            # misaligned bytes.
+            resp.close()
+            raise OSError(
+                f"GET {self._safe_url()} ignored Range (HTTP 200 to bytes={offset}-); "
+                "the host does not support random access and offset>0 cannot be served"
+            )
         self._resp = resp
         self._resp_start = offset if resp.status == 206 else 0
 
@@ -1017,7 +1192,9 @@ class SharingProvider(DataProvider):
             empty = pa.table([pa.array([], type=f.type) for f in schema_arrow], schema=schema_arrow)
             return pad.dataset(empty)
         try:
-            handler = _PresignedHTTPHandler(files, timeout=self.config.timeout_seconds)
+            handler = _PresignedHTTPHandler(
+                files, timeout=self.config.timeout_seconds, allowed_origin=self.config.endpoint
+            )
             fs = pa.fs.PyFileSystem(handler)
             paths = list(handler._by_path)
             return pad.dataset(paths, filesystem=fs, format="parquet", schema=schema_arrow)
@@ -1038,29 +1215,63 @@ class SharingProvider(DataProvider):
 def _stage_files_locally(files: list[dict], dest: str | Path) -> list[Path]:
     """Download presigned parquet files into ``dest`` (used by tests and by
     operators who want a warm local copy; the provider itself scans over
-    ranged GETs instead)."""
+    ranged GETs instead).
+
+    The staging directory is created 0o700 and re-chmod'ed best-effort: it
+    holds shared data on the local disk, so no other user on the node should
+    read it (audit 2026-11-12 P3).
+    """
     out: list[Path] = []
     d = Path(dest)
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass  # a volume that ignores modes; the mkdir mode is the fallback
     for idx, f in enumerate(files):
         target = d / f"part-{idx:05d}.parquet"
-        _download_to(f["url"], target)
+        _download_to(f["url"], target, max_bytes=int(f.get("size") or 0) or None)
         out.append(target)
     return out
 
 
-def _download_to(url: str, target: Path) -> None:
-    """Stream one presigned URL to a local file (ranged/sequential GET)."""
+def _download_to(url: str, target: Path, max_bytes: int | None = None) -> None:
+    """Stream one presigned URL to a local file (ranged/sequential GET).
+
+    ``max_bytes`` bounds the transfer (the add action's declared size, capped
+    by _MAX_STAGE_FILE_BYTES) so a hostile or misreporting server cannot fill
+    the disk. A partial file is removed on any failure.
+    """
+    limit = min(int(max_bytes), _MAX_STAGE_FILE_BYTES) if max_bytes and max_bytes > 0 else _MAX_STAGE_FILE_BYTES
     handler_file = _HTTPRandomAccessFile(url, 30, ssl.create_default_context())
+    written = 0
     try:
         with open(target, "wb") as fh:
             while True:
                 chunk = handler_file.read(_DOWNLOAD_BLOCK)
                 if not chunk:
                     break
+                written += len(chunk)
+                if written > limit:
+                    raise LakehouseError(
+                        f"Delta Sharing staged file exceeded its {limit}-byte cap "
+                        f"({_safe_host_of(url)}); refusing to download further"
+                    )
                 fh.write(chunk)
+    except BaseException:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
     finally:
         handler_file.close()
+
+
+def _safe_host_of(url: str) -> str:
+    """scheme://host/path for error text (never the presigned query)."""
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 __all__ = ["SharingClient", "SharingConfig", "SharingProvider"]

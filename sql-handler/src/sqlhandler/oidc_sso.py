@@ -114,6 +114,10 @@ _TRUE = ("1", "true", "yes")
 _discovery_lock = threading.Lock()
 _discovery_cache: dict[str, tuple[float, dict]] = {}
 _discovery_negative: dict[str, float] = {}
+#: URLs with a discovery fetch IN FLIGHT: concurrent callers serve the stale
+#: copy (or decline) instead of queueing behind one round-trip (the
+#: _jwks_keys pattern; the lock is never held across the network call).
+_discovery_fetching: set[str] = set()
 _DISCOVERY_TTL = 3600.0
 _DISCOVERY_NEGATIVE_TTL = 60.0
 _DISCOVERY_MAX_BYTES = 1_048_576
@@ -308,7 +312,10 @@ def provider_config() -> tuple[str, str] | None:
     the cached well-known document.  ``None`` = unavailable (fail closed).
 
     Network/parse failures arm a short negative cache so a down IdP sees at
-    most one attempt per window per replica.
+    most one attempt per window per replica. The fetch runs OUTSIDE
+    ``_discovery_lock`` with a ``_discovery_fetching`` stampede marker (the
+    ``_jwks_keys`` pattern): a slow/hanging IdP can no longer serialize every
+    /oauth/login and callback behind one round-trip (audit 2026-11-12 P3).
     """
     authz_env, token_env = _env_str(AUTHZ_ENDPOINT_ENV), _env_str(TOKEN_ENDPOINT_ENV)
     if authz_env and token_env:
@@ -317,6 +324,8 @@ def provider_config() -> tuple[str, str] | None:
     if not url:
         return None
     now = time.time()
+    doc: dict | None = None
+    fetch = False
     with _discovery_lock:
         cached = _discovery_cache.get(url)
         if cached and (now - cached[0]) < _DISCOVERY_TTL:
@@ -325,18 +334,37 @@ def provider_config() -> tuple[str, str] | None:
             negative_until = _discovery_negative.get(url)
             if negative_until and now < negative_until:
                 return None
-            try:
-                doc = _fetch_discovery(url, _env_float(FETCH_TIMEOUT_ENV, 3.0))
-            except Exception as exc:
+            if url in _discovery_fetching:
+                # Another thread is already fetching: serve the STALE copy (or
+                # decline) instead of blocking every login behind one
+                # round-trip. The lock is NEVER held across the network call.
+                if cached is None:
+                    return None
+                doc = cached[1]
+            else:
+                _discovery_fetching.add(url)
+                fetch = True
+    if fetch:
+        try:
+            doc = _fetch_discovery(url, _env_float(FETCH_TIMEOUT_ENV, 3.0))
+        except Exception as exc:
+            with _discovery_lock:
                 _discovery_negative[url] = time.time() + _DISCOVERY_NEGATIVE_TTL
-                logger.warning(
-                    "OIDC SSO discovery fetch failed (%s: %s) — /oauth/* briefly unavailable",
-                    type(exc).__name__,
-                    exc,
-                )
-                return None
+            logger.warning(
+                "OIDC SSO discovery fetch failed (%s: %s) — /oauth/* briefly unavailable",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        finally:
+            # Always release the stampede marker (even on BaseException).
+            with _discovery_lock:
+                _discovery_fetching.discard(url)
+        with _discovery_lock:
             _discovery_negative.pop(url, None)
             _discovery_cache[url] = (time.time(), doc)
+    if doc is None:  # defensive: every path above either set it or returned
+        return None
     return (
         authz_env or str(doc["authorization_endpoint"]),
         token_env or str(doc["token_endpoint"]),

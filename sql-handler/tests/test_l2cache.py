@@ -1147,3 +1147,59 @@ def test_size_cap_survives_ttl_zero(tmp_path):
     cache.start_sweeper()
     assert cache._sweeper is not None
     assert cache._sweeper.daemon is True
+
+
+# --------------------------------------- shared metadata: VIRTUAL tables
+# A virtual table has no snapshot version of its own, so its shared entry
+# must be keyed on the definition + BASE-table versions — otherwise a base
+# commit would leave a stale profile/colstats on every replica until TTL.
+
+VIRTUAL_DEF = "SELECT id, amount FROM sales WHERE amount > 15"
+
+
+def _virtual_catalog(tmp_path: Path) -> str:
+    cat = tmp_path / "catalog.json"
+    cat.write_text(json.dumps({"tables": {"big_sales": {"definition": VIRTUAL_DEF}}}), encoding="utf-8")
+    return str(cat)
+
+
+def test_virtual_profile_shared_across_engines(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    cat = _virtual_catalog(tmp_path)
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_CATALOG": cat})
+    r1 = a.profile_table("big_sales")
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
+
+    b = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_CATALOG": cat})
+    r2 = b.profile_table("big_sales")
+    assert json.loads(json.dumps(r2, default=str)) == json.loads(json.dumps(r1, default=str))
+    assert b._l2_meta is not None and b._l2_meta.stats()["hits"] == 1
+    assert b._profile_misses == 0, "replica B re-ran the definition instead of sharing"
+
+
+def test_virtual_profile_shared_invalidated_by_base_version(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    cat = _virtual_catalog(tmp_path)
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_CATALOG": cat})
+    a.profile_table("big_sales")
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
+    a.provider.versions["shop/sales"] = 7  # ETL commit on a BASE table
+    a.profile_table("big_sales")
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 2, "base commit must rekey"
+
+
+def test_virtual_column_stats_shared_invalidated_by_base_version(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    _seed_table(root)
+    l2 = str(tmp_path / "l2")
+    cat = _virtual_catalog(tmp_path)
+    a = _make_engine(l2, root, monkeypatch, env={"SQLHANDLER_CATALOG": cat})
+    a.column_stats("big_sales", "amount")
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 1
+    a.provider.versions["shop/sales"] = 7
+    a.column_stats("big_sales", "amount")
+    assert a._l2_meta is not None and a._l2_meta.stats()["writes"] == 2, "base commit must rekey"

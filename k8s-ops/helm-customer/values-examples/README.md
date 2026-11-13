@@ -21,7 +21,7 @@ Real per-customer values live in `helm-customer/local/` (gitignored, `.helmignor
 ## Using on PCAI
 
 1. Import the packaged `k8s-mcp-customer` chart into the PCAI catalog (once per chart version).
-2. **Create the API-key Secret out of band first** — the chart never creates it and the Deployment fails loud until it exists (command in [../../documentation/DEPLOYMENT.md](../../documentation/DEPLOYMENT.md#required-values)).
+2. **Create the API-key Secret out of band first** — the chart never creates it and the Deployment fails loud until it exists (command in [../../documentation/DEPLOYMENT.md](../../documentation/DEPLOYMENT.md#31-required)).
 3. Adjust every `# SITE:` line (endpoint host, Secret name).
 4. Paste the **whole document** into the chart's *Helm Values* editor and apply.
 

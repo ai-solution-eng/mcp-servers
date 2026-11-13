@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -64,7 +66,7 @@ from .l2cache import (
 from .policy import TableRule, policy_store
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import is_raw_format
-from .sqlguard import _explain_inner_sql, assert_attached_readonly
+from .sqlguard import INTERNAL_REL_PREFIX, _explain_inner_sql, assert_attached_readonly
 
 logger = logging.getLogger("sqlhandler.engine")
 
@@ -138,10 +140,17 @@ def _query_timeout() -> float:
         return 600.0
 
 
-# After a timeout-triggered interrupt, how long to wait for the query thread
-# to unwind before reporting the timeout anyway (the result is discarded
-# either way; this only bounds the error latency).
-_CANCEL_GRACE_SECONDS = 5.0
+def _cancel_grace_seconds() -> float:
+    """How long to wait for a timed-out query thread to unwind.
+
+    ``SQLHANDLER_CANCEL_GRACE_SECONDS`` (default 5). The result is discarded
+    either way; this only bounds the error latency.
+    """
+    raw = os.environ.get("SQLHANDLER_CANCEL_GRACE_SECONDS", "")
+    try:
+        return max(float(raw), 0.0) if raw else 5.0
+    except ValueError:
+        return 5.0
 
 
 def _max_concurrent_queries() -> int:
@@ -169,6 +178,13 @@ def _queue_timeout() -> float:
         return 30.0
 
 
+#: Tokens returned by the gate's re-entrant API. A NESTED hold is a
+#: same-thread nesting (the outer guard owns the real slot); a COVERED acquire
+#: is a QueryJob constructed while the calling thread already holds one.
+_HELD_NESTED = object()
+_HELD_COVERED = object()
+
+
 class _QueryGate:
     """A resizable-ish concurrency gate for queries (semaphore based).
 
@@ -191,6 +207,10 @@ class _QueryGate:
         self._size = -1
         self._lock = threading.Lock()
         self._callers = _limits.CallerGate()
+        # Per-thread nesting depth for the re-entrant guard: a gated method
+        # calling another gated method (or a QueryJob materializing a virtual
+        # table) must not take a SECOND per-caller slot.
+        self._tls = threading.local()
 
     def _semaphore(self) -> threading.Semaphore | None:
         size = _max_concurrent_queries()
@@ -203,7 +223,7 @@ class _QueryGate:
                 self._size = size
             return self._sem
 
-    def acquire(self, caller=None) -> threading.Semaphore | None:
+    def acquire(self, caller=None):
         """Take the per-caller slot, then a global slot; returns the caller slot.
 
         The caller bucket is acquired FIRST: a caller queued behind its own
@@ -211,7 +231,15 @@ class _QueryGate:
         let one caller starve everyone else's global capacity). The global
         semaphore is still acquired on top, so the global cap remains the
         outer bound. No identity -> no caller bucket (the historical path).
+
+        COVERED: when this thread ALREADY holds a slot through the re-entrant
+        API (:meth:`hold`), the caller is already accounted for — a second
+        acquisition would deadlock at a per-caller cap of 1 (e.g. a gated
+        scan creating the QueryJob for its SQL path). Returns the covered
+        sentinel; :meth:`release` is a no-op for it.
         """
+        if getattr(self._tls, "depth", 0) > 0:
+            return _HELD_COVERED
         timeout = _queue_timeout()
         per_caller = _limits.max_concurrent_per_caller(_max_concurrent_queries())
         scope = _limits.gate_scope(caller)
@@ -226,7 +254,7 @@ class _QueryGate:
             )
         sem = self._semaphore()
         if sem is None:
-            return held
+            return (None, held)
         if not sem.acquire(timeout=timeout):
             self._callers.release(held)
             raise LakehouseError(
@@ -235,19 +263,184 @@ class _QueryGate:
                     f"queue wait of {_queue_timeout()}s expired. Retry later."
                 )
             )
-        return held
+        # Return the ACQUIRED semaphore with the caller slot (audit
+        # 2026-11-12): release() used to release whatever self._sem happened
+        # to be, so a size change between acquire and release released the
+        # WRONG semaphore — inflating the new one past its cap and leaking
+        # the old one.
+        return (sem, held)
 
-    def release(self, held: threading.Semaphore | None = None) -> None:
-        sem = self._sem
+    def release(self, held=None) -> None:
+        if held is _HELD_COVERED:
+            return  # covered by the slot the calling thread already holds
+        # (sem, caller_slot) from acquire(); a bare value is tolerated for a
+        # caller slot acquired before this shape existed.
+        sem, caller_slot = held if isinstance(held, tuple) else (None, held)
         if sem is not None:
             try:
                 sem.release()
             except ValueError:
                 pass
-        self._callers.release(held)
+        self._callers.release(caller_slot)
+
+    # ------------------------------------------------- re-entrant compute slots
+    def hold(self, caller=None):
+        """Acquire a slot unless THIS THREAD already holds one.
+
+        Same-thread nesting (profile -> virtual profile, scan -> query, or a
+        QueryJob materializing a virtual table) must never take a second
+        per-caller slot. Returns a token for :meth:`unhold`.
+        """
+        depth = getattr(self._tls, "depth", 0)
+        if depth > 0:
+            self._tls.depth = depth + 1
+            return _HELD_NESTED
+        held = self.acquire(caller)
+        self._tls.depth = 1
+        return held
+
+    def unhold(self, held) -> None:
+        """Release a :meth:`hold` token (nested holds only decrement)."""
+        if held is _HELD_NESTED:
+            self._tls.depth = max(getattr(self._tls, "depth", 1) - 1, 0)
+            return
+        self._tls.depth = 0
+        self.release(held)
+
+    @contextlib.contextmanager
+    def guard(self, caller=None):
+        """``with _query_gate.guard(caller):`` — one re-entrant compute slot."""
+        held = self.hold(caller)
+        try:
+            yield
+        finally:
+            self.unhold(held)
+
+    def enter_job(self) -> None:
+        """Mark this thread as covered by its QueryJob's slot."""
+        self._tls.depth = getattr(self._tls, "depth", 0) + 1
+
+    def exit_job(self) -> None:
+        self._tls.depth = max(getattr(self._tls, "depth", 1) - 1, 0)
 
 
 _query_gate = _QueryGate()
+
+
+class _Flight:
+    """One in-flight query that identical cold callers may wait on."""
+
+    __slots__ = ("error", "event")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.error: BaseException | None = None
+
+
+class _SingleFlight:
+    """Coalesce identical COLD queries: one leader executes, waiters share.
+
+    Keyed on the RESULT CACHE KEY — which already carries the caller's
+    effective-policy hash — so callers with different rules never coalesce
+    (masked and unmasked results stay separate). Waiters block BEFORE taking
+    a concurrency slot, so a stampede of N identical queries costs one slot,
+    not N. On leader failure/timeout the waiters fall through and execute
+    their own copy: one caller's error is never propagated to another.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._flights: dict[str, _Flight] = {}
+        self.leaders = 0
+        self.joined = 0
+        self.served = 0
+
+    def join(self, key: str) -> tuple[_Flight, bool]:
+        """Join the in-flight query for 'key' (returns (flight, is_leader))."""
+        with self._lock:
+            flight = self._flights.get(key)
+            if flight is not None:
+                self.joined += 1
+                return flight, False
+            flight = _Flight()
+            self._flights[key] = flight
+            self.leaders += 1
+            return flight, True
+
+    def finish(self, key: str, flight: _Flight, error: BaseException | None = None) -> None:
+        """Wake the waiters and retire the flight (leader only)."""
+        with self._lock:
+            if self._flights.get(key) is flight:
+                del self._flights[key]
+        flight.error = error
+        flight.event.set()
+
+    def note_served(self) -> None:
+        """Count one waiter served from the leader's cached result."""
+        with self._lock:
+            self.served += 1
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "in_flight": len(self._flights),
+                "leaders": self.leaders,
+                "joined": self.joined,
+                "served": self.served,
+            }
+
+    def reset(self) -> None:
+        """Test seam: forget in-flight entries and counters."""
+        with self._lock:
+            self._flights.clear()
+            self.leaders = 0
+            self.joined = 0
+            self.served = 0
+
+
+_singleflight = _SingleFlight()
+
+
+def _singleflight_enabled() -> bool:
+    """Whether identical cold queries coalesce (SQLHANDLER_SINGLEFLIGHT, default ON)."""
+    return os.environ.get("SQLHANDLER_SINGLEFLIGHT", "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _singleflight_wait_timeout() -> float:
+    """How long a waiter blocks before executing its own copy.
+
+    Derived from the query watchdog (plus the cancel grace) so a waiter never
+    outlives the leader's own timeout; with the watchdog disabled (0) a
+    bounded 3600s backstop keeps a lost leader from hanging the caller.
+    SQLHANDLER_SINGLEFLIGHT_TIMEOUT overrides (0 = return immediately, which
+    effectively disables coalescing).
+    """
+    raw = os.environ.get("SQLHANDLER_SINGLEFLIGHT_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(float(raw), 0.0)
+        except ValueError:
+            pass
+    return (_query_timeout() or 3600.0) + _cancel_grace_seconds()
+
+
+def _gated(fn):
+    """Run a compute method inside the caller's concurrency bucket.
+
+    Only for methods with NO cache fast path — a cache HIT must never queue
+    behind running queries. Re-entrant on the same thread, so a nested gated
+    call (or a QueryJob thread that already holds a slot) is a no-op.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, caller=None, **kwargs):
+        held = _query_gate.hold(caller if caller is not None else current_caller())
+        try:
+            return fn(self, *args, caller=caller, **kwargs)
+        finally:
+            _query_gate.unhold(held)
+
+    return wrapper
 
 
 class QueryJob:
@@ -328,6 +521,36 @@ class QueryJob:
     def _run(self) -> None:
         import duckdb
 
+        # The job's slot is held for this whole thread; nested gated work
+        # (virtual-table materialization during schema registration) is
+        # COVERED by it and must not take a second per-caller slot.
+        _query_gate.enter_job()
+
+        # EARLY CANCELLED CHECK (audit 2026-11-12): a submit that was rejected
+        # after this thread started (registry full -> 429, or an explicit
+        # cancel before the connection opened) sets _cancelled; without this
+        # check the whole query still ran to completion and only the RESULT
+        # was discarded. Bail before any connection or scan.
+        if self._cancelled:
+            with self._lock:
+                self._state = "cancelled"
+                self._error = "Query was cancelled."
+                self._elapsed_ms = (time.monotonic() - self._t0) * 1000.0
+            self._engine._record_outcome(
+                self.sql,
+                self._elapsed_ms,
+                None,
+                state="cancelled",
+                error=self._error,
+                caller=self._caller,
+                queue_wait_s=self._gate_wait_s,
+            )
+            if self._gate_held:
+                self._gate_held = False
+                _query_gate.exit_job()
+                _query_gate.release(self._gate_slot)
+            return
+
         # duckdb.connect() sits INSIDE the try whose finally releases the
         # concurrency gate. It can raise (OOM, fd exhaustion, a DuckDB
         # extension-load failure), and when it sat outside, that exception
@@ -343,11 +566,18 @@ class QueryJob:
                 self._elapsed_ms = (time.monotonic() - self._t0) * 1000.0
             if self._gate_held:
                 self._gate_held = False
+                _query_gate.exit_job()
                 _query_gate.release(self._gate_slot)
             return
         with self._lock:
             self._con = con
         try:
+            # Caller SQL may never name an engine-internal relation: the masking
+            # base relation holds UNMASKED rows and is registered on THIS
+            # connection. Backstop for the direct QueryJob constructors (the
+            # async job tier, the web UI's job path); query_duckdb refuses
+            # earlier, before its cache lookup.
+            _refuse_internal_relations(self.sql)
             if self._engine._sql_needs_external(self.sql):
                 # The attached-catalog connection is SELECT-only, UNCONDITIONALLY
                 # (see sqlhandler/external.py: "the database is a source, never
@@ -436,21 +666,34 @@ class QueryJob:
                 self._con = None
             if self._gate_held:
                 self._gate_held = False
+                _query_gate.exit_job()
                 _query_gate.release(self._gate_slot)
 
     # ------------------------------------------------------------ control
     def cancel(self) -> bool:
-        """Interrupt a running query; True if a live query was interrupted."""
+        """Interrupt a running query; True if a live query was interrupted.
+
+        Cancellation is REGISTERED even before the connection exists (audit
+        2026-11-12): the flag is set first, and ``_run`` refuses to execute a
+        cancelled job, so a submit that was rejected (429/capacity) after the
+        thread started no longer burns a full query. The return value reports
+        what actually happened: True only when the job was still running, so a
+        caller never sees True for a job that already published its terminal
+        state.
+        """
         with self._lock:
             self._cancelled = True
             con = self._con
+            state = self._state
         if con is None:
-            return False
+            # No connection yet: the flag above is what stops the query.
+            return state == "running"
         try:
             con.interrupt()
-            return True
         except Exception:
             return False
+        with self._lock:
+            return self._state == "running"
 
     def wait(self, timeout: float | None = None) -> str:
         """Block until the job finishes (or ``timeout`` elapses); returns state."""
@@ -628,6 +871,78 @@ def _resolve_sample_limit(limit: int | None) -> int | None:
     return limit
 
 
+def _duckdb_temp_dir() -> str:
+    """The DuckDB spill directory the lockdown allowlists (single source).
+
+    Resolved from the environment WITHOUT touching the connection:
+    ``_duckdb_fs_lockdown`` runs BEFORE ``_apply_memory_budget`` sets
+    ``temp_directory``, so ``current_setting('temp_directory')`` would report
+    DuckDB's default (cwd/.tmp) rather than the directory the query actually
+    spills to. Both functions call this helper, so the allowlisted path and
+    the SET temp_directory path can never diverge.
+    """
+    raw = os.environ.get("SQLHANDLER_DUCKDB_TEMP_DIR", "").strip()
+    return (raw or "/tmp/sqlhandler-duckdb-spill").replace("'", "")
+
+
+def _current_temp_dir(con, setting: str = "temp_directory") -> str:
+    """One DuckDB setting's current value ('' when unreadable)."""
+    try:
+        row = con.execute(f"SELECT current_setting('{setting}')").fetchone()
+    except Exception:
+        return ""
+    return str(row[0]) if row and row[0] is not None else ""
+
+
+def _same_dir(current: str, wanted: str) -> bool:
+    """Whether two configured paths name the same directory.
+
+    DuckDB normalizes temp_directory (trailing slash, absolute form), so a
+    string compare would re-SET on every connection; realpath is the honest
+    comparison and tolerates a missing directory (nothing is resolved yet).
+    """
+    if not current or not wanted:
+        return False
+    try:
+        return os.path.realpath(current.rstrip("/")) == os.path.realpath(wanted.rstrip("/"))
+    except OSError:
+        return current.rstrip("/") == wanted.rstrip("/")
+
+
+def _max_temp_directory_size() -> str:
+    """Cap DuckDB's spill footprint (SQLHANDLER_DUCKDB_MAX_TEMP_SIZE).
+
+    Unset DuckDB lets ``temp_directory`` grow to ~90% of the free disk, so a
+    runaway spill can fill the node's /tmp (or the mounted emptyDir) and take
+    every co-tenant with it. A named default keeps the bound visible and
+    operator-tunable; empty/0 leaves DuckDB's own default in place.
+    """
+    raw = os.environ.get("SQLHANDLER_DUCKDB_MAX_TEMP_SIZE", "").strip()
+    if raw.lower() in ("0", "off", "none", "unlimited"):
+        return ""
+    return raw or "20GB"
+
+
+def _l2_decode_max_bytes() -> int:
+    """Per-hit decode ceiling for one L2 result artifact (0 = unbounded).
+
+    ``SQLHANDLER_L2_DECODE_MAX_BYTES`` — the MEMORY bound for a single L2 hit.
+    The store-time ``SQLHANDLER_L2_MAX_BYTES`` is a VOLUME bound (how much one
+    artifact may occupy on the shared PVC, default 2 GiB); a replica that
+    decodes such an artifact allocates it in RAM. Default: a quarter of the
+    container memory limit when one is detectable, else unbounded (the
+    historical behavior — the gate still bounds concurrency).
+    """
+    raw = os.environ.get("SQLHANDLER_L2_DECODE_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            return max(int(raw), 0)
+        except ValueError:
+            pass
+    total = resources.container_memory_bytes()
+    return int(total / 4) if total else 0
+
+
 def _duckdb_fs_lockdown(con) -> None:
     """Disable DuckDB's own file/network access for SQL queries (default on).
 
@@ -651,6 +966,19 @@ def _duckdb_fs_lockdown(con) -> None:
     """
     raw = os.environ.get("SQLHANDLER_DUCKDB_FILE_ACCESS", "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
+        # P2 (audit 2026-11-12): the escape used to return silently, so every
+        # SELECT on every connection could read local files with NOTHING in
+        # the log saying so. Loud, once per process (the posture is per
+        # deployment, not per connection).
+        global _lockdown_off_warned
+        if not _lockdown_off_warned:
+            _lockdown_off_warned = True
+            logger.warning(
+                "DuckDB filesystem lockdown DISABLED by SQLHANDLER_DUCKDB_FILE_ACCESS=1: every query on "
+                "this connection may read the local filesystem (read_csv/read_parquet/COPY ... TO) and "
+                "fetch URLs. This is an explicit operator opt-out; unset it to restore the lockdown "
+                "(further occurrences suppressed)."
+            )
         return
     # Each knob applied INDEPENDENTLY: one unknown/renamed knob (a DuckDB
     # upgrade) must not silently skip the others. Deliberately no
@@ -665,9 +993,55 @@ def _duckdb_fs_lockdown(con) -> None:
     # fail-OPEN posture and REFUSES the query unless the operator opted in
     # via SQLHANDLER_ALLOW_LOCAL_FS=1 — see the block below.
     failed: list[str] = []
-    fs_blocked = True
+    fs_blocked = False
+    # SPILL FIRST (audit 2026-11-12 P1-2): DuckDB's buffer manager writes to
+    # ``temp_directory`` when a query exceeds ``memory_limit``, and a closed
+    # external-access posture refuses those writes unless the spill directory
+    # is allowlisted — live-verified: a 50M-row sort under a 256MB budget died
+    # "File system LocalFileSystem has been disabled by configuration" while
+    # the same query spilled and succeeded without the lockdown. So the
+    # allowlist goes in FIRST: DuckDB refuses to change allowed_directories
+    # once enable_external_access=false is set, and the allowlist is what keeps
+    # spill-to-disk (the documented OOM defence) working.
+    temp_dir = _duckdb_temp_dir()
+    if temp_dir:
+        # temp_directory is a FILE operation: DuckDB refuses to change it once
+        # external access is closed ("Modifying the temp_directory has been
+        # disabled by configuration" — live-verified), so configure the spill
+        # path HERE, while access is still open, and allowlist the same path.
+        try:
+            con.execute(f"SET temp_directory='{temp_dir}'")
+            max_temp = _max_temp_directory_size()
+            if max_temp:
+                con.execute(f"SET max_temp_directory_size='{max_temp}'")
+        except Exception:
+            logger.debug("DuckDB temp_directory could not be set before the lockdown", exc_info=True)
+        try:
+            con.execute(f"SET allowed_directories=['{temp_dir}']")
+        except Exception as exc:  # DuckDB without allowed_directories
+            global _spill_warned
+            if not _spill_warned:
+                _spill_warned = True
+                logger.warning(
+                    "DuckDB allowed_directories could not be set (%s): spill-to-disk will FAIL for "
+                    "queries that exceed memory_limit (further occurrences suppressed). Upgrade "
+                    "DuckDB or set SQLHANDLER_DUCKDB_FILE_ACCESS=1 if this deployment does not need "
+                    "the lockdown.",
+                    type(exc).__name__,
+                )
+    try:
+        con.execute("SET enable_external_access=false")
+        fs_blocked = True
+    except Exception as exc:  # older DuckDB without the knob
+        failed.append(f"enable_external_access ({type(exc).__name__})")
+        # Fall back to the per-filesystem knob: it still closes local reads
+        # (spill stays broken on such a build, which the warning above says).
+        try:
+            con.execute("SET disabled_filesystems='LocalFileSystem'")
+            fs_blocked = True
+        except Exception as exc2:
+            failed.append(f"disabled_filesystems ({type(exc2).__name__})")
     for name, stmt in (
-        ("disabled_filesystems", "SET disabled_filesystems='LocalFileSystem'"),
         ("autoinstall_known_extensions", "SET autoinstall_known_extensions=false"),
         ("autoload_known_extensions", "SET autoload_known_extensions=false"),
     ):
@@ -675,8 +1049,6 @@ def _duckdb_fs_lockdown(con) -> None:
             con.execute(stmt)
         except Exception as exc:  # older DuckDB without a knob
             failed.append(f"{name} ({type(exc).__name__})")
-            if name == "disabled_filesystems":
-                fs_blocked = False
     if not fs_blocked:
         # FAIL CLOSED on the knob that actually matters. disabled_filesystems
         # is the one setting whose failure means local files are READABLE
@@ -697,7 +1069,8 @@ def _duckdb_fs_lockdown(con) -> None:
         )
         if not allow_local:
             raise LakehouseError(
-                "DuckDB refused to disable the local filesystem ('SET disabled_filesystems'), so file/network "
+                "DuckDB refused to disable external file/network access ('SET enable_external_access' and "
+                "'SET disabled_filesystems'), so file/network "
                 "access via DuckDB built-ins cannot be ruled out. Refusing the query rather than running with a "
                 "fail-open filesystem posture. Fix the DuckDB build, or set SQLHANDLER_ALLOW_LOCAL_FS=1 to "
                 "accept local file access explicitly."
@@ -728,11 +1101,41 @@ def _duckdb_fs_lockdown(con) -> None:
 
 _lockdown_warned = False
 _lockdown_fs_warned = False
+_lockdown_off_warned = False
+_spill_warned = False
 # Describe-fill cache writes are coalesced over this window (seconds). Small
 # enough that a warm-start file is never meaningfully stale, large enough that
 # a schema walk writes once instead of once per table.
+#: Volatile SQL functions: a result containing one is true only for the instant
+#: it ran, so it must never enter the result cache (see _result_cache_key).
+#: Deliberately a superset of DuckDB's volatile set — a false positive only
+#: costs a cache miss.
+_VOLATILE_FN_RE = re.compile(
+    r"\b(?:now|today|current_timestamp|current_date|current_time|current_localtime|"
+    r"current_localtimestamp|localtime|localtimestamp|transaction_timestamp|"
+    r"statement_timestamp|clock_timestamp|get_current_time|get_current_timestamp|"
+    r"random|rand|uuid|gen_random_uuid|nextval|currval)\b\s*\(",
+    re.IGNORECASE,
+)
+
+#: The PAREN-LESS volatile spellings. DuckDB accepts `current_timestamp`,
+#: `current_date`, `current_time`, `localtime` and `localtimestamp` as
+#: bare keywords, so the function-call pattern above misses them — and a
+#: cached result then freezes the timestamp for the whole TTL (found by
+#: cross-validation 2026-11-12: "SELECT current_timestamp AS t, id FROM
+#: orders" served the SAME frozen timestamp on the second call).
+_VOLATILE_KEYWORD_RE = re.compile(
+    r"\b(?:current_timestamp|current_date|current_time|localtime|localtimestamp)\b(?!\s*\()",
+    re.IGNORECASE,
+)
+
+#: How many tables the policy-columns provider resolves per policy load
+#: (schema reads are cached; the cap bounds a huge federated lake).
+_POLICY_COLUMNS_MAX_TABLES = 500
+
 _CACHE_SAVE_DEBOUNCE_S = 2.0
 _budget_logged = False
+_budget_warned = False
 
 
 def _apply_memory_budget(con) -> None:
@@ -759,25 +1162,50 @@ def _apply_memory_budget(con) -> None:
         threads = budget.get("threads")
         if isinstance(threads, int) and threads:
             con.execute(f"SET threads={int(threads)}")
-        temp_dir = budget.get("temp_directory")
-        if temp_dir:
-            safe_dir = str(temp_dir).replace("'", "")
+        # _duckdb_temp_dir(), NOT budget["temp_directory"]: the lockdown
+        # allowlists exactly this path, so the two must be byte-identical or
+        # spill-to-disk is refused under the closed posture (P1-2).
+        safe_dir = _duckdb_temp_dir()
+        max_temp = ""
+        if safe_dir:
             os.makedirs(safe_dir, exist_ok=True)
-            con.execute(f"SET temp_directory='{safe_dir}'")
+            # _duckdb_fs_lockdown already configured the spill path (it MUST,
+            # while external access is still open). Only SET here when this
+            # connection has not got it yet — the SQLHANDLER_DUCKDB_FILE_ACCESS=1
+            # escape skips the lockdown entirely, and re-SETting on a closed
+            # connection raises and would silently disable the rest of the
+            # budget.
+            if not _same_dir(_current_temp_dir(con), safe_dir):
+                con.execute(f"SET temp_directory='{safe_dir}'")
+            max_temp = _max_temp_directory_size()
+            if max_temp and not _same_dir(_current_temp_dir(con, "max_temp_directory_size"), max_temp):
+                con.execute(f"SET max_temp_directory_size='{max_temp}'")
         con.execute("SET preserve_insertion_order=false")
         if not _budget_logged:
             _budget_logged = True
             logger.info(
                 "duckdb budget applied: memory_limit=%s threads=%s temp_directory=%s "
-                "(container limit: %s bytes / %s cpus)",
+                "max_temp_size=%s (container limit: %s bytes / %s cpus)",
                 mem,
                 threads,
-                temp_dir,
+                safe_dir,
+                max_temp or "duckdb-default",
                 budget.get("container_memory_bytes"),
                 budget.get("container_cpu_count"),
             )
     except Exception:
-        logger.debug("DuckDB memory budget not applied", exc_info=True)
+        # WARNING, once per process (this runs on every fresh connection): a
+        # budget that silently did not apply is the difference between
+        # spilling to disk and being OOMKilled — the neighbouring lockdown
+        # warns at the same severity for the same reason.
+        global _budget_warned
+        if not _budget_warned:
+            _budget_warned = True
+            logger.warning(
+                "DuckDB memory budget NOT applied (further occurrences suppressed): a wide scan can now "
+                "grow past the container limit and be OOMKilled instead of spilling to disk.",
+                exc_info=True,
+            )
 
 
 def _safe_table_name(table: str) -> str:
@@ -859,6 +1287,15 @@ def _normalize_cache_sql(sql: str) -> str:
             ch = sql[i]
             if in_quote is not None:
                 out.append(ch)
+                if ch == "\\":
+                    # E'...' escape strings use BACKSLASH escapes, which this
+                    # scanner does not decode: it would read the quote in
+                    # E'a\\'  b\\'  c' as the string's terminator and then
+                    # collapse the whitespace that is really INSIDE the string
+                    # — so two DIFFERENT strings normalize to the SAME key and
+                    # caller B is served A's rows (audit 2026-11-12 P1-1).
+                    # Bail to the raw text, exactly like the $/comment bails.
+                    return sql
                 if ch == in_quote:
                     if i + 1 < n and sql[i + 1] == in_quote:
                         out.append(sql[i + 1])  # doubled quote stays inside
@@ -894,6 +1331,21 @@ def _normalize_cache_sql(sql: str) -> str:
         return norm or sql
     except Exception:
         return sql
+
+
+def _first_row(rel):
+    """First row of a DuckDB relation, across DuckDB 1.x/2.x.
+
+    DuckDB 2.0 removed ``Relation.fetchone()`` (a relation no longer keeps a
+    result between calls); ``limit(1).fetchall()`` is the documented
+    replacement. 1.x still has fetchone(), so keep both paths — every call
+    site here is a one-row aggregate, so no rows are dropped.
+    """
+    try:
+        return rel.fetchone()
+    except AttributeError:
+        rows = rel.limit(1).fetchall()
+        return rows[0] if rows else None
 
 
 def _validate_params(params: object) -> object | None:
@@ -1008,13 +1460,15 @@ def _column_stats_queries(con, target: str, col: str, cap: int, top_n: int, col_
         src = f"({inner})"
         rc = col_ident
 
-    row = con.sql(
-        f"SELECT count(*) AS sampled_rows, count({rc}) AS non_null, "
-        f"min({rc}) AS min, max({rc}) AS max, "
-        f"approx_count_distinct({rc}) AS approx_unique, "
-        f"count(DISTINCT {rc}) AS distinct_count "
-        f"FROM {src}"
-    ).fetchone()
+    row = _first_row(
+        con.sql(
+            f"SELECT count(*) AS sampled_rows, count({rc}) AS non_null, "
+            f"min({rc}) AS min, max({rc}) AS max, "
+            f"approx_count_distinct({rc}) AS approx_unique, "
+            f"count(DISTINCT {rc}) AS distinct_count "
+            f"FROM {src}"
+        )
+    )
     sampled_rows = int(row[0]) if row and row[0] is not None else 0
     non_null = int(row[1]) if row and row[1] is not None else 0
     null_count = max(sampled_rows - non_null, 0)
@@ -1031,10 +1485,12 @@ def _column_stats_queries(con, target: str, col: str, cap: int, top_n: int, col_
     quantiles: dict[str, float | None] = {"q25": None, "q50": None, "q75": None}
     if non_null and _QUANTILE_TYPE_RE.search(col_type or ""):
         try:
-            qrow = con.sql(
-                f"SELECT quantile_cont({rc}, 0.25), quantile_cont({rc}, 0.5), "
-                f"quantile_cont({rc}, 0.75) FROM {src} WHERE {rc} IS NOT NULL"
-            ).fetchone()
+            qrow = _first_row(
+                con.sql(
+                    f"SELECT quantile_cont({rc}, 0.25), quantile_cont({rc}, 0.5), "
+                    f"quantile_cont({rc}, 0.75) FROM {src} WHERE {rc} IS NOT NULL"
+                )
+            )
             if qrow:
                 quantiles = {"q25": qrow[0], "q50": qrow[1], "q75": qrow[2]}
         except Exception:
@@ -1124,6 +1580,56 @@ def _attach_structured_tail(exc: Exception) -> Exception:
     except Exception:
         pass
     return exc
+
+
+#: Reserved prefix for SQLhandler's ENGINE-INTERNAL DuckDB relations.
+#:
+#: ``_register_schema`` registers the RAW dataset of a policy-covered table as
+#: a per-query ``__sqlhandler_base_<random>`` relation and builds the masking
+#: view over it; the profile / column_stats scratch relations live in the same
+#: namespace. Those relations carry UNMASKED rows and exist on the SAME
+#: connection the caller's statement runs on, so a statement that names one is
+#: a policy bypass (``SELECT b.ssn FROM t JOIN __sqlhandler_base_1 b ON true``
+#: returned raw SSNs and skipped the row filter — audit 2026-11-12 P0-1).
+#: Caller SQL may therefore never reference the prefix. sqlguard owns the
+#: canonical value so the MCP boundary and the engine cannot drift apart.
+_INTERNAL_REL_PREFIX = INTERNAL_REL_PREFIX
+
+
+def _refuse_internal_relations(sql: str) -> None:
+    """Refuse caller SQL that names an engine-internal relation.
+
+    A case-INSENSITIVE substring test is both sufficient and correct here:
+    DuckDB identifiers are case-insensitive, and a quoted identifier still
+    contains the literal prefix, so no spelling or quoting escapes the check.
+    It is also cheap (one lower() + containment on the statement text) and
+    runs BEFORE any registration, cache lookup or execution — so the internal
+    relation is never created under a name the statement could resolve, and a
+    pre-fix poisoned cache entry can never be served for a bypass statement.
+
+    Raises LakehouseError (the engine's structured error path) rather than
+    ValueError: this is an execution-surface refusal, and the MCP/web layers
+    already map LakehouseError to their tool-error shape. The JSON tail names
+    the code and the fix so an agent self-corrects in one round-trip.
+    """
+    if _INTERNAL_REL_PREFIX not in sql.lower():
+        return
+    raise LakehouseError(
+        "Query refused: SQL may not reference SQLhandler's internal relations "
+        f"(the '{_INTERNAL_REL_PREFIX}' prefix is reserved). Those relations hold UNMASKED "
+        "rows and exist only to apply your row filters and column masks — query the table "
+        "by its own name and the policy is applied for you."
+        + _errors.structured(
+            _errors.E_PARAM_INVALID,
+            [
+                (
+                    f"Remove the '{_INTERNAL_REL_PREFIX}' reference: select from the table "
+                    "name list_tables / describe_table prints."
+                ),
+                "Row filters and column masks are applied automatically on the table's own name.",
+            ],
+        )
+    )
 
 
 class SqlEngine:
@@ -1317,7 +1823,13 @@ class SqlEngine:
         # this process has written anything). A scratch write may never
         # resolve onto a covered source table; anything written later is
         # not in this set and stays overwritable by its owner.
-        self._write_tier_source_paths: set[str] | None = None
+        # Keyed by the caller's effective policy hash (audit 2026-11-12): the
+        # snapshot is built from a POLICY-FILTERED list_tables(), so one
+        # process-wide set built for the FIRST writer would let a later caller
+        # with a BROADER policy write onto a table the first could not see.
+        # "" is the enforcement-off / no-caller key (one shared entry — the
+        # historical behavior).
+        self._write_tier_source_paths: dict[str, set[str]] = {}
         # Query memory: recent query outcomes for the query-memory MCP
         # resource (self-improving loop — agents reuse proven patterns).
         self._query_memory: deque = deque(maxlen=_query_memory_size())
@@ -1388,6 +1900,44 @@ class SqlEngine:
             # set or the queue is full.
             if write_async_enabled():
                 self._l2_cache._ensure_write_worker()
+        # POLICY load-time validation needs the REAL column names (a row filter
+        # or a mask naming a column the table does not have must be rejected
+        # when the file loads, not on the first query). The store has always
+        # accepted a columns provider; nothing ever wired one, so that
+        # validation was dead in production (audit 2026-11-12). Best-effort:
+        # wiring must never break construction.
+        try:
+            policy_store().set_table_columns_provider(self._policy_table_columns)
+        except Exception:
+            logger.debug("could not wire the policy columns provider", exc_info=True)
+
+    def _policy_table_columns(self) -> dict[str, list[str]] | None:
+        """Table ident -> RAW column names, for policy load-time validation.
+
+        Called by ``PolicyStore`` when it (re)loads the policy file, so the
+        cost is paid on a policy edit — not per request — and the dataset cache
+        usually makes it a schema-only read. Bounded (``_POLICY_COLUMNS_MAX_TABLES``)
+        and best-effort: a table that cannot be opened is simply absent from
+        the map, and ``load_policy` skips validation for tables it has no
+        columns for (the runtime first-use validation in ``_effective_rule``
+        still covers them). Never raises: a provider failure must not turn a
+        policy reload into an outage.
+        """
+        try:
+            tables = self._provider_tables()
+        except Exception:
+            return None
+        out: dict[str, list[str]] = {}
+        for info in tables[:_POLICY_COLUMNS_MAX_TABLES]:
+            try:
+                columns = [f.name for f in self._open_dataset(info).schema]
+            except Exception:
+                continue
+            if not columns:
+                continue
+            for ident in (info.path, info.qualified_name, info.name):
+                out.setdefault(ident, columns)
+        return out or None
 
     # ---------------------------------------------------------------- list
     def list_tables(self, *, caller=None) -> list[TableInfo]:
@@ -1874,7 +2424,30 @@ class SqlEngine:
             return _fast_json(data, indent=True) + "\n"
         return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
-    def catalog_content(self, fmt: str = "yaml") -> dict:
+    def _visible_catalog_idents(self, caller) -> set[str] | None:
+        """Table identifiers the caller may see; None when nothing is filtered.
+
+        Reuses the SAME visibility predicate list_tables/describe use (the
+        policy's hidden/visible globs through ``rule_for_table``) — this is not
+        a second rule implementation. None means "no policy context"
+        (enforcement off, no groups configured, or no caller bound: the
+        internal/trusted path), so the full catalog is returned exactly as
+        before the ``caller`` parameter existed.
+        """
+        if not policy_mod.policy_enabled():
+            return None
+        pol = policy_store().get()
+        if pol is None or not pol.groups:
+            return None
+        effective = caller if caller is not None else current_caller()
+        if effective is None:
+            return None
+        idents: set[str] = set()
+        for info in self.list_tables(caller=effective):
+            idents.update((info.path, info.qualified_name, info.name))
+        return idents
+
+    def catalog_content(self, fmt: str = "yaml", *, caller=None) -> dict:
         """The ACTIVE catalog serialized as editable text (YAML by default).
 
         Serves exactly the mapping ``_catalog()`` merges into describe/list
@@ -1887,8 +2460,15 @@ class SqlEngine:
         if fmt not in ("yaml", "json"):
             raise ValueError(f"format must be 'yaml' or 'json', got {fmt!r}")
         tables = self._catalog()
+        visible = self._visible_catalog_idents(caller)
+        filtered = visible is not None
+        if visible is not None:
+            # Omit entries for tables this caller cannot see (the catalog text
+            # is handed to an agent verbatim, so a hidden table's docs must not
+            # leak through the editor view either).
+            tables = {k: v for k, v in tables.items() if k in visible}
         active = self._effective_catalog_file()
-        if active and tables:
+        if active and (tables or filtered):
             text = self._serialize_doc({"tables": tables}, fmt)
             source = "upload" if active == self._catalog_store else "configured"
         else:
@@ -1934,17 +2514,24 @@ class SqlEngine:
                 return info
         raise LakehouseError(f"Table '{table}' not found in data source")
 
-    def catalog_table_entry(self, table: str, fmt: str = "yaml") -> dict:
+    def catalog_table_entry(self, table: str, fmt: str = "yaml", *, caller=None) -> dict:
         """One table's catalog breakout, serialized for the editor.
 
         ``table`` resolves exactly like a query (path, source-qualified or
         bare name). When the catalog has no entry for it, ``found`` is False
         and ``text`` is empty — the UI prefills a skeleton from the table's
         real schema so documenting a dataset starts from its columns.
+
+        ``caller`` (identity spine): a table the caller cannot see is answered
+        with the SAME not-found error describe_table gives, so this view can
+        never be used as an existence oracle for a hidden table.
         """
         if fmt not in ("yaml", "json"):
             raise ValueError(f"format must be 'yaml' or 'json', got {fmt!r}")
         info = self._resolve_catalog_target(table)
+        visible = self._visible_catalog_idents(caller)
+        if visible is not None and not {info.path, info.qualified_name, info.name} & visible:
+            raise LakehouseError(f"Table '{table}' not found in data source")
         key = self._catalog_key_for(info)
         entry = self._catalog().get(key) if key is not None else None
         return {
@@ -2047,6 +2634,15 @@ class SqlEngine:
         author a clear log line instead of a runtime surprise. Returns None
         when the definition is valid.
         """
+        if _INTERNAL_REL_PREFIX in definition.lower():
+            # A catalog definition is executed on a connection where the
+            # masking base relations are registered; naming one is never a
+            # legitimate definition (and the names are random per query now,
+            # so this can only ever be a bypass attempt).
+            return (
+                "definition may not reference SQLhandler's internal relations "
+                f"(the '{_INTERNAL_REL_PREFIX}' prefix is reserved)"
+            )
         if definition in self._definition_verdicts:
             return self._definition_verdicts[definition]
         if len(self._definition_verdicts) > 128:  # bound the memo (edits churn texts)
@@ -2415,9 +3011,14 @@ class SqlEngine:
         dset = self._open_dataset(info)
         schema = dset.schema
         columns_out: list[dict] = [{"name": f.name, "type": str(f.type)} for f in schema]
-        # Policy: masked columns are OMITTED from describe (the caller cannot
-        # SELECT them — the masking view does not expose them — so advertising
-        # them would invite queries that fail, or worse, profile leaks).
+        # Policy: masked columns are OMITTED from describe. They are still
+        # SELECTABLE — the masking view keeps the column under its original
+        # alias and returns the mask value (policy.build_mask_select), so this
+        # is an ergonomics choice, not a capability boundary: the agent is
+        # told about the columns it can use for filters/joins, and a masked
+        # column it asks for explicitly still answers with the mask rather
+        # than an error. (The earlier comment claimed the column could not be
+        # selected; it can — corrected in audit 2026-11-12.)
         if rule.column_masks:
             masked = {c.lower() for c in rule.column_masks}
             columns_out = [c for c in columns_out if c["name"].lower() not in masked]
@@ -2654,7 +3255,9 @@ class SqlEngine:
         self._save_cache_debounced()
         return result
 
-    def _profile_external(self, spec: AttachSpec, qualified: str, columns: Sequence[str] | None = None) -> dict:
+    def _profile_external(
+        self, spec: AttachSpec, qualified: str, columns: Sequence[str] | None = None, *, caller=None
+    ) -> dict:
         """profile_table for an attached-database table.
 
         ``SUMMARIZE`` runs against the live server (bounded by
@@ -2671,7 +3274,12 @@ class SqlEngine:
                 self._profile_hits += 1
                 return hit[1]
         cap = _profile_max_rows()
-        con = self._external_connection()
+        held = _query_gate.hold(caller)
+        try:
+            con = self._external_connection()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
             inner = f"SELECT {col_sel} FROM {qualified}"
@@ -2696,12 +3304,13 @@ class SqlEngine:
                     if isinstance(cnt, int) and cnt > profiled_rows:
                         profiled_rows = cnt
             if not summary.num_rows:
-                row = con.sql(f"SELECT count(*) FROM ({inner})").fetchone()
+                row = _first_row(con.sql(f"SELECT count(*) FROM ({inner})"))
                 profiled_rows = int(row[0]) if row and row[0] is not None else 0
         except Exception as exc:
             raise LakehouseError(f"Profiling attached table '{qualified}' failed: {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
         result = {
             "table": qualified,
             "uri": spec.display_uri,
@@ -2897,7 +3506,7 @@ class SqlEngine:
         effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
-            return self._profile_external(*ext, columns=columns)
+            return self._profile_external(*ext, columns=columns, caller=effective_caller)
         info = self._resolve(table)
         rule = self._effective_rule(info, effective_caller)
         if rule.hidden:
@@ -2942,7 +3551,14 @@ class SqlEngine:
         import duckdb
 
         cap = _profile_max_rows()
-        con = duckdb.connect()
+        # One concurrency slot for the actual DuckDB work — the cache lookups
+        # above are fast paths and must never queue behind running queries.
+        held = _query_gate.hold(effective_caller)
+        try:
+            con = duckdb.connect()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
@@ -2993,6 +3609,7 @@ class SqlEngine:
             raise LakehouseError(f"Profiling failed for table '{table}': {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
 
         result = {
             "table": table,
@@ -3025,7 +3642,7 @@ class SqlEngine:
         row-group/log stats could not be read) — the one profile path that
         still scans the data twice.
         """
-        row = con.sql(f"SELECT count(*) FROM ({inner})").fetchone()
+        row = _first_row(con.sql(f"SELECT count(*) FROM ({inner})"))
         return int(row[0]) if row else 0
 
     @staticmethod
@@ -3062,6 +3679,12 @@ class SqlEngine:
         over masked base views (transitive masking) and the cache key folds
         the caller's policy hash — a masked caller's virtual profile is a
         DISTINCT cached entry from an unmasked one.
+
+        The result is also published to the SHARED metadata tier (when L2 is
+        configured), keyed on the definition digest + base-table snapshot
+        versions rather than the virtual table's own (nonexistent) version —
+        so a base commit invalidates it immediately and every replica shares
+        the expensive definition run.
         """
         effective_caller = caller if caller is not None else current_caller()
         policy_hash = self._caller_policy_hash(effective_caller)
@@ -3073,17 +3696,33 @@ class SqlEngine:
             if hit is not None and now - hit[0] < self.cache_ttl:
                 self._profile_hits += 1
                 return hit[1]
+
+        shared_key = self._virtual_metadata_shared_key("profile", info, col_key, caller=effective_caller)
+        l2_meta = self._l2_meta
+        if shared_key is not None and l2_meta is not None:
+            shared = l2_meta.get(shared_key)
+            if shared is not None:
+                with self._lock:
+                    self._profile_hits += 1
+                if self.cache_ttl > 0:
+                    self._profile_cache_put(key, shared)
+                return shared
         import duckdb
 
         cap = _profile_max_rows()
         target = _safe_ident(info.name)
-        con = duckdb.connect()
+        held = _query_gate.hold(effective_caller)
+        try:
+            con = duckdb.connect()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
             self._register_schema(con, f"SELECT * FROM {target}", caller=effective_caller)
             try:
-                counted = con.sql(f"SELECT count(*) FROM {target}").fetchone()
+                counted = _first_row(con.sql(f"SELECT count(*) FROM {target}"))
                 n_rows: int | None = int(counted[0]) if counted else None
             except Exception:
                 n_rows = None  # the summary below still works on a sample
@@ -3098,6 +3737,7 @@ class SqlEngine:
             raise LakehouseError(f"Profiling failed for virtual table '{info.name}': {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
         profiled_rows = n_rows if (n_rows is None or cap <= 0) else min(n_rows, cap)
         result = {
             "table": table,
@@ -3115,6 +3755,15 @@ class SqlEngine:
             self._profile_misses += 1
         if self.cache_ttl > 0:
             self._profile_cache_put(key, result)
+        if shared_key is not None and l2_meta is not None:
+            # Record the base tables so a scratch write over any of them
+            # evicts this entry (the same selective-eviction contract as the
+            # physical profile/colstats tier).
+            physical, _virtuals = self._expand_query_tables([info])
+            tables = [info.name, info.path]
+            for t in physical:
+                tables += [t.name, t.path, t.qualified_name]
+            l2_meta.put(shared_key, result, tables=tables)
         return result
 
     # -------------------------------------------------------- column stats
@@ -3143,7 +3792,7 @@ class SqlEngine:
         effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
-            return self._column_stats_external(*ext, column, top_n)
+            return self._column_stats_external(*ext, column, top_n, caller=effective_caller)
         info = self._resolve(table)
         rule = self._effective_rule(info, effective_caller)
         if rule.hidden:
@@ -3163,9 +3812,14 @@ class SqlEngine:
                 self._profile_hits += 1
                 return hit[1]
 
-        shared_key = self._metadata_shared_key(
-            ["colstats", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
-        )
+        if info.format == "virtual":
+            # A virtual table has no snapshot version of its own: key the
+            # shared entry on the definition + base-table versions instead.
+            shared_key = self._virtual_metadata_shared_key("colstats", info, col_key, caller=effective_caller)
+        else:
+            shared_key = self._metadata_shared_key(
+                ["colstats", info.source, info.path, col_key, policy_hash], info, caller=effective_caller
+            )
         l2_meta = self._l2_meta
         if shared_key is not None and l2_meta is not None:
             shared = l2_meta.get(shared_key)
@@ -3182,7 +3836,12 @@ class SqlEngine:
             raise LakehouseError(f"Column '{col}' on table '{table}' is masked for this caller and cannot be profiled.")
         import duckdb
 
-        con = duckdb.connect()
+        held = _query_gate.hold(effective_caller)
+        try:
+            con = duckdb.connect()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             _duckdb_fs_lockdown(con)
             _apply_memory_budget(con)
@@ -3220,6 +3879,7 @@ class SqlEngine:
             raise LakehouseError(f"Column stats failed for '{table}.{column}': {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
         result = {
             "table": table,
             "column": col,
@@ -3245,7 +3905,7 @@ class SqlEngine:
             l2_meta.put(shared_key, result, tables=[info.name, info.path, info.qualified_name])
         return result
 
-    def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int) -> dict:
+    def _column_stats_external(self, spec: AttachSpec, qualified: str, column: str, top_n: int, *, caller=None) -> dict:
         """column_stats for an attached-database table (LIMIT runs server-side)."""
         cap = _profile_max_rows()
         key = ("colstats-ext", qualified, (str(column).strip().lower(),))
@@ -3255,7 +3915,12 @@ class SqlEngine:
             if hit is not None and now - hit[0] < self.cache_ttl:
                 self._profile_hits += 1
                 return hit[1]
-        con = self._external_connection()
+        held = _query_gate.hold(caller)
+        try:
+            con = self._external_connection()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             col, col_type = _validate_column(self._describe_external(spec, qualified), column, qualified)
             stats = _column_stats_queries(con, qualified, col, cap, top_n, col_type)
@@ -3265,6 +3930,7 @@ class SqlEngine:
             raise LakehouseError(f"Column stats failed for attached table '{qualified}.{column}': {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
         result = {
             "table": qualified,
             "column": col,
@@ -3372,6 +4038,7 @@ class SqlEngine:
         observability.audit_query(sql, state, duration_ms, n_rows, error, caller=caller)
 
     # ------------------------------------------------------------- scans
+    @_gated
     def scan_arrow(
         self,
         table: str,
@@ -3475,6 +4142,7 @@ class SqlEngine:
         )
 
     # -------------------------------------------------------- sample rows
+    @_gated
     def sample_rows(
         self,
         table: str,
@@ -3522,7 +4190,7 @@ class SqlEngine:
         effective_caller = caller if caller is not None else current_caller()
         ext = self._match_external_table(table)
         if ext is not None:
-            return self._sample_rows_external(*ext, limit=limit, columns=columns)
+            return self._sample_rows_external(*ext, limit=limit, columns=columns, caller=effective_caller)
         info = self._resolve(table)
         rule = self._effective_rule(info, effective_caller)
         if rule.hidden:
@@ -3635,6 +4303,8 @@ class SqlEngine:
         qualified: str,
         limit: int | None,
         columns: Sequence[str] | None,
+        *,
+        caller=None,
     ) -> dict:
         """sample_rows for an attached-database table: LIMIT runs server-side."""
         cap = _profile_max_rows()
@@ -3643,7 +4313,12 @@ class SqlEngine:
             resolved = cap
         elif resolved is not None and cap > 0:
             resolved = min(resolved, cap)
-        con = self._external_connection()
+        held = _query_gate.hold(caller)
+        try:
+            con = self._external_connection()
+        except BaseException:
+            _query_gate.unhold(held)
+            raise
         try:
             col_sel = ", ".join(_safe_ident(c) for c in columns) if columns else "*"
             inner = f"SELECT {col_sel} FROM {qualified}"
@@ -3656,6 +4331,7 @@ class SqlEngine:
             raise LakehouseError(f"Sampling attached table '{qualified}' failed: {exc}") from exc
         finally:
             con.close()
+            _query_gate.unhold(held)
         return self._shape_sample(
             table=qualified,
             uri=spec.display_uri,
@@ -3810,6 +4486,11 @@ class SqlEngine:
                 Also feeds policy enforcement (the masking views) and the
                 policy hash in the result-cache key.
         """
+        # Caller SQL may never name an engine-internal relation (the unmasked
+        # masking base / the profile scratch relations). Checked BEFORE the
+        # result-cache lookup, so neither execution nor a cached entry can
+        # serve a bypass statement.
+        _refuse_internal_relations(sql)
         if version_as_of is not None:
             _validate_snapshot_version(version_as_of, "Time travel")
         # Keyword-only default: explicit caller wins; else the ambient
@@ -3854,7 +4535,7 @@ class SqlEngine:
         # result is stored into L1+L2 exactly like a full query's.
         cache_key = self._result_cache_key(sql, params, limit, row_cap, version_as_of, caller=effective_caller)
         if cache_key is not None:
-            cached = self._result_cache_lookup(cache_key)
+            cached = self._result_cache_lookup(cache_key, caller=effective_caller, sql=sql)
             if cached is not None:
                 self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
                 return cached
@@ -3914,31 +4595,60 @@ class SqlEngine:
                     # backstop, this is the fast lane.
                     self._result_cache_store(cache_key, fast, sql=sql, l2_min_bytes=0)
                 return fast
-        timeout = _query_timeout()
-        job = QueryJob(
-            self,
-            sql,
-            limit=limit,
-            params=params,
-            version_as_of=version_as_of,
-            row_cap=row_cap,
-            caller=effective_caller,
-        )
-        if timeout > 0:
-            job.wait(timeout)
-            if job.state == "running":
-                # Interrupt inside DuckDB so the worker thread unwinds and
-                # the connection is closed instead of leaking.
-                job.cancel()
-                job.wait(_CANCEL_GRACE_SECONDS)
-                raise LakehouseError(
-                    _errors.enrich(f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled.")
-                )
-        else:
-            job.wait()
-        if job.state == "done" and cache_key is not None and job.result is not None:
-            self._result_cache_store(cache_key, job.result, sql=sql)
-        return job.result
+        # SINGLE-FLIGHT (cache stampede): N identical cold queries from
+        # callers with the same effective rules execute ONCE — one leader,
+        # the rest wait for the cache fill. Waiters block BEFORE any
+        # concurrency slot is taken (the QueryJob below belongs to the
+        # leader). A failed/timed-out leader wakes the waiters, which then
+        # run their own copy: one caller's error never becomes another's.
+        flight: _Flight | None = None
+        if cache_key is not None and _singleflight_enabled():
+            flight, leader = _singleflight.join(cache_key)
+            if not leader:
+                if flight.event.wait(_singleflight_wait_timeout()):
+                    cached = self._result_cache_lookup(cache_key, caller=effective_caller, sql=sql)
+                    if cached is not None:
+                        _singleflight.note_served()
+                        self._record_outcome(sql, 0.0, cached.num_rows, state="ok", caller=effective_caller)
+                        return cached
+                # Leader failed/timed out, or its result was not cacheable:
+                # execute our own copy; do NOT finish another's flight.
+                flight = None
+        error: BaseException | None = None
+        try:
+            timeout = _query_timeout()
+            job = QueryJob(
+                self,
+                sql,
+                limit=limit,
+                params=params,
+                version_as_of=version_as_of,
+                row_cap=row_cap,
+                caller=effective_caller,
+            )
+            if timeout > 0:
+                job.wait(timeout)
+                if job.state == "running":
+                    # Interrupt inside DuckDB so the worker thread unwinds and
+                    # the connection is closed instead of leaking.
+                    job.cancel()
+                    job.wait(_cancel_grace_seconds())
+                    raise LakehouseError(
+                        _errors.enrich(
+                            f"Query timed out after {timeout}s (SQLHANDLER_QUERY_TIMEOUT) and was cancelled."
+                        )
+                    )
+            else:
+                job.wait()
+            if job.state == "done" and cache_key is not None and job.result is not None:
+                self._result_cache_store(cache_key, job.result, sql=sql)
+            return job.result
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            if flight is not None:
+                _singleflight.finish(cache_key, flight, error)
 
     # ------------------------------------------------------------- writes
     def execute_write(
@@ -3988,6 +4698,10 @@ class SqlEngine:
                     "the deliberate default; writes are operator-gated)."
                 )
             )
+        # The statement carries caller SQL (the SELECT payload, and the target
+        # expression): the internal-relation refusal applies to the write path
+        # too, before classification or any IO.
+        _refuse_internal_relations(sql)
         effective_caller = caller if caller is not None else current_caller()
         # 1. classify BEFORE anything else — no cache, no dataset opens, no IO.
         plan = writes_mod.classify_sql(sql)
@@ -4022,7 +4736,7 @@ class SqlEngine:
             backend, canonical, _uri = writes_mod.resolve_write_target(cls.target, effective_caller)
         except writes_mod.WriteError as exc:
             raise LakehouseError(_errors.enrich(str(exc))) from exc
-        self._refuse_write_target_collision(cls.target, canonical)
+        self._refuse_write_target_collision(cls.target, canonical, effective_caller)
         # 3. run the SELECT payload on a fresh locked-down connection with
         #    the caller's policy views — reads inside the write are governed
         #    reads (the mask applies; hidden tables register empty).
@@ -4037,10 +4751,17 @@ class SqlEngine:
         # ``append`` fails on a schema mismatch (fail closed — silently
         # widening a target's schema is not v1 behavior).
         write_mode = mode or ("append" if cls.stmt_type == "INSERT" else "overwrite")
-        if backend == "iceberg":
-            summary = self._write_iceberg_scratch(canonical, rows, write_mode)
-        else:
-            summary = self._write_delta_scratch(canonical, rows, write_mode)
+        # The write itself is real compute too; the SELECT above already went
+        # through the QueryJob gate, so this slot is taken only around the
+        # backend write (no nested job, no deadlock).
+        held = _query_gate.hold(effective_caller)
+        try:
+            if backend == "iceberg":
+                summary = self._write_iceberg_scratch(canonical, rows, write_mode)
+            else:
+                summary = self._write_delta_scratch(canonical, rows, write_mode)
+        finally:
+            _query_gate.unhold(held)
         # The write REPLACED files under a path the engine may hold a cached
         # dataset handle for (a scratch root inside the provider root):
         # evict it so the next read opens the NEW snapshot (the delta
@@ -4083,6 +4804,9 @@ class SqlEngine:
         """
         import duckdb
 
+        # Defense in depth for the write tier: the payload SELECT is caller SQL
+        # and it is registered/executed here (see _refuse_internal_relations).
+        _refuse_internal_relations(select_sql)
         if self._sql_needs_external(select_sql):
             raise LakehouseError(
                 _errors.enrich(
@@ -4221,7 +4945,7 @@ class SqlEngine:
                 lease.release()
         return {"target": canonical, "backend": "iceberg", "rows": rows.num_rows, "mode": write_mode}
 
-    def _refuse_write_target_collision(self, target: str | None, canonical: str) -> None:
+    def _refuse_write_target_collision(self, target: str | None, canonical: str, caller=None) -> None:
         """Writes are ALWAYS outside policy-covered tables (review §4).
 
         A sloppy root could overlap a source root; refuse a target whose
@@ -4232,10 +4956,19 @@ class SqlEngine:
         time is a source forever, and anything written since (the caller's
         own prior CTAS re-listed under a scratch root) is not in the
         snapshot and stays writable.
+
+        The snapshot is per POLICY HASH, not per process (audit 2026-11-12):
+        ``list_tables`` is policy-filtered, so a single process-wide set built
+        for the first writer would omit every table THAT caller's policy hid —
+        and a later caller whose policy shows them could then write onto a
+        source table. Enforcement off (hash "") keeps one shared entry, i.e.
+        exactly the historical behavior.
         """
-        if self._write_tier_source_paths is None:
-            paths: set[str] = set()
-            for info in self.list_tables():
+        policy_hash = self._caller_policy_hash(caller)
+        paths = self._write_tier_source_paths.get(policy_hash)
+        if paths is None:
+            paths = set()
+            for info in self.list_tables(caller=caller):
                 loc = info.location
                 if not loc:
                     continue
@@ -4246,14 +4979,14 @@ class SqlEngine:
                     paths.add(os.path.realpath(loc))
                 except OSError:
                     paths.add(os.path.normpath(os.path.abspath(loc)))
-            self._write_tier_source_paths = paths
-        if not self._write_tier_source_paths:
+            self._write_tier_source_paths[policy_hash] = paths
+        if not paths:
             return
         try:
             canonical_loc = os.path.realpath(canonical) if os.path.isabs(canonical) else canonical
         except OSError:
             canonical_loc = canonical
-        if canonical_loc in self._write_tier_source_paths:
+        if canonical_loc in paths:
             raise LakehouseError(
                 _errors.enrich(
                     f"Write refused: target '{canonical}' resolves onto a configured source "
@@ -4615,10 +5348,12 @@ class SqlEngine:
         through :func:`_cache_policy_part` — the conditional-slot rule.
 
         THE WIRING (identity spine Stage 1 + policy Stage 2): the caller
-        rides :func:`current_caller` — set by the server per request (MCP
-        tools/web UI) and passed EXPLICITLY into ``query_duckdb`` (keyword
-        ``caller``) where a raw ``threading.Thread`` (``QueryJob``) would
-        otherwise lose it (contextvars do not cross threads). With
+        rides :func:`current_caller` — bound by the server's identity
+        middleware per request (and copied into the dispatch worker thread by
+        ``asyncio.to_thread``) — AND is passed EXPLICITLY into
+        ``query_duckdb`` (keyword ``caller``) by every tool/route, because a
+        raw ``threading.Thread`` (``QueryJob``) cannot inherit a contextvar.
+        Explicit wins; the ambient slot is the fail-closed backstop. With
         enforcement OFF this returns ``""`` everywhere: keys stay
         byte-identical, cross-caller sharing unchanged (the golden tests
         pin it).
@@ -4665,6 +5400,35 @@ class SqlEngine:
         except Exception:
             return None
 
+    def _virtual_metadata_shared_key(self, kind: str, info: TableInfo, col_key, caller=None) -> str | None:
+        """Shared-metadata key for a VIRTUAL table's profile / column_stats.
+
+        The physical tier's key uses the table's own snapshot version, which a
+        virtual table does not have (its data is a definition over base
+        tables) — ``provider.check_version`` returns None for it, so a base
+        commit would NOT invalidate the shared entry. The correct identity is
+        :meth:`_virtual_cache_base`'s digest: the definition text of the table
+        and every virtual table it builds on, the caller's policy hash, and
+        the resolved base tables' snapshot versions. A base commit (or a
+        definition/policy edit) therefore invalidates immediately, exactly
+        like the materialization cache. None when the shared tier is off or
+        the identity cannot be resolved (best-effort, like the physical tier).
+        """
+        if self._l2_meta is None:
+            return None
+        try:
+            definition = self._definition_sql(info.name)
+            base = self._virtual_cache_base(info, definition, caller=caller)
+            # base["sha256"] covers the definition text + policy hash; the
+            # BASE snapshot versions live beside it (the materialization
+            # path checks them from the sidecar), so they must enter THIS
+            # key explicitly or a base commit would not rekey.
+            versions = json.dumps(base["versions"], sort_keys=True, default=str)
+            parts = [kind, info.source, info.path, base["sha256"], versions, repr(col_key)]
+            return hashlib.sha256("\x1f".join(str(p) for p in parts).encode()).hexdigest()
+        except Exception:
+            return None
+
     def _preview_supersede_lookup(
         self,
         sql: str,
@@ -4702,7 +5466,7 @@ class SqlEngine:
             key = self._preview_canonical_key(sql, version_as_of, caller=caller)
             if key is None:
                 return None
-            table_ = self._result_cache_lookup(key)
+            table_ = self._result_cache_lookup(key, caller=caller, sql=sql)
             if table_ is None:
                 return None
             # Slice ONLY when the entry has at least the asked count. A
@@ -4769,7 +5533,7 @@ class SqlEngine:
             key = self._preview_canonical_key(sql, version_as_of, caller=caller)
             if key is None:
                 return
-            existing = self._result_cache_lookup(key)
+            existing = self._result_cache_lookup(key, caller=caller, sql=sql)
             if existing is not None and existing.num_rows >= table_.num_rows:
                 return  # the canonical entry is already at least this big
             self._result_cache_store(key, table_, sql=None, l2_min_bytes=0)
@@ -4804,6 +5568,12 @@ class SqlEngine:
         """
         if self._result_cache_ttl <= 0:
             return None
+        if _VOLATILE_FN_RE.search(sql) or _VOLATILE_KEYWORD_RE.search(sql):
+            # A result containing now()/random()/uuid() is only true for the
+            # instant it ran; caching it would freeze that value for the whole
+            # TTL and serve it as if it were live (audit 2026-11-12 P2).
+            # Conservative by design: a false positive costs one cache miss.
+            return None
         try:
             refs = self._referenced_tables(sql)
             if not refs or any(i.format == "virtual" for i in refs):
@@ -4826,7 +5596,7 @@ class SqlEngine:
         except Exception:
             return None
 
-    def _result_cache_lookup(self, key: str) -> pa.Table | None:
+    def _result_cache_lookup(self, key: str, caller=None, sql: str | None = None) -> pa.Table | None:
         """The cached result for ``key``: memory L1 first, then the shared L2.
 
         An L1 hit is exactly today's path. On an L1 miss the shared-disk L2
@@ -4835,6 +5605,14 @@ class SqlEngine:
         memory hit again. Every L2 step is best-effort: a missing, corrupt
         or expired entry is an ordinary miss, and the L2 is disabled
         entirely unless SQLHANDLER_L2_DIR is set.
+
+        The L2 decode runs INSIDE the query gate and against a per-hit byte
+        ceiling (audit 2026-11-12 P1-10): a hit materializes a fresh Arrow
+        table from parquet, and the L2 volume cap (default 2 GiB) is not a
+        memory bound — N concurrent hits on one shared entry would each
+        allocate it, outside the gate that exists to bound exactly that. An
+        entry over the ceiling is an ordinary miss: the caller recomputes
+        under its own slot, where the row cap applies.
         """
         with self._lock:
             hit = self._result_cache.get(key)
@@ -4849,7 +5627,11 @@ class SqlEngine:
                     self._result_cache_hits += 1
                     return table
         if self._l2_cache is not None:
-            table = self._l2_cache.lookup(key)
+            held = _query_gate.hold(caller)
+            try:
+                table = self._l2_cache.lookup(key, max_bytes=_l2_decode_max_bytes())
+            finally:
+                _query_gate.unhold(held)
             if table is not None:
                 # L1-ONLY warm (no L2 republish): the artifact was just read
                 # back from the shared dir, so writing it again would encode
@@ -4857,7 +5639,11 @@ class SqlEngine:
                 # mode consume a write-queue slot) on EVERY cross-replica
                 # hit. The shared entry stays as published; only this
                 # replica memory gains a copy.
-                self._result_cache_store(key, table, publish_l2=False)
+                # sql= (audit 2026-11-12): the L1 entry warmed from an L2 hit
+                # must carry its SQL into the write-tier side map, or a scratch
+                # CTAS cannot evict it and the replica serves the pre-write rows
+                # until the TTL expires.
+                self._result_cache_store(key, table, sql=sql, publish_l2=False)
                 return table
         return None
 
@@ -4930,6 +5716,15 @@ class SqlEngine:
                 # (stale rows after a scratch write).
                 self._result_cache_sql.pop(evicted_key, None)
                 self._result_cache_bytes -= evicted[1].nbytes
+            previous = self._result_cache.get(key)
+            if previous is not None:
+                # OVERWRITE (a "biggest wins" preview upgrade, or two
+                # concurrent misses storing the same key): give the old
+                # table's bytes back or the counter inflates forever —
+                # eviction trusts it, only ever subtracts what it evicts, and
+                # the phantom bytes then starve L1 toward empty until restart
+                # (audit 2026-11-12 P2).
+                self._result_cache_bytes -= previous[1].nbytes
             self._result_cache[key] = (time.time(), table)
             self._result_cache_bytes += nbytes
             self._result_cache_writes += 1
@@ -5049,7 +5844,8 @@ class SqlEngine:
         ``caller`` (keyword-friendly; identity spine): when policy
         enforcement covers a physical table, the MASKING VIEW is registered
         under the caller-visible names instead of the raw dataset — the
-        base dataset goes under a private name (``__sqlhandler_base_<n>``)
+        base dataset goes under a private name (``__sqlhandler_base_<random>``,
+        fresh per query so the name cannot be guessed or reused by a caller)
         and the masking view (row filter + column masks, policy.py) reads
         it. Virtual definitions compose over these views, so masking is
         inherited TRANSITIVELY (the verified composition path). No caller /
@@ -5061,7 +5857,6 @@ class SqlEngine:
             name_counts[info.name] = name_counts.get(info.name, 0) + 1
         effective_caller = caller if caller is not None else current_caller()
         physical, virtuals = self._expand_query_tables(self._referenced_tables(sql))
-        base_seq = 0
         # Names whose base view could NOT be registered, with the real reason.
         #
         # WHY THIS EXISTS (live incident 2026-10-20): a base table that failed
@@ -5131,8 +5926,12 @@ class SqlEngine:
                 continue
             # POLICY-COVERED: raw dataset under a private base name, masking
             # view under every caller-visible name.
-            base_seq += 1
-            base_name = f"__sqlhandler_base_{base_seq}"
+            # RANDOM per query, not a counter (audit 2026-11-12 P0-1): this
+            # relation holds the RAW, unmasked dataset, and a deterministic
+            # name let a caller join it directly (`JOIN __sqlhandler_base_1 b
+            # ON true`) to read masked columns and skip the row filter. The
+            # `__sqlhandler_` prefix stays so the caller-SQL guard covers it.
+            base_name = f"__sqlhandler_base_{uuid.uuid4().hex[:12]}"
             try:
                 con.register(base_name, dset)
                 columns = [f.name for f in dset.schema]
@@ -5436,8 +6235,18 @@ class SqlEngine:
         # (a full disk, an interrupt) orphaned a "<name>.meta.tmp" in the
         # cache directory forever — never read, never replaced, never swept.
         tmp_meta: str | None = None
+        # A materialization is real compute (a masked result built from the
+        # definition). COVERED when the caller is already inside a query slot
+        # (the normal case: QueryJob / a gated scan or profile); a direct
+        # caller still takes one.
+        held = _query_gate.hold(caller)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # POD-PRIVATE directory (best-effort): a materialization is a
+            # MASKED result, access-controlled only by its policy-infixed
+            # filename, so the tree must not be world-readable when the
+            # shared volume is not already isolated. mkstemp writes the
+            # artifacts 0600 and the rename keeps that mode.
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             table = con.sql(definition).arrow()
             if isinstance(table, pa.RecordBatchReader):
                 table = table.read_all()
@@ -5486,6 +6295,7 @@ class SqlEngine:
             if tmp_meta:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_meta)
+            _query_gate.unhold(held)
 
     def _cluster_result(self, con, info: TableInfo, table: pa.Table) -> pa.Table:
         """Sort a materialized virtual result by its most discriminative columns.
@@ -5505,11 +6315,13 @@ class SqlEngine:
             probe = "_sqlhandler_sort_probe"
             con.register(probe, table)
             cols = table.column_names[:16]
-            stats = con.sql(
-                "SELECT "
-                + ", ".join(f"approx_count_distinct({_safe_ident(c)}) AS k{i}" for i, c in enumerate(cols))
-                + f" FROM {probe}"
-            ).fetchone()
+            stats = _first_row(
+                con.sql(
+                    "SELECT "
+                    + ", ".join(f"approx_count_distinct({_safe_ident(c)}) AS k{i}" for i, c in enumerate(cols))
+                    + f" FROM {probe}"
+                )
+            )
             ranked = sorted(zip(cols, stats), key=lambda kv: kv[1])
             keys = [c for c, distinct in ranked if distinct > 1][:3]
             if not keys:
@@ -6264,6 +7076,9 @@ class SqlEngine:
 
     def cache_stats(self) -> dict:
         """Small in-memory snapshot of the metadata caches (for observability)."""
+        # Measured/collected BEFORE the engine lock (the L2 has its own lock;
+        # stats() is O(1) now — see l2cache.stats).
+        l2_stats = self._l2_cache.stats() if self._l2_cache is not None else None
         with self._lock:
             return {
                 "describe_cached_tables": len(self._describe_cache),
@@ -6288,6 +7103,11 @@ class SqlEngine:
                     "hits": self._result_cache_hits,
                     "writes": self._result_cache_writes,
                 },
+                # Single-flight coalescing: identical cold queries waiting on
+                # one leader. "served" = waiters answered from the leader's
+                # cache fill; leaders - served (roughly) = the executions
+                # saved. Additive.
+                "singleflight": {"enabled": _singleflight_enabled(), **_singleflight.stats()},
                 # Metadata round-trips paid to build cache KEYS (BUG B
                 # visibility). "provider_calls" is the number of
                 # provider.check_version() calls — one _delta_log LIST per
@@ -6313,9 +7133,12 @@ class SqlEngine:
                 # None when the layer is disabled so dashboards can
                 # distinguish "off" from "on with zero hits". Additive — with
                 # the L2 off every pre-existing key renders byte-identically.
-                "l2_hits": self._l2_cache.stats()["hits"] if self._l2_cache is not None else 0,
-                "l2_writes": self._l2_cache.stats()["writes"] if self._l2_cache is not None else 0,
-                "l2": self._l2_cache.stats() if self._l2_cache is not None else None,
+                # ONE stats() call, taken OUTSIDE this lock: it used to be
+                # three calls, each a directory walk under the L2 lock, on
+                # every /metrics scrape (audit 2026-11-12).
+                "l2_hits": l2_stats["hits"] if l2_stats is not None else 0,
+                "l2_writes": l2_stats["writes"] if l2_stats is not None else 0,
+                "l2": l2_stats,
                 "l2_meta": self._l2_meta.stats() if self._l2_meta is not None else None,
                 "tables_cached": self._tables is not None,
                 "tables_cached_age_s": round((time.monotonic() - self._tables_ts), 1)

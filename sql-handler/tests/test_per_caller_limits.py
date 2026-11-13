@@ -15,6 +15,8 @@ behavior). Covered here:
 Run: python -m pytest tests/test_per_caller_limits.py -v
 """
 
+import json
+import threading
 import time
 
 import pyarrow as pa
@@ -41,6 +43,8 @@ def _clean_scopes(monkeypatch):
         "SQLHANDLER_QUEUE_TIMEOUT",
         "SQLHANDLER_MAX_JOBS",
         "SQLHANDLER_MAX_JOBS_PER_CALLER",
+        "SQLHANDLER_MAX_SCOPES",
+        "SQLHANDLER_FAIRNESS_SCOPE",
     ):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -64,6 +68,105 @@ def test_gate_scope_is_bounded_and_none_without_identity():
     assert limits.gate_scope(None) is None
     assert limits.gate_scope(Caller()) is None
     assert limits.gate_scope(ALICE) == "subject:alice"
+
+
+@pytest.fixture()
+def grouped_policy(tmp_path, monkeypatch):
+    """Policy on: alice+bob share group g1; carol's key is bound to g2."""
+    from sqlhandler import policy as policy_mod
+
+    pf = tmp_path / "policy.json"
+    pf.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "default_group": "g1",
+                "groups": {
+                    "g1": {"tables": {"t/*": {"column_masks": {"c": "redact"}}}},
+                    "g2": {"hidden_tables": ["secret/*"]},
+                },
+                "subjects": {"alice": ["g1"], "bob": ["g1"]},
+                "key_fps": {"sha256:ccc": ["g2"]},
+            }
+        )
+    )
+    monkeypatch.setenv(policy_mod.POLICY_ENABLED_ENV, "1")
+    monkeypatch.setenv(policy_mod.POLICY_FILE_ENV, str(pf))
+    policy_mod.reset_policy_store()
+    yield pf
+    policy_mod.reset_policy_store()
+
+
+def test_fairness_scope_defaults_to_identity(grouped_policy):
+    assert limits.fairness_scope() == "identity"
+    assert limits.gate_scope(ALICE) == "subject:alice"
+    assert limits.gate_scope(BOB) == "subject:bob"
+    assert limits.gate_scope(ALICE) != limits.gate_scope(BOB)
+
+
+def test_fairness_scope_rules_shares_one_bucket_per_rule_set(grouped_policy, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_FAIRNESS_SCOPE", "rules")
+    assert limits.fairness_scope() == "rules"
+    alice = limits.gate_scope(ALICE)
+    bob = limits.gate_scope(BOB)
+    keyed = limits.gate_scope(KEYED)
+    assert alice == bob, "same policy group ⇒ one fairness bucket"
+    assert alice.startswith("rules:")
+    assert keyed != alice, "different rules ⇒ a different bucket"
+
+
+def test_fairness_scope_rules_falls_back_to_identity_without_policy(monkeypatch):
+    from sqlhandler import policy as policy_mod
+
+    monkeypatch.setenv("SQLHANDLER_FAIRNESS_SCOPE", "rules")
+    monkeypatch.delenv(policy_mod.POLICY_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(policy_mod.POLICY_FILE_ENV, raising=False)
+    policy_mod.reset_policy_store()
+    assert limits.gate_scope(ALICE) == "subject:alice"
+    assert limits.gate_scope(BOB) == "subject:bob"
+
+
+def test_fairness_scope_rules_falls_back_for_empty_rules(tmp_path, monkeypatch):
+    from sqlhandler import policy as policy_mod
+
+    pf = tmp_path / "policy.json"
+    pf.write_text(json.dumps({"version": 1, "default_group": "g", "groups": {"g": {}}}))
+    monkeypatch.setenv(policy_mod.POLICY_ENABLED_ENV, "1")
+    monkeypatch.setenv(policy_mod.POLICY_FILE_ENV, str(pf))
+    monkeypatch.setenv("SQLHANDLER_FAIRNESS_SCOPE", "rules")
+    policy_mod.reset_policy_store()
+    try:
+        # Empty composed rules ⇒ "" hash ⇒ identity fallback, never one shared bucket.
+        assert limits.gate_scope(ALICE) == "subject:alice"
+        assert limits.gate_scope(BOB) == "subject:bob"
+    finally:
+        policy_mod.reset_policy_store()
+
+
+def test_fairness_scope_rules_shares_the_concurrency_slot(grouped_policy, monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_FAIRNESS_SCOPE", "rules")
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "4")
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER", "1")
+    monkeypatch.setenv("SQLHANDLER_QUEUE_TIMEOUT", "0.05")
+    gate = _QueryGate()
+    alice_slot = gate.acquire(ALICE)
+    try:
+        with pytest.raises(LakehouseError) as excinfo:
+            gate.acquire(BOB)  # same rule set ⇒ same bucket ⇒ at its cap
+        assert "for this caller" in str(excinfo.value)
+    finally:
+        gate.release(alice_slot)
+    bob_slot = gate.acquire(BOB)  # released again
+    gate.release(bob_slot)
+
+
+def test_max_scopes_is_env_controllable(monkeypatch):
+    monkeypatch.setenv("SQLHANDLER_MAX_SCOPES", "2")
+    limits.reset_scopes()
+    assert limits.max_scopes() == 2
+    assert limits.bounded_scope("subject:a") == "subject:a"
+    assert limits.bounded_scope("subject:b") == "subject:b"
+    assert limits.bounded_scope("subject:c") == limits.OTHER
 
 
 def test_bounded_scope_collapses_past_the_cap(monkeypatch):
@@ -158,6 +261,79 @@ def test_query_gate_global_cap_still_bounds_all_callers(monkeypatch):
         assert "Too many concurrent queries (limit 1)" in str(excinfo.value)
     finally:
         gate.release(alice_slot)
+
+
+def test_query_gate_hold_is_reentrant_on_one_thread(monkeypatch):
+    """A nested hold on the SAME thread must not take a second per-caller slot
+    (profile -> virtual profile, scan -> query, job -> materialization)."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "4")
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER", "1")
+    monkeypatch.setenv("SQLHANDLER_QUEUE_TIMEOUT", "0.05")
+    gate = _QueryGate()
+    outer = gate.hold(ALICE)
+    inner = gate.hold(ALICE)  # re-entrant: no second acquisition
+    gate.unhold(inner)
+    gate.unhold(outer)
+    again = gate.hold(ALICE)  # the slot was released exactly once
+    gate.unhold(again)
+
+
+def test_query_gate_acquire_is_covered_inside_a_hold(monkeypatch):
+    """A QueryJob constructed inside a gated path is COVERED by the slot the
+    calling thread already holds — it must not queue against itself."""
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "4")
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER", "1")
+    monkeypatch.setenv("SQLHANDLER_QUEUE_TIMEOUT", "0.05")
+    gate = _QueryGate()
+    held = gate.hold(ALICE)
+    covered = gate.acquire(ALICE)
+    assert covered is not None
+    gate.release(covered)  # no-op for the covered token
+    gate.unhold(held)
+    slot = gate.acquire(ALICE)  # the real slot is free again
+    gate.release(slot)
+
+
+def test_profile_and_scan_compute_takes_the_per_caller_slot(tmp_path, monkeypatch):
+    """The gate now covers the non-QueryJob compute paths too: with the
+    caller's only slot held elsewhere, profile / column_stats / sample / scan
+    queue (and fail cleanly on the queue timeout) instead of running
+    unbounded."""
+    from sqlhandler.engine import _query_gate
+
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES", "4")
+    monkeypatch.setenv("SQLHANDLER_MAX_CONCURRENT_QUERIES_PER_CALLER", "1")
+    monkeypatch.setenv("SQLHANDLER_QUEUE_TIMEOUT", "0.05")
+    eng = _make_engine(tmp_path)
+
+    calls = {
+        "profile": lambda: eng.profile_table("work_order", caller=ALICE),
+        "column_stats": lambda: eng.column_stats("work_order", "id", caller=ALICE),
+        "sample": lambda: eng.sample_rows("work_order", caller=ALICE),
+        "scan": lambda: eng.scan_arrow("work_order", caller=ALICE),
+    }
+    held = _query_gate.hold(ALICE)
+    try:
+        for name, call in calls.items():
+            errors = []
+
+            def _run():
+                try:
+                    call()
+                except LakehouseError as exc:
+                    errors.append(str(exc))
+
+            thread = threading.Thread(target=_run)
+            thread.start()
+            thread.join(timeout=10)
+            assert errors, f"{name} ran without taking the per-caller slot"
+            assert "for this caller" in errors[0], name
+    finally:
+        _query_gate.unhold(held)
+
+    # With the slot released, every path works again.
+    for name, call in calls.items():
+        assert call() is not None, name
 
 
 def test_query_gate_releases_the_caller_slot_on_global_timeout(monkeypatch):
@@ -286,3 +462,14 @@ def test_record_outcome_attributes_duration_and_queue_wait_to_the_caller(tmp_pat
     text = observability.metrics.render(None)
     assert 'sqlhandler_caller_query_duration_seconds_sum{caller_scope="subject:alice"}' in text
     assert 'sqlhandler_caller_queue_wait_seconds_sum{caller_scope="subject:alice"}' in text
+
+
+def test_cancel_grace_is_env_controllable(monkeypatch):
+    from sqlhandler.engine import _cancel_grace_seconds
+
+    monkeypatch.delenv("SQLHANDLER_CANCEL_GRACE_SECONDS", raising=False)
+    assert _cancel_grace_seconds() == 5.0
+    monkeypatch.setenv("SQLHANDLER_CANCEL_GRACE_SECONDS", "1.5")
+    assert _cancel_grace_seconds() == 1.5
+    monkeypatch.setenv("SQLHANDLER_CANCEL_GRACE_SECONDS", "banana")
+    assert _cancel_grace_seconds() == 5.0

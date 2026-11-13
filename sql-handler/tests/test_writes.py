@@ -111,12 +111,15 @@ def test_classification_matrix():
         "CREATE OR REPLACE TABLE s.out AS SELECT 1",
         "INSERT INTO s.out SELECT 1",
         "INSERT INTO s.out (a, b) SELECT 1, 2",
-        "COPY (SELECT 1) TO 'out.parquet'",
     ]
     for sql in scratch:
         assert writes.classify_sql(sql)[0].kind == writes.CLASS_WRITE_SCRATCH, sql
 
     others = [
+        # audit 2026-11-12 (P2): COPY is NOT a supported scratch write — it
+        # writes a FILE through a filesystem-locked connection, so it could
+        # never succeed; it is refused with a CREATE TABLE ... AS SELECT hint.
+        ("COPY (SELECT 1) TO 'out.parquet'", "COPY"),
         ("UPDATE t SET a = 1", "UPDATE"),
         ("DELETE FROM t", "DELETE"),
         ("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a", "MERGE_INTO"),
@@ -665,7 +668,10 @@ def test_write_target_collision_with_source_refused(monkeypatch, tmp_path):
     src = tmp_path / alice_slug / "work_order"
     src.mkdir(parents=True)
     write_deltalake(str(src), pa.table({"id": pa.array([9], type=pa.int64())}), mode="overwrite")
-    eng._write_tier_source_paths = None  # re-snapshot (fixture wrote a source)
+    # re-snapshot (fixture wrote a source). The cache is keyed by policy hash
+    # since the 2026-11-12 audit (a single global snapshot let one caller's
+    # filtered table list decide another caller's write guard).
+    eng._write_tier_source_paths = {}
     with pytest.raises(LakehouseError, match="resolves onto a configured source"):
         eng.execute_write("CREATE TABLE work_order AS SELECT id FROM workorder_work_order", caller=alice)
     # a DIFFERENT name under the same namespace is not a source location and

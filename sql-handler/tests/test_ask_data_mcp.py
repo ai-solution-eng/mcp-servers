@@ -196,10 +196,10 @@ def test_ask_data_token_budget_caps(call_tool, monkeypatch, tmp_path):
     profiled: list[list[str]] = []
     real_profile = eng.profile_table
 
-    def spy_profile(table: str, columns: list[str] | None = None):
+    def spy_profile(table: str, columns: list[str] | None = None, **kwargs):
         if columns:
             profiled.append(list(columns))
-        return real_profile(table, columns=columns)
+        return real_profile(table, columns=columns, **kwargs)
 
     monkeypatch.setattr(eng, "profile_table", spy_profile)
     monkeypatch.setattr(server, "_handler", lambda: eng)
@@ -220,9 +220,9 @@ def test_ask_data_search_cap_five(monkeypatch, tmp_path):
     asked = []
     real_search = eng.search_tables
 
-    def spy_search(query, limit=20):
+    def spy_search(query, limit=20, **kwargs):
         asked.append(limit)
-        return real_search(query, limit=limit)
+        return real_search(query, limit=limit, **kwargs)
 
     monkeypatch.setattr(eng, "search_tables", spy_search)
     monkeypatch.setattr(server, "_handler", lambda: eng)
@@ -261,3 +261,20 @@ def test_ask_data_advertised_in_tools_list(client):
     names = {t["name"] for t in body["result"]["tools"]}
     assert "ask_data" in names
     assert "explain_query" in names
+
+
+def test_ask_data_caps_are_env_controllable(monkeypatch, tmp_path):
+    """The ask_data context budget is operator-tunable (env), not a constant."""
+    eng = _make_engine(tmp_path)
+    asked = []
+    real_search = eng.search_tables
+
+    def spy_search(query, limit=20, **kwargs):
+        asked.append(limit)
+        return real_search(query, limit=limit, **kwargs)
+
+    monkeypatch.setattr(eng, "search_tables", spy_search)
+    monkeypatch.setattr(server, "_handler", lambda: eng)
+    monkeypatch.setenv("SQLHANDLER_ASK_MAX_TABLES", "2")
+    server.ask_data("work order")
+    assert asked == [2]

@@ -29,7 +29,7 @@ import os
 import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
-from .config import FileConfig
+from .config import FileConfig, listing_max_entries
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import (
     build_raw_dataset,
@@ -151,6 +151,13 @@ class FileProvider(DataProvider):
             infos = fs.get_file_info(selector)
         except Exception as exc:
             raise LakehouseError(f"Could not list NFS path '{root}': {exc}") from exc
+        cap = listing_max_entries()
+        if cap and len(infos) > cap:
+            raise LakehouseError(
+                f"NFS listing of '{root}' found {len(infos)} entries, past "
+                f"SQLHANDLER_LISTING_MAX_ENTRIES={cap} (refusing rather than silently truncating — "
+                "mount a narrower directory or raise the knob)"
+            )
 
         dirs = [fi for fi in infos if fi.type == pafs.FileType.Directory]
         files = [fi for fi in infos if fi.type == pafs.FileType.File]

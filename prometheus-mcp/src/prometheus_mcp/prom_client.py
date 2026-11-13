@@ -39,6 +39,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import httpx2
 
@@ -256,6 +257,37 @@ def format_value(value: str | None) -> str | None:
     return f"{round(f, 4):g}"
 
 
+def _data_items(data: Any, key: str) -> list:
+    """Unwrap one Prometheus response's ``data`` field into a list.
+
+    Prometheus does NOT use one envelope shape across its API — the ``data``
+    field is an ARRAY for the discovery endpoints and an OBJECT for the
+    query/alerts/rules family:
+
+    * ``/api/v1/query``, ``/api/v1/query_range`` — object
+      ``{"resultType": …, "result": [...]}``;
+    * ``/api/v1/series`` — **array of label sets**: ``[{…}, {…}]``;
+    * ``/api/v1/label/<name>/values`` — **array of strings**: ``["a", "b"]``;
+    * ``/api/v1/alerts`` / ``/api/v1/rules`` — object again (``alerts`` /
+      ``groups``).
+
+    Assuming the object shape everywhere is what broke ``series()`` and
+    ``label_values()`` with ``AttributeError: 'list' object has no attribute
+    'get'`` — invisible while ``prom_query`` worked, because that path's
+    ``data`` really is an object. This helper accepts BOTH shapes (a
+    Prometheus-compatible backend or gateway may answer in either), so a
+    list-shaped ``data`` is returned as-is and an object is unwrapped by
+    *key*. Anything else (missing ``data``, a scalar) degrades to ``[]``
+    instead of raising.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        items = data.get(key, [])
+        return items if isinstance(items, list) else []
+    return []
+
+
 class PrometheusClient:
     """Read-only async client for one Prometheus server."""
 
@@ -271,7 +303,7 @@ class PrometheusClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _get(self, path: str, params: dict) -> dict:
+    async def _get(self, path: str, params: dict) -> Any:
         params = {k: v for k, v in params.items() if v is not None}
         try:
             resp = await self._client.get(path, params=params)
@@ -292,6 +324,9 @@ class PrometheusClient:
             raise PrometheusError(
                 f"Prometheus query error: {body.get('errorType', 'unknown')}: {body.get('error', 'no detail')}"
             )
+        # The payload of ``data`` is NOT uniformly an object: array for
+        # /series and /label/<n>/values, object for the query family. Callers
+        # unwrap it through _data_items(); this stays untyped on purpose.
         return body.get("data", {})
 
     # ------------------------------------------------------------- queries
@@ -308,7 +343,7 @@ class PrometheusClient:
 
     async def series(self, match: str, start: str | None = None, end: str | None = None) -> list[dict]:
         data = await self._get("/api/v1/series", {"match[]": match, "start": start, "end": end})
-        return data.get("result", [])
+        return _data_items(data, "result")
 
     async def label_values(self, label: str, match: str | None = None) -> list[str]:
         if not LABEL_NAME_RE.match(str(label)):
@@ -322,15 +357,15 @@ class PrometheusClient:
             )
         params = {"match[]": match} if match else {}
         data = await self._get(f"/api/v1/label/{label}/values", params)
-        return data.get("result", [])
+        return _data_items(data, "result")
 
     async def alerts(self) -> list[dict]:
         data = await self._get("/api/v1/alerts", {})
-        return data.get("alerts", [])
+        return _data_items(data, "alerts")
 
     async def rules(self) -> list[dict]:
         data = await self._get("/api/v1/rules", {})
-        return data.get("groups", [])
+        return _data_items(data, "groups")
 
 
 # ------------------------------------------------------------------ shaping

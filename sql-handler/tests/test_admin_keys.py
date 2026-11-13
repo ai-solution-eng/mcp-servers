@@ -56,6 +56,7 @@ from sqlhandler.policy import (
     POLICY_ENABLED_ENV,
     POLICY_FILE_ENV,
     PolicyError,
+    _acl_grants_group,
     load_policy,
     policy_store,
     reset_policy_store,
@@ -380,7 +381,7 @@ def test_admins_with_datasets_doc_coexists(tmp_path, monkeypatch):
     assert pol.admins == ("alice", fp)  # the key: spelling normalized to bare
     assert pol.datasets is not None
     # grants compiled as usual (bob's assignment, the global group, default)
-    assert pol.subjects == {"bob": ("_acl_global", "_acl_id_0")}
+    assert pol.subjects == {"bob": ("_acl_global", _acl_grants_group(["payroll/*"]))}
     assert pol.default_group == "_acl_global"
 
 
@@ -597,14 +598,19 @@ def test_union_disabled_or_empty_store_changes_nothing(monkeypatch):
     assert keys_file_path() is None
 
 
-def test_union_empty_store_never_arms_gate(tmp_path, monkeypatch):
-    """A configured but EMPTY keys file does not lock anyone out (bootstrap:
-    the file exists, no key minted yet → open gate, exactly the env-only
-    posture)."""
+def test_union_empty_store_arms_gate(tmp_path, monkeypatch):
+    """A CONFIGURED keys file arms the gate even when it holds no keys.
+
+    Audit 2026-11-12 (P1-4): the old behaviour — an empty store reads as "no
+    gate" — meant that REVOKING THE LAST KEY (the emergency compromise
+    action) turned /mcp anonymous, and a corrupt/truncated store did the same
+    on the next restart. "Configured" now means "authentication required";
+    only an UNCONFIGURED store keeps the openMode posture."""
     kf = _keys_file(tmp_path, entries=[])
     monkeypatch.setenv(KEYS_ENV, str(kf))
     status, caller, _ = _stack_request(None, kf, [], monkeypatch)
-    assert status is None and caller.cls == "anonymous"
+    assert status == 401, "an empty configured store must refuse anonymous callers"
+    assert caller.cls == "anonymous"
 
 
 def test_union_via_full_http_app(tmp_path, monkeypatch):

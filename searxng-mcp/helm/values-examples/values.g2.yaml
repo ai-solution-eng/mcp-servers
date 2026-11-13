@@ -35,7 +35,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.7.0   # keep in lockstep with Chart.yaml appVersion
+  tag: v1.7.1   # keep in lockstep with Chart.yaml appVersion
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).
@@ -74,7 +74,7 @@ service:
 
 resources:
   requests: {cpu: 200m, memory: 200Mi}
-  limits: {cpu: "1", memory: 512Mi}
+  limits: {cpu: "1", memory: 1Gi}
 
 # ============================================================================
 # Headless-browser Sidecar
@@ -86,12 +86,12 @@ browser:
   enabled: true
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.6.1
+    tag: v1.7.1
     pullPolicy: IfNotPresent
 
   resources:
     requests: {cpu: 250m, memory: 512Mi}
-    limits: {memory: 1Gi}
+    limits: {memory: 1536Mi}
 
   caCert:
     enabled: true   # Chromium needs the corporate MITM CA (must carry the proxy root too)
@@ -116,9 +116,23 @@ fetch:
   allowHosts: ""
   denyExtra: ""
   cacheTtl: ""
+  cacheMaxBytes: ""
+  cacheMaxEntries: ""
+  cacheMaxEntryBytes: ""
   maxBodyBytes: ""
   maxScreenshotKb: ""
   maxRedirects: ""
+# ============================================================================
+# Search Result Cache
+# ============================================================================
+
+# Chart defaults ("" = built-in values); entries larger than the per-entry
+# cap are returned but never cached.
+search:
+  cacheTtl: ""
+  cacheMaxBytes: ""
+  cacheMaxEntries: ""
+  cacheMaxEntryBytes: ""
 
 # ============================================================================
 # Egress Proxy

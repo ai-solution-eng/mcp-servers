@@ -35,7 +35,7 @@ image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
   # Registry tags are mutable — pullPolicy MUST stay Always (IfNotPresent
   # silently serves a cached old digest); cut releases with immutable tags.
-  tag: v0.7.0
+  tag: v0.7.1
   pullPolicy: Always
 
 imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE

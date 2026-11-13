@@ -62,7 +62,10 @@ def _lock_pins() -> dict[str, str]:
             continue
         name, _, version = stripped.partition("==")
         name = name.split(";")[0].strip()
-        version = version.split(";")[0].strip()
+        # The lock is HASH-BEARING since the 2026-11-12 audit: a requirement
+        # line ends with " \" and its --hash lines follow. Strip the
+        # continuation before comparing the version.
+        version = version.split(";")[0].strip().rstrip("\\").strip()
         if name and version:
             pins[name.lower().replace("_", "-")] = version
     return pins

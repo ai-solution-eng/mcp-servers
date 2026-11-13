@@ -36,7 +36,7 @@ deployment:
 # pullPolicy stays Always on purpose (mutable-tag history — see helm/values.yaml).
 image:
   repository: ghcr.io/ai-solution-eng/prometheus-mcp
-  tag: v0.7.0
+  tag: v0.7.1
   pullPolicy: Always
 
 imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE

@@ -77,7 +77,7 @@ from .config import (
     load_dotenv,
     load_source_providers,
 )
-from .engine import SqlEngine, _max_rows
+from .engine import SqlEngine, _max_rows, reset_current_caller, set_current_caller
 from .jobs import JobError
 from .provider import make_provider
 from .sqlguard import assert_mcp_readonly, mcp_readonly_enabled
@@ -90,9 +90,50 @@ logger = logging.getLogger("sqlhandler")
 # --------------------------------------------------------------------------
 
 
+def _listed_tools() -> list[Tool]:
+    """tools/list payloads with the env-dependent readOnly hints applied live.
+
+    Two opt-outs make a "read-only" tool able to write (P1-8, 2026-11-12
+    audit), so the hint follows BOTH, per listing:
+
+    * run_sql — MCP_READONLY=0 admits DDL/DML, and the write tier
+      (SQLHANDLER_WRITES_ENABLED) admits ONE classified scratch write;
+    * query_saved — the stored SQL is re-guarded only while
+      SQLHANDLER_MCP_READONLY is on, so with it off a saved DDL template runs;
+    * query_submit — the D2 opt-out applies at SUBMIT time too (jobs.py),
+      so with MCP_READONLY=0 a DDL job can be submitted.
+
+    Every other tool's annotations are static and env-independent.
+    """
+    run_sql_read_only = mcp_readonly_enabled() and not _writes.writes_enabled()
+    saved_read_only = mcp_readonly_enabled()
+    submit_read_only = mcp_readonly_enabled()
+    if run_sql_read_only and saved_read_only and submit_read_only:
+        return _TOOLS  # the default posture: every static hint is already honest
+    out: list[Tool] = []
+    for t in _TOOLS:
+        if t.name == "run_sql":
+            ann = _tool_annotations(
+                read_only=run_sql_read_only, destructive=False, idempotent=True, open_world=True
+            )
+        elif t.name == "query_saved":
+            ann = _tool_annotations(
+                read_only=saved_read_only, destructive=False, idempotent=True, open_world=True
+            )
+        elif t.name == "query_submit":
+            ann = _tool_annotations(
+                read_only=submit_read_only, destructive=False, idempotent=False, open_world=True
+            )
+        else:
+            out.append(t)
+            continue
+        out.append(t.model_copy(update={"annotations": ann}))
+    return out
+
+
 async def _handle_list_tools(ctx, params) -> ListToolsResult:
     """Return tools/list results (wired onto the low-level Server below)."""
-    return ListToolsResult(tools=_TOOLS)
+    return ListToolsResult(tools=_listed_tools())
 
 
 def mcp_tool_specs() -> list[dict]:
@@ -156,6 +197,22 @@ def _param_invalid(name: str, args: dict) -> tuple[str, list[str]] | None:
     return message, hints
 
 
+class _ToolError(str):
+    """A tool-function FAILURE return: byte-identical text, marked type.
+
+    The tools/call contract wants isError=true when a tool fails, but every
+    tool catches internally and returns an error STRING. Returning that text
+    as this subclass keeps it identical for every str consumer while letting
+    _dispatch_tool derive the flag (P1-7, 2026-11-12 audit)."""
+
+
+def _ok(text: str) -> tuple[str, bool]:
+    """The success-shape return: a _ToolError marker decides the flag."""
+    if isinstance(text, _ToolError):
+        return str(text), True
+    return text, False
+
+
 def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
     """Run one tool synchronously; returns (text, is_error).
 
@@ -174,7 +231,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
     caller = _identity.caller_from_request_state(request)
     try:
         if name == "admin_grants":
-            return admin_grants(caller=caller), False
+            return _ok(admin_grants(caller=caller))
         elif name == "admin_policy_set":
             doc = args.get("policy")
             if not isinstance(doc, str):
@@ -186,7 +243,7 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
                     ),
                     True,
                 )
-            return admin_policy_set(doc, caller=caller), False
+            return _ok(admin_policy_set(doc, caller=caller))
         elif name == "admin_key_mint":
             label = args.get("label")
             if label is not None and not isinstance(label, str):
@@ -194,14 +251,14 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
             assign = args.get("assign")
             if assign is not None and not isinstance(assign, list):
                 return _errors.enrich("Error minting key: assign must be a list of glob strings."), True
-            return admin_key_mint(label, assign, caller=caller), False
+            return _ok(admin_key_mint(label, assign, caller=caller))
         elif name == "admin_key_revoke":
-            return admin_key_revoke(str(args.get("fp", "")), caller=caller), False
+            return _ok(admin_key_revoke(str(args.get("fp", "")), caller=caller))
         elif name == "ask_data":
             execute = args.get("execute")
             if execute is not None and not isinstance(execute, bool):
                 return _errors.enrich("Error planning question: execute must be a boolean."), True
-            return ask_data(str(args.get("question", "")), execute=bool(execute)), False
+            return _ok(ask_data(str(args.get("question", "")), execute=bool(execute), caller=caller))
         elif name == "explain_query":
             params = args.get("params")
             if params is not None and not isinstance(params, (dict, list)):
@@ -211,104 +268,108 @@ def _dispatch_tool(name: str, args: dict, request=None) -> tuple[str, bool]:
             include_plan = args.get("include_plan")
             if include_plan is not None and not isinstance(include_plan, bool):
                 return _errors.enrich("Error explaining query: include_plan must be a boolean."), True
-            return explain_query(
+            return _ok(explain_query(
                 str(args.get("sql", "")),
                 params,
                 args.get("version_as_of"),
                 bool(include_plan),
                 caller=caller,
-            ), False
+            ))
         elif name == "sample_rows":
             raw_limit = args.get("limit")
             limit = int(raw_limit) if raw_limit is not None else 20
-            return sample_rows(str(args.get("table", "")), limit, args.get("columns"), caller=caller), False
+            return _ok(sample_rows(str(args.get("table", "")), limit, args.get("columns"), caller=caller))
         elif name == "whoami":
-            return whoami(caller=caller), False
+            return _ok(whoami(caller=caller))
         elif name == "list_tables":
-            return list_tables(), False
+            return _ok(list_tables(caller=caller))
         elif name == "describe_table":
-            return describe_table(str(args.get("table", ""))), False
+            return _ok(describe_table(str(args.get("table", "")), caller=caller))
         elif name == "profile_table":
             cols = args.get("columns")
             col_list = [c.strip() for c in str(cols).split(",") if c.strip()] if cols else None
-            return profile_table(str(args.get("table", "")), col_list), False
+            return _ok(profile_table(str(args.get("table", "")), col_list, caller=caller))
         elif name == "search_tables":
-            return search_tables(str(args.get("query", ""))), False
+            return _ok(search_tables(str(args.get("query", "")), caller=caller))
         elif name == "run_sql":
             params = args.get("params")
             if params is not None and not isinstance(params, (dict, list)):
                 return "Error running SQL: params must be an object or an array.", True
-            return run_sql(
+            return _ok(run_sql(
                 str(args.get("sql", "")),
                 args.get("limit"),
                 args.get("output_format") or "markdown",
                 params,
                 args.get("version_as_of"),
                 offset=args.get("offset", 0),
-            ), False
+                caller=caller,
+            ))
         elif name == "scan_table":
             # An explicit limit of 0 is honored (empty result); only a
             # missing limit defaults to 100. A negative limit resolves to
             # the SQLHANDLER_MAX_ROWS cap inside scan_table (decision D4).
             raw_limit = args.get("limit")
             limit = int(raw_limit) if raw_limit is not None else 100
-            return scan_table(
+            return _ok(scan_table(
                 str(args.get("table", "")),
                 args.get("columns"),
                 limit,
                 args.get("output_format") or "markdown",
                 args.get("version_as_of"),
                 offset=args.get("offset", 0),
-            ), False
+                caller=caller,
+            ))
         elif name == "column_stats":
             raw_top = args.get("top_n")
             top_n = int(raw_top) if raw_top is not None else 5
-            return column_stats(str(args.get("table", "")), str(args.get("column", "")), top_n), False
+            return _ok(column_stats(str(args.get("table", "")), str(args.get("column", "")), top_n, caller=caller))
         elif name == "query_submit":
             params = args.get("params")
             if params is not None and not isinstance(params, (dict, list)):
                 return "Error submitting query job: params must be an object or an array.", True
-            return query_submit(
+            return _ok(query_submit(
                 str(args.get("sql", "")),
                 args.get("limit"),
                 params,
                 args.get("version_as_of"),
                 caller=caller,
-            ), False
+            ))
         elif name == "query_status":
-            return query_status(str(args.get("job_id", "")), caller=caller), False
+            return _ok(query_status(str(args.get("job_id", "")), caller=caller))
         elif name == "query_result":
-            return query_result(
+            return _ok(query_result(
                 str(args.get("job_id", "")),
                 args.get("output_format") or "markdown",
                 caller=caller,
-            ), False
+            ))
         elif name == "query_cancel":
-            return query_cancel(str(args.get("job_id", "")), caller=caller), False
+            return _ok(query_cancel(str(args.get("job_id", "")), caller=caller))
         elif name == "query_save":
-            return query_save(
+            return _ok(query_save(
                 args.get("name"),
                 str(args.get("sql", "")),
                 args.get("params"),
                 args.get("description"),
                 request,
-            ), False
+                caller=caller,
+            ))
         elif name == "query_list":
-            return query_list(), False
+            return _ok(query_list(caller=caller))
         elif name == "query_delete":
-            return query_delete(args.get("name"), request), False
+            return _ok(query_delete(args.get("name"), request, caller=caller))
         elif name == "query_saved":
             params = args.get("params")
             if params is not None and not isinstance(params, (dict, list)):
                 return "Error running saved query: params must be an object or an array.", True
-            return query_saved(
+            return _ok(query_saved(
                 str(args.get("name", "")),
                 params,
                 args.get("limit"),
                 args.get("output_format") or "markdown",
                 args.get("version_as_of"),
                 offset=args.get("offset", 0),
-            ), False
+                caller=caller,
+            ))
         return f"Unknown tool: {name}", True
     except Exception as exc:
         # The dispatch-level catch: the human message stays primary, the
@@ -524,7 +585,11 @@ _TOOLS = [
             "<db-alias>.<schema>.<table> and can be joined with lake tables in the same "
             "query. Aggregations, filters, and joins are pushed into the scan. "
             "SELECT-only: DDL/DML (INSERT, CREATE, ATTACH, COPY, ...) are rejected "
-            "unless the operator set SQLHANDLER_MCP_READONLY=0."
+            "unless the operator set SQLHANDLER_MCP_READONLY=0. This tool is NOT "
+            "read-only when SQLHANDLER_MCP_READONLY=0 (DDL/DML allowed) or the "
+            "write tier is enabled (SQLHANDLER_WRITES_ENABLED: ONE classified "
+            "scratch write — CTAS/INSERT/COPY INTO under the allowlisted scratch "
+            "root — is admitted)."
         ),
         input_schema={
             "type": "object",
@@ -787,7 +852,9 @@ Tool(
         description=(
             "Start an async query job and return its job_id immediately — for "
             "queries that may outlive a tool-call timeout. The read-only guard "
-            "applies at SUBMIT time (DDL is refused, same as run_sql); the job "
+            "applies at SUBMIT time (DDL is refused, same as run_sql; with "
+            "SQLHANDLER_MCP_READONLY=0 a DDL job can be submitted and this "
+            "tool is NOT read-only); the job "
             "runs on the same engine path with the same SQLHANDLER_QUERY_TIMEOUT "
             "(600s default, watchdog-enforced) and SQLHANDLER_MAX_ROWS cap. "
             "Poll query_status, then fetch ONCE with query_result. The registry "
@@ -916,7 +983,9 @@ Tool(
             "Run a saved parameterized query by name. Call-time params override "
             "stored ones (dict merge) and travel as BIND parameters — the stored "
             "SQL is never string-interpolated. The read-only guard is re-applied "
-            "at run time. output_format/limit/version_as_of work like run_sql."
+            "at run time; with SQLHANDLER_MCP_READONLY=0 a saved DDL template "
+            "runs and this tool is NOT read-only. output_format/limit/version_"
+            "as_of work like run_sql."
         ),
         input_schema={
             "type": "object",
@@ -1091,7 +1160,12 @@ class _ProbesAuthMiddleware:
 
     @staticmethod
     def _expected() -> list[str]:
-        expected = [os.environ.get("SQLHANDLER_API_TOKEN", "").strip()]
+        # Comma-separated, same as the /api middleware (cross-validation
+        # 2026-11-12, P3: a rotation list authenticated /api but locked
+        # /metrics out because this read the whole string as ONE token).
+        expected = [
+            t.strip() for t in os.environ.get("SQLHANDLER_API_TOKEN", "").split(",") if t.strip()
+        ]
         expected.extend(_McpApiKeyMiddleware._keys())
         return [t for t in expected if t]
 
@@ -1460,11 +1534,15 @@ def _prewarm(handler: SqlEngine, tables: tuple[str, ...]) -> None:
 # --------------------------------------------------------------------------
 
 
-def list_tables() -> str:
-    """List the tables available in the configured data source."""
+def list_tables(*, caller=None) -> str:
+    """List the tables available in the configured data source.
+
+    ``caller`` (identity spine) scopes the list: tables the caller's policy
+    HIDES are omitted, and the per-caller cache key is used.
+    """
     try:
         handler = _handler()
-        tables = handler.list_tables()
+        tables = handler.list_tables(caller=caller)
         lines: list[str]
         if not tables:
             lines = ["No tables found in the configured data source."]
@@ -1510,14 +1588,18 @@ def list_tables() -> str:
             lines.append(f"(attached-database listing unavailable: {exc})")
         return "\n".join(lines)
     except Exception as exc:
-        return f"Error listing tables: {exc}"
+        return _ToolError(f"Error listing tables: {exc}")
 
 
-def describe_table(table: str) -> str:
-    """Return column names, types, and the canonical URI for a table."""
+def describe_table(table: str, *, caller=None) -> str:
+    """Return column names, types, and the canonical URI for a table.
+
+    ``caller`` (identity spine) applies policy: hidden tables refuse, masked
+    columns are omitted, and the describe cache is keyed per policy hash.
+    """
     try:
         handler = _handler()
-        info = handler.describe_table(table)
+        info = handler.describe_table(table, caller=caller)
         lines = [f"Table: {info['table']}", f"URI: {info['uri']}"]
         if info.get("virtual"):
             lines.append("Kind: VIRTUAL — computed on the fly from its semantic-catalog definition")
@@ -1533,14 +1615,18 @@ def describe_table(table: str) -> str:
             lines.append(line)
         return "\n".join(lines)
     except Exception as exc:
-        return f"Error describing table: {exc}"
+        return _ToolError(f"Error describing table: {exc}")
 
 
-def profile_table(table: str, columns: list[str] | None = None) -> str:
-    """Return per-column statistics for a table as a markdown table."""
+def profile_table(table: str, columns: list[str] | None = None, *, caller=None) -> str:
+    """Return per-column statistics for a table as a markdown table.
+
+    ``caller`` (identity spine) profiles through the caller's masking view
+    and keys the profile cache per policy hash.
+    """
     try:
         handler = _handler()
-        p = handler.profile_table(table, columns=columns)
+        p = handler.profile_table(table, columns=columns, caller=caller)
         header = [f"Table: {p['table']}"]
         if p.get("n_rows") is not None:
             header.append(
@@ -1554,16 +1640,24 @@ def profile_table(table: str, columns: list[str] | None = None) -> str:
         import pandas as pd
 
         df = pd.DataFrame(p["columns"])
+        # Same escape contract as _arrow_to_markdown (cross-validation
+        # 2026-11-12, P2): a pipe or newline in a column name / min-max value
+        # otherwise splits the row and an LLM reads the wrong column.
+        df = _escape_markdown_cells(df)
         return "\n".join(header) + "\n\n" + df.to_markdown(index=False)
     except Exception as exc:
-        return f"Error profiling table: {exc}"
+        return _ToolError(f"Error profiling table: {exc}")
 
 
-def search_tables(query: str) -> str:
-    """Keyword search over table names/columns/catalog descriptions."""
+def search_tables(query: str, *, caller=None) -> str:
+    """Keyword search over table names/columns/catalog descriptions.
+
+    ``caller`` (identity spine) hides tables the caller's policy does not
+    expose — search must not become an existence oracle for them.
+    """
     try:
         handler = _handler()
-        results = handler.search_tables(query)
+        results = handler.search_tables(query, caller=caller)
         if not results:
             return f"No tables match {query!r}. Try broader keywords, or run list_tables."
         lines = [f"Found {len(results)} table(s) matching {query!r}:"]
@@ -1576,7 +1670,7 @@ def search_tables(query: str) -> str:
                 lines.append(f"      {r['description']}")
         return "\n".join(lines)
     except Exception as exc:
-        return f"Error searching tables: {exc}"
+        return _ToolError(f"Error searching tables: {exc}")
 
 
 def run_sql(
@@ -1625,6 +1719,14 @@ def run_sql(
             if len(classes) == 1 and classes[0].kind == _writes.CLASS_WRITE_SCRATCH:
                 arrow = _handler().execute_write(sql, params=params, caller=caller)
                 return _write_summary_output(arrow, fmt=fmt)
+            if len(classes) == 1 and classes[0].kind == _writes.CLASS_WRITE_OTHER:
+                # Surface the classifier's OWN reason (audit 2026-11-12): a
+                # statement the write tier knows it cannot serve (e.g. COPY,
+                # which writes a FILE through a filesystem-locked connection)
+                # used to fall through to the generic D2 "not allowed" text,
+                # hiding the actionable rewrite hint.
+                reason = getattr(classes[0], "reason", "") or "this statement is not a supported write"
+                raise _writes.WriteError(reason)
         if mcp_readonly_enabled():
             # Decision D2: MCP callers get the web API's read-only guarantee
             # by default. ValueError -> the "Error running SQL:" text below,
@@ -1640,7 +1742,7 @@ def run_sql(
         )
         return _arrow_to_output(arrow, max_rows=limit, fmt=fmt, offset=page_offset, tool="run_sql")
     except Exception as exc:
-        return f"Error running SQL: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error running SQL: {_errors.enrich(str(exc))}")
 
 
 def _write_summary_output(arrow, fmt: str = "markdown") -> str:
@@ -1678,6 +1780,7 @@ def scan_table(
     version_as_of: int | None = None,
     *,
     offset: int = 0,
+    caller=None,
 ) -> str:
     """Fetch rows/columns from a table via pyarrow (columnar).
 
@@ -1712,13 +1815,14 @@ def scan_table(
             columns=col_list,
             limit=_fetch_limit(resolved_limit, page_offset),
             version_as_of=version_as_of,
+            caller=caller,
         )
         return _arrow_to_output(arrow, max_rows=resolved_limit, fmt=fmt, offset=page_offset, tool="scan_table")
     except Exception as exc:
-        return f"Error scanning table: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error scanning table: {_errors.enrich(str(exc))}")
 
 
-def column_stats(table: str, column: str, top_n: int = 5) -> str:
+def column_stats(table: str, column: str, top_n: int = 5, *, caller=None) -> str:
     """Statistics for ONE column over a bounded sample (additive).
 
     distinct count, null count/pct, min/max, q25/q50/q75 and the top-N
@@ -1726,10 +1830,10 @@ def column_stats(table: str, column: str, top_n: int = 5) -> str:
     cap profile_table uses (never a full-table scan beyond the profile cap).
     """
     try:
-        s = _handler().column_stats(table, column, top_n)
+        s = _handler().column_stats(table, column, top_n, caller=caller)
         return _column_stats_markdown(s)
     except Exception as exc:
-        return f"Error computing column stats: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error computing column stats: {_errors.enrich(str(exc))}")
 
 
 def _md_cell(value) -> str:
@@ -1788,10 +1892,11 @@ def whoami(*, caller=None) -> str:
     policy is configured. A caller NEVER sees another user's view: the
     rules are computed for THIS caller only.
 
-    Note: ``_effective_rule`` lands with the engine-side Stage-2 policy
-    integration (another agent's zone); until then the per-table view
-    degrades to "everything visible" via the fail-open fallback below
-    (never a 500 - whoami is a preview, not an enforcement surface).
+    Note: the per-table view is computed through the engine's real
+    ``_effective_rule(info, caller)`` (the Stage-2 policy integration that
+    landed in the W-waves), so it matches what enforcement actually does.
+    A failure in that computation still degrades to "everything visible"
+    rather than raising - whoami is a preview, not an enforcement surface.
     """
     try:
         effective_caller = caller if caller is not None else _identity.ANONYMOUS
@@ -1844,7 +1949,7 @@ def whoami(*, caller=None) -> str:
         }
         return json.dumps(payload, indent=2, default=str)
     except Exception as exc:
-        return f"Error computing whoami: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error computing whoami: {_errors.enrich(str(exc))}")
 
 
 def _whoami_rest_payload(request) -> dict:
@@ -1961,7 +2066,7 @@ def _ask_data_markdown(
     if describe:
         lines += ["", f"Schema of {primary['table']}:"]
         cols = describe.get("columns") or []
-        shown = cols[:_ASK_MAX_COLUMNS]
+        shown = cols[: _ask_max_columns()]
         for c in shown:
             line = f"- {c.get('name')}: {c.get('type')}"
             if c.get("description"):
@@ -1973,8 +2078,8 @@ def _ask_data_markdown(
         if describe.get("description") and not primary.get("description"):
             lines.append(f"- description: {describe['description']}")
     if profile:
-        lines += ["", f"Column statistics (top {_ASK_MAX_PROFILE_COLUMNS}, sampled — see profile_table for all):"]
-        for c in profile.get("columns", [])[:_ASK_MAX_PROFILE_COLUMNS]:
+        lines += ["", f"Column statistics (top {_ask_max_profile_columns()}, sampled — see profile_table for all):"]
+        for c in profile.get("columns", [])[: _ask_max_profile_columns()]:
             rng = ""
             if c.get("min") is not None or c.get("max") is not None:
                 rng = f", range {c.get('min')} … {c.get('max')}"
@@ -2000,7 +2105,7 @@ def _ask_data_markdown(
     return "\n".join(lines)
 
 
-def ask_data(question: str, execute: bool = False) -> str:
+def ask_data(question: str, execute: bool = False, *, caller=None) -> str:
     """Turn a plain-language data question into a SQL plan — never executes.
 
     For "how many work orders are overdue?" / "answer this question about
@@ -2022,7 +2127,7 @@ def ask_data(question: str, execute: bool = False) -> str:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Provide the question to plan (e.g. 'total amount by order kind').")
         handler = _handler()
-        matches = handler.search_tables(question, limit=_ASK_MAX_TABLES)
+        matches = handler.search_tables(question, limit=_ask_max_tables(), caller=caller)
         describes: dict[str, dict] = {}
         profile: dict | None = None
         draft: str | None = None
@@ -2033,19 +2138,21 @@ def ask_data(question: str, execute: bool = False) -> str:
             # profile up to 6 columns of it so the draft's filters start honest.
             top = matches[0]
             try:
-                describe = handler.describe_table(top["table"])
+                describe = handler.describe_table(top["table"], caller=caller)
                 # The draft targets the SQL-addressable identifier (the same
                 # registered view a run_sql would use), NOT the discovery
                 # path form — see _safe_sql_target.
                 describe = {**describe, "draft_target": top.get("qualified_name") or top["table"]}
                 describes[top["table"]] = describe
                 cols = describe.get("columns") or []
-                if cols and len(cols) > _ASK_MAX_COLUMNS:
-                    cols = cols[:_ASK_MAX_COLUMNS]
+                if cols and len(cols) > _ask_max_columns():
+                    cols = cols[: _ask_max_columns()]
                 if cols:
                     try:
                         profile = handler.profile_table(
-                            top["table"], columns=[c["name"] for c in cols[:_ASK_MAX_PROFILE_COLUMNS]]
+                            top["table"],
+                            columns=[c["name"] for c in cols[: _ask_max_profile_columns()]],
+                            caller=caller,
                         )
                     except Exception:
                         profile = None  # profiling is optional enrichment
@@ -2066,15 +2173,38 @@ def ask_data(question: str, execute: bool = False) -> str:
             "run the drafted SQL with an explicit run_sql call).",
         )
     except Exception as exc:
-        return f"Error planning question: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error planning question: {_errors.enrich(str(exc))}")
 
 
-# ask_data token-budget discipline (review 2d): the caps that keep one
-# question's answer inside a model context - candidates listed (5), columns
-# described per candidate table (20), columns profiled (6).
+# ask_data token-budget discipline: the caps that keep one question's answer
+# inside a model context - candidates listed, columns described per candidate
+# table, columns profiled. Defaults shown; each is env-controllable.
 _ASK_MAX_TABLES = 5
 _ASK_MAX_COLUMNS = 20
 _ASK_MAX_PROFILE_COLUMNS = 6
+
+
+def _ask_cap(name: str, default: int) -> int:
+    """Read one non-negative ask_data cap (garbage -> the default)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return default
+
+
+def _ask_max_tables() -> int:
+    return _ask_cap("SQLHANDLER_ASK_MAX_TABLES", _ASK_MAX_TABLES)
+
+
+def _ask_max_columns() -> int:
+    return _ask_cap("SQLHANDLER_ASK_MAX_COLUMNS", _ASK_MAX_COLUMNS)
+
+
+def _ask_max_profile_columns() -> int:
+    return _ask_cap("SQLHANDLER_ASK_MAX_PROFILE_COLUMNS", _ASK_MAX_PROFILE_COLUMNS)
 
 
 # E_ROWS_CAPPED fix hints (rendered in the structured tail of capped results).
@@ -2183,7 +2313,7 @@ def sample_rows(table: str, limit: int = 20, columns: str | None = None, *, call
         s = handler.sample_rows(table, limit=raw_limit, columns=col_list, caller=caller)
         return _sample_rows_markdown(s)
     except Exception as exc:
-        return f"Error sampling rows: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error sampling rows: {_errors.enrich(str(exc))}")
 
 
 def explain_query(
@@ -2210,7 +2340,7 @@ def explain_query(
         )
         return _explain_query_markdown(r)
     except Exception as exc:
-        return f"Error explaining query: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error explaining query: {_errors.enrich(str(exc))}")
 
 
 def _draft_sql(question: str, describe: dict) -> str:
@@ -2226,7 +2356,7 @@ def _draft_sql(question: str, describe: dict) -> str:
     """
     target = _safe_sql_target(describe)
     columns = [c.get("name", "") for c in describe.get("columns", []) if c.get("name")]
-    selected = ", ".join(_safe_ident_col(c) for c in columns[:_ASK_MAX_PROFILE_COLUMNS]) or "*"
+    selected = ", ".join(_safe_ident_col(c) for c in columns[: _ask_max_profile_columns()]) or "*"
     limit = _max_rows()
     return f"SELECT {selected} FROM {target} LIMIT {max(limit, 1)}"
 
@@ -2258,6 +2388,12 @@ def _suggest_follow_up(question: str, top: dict, describe: dict) -> str:
     if cols:
         first = str(cols[0].get("name", ""))
         return f"Profile one column before filtering: column_stats(table='{name}', column='{first}')."
+    # No columns to suggest (an empty describe). Return a real sentence: an
+    # implicit None rendered "Suggested follow-up: None" to the caller
+    # (audit 2026-11-12, P3).
+    if name:
+        return f"Inspect the table shape before filtering: describe_table(table='{name}')."
+    return "List the available tables first: list_tables()."
 
 
 # ---------------------------------------------------------------------------
@@ -2339,33 +2475,33 @@ def query_cancel(job_id: str, *, caller=None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def query_save(name, sql, params=None, description=None, request=None) -> str:
+def query_save(name, sql, params=None, description=None, request=None, *, caller=None) -> str:
     """Save a parameterized query under a name (writes are auth-gated).
 
     The SQL is validated at save time (parsed; SELECT-only while the MCP
     read-only mode is on) and parameters are stored as BIND params — the
     stored SQL keeps its $name / ? placeholders and is never
     string-interpolated at run time.
-    """
-    # Caller attribution rides the saved entry when the store supports it
-    # (owner-scoped listing under policy enforcement); forward-compatible
-    # with the pre-attribution saved.py signature.
-    import inspect as _inspect
 
-    kwargs: dict = {}
-    if "caller" in _inspect.signature(_saved.api_saved_save).parameters:
-        kwargs["caller"] = _identity.caller_from_request_state(request)
+    ``caller`` (identity spine) is the owner scope the entry is saved under:
+    under policy enforcement, listing/running is owner-scoped, so an
+    unattributed save would be invisible to (or worse, visible to everyone
+    instead of) its author.
+    """
     entry = _saved.api_saved_save(
         {"name": name, "sql": sql, "params": params, "description": description},
         request,
-        **kwargs,
+        caller=caller,
     )
     return json.dumps({"saved": True, **entry}, default=str)
 
 
-def query_list() -> str:
-    """List saved queries (name, SQL, params, description)."""
-    entries = _saved.api_saved_list()
+def query_list(*, caller=None) -> str:
+    """List saved queries (name, SQL, params, description).
+
+    ``caller`` (identity spine): owner-scoped under policy enforcement.
+    """
+    entries = _saved.api_saved_list(caller=caller)
     if not entries:
         return "No saved queries yet. Save one with query_save(name, sql, params)."
     lines = [f"Saved queries ({len(entries)}):"]
@@ -2379,9 +2515,9 @@ def query_list() -> str:
     return "\n".join(lines)
 
 
-def query_delete(name, request=None) -> str:
+def query_delete(name, request=None, *, caller=None) -> str:
     """Delete a saved query by name (writes are auth-gated)."""
-    result = _saved.api_saved_delete(name, request)
+    result = _saved.api_saved_delete(name, request, caller=caller)
     return f"Deleted saved query {result['deleted']!r}."
 
 
@@ -2393,6 +2529,7 @@ def query_saved(
     version_as_of: int | None = None,
     *,
     offset: int = 0,
+    caller=None,
 ) -> str:
     """Run a saved query by name; call-time params override stored ones.
 
@@ -2400,13 +2537,14 @@ def query_saved(
     into the SQL. The read-only guard is re-applied to the stored SQL at run
     time, so a hand-edited store cannot smuggle DDL past the read-only mode.
     """
-    sql, merged, _entry = _saved.api_saved_run(name, {"params": params})
+    sql, merged, _entry = _saved.api_saved_run(name, {"params": params}, caller=caller)
     page_offset = _resolve_offset(offset)
     arrow = _handler().query_duckdb(
         sql,
         limit=_fetch_limit(limit, page_offset),
         params=merged,
         version_as_of=version_as_of,
+        caller=caller,
     )
     return _arrow_to_output(arrow, max_rows=limit, fmt=output_format, offset=page_offset, tool="query_saved")
 
@@ -2439,6 +2577,94 @@ def _resolve_scan_limit(limit: int | None) -> int | None:
     return limit
 
 
+try:  # optional fast renderer (pure Arrow); None = always use pandas
+    from .fastrender import arrow_to_markdown_fast as _fast_markdown
+except Exception:  # pragma: no cover - fastrender is pure-python and shipped
+    _fast_markdown = None
+
+
+#: Characters a markdown table cell must escape (audit 2026-11-12, P2).
+#: A raw `|` starts a new CELL and a newline ends the ROW, so a value like
+#: `x|y` silently shifts every later column — an LLM reading the table then
+#: attributes a value to the wrong column. `<br>` is the table-safe newline.
+_MD_PIPE = "\\|"
+
+
+def _escape_markdown_cells(df):
+    """Escape pipe/newline inside STRING cells of a markdown-bound frame.
+
+    Numeric/bool/temporal columns are untouched (their repr can never contain
+    a pipe), so the common path pays one dtype check per column.
+    """
+    try:
+        import pandas as pd
+
+        out = df.copy()
+        for col in out.columns:
+            series = out[col]
+            if series.dtype == object or pd.api.types.is_string_dtype(series.dtype):
+                out[col] = series.map(
+                    lambda v: v.replace("|", _MD_PIPE).replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
+                    if isinstance(v, str)
+                    else v
+                )
+        return out
+    except Exception:  # rendering must never fail on the escape pass
+        return df
+
+
+def _has_timestamp_column(arrow) -> bool:
+    """Timestamp columns are EXCLUDED from the fast renderer.
+
+    fastrender's naive-timestamp formatter drops the time for a clean
+    midnight ("1970-01-01") while the pandas/numpy path renders
+    "1970-01-01T00:00:00.000000" - a parity break its own tests missed
+    (found 2026-11-12 while wiring it). The fast path is therefore skipped for
+    any table carrying a timestamp column; this predicate is pinned by a test
+    so removing the exclusion is a deliberate act (fix the formatter to be
+    resolution-aware first).
+    """
+    try:
+        import pyarrow as pa
+
+        return any(pa.types.is_timestamp(f.type) for f in arrow.schema)
+    except Exception:
+        return True
+
+
+def _escape_markdown_arrow(arrow):
+    """Escape pipe/newline in STRING columns before markdown rendering.
+
+    Done at the ARROW level so BOTH renderers (the pure-Arrow fast path and
+    the pandas/tabulate fallback) see identical, already-escaped values -
+    otherwise the escape would have to be duplicated per renderer and a table
+    that the fast path handles would lose it (cross-validation 2026-11-12).
+    A raw pipe starts a new CELL and a newline ends the ROW, so an unescaped
+    value makes an LLM read the wrong column.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        changed = False
+        cols = []
+        for field, col in zip(arrow.schema, arrow.columns):
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+                new = pc.replace_substring(col, pattern="|", replacement="\\|")
+                new = pc.replace_substring(new, pattern="\r\n", replacement="<br>")
+                new = pc.replace_substring(new, pattern="\n", replacement="<br>")
+                new = pc.replace_substring(new, pattern="\r", replacement="<br>")
+                cols.append(new)
+                changed = True
+            else:
+                cols.append(col)
+        if not changed:
+            return arrow
+        return pa.Table.from_arrays(cols, schema=arrow.schema)
+    except Exception:  # escaping must never break rendering
+        return arrow
+
+
 def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
     """Render a pyarrow Table as a compact markdown table for an LLM."""
     try:
@@ -2452,6 +2678,25 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
             max_rows = min(max_rows, cap)
         if cap > 0 and arrow.num_rows > cap:
             arrow = arrow.slice(0, cap)
+        arrow = _escape_markdown_arrow(arrow)
+        # Pure-Arrow renderer first (audit 2026-11-12: fastrender.py was dead
+        # code while SCALING.md claimed it was wired). Its contract is
+        # all-or-nothing: None means "this table is outside the proven parity
+        # set", and we fall back to pandas/tabulate on the SAME escaped data.
+        if _fast_markdown is not None and not _has_timestamp_column(arrow):
+            try:
+                # Boundary rule (D4) applies to the FAST path too: 0 means
+                # unlimited and a negative count must never slice — the
+                # renderer treats 0 as "zero rows" and would drop everything
+                # (pinned by test_security::test_markdown_non_positive_max_rows
+                # _never_drops_rows).
+                fast = _fast_markdown(
+                    arrow, max_rows=(max_rows if (max_rows is not None and max_rows > 0) else None)
+                )
+            except Exception:  # a renderer bug must never break a tool result
+                fast = None
+            if fast is not None:
+                return fast
         df = arrow.to_pandas()
         # Boundary rule: only a POSITIVE max_rows may reach .head(). 0 means
         # unlimited (no head at all), and a negative count would silently
@@ -2461,6 +2706,17 @@ def _arrow_to_markdown(arrow, max_rows: int | None = 100) -> str:
         return df.to_markdown(index=False)
     except Exception:
         return str(arrow)
+
+
+#: Leading characters that make a spreadsheet treat a TEXT cell as a formula.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_csv_cell(value):
+    """Prefix a formula-looking TEXT cell with an apostrophe; pass others through."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def _validate_output_format(output_format: str) -> str:
@@ -2558,8 +2814,14 @@ def _render_result_rows(
         payload = arrow_to_payload(arrow)
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(payload["columns"])
-        writer.writerows(payload["rows"])
+        # Headers are query-derived too (a column alias can start with "=").
+        writer.writerow([_neutralize_csv_cell(c) for c in payload["columns"]])
+        # Spreadsheet formula injection (audit 2026-11-12, P2): a TEXT cell
+        # beginning with = + - @ (or a tab/CR) is executed as a formula when
+        # the CSV is opened in Excel/Sheets. A leading apostrophe is the
+        # standard neutralizer and is invisible in the sheet. Non-string cells
+        # (real numbers) are untouched, so `-5` stays numeric.
+        writer.writerows([_neutralize_csv_cell(v) for v in row] for row in payload["rows"])
         return buf.getvalue()
     return _arrow_to_markdown(arrow, max_rows=None)
 
@@ -2894,7 +3156,11 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
         except Exception:
             entry = None
         if entry is not None:
-            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
+            # A self-minted key is BOUND to a store-verified subject; carry it so the admin surface, whoami and the data plane all resolve the same caller (the documented "authenticates AS that user"). Admin-minted keys have no subject and stay key-only.
+            subject = str(entry.get("subject") or "") or None
+            return _identity.Caller(
+                cls=_identity.CALLER_CLASS_KEY, subject=subject, key_fp=entry.get("fp"), via="key"
+            )
     if presented["api_key"]:
         return None  # a wrong explicit key claim — refuse, full stop
 
@@ -2913,7 +3179,11 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
         except Exception:
             entry = None
         if entry is not None:
-            return _identity.Caller(cls=_identity.CALLER_CLASS_KEY, subject=None, key_fp=entry.get("fp"), via="key")
+            # A self-minted key is BOUND to a store-verified subject; carry it so the admin surface, whoami and the data plane all resolve the same caller (the documented "authenticates AS that user"). Admin-minted keys have no subject and stay key-only.
+            subject = str(entry.get("subject") or "") or None
+            return _identity.Caller(
+                cls=_identity.CALLER_CLASS_KEY, subject=subject, key_fp=entry.get("fp"), via="key"
+            )
     if presented["bearer"]:
         caller = _identity.caller_from_request_state(request)
         if not getattr(caller, "is_anonymous", True):
@@ -2930,6 +3200,95 @@ def _admin_resolve_caller(request, presented: dict[str, list[str]]):
     return caller
 
 
+#: Signature of the last logged designation diagnostic (log once per state).
+_admin_designation_sig: tuple | None = None
+
+
+def _warn_admin_designation_once() -> None:
+    """Log ONCE per (admins, configured keys) state when key-based admin is unreachable.
+
+    Live 2026-11-12: the policy named sha256:b1a47ad2d71c while the
+    deployment's only key hashed to sha256:a56c9e0bc0cd — a rotation left
+    the designation dangling and every admin request 403'd behind one
+    generic string. One log line names the mismatch instead.
+    """
+    global _admin_designation_sig
+    try:
+        from .policy import policy_store
+
+        admins = tuple(getattr(policy_store().get(), "admins", ()) or ())
+        fps = tuple(sorted({_identity.key_fp(k) for k in _McpApiKeyMiddleware._keys()}))
+    except Exception:
+        return
+    sig = (admins, fps)
+    if sig == _admin_designation_sig:
+        return
+    _admin_designation_sig = sig
+    designated_fps = tuple(sorted(a for a in admins if a.startswith("sha256:")))
+    subjects = tuple(sorted(a for a in admins if not a.startswith("sha256:")))
+    if not admins:
+        logger.warning(
+            "policy designates NO admins — the administration plane is unreachable for "
+            "every caller (configured key fps: %s). Add 'subject:<name>' or "
+            "'key:sha256:<12hex>' to the policy's admins list.",
+            list(fps) or "(none)",
+        )
+    elif designated_fps and not (set(designated_fps) & set(fps)):
+        logger.warning(
+            "admin designation matches NO configured key: admins fps=%s, configured key "
+            "fps=%s — key-based admin is unreachable%s",
+            list(designated_fps),
+            list(fps),
+            " (subject-based admin may still work)" if subjects else "",
+        )
+
+
+def _admin_forbidden_reason(caller) -> str:
+    """The 403 body — names the CAUSE, never the designated identities.
+
+    Three different operator fixes used to hide behind one string ("admin
+    access required"): no policy loaded, a policy with no admins entry, and
+    "you are not on the list". Each now says which it is. The admins list
+    itself is never echoed — a refusal must not become a probe (see
+    require_admin's 401-before-403 ordering).
+    """
+    try:
+        from .policy import policy_store
+
+        store = policy_store()
+        admins = tuple(getattr(store.get(), "admins", ()) or ())
+        health = store.health()
+    except Exception:
+        return _ADMIN_FORBIDDEN
+    if not admins:
+        if health.get("broken"):
+            return (
+                "admin access required: the policy file is INVALID and designates no admins — "
+                "fix the policy file (the deployment is failing closed)"
+            )
+        if health.get("loaded"):
+            return (
+                "admin access required: the loaded policy designates no admins — add "
+                "'subject:<name>' or 'key:sha256:<12hex>' to its admins list"
+            )
+        if not _admin_keys.bootstrap_admin_enabled():
+            return (
+                "admin access required: no policy is loaded and the bootstrap fallback is "
+                f"disabled ({_admin_keys.BOOTSTRAP_ADMIN_ENV}=0) — add an admins entry to the policy"
+            )
+        return (
+            "admin access required: no policy is loaded and the bootstrap fallback needs an "
+            "API key (present X-API-Key or Authorization: Bearer)"
+        )
+    fp = getattr(caller, "key_fp", None)
+    if fp:
+        return f"admin access required: key fingerprint {fp} is not in the policy's admins list"
+    subject = getattr(caller, "subject", None)
+    if subject:
+        return f"admin access required: subject {subject!r} is not in the policy's admins list"
+    return _ADMIN_FORBIDDEN
+
+
 def require_admin(request) -> object:
     """The D1 admin gate: authenticate first (401), then authorize (403).
 
@@ -2940,10 +3299,13 @@ def require_admin(request) -> object:
     * anonymous (no credential, or one that matches nothing configured) →
       401 {"error": "unauthorized: ..."} — authentication precedes
       authorization so an anonymous caller can never probe the admins list;
-    * authenticated but NOT in the policy's ``admins`` list (subjects and/or
-      ``sha256:<12hex>`` fingerprints, read through
-      ``admin_keys.is_admin`` — hot-reloaded with the policy file) →
-      403 {"error": "admin access required"}.
+    * authenticated but NOT designated (the policy's ``admins`` list of
+      subjects and/or ``sha256:<12hex>`` fingerprints, read through
+      ``admin_keys.is_admin`` — hot-reloaded with the policy file, and
+      bootstrapped from the configured API key when NO policy is loaded) →
+      403 with a CAUSE-SPECIFIC message (no policy / no admins entry / not
+      on the list). The message never enumerates the admins list: a caller
+      learns their own fingerprint and the category, never who IS admin.
     """
     presented = _admin_presented_keys(request)
     caller = _admin_resolve_caller(request, presented)
@@ -2958,7 +3320,8 @@ def require_admin(request) -> object:
             "(X-API-Key / Authorization: Bearer) designated in the policy's admins list",
         )
     if not _admin_keys.is_admin(caller):
-        raise AdminHTTPError(403, _ADMIN_FORBIDDEN)
+        _warn_admin_designation_once()
+        raise AdminHTTPError(403, _admin_forbidden_reason(caller))
     return caller
 
 
@@ -3602,7 +3965,7 @@ def admin_grants(*, caller=None) -> str:
     except AdminHTTPError:
         raise
     except Exception as exc:
-        return f"Error reading grants: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error reading grants: {_errors.enrich(str(exc))}")
 
 
 def admin_policy_set(policy: str, *, caller=None) -> str:
@@ -3622,7 +3985,7 @@ def admin_policy_set(policy: str, *, caller=None) -> str:
     except AdminHTTPError:
         raise  # __str__ carries the structured fix_hints (dispatcher renders)
     except Exception as exc:
-        return f"Error setting policy: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error setting policy: {_errors.enrich(str(exc))}")
 
 
 def admin_key_mint(label=None, assign=None, *, caller=None) -> str:
@@ -3644,7 +4007,7 @@ def admin_key_mint(label=None, assign=None, *, caller=None) -> str:
     except AdminHTTPError:
         raise
     except Exception as exc:
-        return f"Error minting key: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error minting key: {_errors.enrich(str(exc))}")
 
 
 def admin_key_revoke(fp: str, *, caller=None) -> str:
@@ -3661,7 +4024,7 @@ def admin_key_revoke(fp: str, *, caller=None) -> str:
     except AdminHTTPError:
         raise
     except Exception as exc:
-        return f"Error revoking key: {_errors.enrich(str(exc))}"
+        return _ToolError(f"Error revoking key: {_errors.enrich(str(exc))}")
 
 
 def _admin_mint_key(label: str, assign: list[str] | None, created_by: str) -> dict:
@@ -3891,30 +4254,64 @@ _START_TIME = time.time()
 class _ApiTokenMiddleware:
     """ASGI middleware: require a shared token on every /api/* request.
 
-    Comparison is constant-time (hmac.compare_digest). The token protects
-    the JSON API on deployments without gateway auth; the MCP endpoint and
-    the UI stay governed by their own layers.
+    Accepts the token via Authorization: Bearer, X-API-Token or X-API-Key
+    (F4, 2026-11-12: the UI's key widget sends X-API-Key); EVERY presented
+    claim is tried, constant-time per configured token
+    (observability.token_matches). SQLHANDLER_API_TOKEN may be a
+    COMMA-SEPARATED LIST — the chart can wire the same rotation-list
+    Secret shape as MCP_API_KEYS. The token protects the JSON API on
+    deployments without gateway auth; the MCP endpoint and the UI stay
+    governed by their own layers.
     """
 
     def __init__(self, app, token: str):
         self.app = app
-        self.token = token
+        # Comma-separated token LIST (rotation story): empty entries are
+        # dropped; an EMPTY list is reachable only via a comma/whitespace-only
+        # env, which _build_http_app already declines to install (strips to
+        # "" first).
+        self.tokens = tuple(t.strip() for t in (token or "").split(",") if t.strip())
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path", "").startswith("/api"):
-            provided = ""
+            # D19 parity: collect EVERY presented claim — explicit
+            # X-API-Key/X-API-Token and the ambient Bearer — so a relay's
+            # server-level Bearer cannot shadow a valid per-request key
+            # riding the same request, and the UI's X-API-Key works.
+            claims: list[str] = []
             for k, v in scope.get("headers", []):
-                if k == b"authorization":
-                    provided = v.decode("latin-1")
-                    break
-                if k == b"x-api-token":
-                    provided = v.decode("latin-1")
-                    break
-            if not observability.token_matches(provided, self.token):
+                lk = k.lower() if isinstance(k, bytes) else k
+                if lk in (b"x-api-key", b"x-api-token"):
+                    value = v.decode("latin-1").strip()
+                    if value and value not in claims:
+                        claims.append(value)
+                elif lk == b"authorization":
+                    scheme, _, token = v.decode("latin-1").partition(" ")
+                    if scheme.lower() == "bearer":
+                        value = token.strip()
+                        if value and value not in claims:
+                            claims.append(value)
+            ok = any(
+                observability.token_matches(provided, candidate)
+                for provided in claims
+                for candidate in self.tokens
+            )
+            if not ok:
                 resp = JSONResponse({"error": "Unauthorized: missing or invalid API token."}, status_code=401)
                 await resp(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+
+def _keys_store_state() -> str:
+    """The keys store state: "disabled" | "ok" | "empty" | "unreadable".
+
+    Thin alias for admin_keys.store_state() (the P1-4 auth-gate contract):
+    the /mcp gate arms on CONFIGURED (state != "disabled") and fails closed
+    (503) on "unreadable" — never on the store's SIZE.
+    """
+    return _admin_keys.store_state()
 
 
 class _McpApiKeyMiddleware:
@@ -3946,11 +4343,15 @@ class _McpApiKeyMiddleware:
     the minted entry's fingerprint into ``scope["state"]`` exactly like an
     env match, so the identity spine is unchanged (key-class caller, same
     fp vocabulary). The gate ARMS on the union: env keys alone (exactly as
-    before) OR a keys-file-only deployment with at least one minted entry
-    (a disabled store or an empty one never arms it — no bootstrap
-    lockout, zero store I/O beyond one env read). When the store is
-    disabled the match is a cheap no-op and behavior is byte-identical to
-    the env-only days.
+    before) OR a CONFIGURED store — P1-4 fail-closed (2026-11-12 audit):
+    an EMPTY store (the last key was revoked) still arms the gate (401 for
+    keyless callers). An UNREADABLE store fails CLOSED with 503 — unless
+    env keys are configured, in which case they still authenticate (they
+    live in the process environment, not the store) and only the
+    unverifiable minted keys are refused (401). Only a disabled store (no
+    keys file) leaves arming to the env keys / openMode escape. When the
+    store is disabled the match is a cheap no-op and behavior is
+    byte-identical to the env-only days.
 
     Identity spine (additive, behavior-neutral): when a key MATCHES, its
     fingerprint (``sha256:<12hex>`` — never the key) is recorded into
@@ -3982,19 +4383,62 @@ class _McpApiKeyMiddleware:
                     keys.append(k)
         return keys
 
+    #: Once-per-process ERROR flag: a configured-but-unreadable keys store
+    #: is a deploy-level fault; without env keys the gate fails closed
+    #: (503) until fixed, with env keys it degrades to env-only auth.
+    _store_unreadable_logged = False
+
+    @classmethod
+    def _log_store_unreadable(cls, env_keys_present: bool) -> None:
+        if not cls._store_unreadable_logged:
+            cls._store_unreadable_logged = True
+            log = logging.getLogger("sqlhandler.server")
+            if env_keys_present:
+                log.error(
+                    "MCP API-key store is configured but UNREADABLE — env keys "
+                    "(MCP_API_KEYS/SQLHANDLER_API_KEYS) still authenticate; minted "
+                    "keys-store keys cannot be verified and are refused until the "
+                    "store recovers."
+                )
+            else:
+                log.error(
+                    "MCP API-key store is configured but UNREADABLE — no env keys "
+                    "are configured, so /mcp fails CLOSED (503) for every caller "
+                    "until the store recovers."
+                )
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path", "").startswith("/mcp"):
             keys = self._keys()
+            # P1-4 fail-closed, reconciled (task-11 follow-up): the store's
+            # STATE decides arming — a CONFIGURED-but-empty store (last key
+            # revoked) arms the gate, a disabled one leaves the openMode
+            # escape — but a store FAULT must not refuse a credential that
+            # does not live in the store. Env keys are read from the process
+            # environment, so with them configured the request is SERVED and
+            # only the unverifiable minted keys are refused (401); with no
+            # env keys nothing can authenticate -> 503.
+            store_state = _keys_store_state()
+            store_ok = store_state != "unreadable"
+            if not store_ok:
+                # A store that LOADED and then became unreadable (a mount
+                # hiccup, a truncated write) must not strand keys the process
+                # already holds in memory: _load keeps the last-good contents
+                # and list_keys() still returns them (cross-validation
+                # 2026-11-12, P2). Serve that last-good set, loudly; only a
+                # store we never read AND cannot authenticate against is a 503.
+                last_good = _admin_keys.list_keys()
+                if not keys and not last_good:
+                    self._log_store_unreadable(env_keys_present=False)
+                    resp = JSONResponse({"error": "authentication store unavailable"}, status_code=503)
+                    await resp(scope, receive, send)
+                    return
+                self._log_store_unreadable(env_keys_present=bool(keys) or bool(last_good))
+                store_ok = True  # serve from last-good contents
             if keys:
                 gate_on = True
             else:
-                # The union's store half can arm the gate on its own (a
-                # keys-file-only deployment): configured AND non-empty.
-                # A disabled store or an empty one never arms it — no
-                # bootstrap lockout, and env-only deployments keep the
-                # exact env-only behavior (zero store I/O: the path check
-                # is one env read).
-                gate_on = _admin_keys.keys_file_path() is not None and bool(_admin_keys.list_keys())
+                gate_on = store_state != "disabled"
             if gate_on:
                 # D19 explicit-over-ambient (parity with _admin_presented_keys
                 # on /api and with MultimodalRAG's mcp_auth): collect EVERY
@@ -4037,8 +4481,11 @@ class _McpApiKeyMiddleware:
                             break
                     # Store fallback per candidate: a minted key (keys file)
                     # when no env key matched. No-op (None, zero I/O) when
-                    # the store is disabled.
-                    store_entry = _admin_keys.match_presentation(candidate)
+                    # the store is disabled — and SKIPPED when it is
+                    # unreadable (minted keys are unverifiable -> 401).
+                    store_entry = (
+                        _admin_keys.match_presentation(candidate) if store_ok else None
+                    )
                     if store_entry is not None:
                         matched = None
                         break
@@ -4052,7 +4499,9 @@ class _McpApiKeyMiddleware:
                             if matched is not None:
                                 store_entry = None
                                 break
-                        store_entry = _admin_keys.match_presentation(candidate)
+                        store_entry = (
+                            _admin_keys.match_presentation(candidate) if store_ok else None
+                        )
                         if store_entry is not None:
                             matched = None
                             break
@@ -4089,6 +4538,48 @@ class _McpApiKeyMiddleware:
 _identity.set_static_keys_source(_McpApiKeyMiddleware._keys)
 
 
+def _key_subject_lookup(fp: str) -> str | None:
+    """The subject a SELF-MINTED key is bound to (store-verified at mint time).
+
+    Wired into the identity ladder so a subject-bound key presented over /api
+    resolves to the same subject-carrying caller it gets on /mcp — otherwise a
+    key minted BY a human would act as an anonymous key on the REST surface
+    (fail-restrictive, but inconsistent with its documented behaviour).
+    Admin-minted keys have no subject and stay key-only.
+    """
+    try:
+        for entry in _admin_keys.list_keys():
+            if entry.get("fp") == fp and entry.get("subject"):
+                return str(entry["subject"])
+    except Exception:  # a store hiccup must never block authentication
+        logger.debug("key subject lookup failed", exc_info=True)
+    return None
+
+
+_identity.set_key_subject_lookup(_key_subject_lookup)
+
+
+def _match_configured_key(raw: str):
+    """Authenticate a presented credential against the SAME union the /mcp gate
+    uses: the env key list (raw compare) and the minted keys store (digest
+    compare). Returns (fingerprint, subject) or None — the identity ladder's
+    key rung, so /api accepts exactly what /mcp accepts."""
+    if not raw:
+        return None
+    for candidate in _McpApiKeyMiddleware._keys():
+        if candidate and hmac.compare_digest(raw.encode("utf-8"), candidate.encode("utf-8")):
+            fp = _identity.key_fp(candidate)
+            return (fp, _key_subject_lookup(fp))
+    entry = _admin_keys.match_presentation(raw)
+    if entry is not None:
+        subject = str(entry.get("subject") or "") or None
+        return (str(entry.get("fp") or ""), subject)
+    return None
+
+
+_identity.set_key_matcher(_match_configured_key)
+
+
 class _CallerIdentityMiddleware:
     """ASGI middleware: resolve one Caller per request (identity spine, Stage 1).
 
@@ -4120,16 +4611,28 @@ class _CallerIdentityMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        token = None
         if scope["type"] == "http":
             caller = _identity.caller_from_scope(scope)
             state = scope.setdefault("state", {})
             state[self.CALLER_STATE] = caller
-            # Request-scoped contextvar (audit reads it when no explicit
-            # provider is bound). Set inside the request's async context so
-            # it never leaks across requests — ContextVar.set is scoped to
-            # the current task.
+            # Request-scoped contextvars (audit + engine). Set inside the
+            # request's async context so they never leak across requests —
+            # ContextVar.set is scoped to the current task. The ENGINE slot
+            # makes caller=-less engine calls policy-aware as well: every
+            # dispatch/tool path forwards the caller explicitly (the primary
+            # wiring), but this is the fail-closed backstop for any path that
+            # forgets, and asyncio.to_thread copies the context into the
+            # worker thread so the MCP dispatch body sees it. Explicit
+            # caller= still wins; QueryJob's raw thread cannot inherit it and
+            # keeps riding the caller on the job object.
             _identity.CALLER_CONTEXT.set(caller)
-        await self.app(scope, receive, send)
+            token = set_current_caller(caller)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if token is not None:
+                reset_current_caller(token)
 
 
 class _IdentityRequiredMiddleware:
@@ -4344,6 +4847,17 @@ def _policy_readiness_warning() -> dict:
                 )
     except Exception:  # a probe must never fail the pod it is checking
         pass
+    try:
+        # Bootstrap admin is a POSTURE, not a health failure: with no policy
+        # loaded the configured API key is the administrator. Surfaced here
+        # only while it is ACTIVE, so the historical /ready shape is
+        # unchanged everywhere else.
+        if _admin_keys.bootstrap_admin_active():
+            out["bootstrap_admin"] = (
+                "active: no policy is loaded — the configured API key is the administrator"
+            )
+    except Exception:  # a probe must never fail the pod it is checking
+        pass
     return out
 
 
@@ -4466,10 +4980,11 @@ def _build_http_app():
 
     app.add_route("/metrics", _metrics)
 
-    # When SQLHANDLER_API_TOKEN is set, every /api/* call must present it
-    # (Authorization: Bearer <token> or X-API-Token: <token>) — for machine
-    # callers of the JSON API on deployments that are NOT behind the PCAI
-    # oauth2-proxy gateway. /mcp, /ui and /health|/ready are unaffected.
+    # When SQLHANDLER_API_TOKEN is set, every /api/* call must present one
+    # of its tokens (Authorization: Bearer, X-API-Token or X-API-Key; the
+    # env may be a comma-separated LIST) — for machine callers of the JSON
+    # API on deployments that are NOT behind the PCAI oauth2-proxy gateway.
+    # /mcp, /ui and /health|/ready are unaffected.
     api_token = os.environ.get("SQLHANDLER_API_TOKEN", "").strip()
     if api_token:
         app.add_middleware(_ApiTokenMiddleware, token=api_token)

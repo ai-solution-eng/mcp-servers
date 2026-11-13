@@ -87,10 +87,16 @@ set (sorted JSON). THIS is what ``SqlEngine._policy_hash()`` returns — the
 conditional slot from the L2 slice activates here: empty when enforcement
 is off (byte-identical cache keys, cross-caller sharing unchanged), a value
 when on (masked results can never share an entry with unmasked ones — the
-non-negotiable invariant). The ``datasets`` document folds into the file
-hash (any edit reloads), and a ``visible_tables`` group is RESTRICTIVE: it
-never counts as "no rules", so allow-listed callers always hash into their
-own cache-key space.
+non-negotiable invariant). The payload is the SORTED, DE-DUPLICATED list of
+the resolved groups' canonical specs, with the group NAMES left out: the
+effective rules are the composition of the specs, so callers whose rules are
+identical share one hash (and one cache-key space) regardless of how the
+operator labelled the groups. The ``datasets`` document is NOT folded into
+this hash — the compiled specs already carry the caller's grants, and
+folding the whole document would re-hash every caller on an unrelated edit.
+It DOES fold into the FILE hash (``Policy.hash``, hot-reload detection),
+and a ``visible_tables`` group is RESTRICTIVE: it never counts as "no
+rules", so allow-listed callers always hash into their own cache-key space.
 """
 
 from __future__ import annotations
@@ -111,7 +117,17 @@ logger = logging.getLogger("sqlhandler.policy")
 
 POLICY_FILE_ENV = "SQLHANDLER_POLICY_FILE"
 POLICY_ENABLED_ENV = "SQLHANDLER_POLICY_ENABLED"
+#: The keying secret for hash column masks (env, re-read per call). SET =
+#: sha256(secret || value) - a KEYED digest, so low-entropy values (SSN,
+#: email, salary) cannot be enumerated/rainbow-tabled and the digest is not
+#: comparable across deployments. UNSET = the plain digest (logged as one
+#: warning at load: enumerable).
+MASK_HASH_SECRET_ENV = "SQLHANDLER_MASK_HASH_SECRET"  # secret-scan:allow (env var NAME, not a secret)
 
+#: Hash algorithms the mask grammar SUPPORTS - DuckDB functions that exist in
+#: the pinned build. Anything else hash-SHAPED is a load-time refusal, never a
+#: silent substitution (sha512 used to become sha256; sha1 used to become md5).
+_MASK_HASH_ALGOS = ("sha256", "sha1", "md5")
 _HASH_ALGO_RE = re.compile(r"^(?:sha)?(1|224|256|384|512)$", re.IGNORECASE)
 
 _ROW_FILTER_MAX = 4096
@@ -119,6 +135,7 @@ _MASK_VALUE_MAX = 256
 _POLICY_DENIED = "E_POLICY_DENIED"
 
 __all__ = [
+    "MASK_HASH_SECRET_ENV",
     "POLICY_DENIED",
     "POLICY_ENABLED_ENV",
     "POLICY_FILE_ENV",
@@ -130,6 +147,7 @@ __all__ = [
     "canonical_hash",
     "dump_doc",
     "load_policy",
+    "mask_hash_secret",
     "owner_key",
     "policy_enabled",
     "policy_file_path",
@@ -343,6 +361,21 @@ class Policy:
         NOTE the deliberate asymmetry with :meth:`groups_for` (default-group
         fallback): the hash is computed from the RESOLVED rules, so two
         callers in the same group share cache entries.
+
+        The payload is the SORTED, DE-DUPLICATED list of the resolved groups'
+        canonical specs — deliberately WITHOUT the group names. The effective
+        rules are the composition of those specs (``rule_for_table`` never
+        reads a name, and composing the same spec twice is idempotent), so
+        callers whose rules are identical share one hash even when the
+        operator named the groups differently, and the content-addressed
+        ``datasets`` groups share between identities with identical grants.
+
+        The ``datasets`` document itself is NOT folded in: the compiled group
+        specs already carry this caller's global + assignment + blocked globs,
+        and folding the whole document would re-hash EVERY caller on any
+        unrelated assignment edit — a pure cache fork with no rule change.
+        The FILE hash (``Policy.hash``) still folds it, so the store
+        hot-reloads on any edit.
         """
         groups = self.groups_for(subject, key_fp)
         if not groups:
@@ -355,23 +388,23 @@ class Policy:
         composed = self._compose_empty_check(groups)
         if composed:
             return ""
-        effective: dict = {"groups": {}}
+        specs = []
         for g in sorted(groups):
             spec = self.groups.get(g)
             if isinstance(spec, dict):
-                effective["groups"][g] = _canonicalize_group(spec)
-        # The table-side identity of the file matters too: a caller whose
-        # rules are unchanged but whose FILE changed (their group's rules
-        # rewritten) must get a new hash. Folding the file hash would change
-        # the hash for EVERY caller on any edit; folding the group specs
-        # (canonicalized above) changes it only for callers whose rules
-        # actually changed. Hidden-table globs are part of the group spec.
-        # The datasets document folds in too: it is the compact authoring
-        # form of exactly those bindings, so two callers under different
-        # assignment sets hash differently while identical sets share.
-        if self.datasets is not None:
-            effective["datasets"] = self.datasets
-        return canonical_hash(effective)
+                specs.append(_canonicalize_group(spec))
+        # Canonical JSON gives a deterministic order; the set drops duplicates
+        # (identical rules under two group names compose identically). The
+        # payload is the SPECS, not a {name: spec} map: names are labels, not
+        # rules, and including them forked the cache for no security gain.
+        canonical = sorted({json.dumps(s, sort_keys=True, separators=(",", ":"), default=str) for s in specs})
+        payload: dict = {"groups": [json.loads(c) for c in canonical]}
+        mask_key = _mask_key_digest()
+        if mask_key:
+            # A KEYED digest is a different value set: never share a cache
+            # entry (or a virtual materialization) with the unkeyed output.
+            payload["mask_key"] = mask_key
+        return canonical_hash(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +461,18 @@ def _canonicalize_group(spec: dict) -> dict:
 
 
 def _glob_match(pattern: str, value: str) -> bool:
-    """fnmatch glob (case-SENSITIVE: table names are data, not DNS labels)."""
+    """fnmatch glob, matched BOTH exactly and case-INSENSITIVELY.
+
+    The second clause is deliberate and load-bearing: table names reach this
+    module from DuckDB (case-insensitive identifiers) and from object stores
+    whose listing case may differ from the operator's file. An operator who
+    writes ``visible_tables: ["public_*"]`` therefore also grants
+    ``PUBLIC_PII`` - grants are CASE-INSENSITIVE (a deny-list is the safe
+    direction: ``hidden_tables: ["Payroll*"]`` hides ``payroll``). This is
+    pinned by tests/test_authz_audit_fixes.py; changing it to case-sensitive
+    would silently REVOKE grants, so it is behaviour, not a bug. ``fnmatch``
+    also lets ``*`` cross ``/`` (``workorder/*`` matches ``workorder/a/b``).
+    """
     if not pattern:
         return False
     return fnmatch.fnmatchcase(value, pattern) or fnmatch.fnmatchcase(value.lower(), pattern.lower())
@@ -444,6 +488,25 @@ def _glob_hits(patterns: list, *values: str) -> bool:
 
 _ACL_GLOBAL_GROUP = "_acl_global"
 _KEY_FP_RE = re.compile(r"^sha256:[0-9a-f]{12}$")  # audit.key_fingerprint's exact shape
+
+
+def _acl_grants_group(globs: list[str]) -> str:
+    """Content-addressed group name for one assignment's glob set.
+
+    The name is derived from the CANONICAL glob list (sorted, de-duplicated),
+    never from the assignment's position or identity. Two callers granted the
+    same datasets therefore resolve to ONE group — and so share one
+    effective-policy hash and one cache-key space — while an edit to an
+    UNRELATED assignment no longer renames this one (the old
+    ``_acl_id_<index>`` scheme shifted every later index on any insertion,
+    silently forking every caller's cache keys).
+
+    Blocked globs are NOT part of the name: they are appended to every
+    group's spec, so a block edit changes the SPEC (and the hash) without
+    renaming the group.
+    """
+    payload = json.dumps(sorted({str(g).strip() for g in globs}), separators=(",", ":"))
+    return "_acl_grants_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _compile_datasets(data: dict, origin: str) -> tuple[dict, dict, dict, str, dict]:
@@ -491,18 +554,21 @@ def _compile_datasets(data: dict, origin: str) -> tuple[dict, dict, dict, str, d
     if not isinstance(raw_assignments, dict):
         raise PolicyError(f"{origin}: datasets.assignments must be an object of identity -> [globs]")
 
-    generated: dict[str, dict] = {_ACL_GLOBAL_GROUP: {"visible_tables": list(global_globs)}}
+    generated: dict[str, dict] = {_ACL_GLOBAL_GROUP: {"visible_tables": sorted({str(g).strip() for g in global_globs})}}
     subjects: dict[str, tuple[str, ...]] = {}
     key_fps: dict[str, tuple[str, ...]] = {}
     seen_fps: dict[str, str] = {}
     seen_subjects: dict[str, str] = {}
-    for i, (raw_key, globs_raw) in enumerate(sorted(raw_assignments.items(), key=lambda kv: str(kv[0]))):
+    for raw_key, globs_raw in sorted(raw_assignments.items(), key=lambda kv: str(kv[0])):
         if not isinstance(raw_key, str) or not raw_key.strip():
             raise PolicyError(f"{origin}: datasets.assignments keys must be non-empty strings")
         key = raw_key.strip()
         globs = _globs(globs_raw, f"assignments.{key!r}")
-        group = f"_acl_id_{i}"
-        generated[group] = {"visible_tables": list(globs)}
+        # CONTENT-addressed, not index-addressed: identical grants share one
+        # group (and therefore one cache-key space), and unrelated assignment
+        # edits never rename an existing group.
+        group = _acl_grants_group(globs)
+        generated[group] = {"visible_tables": sorted({str(g).strip() for g in globs})}
         # Two accepted spellings, one binding: the minted bare form
         # ("sha256:<12hex>") and the self-documenting prefixed one. A key
         # that LOOKS like a fingerprint attempt (either prefix) but fails
@@ -536,8 +602,9 @@ def _compile_datasets(data: dict, origin: str) -> tuple[dict, dict, dict, str, d
     # generated group (deny-bias makes a block un-overridable by any grant,
     # including the global one).
     if blocked_globs:
+        canonical_blocked = sorted({str(g).strip() for g in blocked_globs})
         for spec in generated.values():
-            spec["hidden_tables"] = list(blocked_globs)
+            spec["hidden_tables"] = canonical_blocked
     return generated, subjects, key_fps, _ACL_GLOBAL_GROUP, doc
 
 
@@ -631,36 +698,69 @@ def dump_doc(data: dict, fmt: str = "yaml") -> str:
     return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
+def mask_hash_secret(environ: dict[str, str] | None = None) -> str:
+    """The keying secret for hash masks ('' when unset). Re-read per call."""
+    env = os.environ if environ is None else environ
+    return env.get(MASK_HASH_SECRET_ENV, "").strip()
+
+
+def _mask_key_digest() -> str:
+    """A non-secret digest of the mask key ('' when unkeyed).
+
+    Folded into the effective-policy hash so enabling or ROTATING
+    SQLHANDLER_MASK_HASH_SECRET moves every masked caller into a fresh
+    cache-key space: a keyed digest must never be served from an entry (or a
+    virtual materialization) computed unkeyed, or from another key's output.
+    Empty when unset, so unkeyed/enforcement-off keys stay byte-identical.
+    """
+    secret = mask_hash_secret()
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16] if secret else ""
+
+
 def _mask_sql(col: str, spec: str, available: set[str]) -> str:
     """The SELECT-list expression for one masked column (validated spec).
 
-    * ``redact``       → ``'***'`` (a constant; type-flexible)
-    * ``hash``|``sha256[:n]`` → ``md5(col)`` / ``sha256(col)`` — hex text,
-      NOT reversible; ``sha256:<n>`` truncates to n hex chars (readable fp
-      style) via ``substring``.
-    * anything else    → a SQL string-literal constant: the operator WROTE
-      the value (e.g. ``"REDACTED-CUSTOMER"`` or ``"0"``). Numbers/identifiers
-      are NOT interpreted — masks replace values, they never compute from
-      other columns (a mask expr referencing other columns would need the
-      same validation row filters get; keep v1 boring and safe).
+    Grammar (ONE explicit language - anything hash-SHAPED but unsupported is a
+    refusal, never a silent substitution):
+
+    * ``redact``          -> ``'***'`` (a constant; type-flexible)
+    * ``hash``            -> sha256 of the value, KEYED when
+      SQLHANDLER_MASK_HASH_SECRET is set
+    * ``sha256`` | ``sha1`` | ``md5`` -> that digest of the value
+    * ``<algo>:<n>``      -> the digest truncated to n hex chars (1-128)
+      via ``substring``
+    * anything else       -> a SQL string-literal constant: the operator
+      WROTE the value (e.g. ``"REDACTED-CUSTOMER"`` or ``"0"``). Numbers and
+      identifiers are NOT interpreted - masks replace values, they never
+      compute from other columns.
+
+    A hash mask is NOT reversible, but an UNKEYED digest of a low-entropy
+    value (an SSN, an email, a salary) is enumerable and preserves equality
+    across rows and deployments - setting the key closes that (audit
+    2026-11-12 P2).
     """
     name = spec.strip()
     lowered = name.lower()
     if lowered == "redact":
         return "'***'"
-    m = _HASH_ALGO_RE.match(lowered) or _HASH_ALGO_RE.match(lowered.split(":", 1)[0])
-    if lowered in ("hash", "md5") or (m and ":" not in lowered):
-        # bare hash/sha256/md5 → full digest of the column
-        return _hash_expr(col, lowered if lowered != "hash" else "sha256", None, available)
-    if ":" in lowered and m and lowered.split(":", 1)[0].lower() in ("sha", "sha256", "sha1", "sha512", "md5"):
-        algo, _, trunc = lowered.partition(":")
-        try:
-            n = int(trunc)
-        except ValueError:
-            raise PolicyError(f"column mask {col!r}: hash truncation {trunc!r} is not an integer") from None
-        if not 1 <= n <= 128:
-            raise PolicyError(f"column mask {col!r}: hash truncation must be 1-128 hex chars")
-        return _hash_expr(col, algo, n, available)
+    algo, sep, trunc = lowered.partition(":")
+    if algo == "hash":
+        algo = "sha256"
+    if algo in _MASK_HASH_ALGOS:
+        if sep:
+            try:
+                n = int(trunc)
+            except ValueError:
+                raise PolicyError(f"column mask {col!r}: hash truncation {trunc!r} is not an integer") from None
+            if not 1 <= n <= 128:
+                raise PolicyError(f"column mask {col!r}: hash truncation must be 1-128 hex chars")
+            return _hash_expr(col, algo, n, available)
+        return _hash_expr(col, algo, None, available)
+    if _HASH_ALGO_RE.match(lowered) or algo in ("sha", "sha224", "sha384", "sha512"):
+        raise PolicyError(
+            f"column mask {col!r}: {spec!r} is a hash spec with an unsupported algorithm "
+            f"(supported: {', '.join(_MASK_HASH_ALGOS)}; name the algorithm, not a digest length)"
+        )
     # constant literal (SQL string literal; length-capped at validation).
     # A spec the operator ALREADY wrote as a SQL literal ('0.0') passes
     # through as-is; a bare value is wrapped. (Numbers-as-strings are fine:
@@ -672,10 +772,32 @@ def _mask_sql(col: str, spec: str, available: set[str]) -> str:
 
 
 def _hash_expr(col: str, algo: str, truncate: int | None, available: set[str]) -> str:
-    """DuckDB hash expression for one column (identifier validated)."""
+    """DuckDB hash expression for one column (identifier validated).
+
+    KEYED when SQLHANDLER_MASK_HASH_SECRET is set: ``sha256(value || secret)``
+    (the ``||`` operator, not ``concat`` - it keeps NULL-propagating
+    semantics). The key rides the generated masking VIEW body, which exists
+    only on the per-query connection and is never logged (the debug line logs
+    the SPEC, not the SQL).
+
+    TYPING NOTE (cross-validation 2026-11-12): the keyed form CASTs to
+    VARCHAR, so an int column hashes its TEXT form; the unkeyed form hashes
+    DuckDB's native binary value. The two spaces never mix - Policy
+    .effective_hash folds the key digest in, so a keyed and an unkeyed result
+    cannot share a cache entry - and changing the unkeyed form would silently
+    change every existing digest for a non-string column, so the asymmetry is
+    documented rather than "fixed".
+    """
     ident = _validated_ident(col, available)
-    func = {"sha256": "sha256", "md5": "md5", "sha1": "md5"}.get(algo.lower(), "sha256")
-    expr = f"{func}({ident})"
+    if algo.lower() not in _MASK_HASH_ALGOS:  # _mask_sql refuses these first
+        raise PolicyError(f"column mask {col!r}: unsupported hash algorithm {algo!r}")
+    func = algo.lower()
+    secret = mask_hash_secret()
+    if secret:
+        literal = "'" + secret.replace("'", "''") + "'"
+        expr = f"{func}(CAST({ident} AS VARCHAR) || {literal})"
+    else:
+        expr = f"{func}({ident})"
     if truncate:
         return f"substring({expr}, 1, {int(truncate)})"
     return expr
@@ -694,6 +816,95 @@ def _validated_ident(col: str, available: set[str]) -> str:
     return '"' + match.replace('"', '""') + '"'
 
 
+def _compile_mask_spec(
+    origin: str, pattern: str, col: str, spec: str, table_columns: dict[str, list[str]] | None
+) -> str:
+    """Compile ONE mask spec at LOAD time; raise PolicyError when it cannot be.
+
+    The primary fix for audit 2026-11-12 P1-3: a mask spec is code, and a spec
+    that does not compile used to load cleanly and then silently serve the RAW
+    column (sha256:12x / sha256:0). Two checks, deliberately separate:
+
+    * the SPEC ITSELF must compile - _mask_sql is run against the mask's own
+      column name so a column-existence problem can never mask a malformed
+      spec. This needs no catalog, so it runs for every mask on every file.
+    * when the catalog already knows the covered table(s), the mask's column
+      must resolve against at least one of them (_validated_ident's rule,
+      which build_mask_select's docstring already promised). A pattern
+      matching several tables passes when ANY of them carries the column -
+      for the others the mask is a no-op by construction (they have no such
+      column to leak).
+    """
+    try:
+        expr = _mask_sql(str(col), spec, {str(col).strip()})
+    except PolicyError as exc:
+        raise PolicyError(
+            f"{origin}: table {pattern!r}: column mask {col!r} = {spec!r} cannot be compiled: {exc}"
+        ) from exc
+    if not table_columns:
+        return expr
+    matches = [cols for tkey, cols in table_columns.items() if cols and _glob_match(pattern, str(tkey))]
+    if not matches:
+        # The covered table has not been described yet: the spec-syntax check
+        # above is all that is knowable now (the runtime path renders the
+        # redact constant rather than the raw column if it still cannot bind).
+        return expr
+    first_error: str | None = None
+    for cols in matches:
+        try:
+            _mask_sql(str(col), spec, set(cols))
+            # The spec-independent COLUMN check: redact/constant specs never
+            # reach _validated_ident inside _mask_sql, yet a mask naming a
+            # column the table does not have is dead config - the intended
+            # column is then served RAW (the same class of fail-open as a
+            # malformed spec), so it refuses too.
+            _validated_ident(str(col), set(cols))
+            return expr
+        except PolicyError as exc:
+            first_error = first_error or str(exc)
+    raise PolicyError(
+        f"{origin}: table {pattern!r}: column mask {col!r} = {spec!r} does not resolve against the "
+        f"covered table's columns ({first_error})"
+    )
+
+
+#: Masks already reported by the query-time fallback (one WARNING per pair).
+_MASK_FALLBACK_WARNED: set[tuple[str, str]] = set()
+
+#: One-shot flag: the unkeyed-hash-mask warning (per process, not per reload).
+_UNKEYED_MASK_WARNED = False
+
+
+def _warn_unkeyed_masks(origin: str) -> None:
+    """One WARNING per process: unkeyed hash masks are enumerable."""
+    global _UNKEYED_MASK_WARNED
+    if _UNKEYED_MASK_WARNED:
+        return
+    _UNKEYED_MASK_WARNED = True
+    logger.warning(
+        "policy %s uses UNKEYED hash column masks: a digest of a low-entropy value (SSN, email, "
+        "salary) is enumerable and preserves equality across rows and deployments. Set %s to key "
+        "them (sha256(secret||value)).",
+        origin,
+        MASK_HASH_SECRET_ENV,
+    )
+
+
+def _warn_mask_fallback(col: str, spec: str, exc: Exception) -> None:
+    """One WARNING per (column, spec) when a mask cannot compile at query time."""
+    key = (str(col), str(spec))
+    if key in _MASK_FALLBACK_WARNED or len(_MASK_FALLBACK_WARNED) >= 256:
+        return
+    _MASK_FALLBACK_WARNED.add(key)
+    logger.warning(
+        "column mask for %r (%r) cannot be compiled (%s) - rendering the REDACT constant instead of "
+        "the raw column; fix the policy file (load-time validation should have refused it)",
+        col,
+        spec,
+        exc,
+    )
+
+
 def build_mask_select(
     base_relation: str,
     columns: list[str],
@@ -708,8 +919,9 @@ def build_mask_select(
     Returns the full SELECT text; the caller creates ``CREATE VIEW name AS``.
 
     Unknown-column masks are ASSUMED validated at load (``validate_policy``
-    refuses them); the defensive fallback here passes the column through
-    rather than breaking a query on a hot-reload race.
+    refuses them); a mask that STILL cannot compile here (a hot-reload race,
+    a table described after the policy loaded) renders the REDACT constant -
+    never the raw column (audit 2026-11-12 P1-3: this fallback used to leak).
     """
     parts: list[str] = []
     for col in columns:
@@ -719,9 +931,15 @@ def build_mask_select(
             continue
         try:
             expr = _mask_sql(col, spec, set(columns))
-        except PolicyError:
-            parts.append('"' + col.replace('"', '""') + '"')
-            continue
+        except PolicyError as exc:
+            # FAIL CLOSED (audit 2026-11-12 P1-3): a mask that cannot be
+            # compiled must never degrade to the RAW column - the whole point
+            # of the rule is that this column is not readable. Load-time
+            # validation refuses such a file; this branch covers the
+            # hot-reload race and tables described after the policy loaded,
+            # where the safe floor is the constant 'redact' renders.
+            _warn_mask_fallback(col, spec, exc)
+            expr = "'***'"
         alias = '"' + col.replace('"', '""') + '"'
         parts.append(f"{expr} AS {alias}")
     sel = ", ".join(parts) if parts else "*"
@@ -817,6 +1035,7 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
         groups = data.get("groups") or {}
         if not isinstance(groups, dict):
             raise PolicyError(f"{origin}: 'groups' must be an object")
+    saw_hash_mask = False
     for name, spec in groups.items():
         if not isinstance(spec, dict):
             raise PolicyError(f"{origin}: group {name!r} must be an object")
@@ -843,11 +1062,22 @@ def load_policy(path: str, *, table_columns: dict[str, list[str]] | None = None)
                     raise PolicyError(f"{origin}: mask for {col!r} in {pattern!r} must be a non-empty string")
                 if len(mask) > _MASK_VALUE_MAX:
                     raise PolicyError(f"{origin}: mask for {col!r} too long (cap {_MASK_VALUE_MAX})")
+                # COMPILE the spec at load (audit 2026-11-12 P1-3): a typo'd
+                # mask used to load cleanly and silently serve the raw column.
+                expr = _compile_mask_spec(origin, str(pattern), str(col), mask, table_columns)
+                if "sha256(" in expr or "sha1(" in expr or "md5(" in expr:
+                    saw_hash_mask = True
             if rf is not None and rf.strip() and table_columns:
                 for tkey, cols in table_columns.items():
                     if _glob_match(str(pattern), tkey) and cols:
                         validate_row_filter(rf, cols, f"{name}.{pattern}")
                         break
+
+    if saw_hash_mask and not mask_hash_secret():
+        # Keyed hashing is opt-in operator configuration; say so loudly ONCE
+        # rather than silently shipping enumerable digests.
+        _warn_unkeyed_masks(origin)
+
 
     def _bindings(key: str) -> dict[str, tuple[str, ...]]:
         out: dict[str, tuple[str, ...]] = {}

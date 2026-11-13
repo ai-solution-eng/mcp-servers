@@ -10,12 +10,14 @@ do NOT cross (the verified thread-boundary hazard).
 Resolution ladder (the final OAuth posture, DECISIONS.md "OAuth REVISION"):
 
 1. **Relay attribution headers** ``X-MCP-Caller-Subject`` (+ ``X-MCP-Caller-Class``)
-   — accepted ONLY on a request that presented a valid /mcp key. Attribution-
-   never-authorization: the gateway stamps the header on already-authorized
-   calls, so a leaked header without a key resolves to the key-fingerprint rung
-   at worst. Key validity alone proves a key matched — NOT that the gateway
-   wrote the header — so an OPT-IN HMAC binds the attribution to the gateway
-   (``SQLHANDLER_RELAY_HMAC_SECRET``; unset = legacy trust, unchanged).
+   — accepted ONLY on a request that presented a valid /mcp key. Key validity
+   alone proves a key matched — NOT that the gateway wrote the header — and the
+   attributed subject is an AUTHORIZATION input (policy ``admins``, ``subjects``
+   grants, owner scopes, write namespaces). So the header is trusted only with
+   PROOF: ``SQLHANDLER_RELAY_HMAC_SECRET`` set plus a valid signature (the
+   normal posture), or the explicit legacy opt-in
+   ``SQLHANDLER_TRUST_RELAY_HEADERS=1`` (audit 2026-11-12 P1-5: an unsigned
+   header is REFUSED by default, not trusted).
 3. **OIDC bearer JWT** — an ``Authorization: Bearer`` value that (a) has the
    three-segment JWT shape and (b) does NOT match a configured static key
    is verified RS256-only against the operator's JWKS
@@ -87,6 +89,7 @@ __all__ = [
     "RELAY_HMAC_SECRET_ENV",
     "RELAY_SIG_MAX_SKEW_SECONDS",
     "TRUST_BROWSER_HEADERS_ENV",
+    "TRUST_RELAY_HEADERS_ENV",
     "Caller",
     "anonymous_caller",
     "browser_headers_trusted",
@@ -95,13 +98,18 @@ __all__ = [
     "class_for_subject_kind",
     "key_fp",
     "match_api_key",
+    "relay_headers_trusted",
     "relay_hmac_secret",
     "relay_signature_headers",
+    "resolve_api_token_caller",
     "resolve_bearer_jwt",
     "resolve_browser_caller",
+    "resolve_explicit_key_caller",
     "resolve_forwarded_access_token",
     "resolve_relay_caller",
     "resolve_sso_cookie",
+    "set_key_matcher",
+    "set_key_subject_lookup",
     "set_static_keys_source",
 ]
 
@@ -119,12 +127,18 @@ HEADER_CALLER_SIG = "X-MCP-Caller-Sig"
 #: Unix-seconds timestamp covered by the signature (replay window, ±300 s).
 HEADER_CALLER_TS = "X-MCP-Caller-Ts"
 
-#: The relay-attribution HMAC secret (env, re-read per call). UNSET = the
-#: legacy posture: the relay headers are trusted on any key-valid request
-#: (backward compatible, exactly today's behavior). SET = the headers are
-#: honored ONLY with a valid signature, so a key holder can no longer claim
-#: another subject (in particular an admin subject).
+#: The relay-attribution HMAC secret (env, re-read per call). SET = the relay
+#: headers are honored ONLY with a valid signature (the normal posture).
+#: UNSET = attribution is NOT trusted unless the legacy opt-in below is on:
+#: the subject feeds authorization (admins, subject grants, owner scopes), so
+#: an unsigned header would let any key holder claim any identity.
 RELAY_HMAC_SECRET_ENV = "SQLHANDLER_RELAY_HMAC_SECRET"  # secret-scan:allow (env var NAME, not a secret)
+#: The LEGACY trust opt-in for SIGNATURE-LESS relay attribution. Unset/false =
+#: an unsigned ``X-MCP-Caller-Subject`` is refused (fail closed, the default);
+#: truthy = the pre-2026-11 behavior (any key-valid request may claim any
+#: subject). Only for a deployment whose gateway cannot sign AND whose ingress
+#: pins the attribution header.
+TRUST_RELAY_HEADERS_ENV = "SQLHANDLER_TRUST_RELAY_HEADERS"
 #: Max |now - ts| accepted for a relay signature (replay window).
 RELAY_SIG_MAX_SKEW_SECONDS = 300
 
@@ -254,6 +268,19 @@ def browser_headers_trusted(environ: dict[str, str] | None = None) -> bool:
     return env.get(TRUST_BROWSER_HEADERS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def relay_headers_trusted(environ: dict[str, str] | None = None) -> bool:
+    """True when the operator opted into SIGNATURE-LESS relay attribution.
+
+    Re-read per call (the fleet convention). Unset/false = an unsigned
+    ``X-MCP-Caller-Subject`` is refused (fail closed, audit 2026-11-12 P1-5);
+    truthy = the legacy posture, which makes any key holder able to claim any
+    subject the policy grants on (including an admin subject). The env asserts
+    the deployment's gateway cannot sign and its ingress pins the header.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(TRUST_RELAY_HEADERS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _header(scope, name: str) -> str:
     """One header value from an ASGI scope (bytes-keyed), or ''."""
     lname = name.lower().encode("latin-1")
@@ -327,20 +354,64 @@ def _relay_sig_valid(secret: str, ts: str, subject: str, cls: str, sig: str) -> 
         return False
 
 
+#: One-shot warnings (the fleet convention: loud once, never per request).
+_relay_unsigned_warned = False
+_relay_optin_warned = False
+
+
+def _warn_unsigned_relay_rejected() -> None:
+    """One WARNING per process when an UNSIGNED relay attribution is refused."""
+    global _relay_unsigned_warned
+    if _relay_unsigned_warned:
+        return
+    _relay_unsigned_warned = True
+    logger.warning(
+        "refused an UNSIGNED relay attribution (%s) over a valid key: %s is unset, so the "
+        "subject is not trusted (it is an authorization input for admin/policy grants). Set %s "
+        "to verify the gateway's signature, or %s=1 for the legacy trust posture.",
+        HEADER_CALLER_SUBJECT,
+        RELAY_HMAC_SECRET_ENV,
+        RELAY_HMAC_SECRET_ENV,
+        TRUST_RELAY_HEADERS_ENV,
+    )
+
+
+def _warn_relay_optin() -> None:
+    """One WARNING per process when the signature-less opt-in actually grants."""
+    global _relay_optin_warned
+    if _relay_optin_warned:
+        return
+    _relay_optin_warned = True
+    logger.warning(
+        "RELAY ATTRIBUTION IS UNSIGNED AND TRUSTED (%s=1, %s unset): any valid key holder can "
+        "claim any caller subject, including one the policy designates as an admin. Set %s to "
+        "verify the gateway's HMAC signature.",
+        TRUST_RELAY_HEADERS_ENV,
+        RELAY_HMAC_SECRET_ENV,
+        RELAY_HMAC_SECRET_ENV,
+    )
+
+
 def resolve_relay_caller(scope, key_valid: bool) -> Caller | None:
     """Rung 1: the relay's attribution headers over a KEY-VALID request.
 
     Returns None when the request has no valid key (spoofing refusal — the
-    header is then never trusted) or carries no subject header.
+    header is then never trusted), carries no subject header, or cannot PROVE
+    the attribution.
 
     KEY VALIDITY IS NECESSARY BUT NOT SUFFICIENT: any key holder could
     otherwise claim ANY subject (including an admin subject — ``admin_keys``
-    checks ``subject in pol.admins``). When ``SQLHANDLER_RELAY_HMAC_SECRET``
-    is set, the attribution must therefore also carry a valid
-    ``X-MCP-Caller-Sig`` / ``X-MCP-Caller-Ts`` pair; a missing, stale or
-    wrong signature resolves to None (the ladder falls through to the
-    key-fingerprint rung). With the secret UNSET the behavior is exactly the
-    historical one (backward compatible).
+    checks ``subject in pol.admins``, and the subject also keys dataset
+    grants, owner scopes and write namespaces). Two ways to prove it:
+
+    * ``SQLHANDLER_RELAY_HMAC_SECRET`` set — the attribution must carry a
+      valid ``X-MCP-Caller-Sig`` / ``X-MCP-Caller-Ts`` pair; a missing, stale
+      or wrong signature resolves to None (the ladder falls through to the
+      key-fingerprint rung). This is the normal posture.
+    * the secret UNSET — the attribution is REFUSED (fail closed, audit
+      2026-11-12 P1-5) unless the operator sets the explicit legacy opt-in
+      ``SQLHANDLER_TRUST_RELAY_HEADERS=1``, which restores the pre-2026-11
+      behavior (any key-valid request may claim any subject).
     """
     if not key_valid:
         return None
@@ -354,6 +425,13 @@ def resolve_relay_caller(scope, key_valid: bool) -> Caller | None:
         if proof is None or not _relay_sig_valid(secret, proof[0], subject, cls, proof[1]):
             logger.debug("relay attribution rejected: missing or invalid signature")
             return None
+        return Caller(cls=cls, subject=subject, key_fp=None, via="relay")
+    # NO SECRET: an unsigned subject is an unproven AUTHORIZATION claim.
+    if not relay_headers_trusted():
+        logger.debug("relay attribution rejected: unsigned and %s is not set", TRUST_RELAY_HEADERS_ENV)
+        _warn_unsigned_relay_rejected()
+        return None
+    _warn_relay_optin()
     return Caller(cls=cls, subject=subject, key_fp=None, via="relay")
 
 
@@ -389,6 +467,81 @@ def match_api_key(provided: str, keys: list[str]) -> str | None:
     return None
 
 
+def _presented_credentials(scope) -> list[str]:
+    """Every credential presented on THIS request, explicit claims first (D19).
+
+    Explicit X-API-Key / X-API-Token before the ambient Authorization Bearer,
+    so a relay's server-level Bearer cannot shadow a per-request key riding the
+    same request (the pcai-llm-gateway header shape).
+    """
+    candidates: list[str] = []
+    for name in ("X-API-Key", "X-API-Token"):
+        value = _header(scope, name)
+        if value and value.strip():
+            candidates.append(value.strip())
+    raw = _header(scope, "Authorization")
+    if raw:
+        scheme, _, token = raw.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            candidates.append(token.strip())
+    return candidates
+
+
+def resolve_explicit_key_caller(scope) -> Caller | None:
+    """Rung: an EXPLICITLY presented static key on a surface with no key gate.
+
+    /mcp has _McpApiKeyMiddleware, which records the matched fingerprint (and
+    a self-minted key's store-verified subject) in scope["state"]. /api/* has
+    no such middleware, so before this rung a caller holding a VALID key
+    resolved to ANONYMOUS on /api - and with the chart default
+    SQLHANDLER_REQUIRE_IDENTITY=1 every /api read returned 401 while
+    /api/whoami (which resolves keys on its own) reported "authenticated".
+    The documented "paste an API key" recovery therefore did not exist
+    (audit 2026-11-12 cross-validation, P1).
+
+    Explicit-only (D19): the credential must be presented on THIS request as
+    X-API-Key, X-API-Token or a Bearer that matches a configured key. When the
+    /mcp middleware already resolved one (state slot present) this rung
+    declines - that path is richer (it carries the store subject), but the
+    subject is now looked up HERE too for a self-minted key, so a subject-
+    bound key used over /api carries the same grants it has on /mcp.
+    A matched key yields via="key" and its fingerprint, never the key itself.
+    """
+    if (scope.get("state") or {}).get("sqlhandler.key_fp"):
+        return None  # the /mcp middleware already resolved (and enriched) it
+    for provided in _presented_credentials(scope):
+        matched = _match_configured_key(provided)
+        if matched is not None:
+            fp, subject = matched
+            return Caller(cls=CALLER_CLASS_KEY, subject=subject, key_fp=fp, via="key")
+    return None
+
+
+def resolve_api_token_caller(scope) -> Caller | None:
+    """Rung: the deployment-wide shared token (SQLHANDLER_API_TOKEN).
+
+    That token is a CREDENTIAL, not merely a gate. With
+    SQLHANDLER_REQUIRE_IDENTITY on, a caller who presents it must resolve to a
+    non-anonymous identity or the two layers contradict each other: the token
+    middleware (inner) accepts the request while the identity gate (outer)
+    401s it - a deployment that configured SQLHANDLER_API_TOKEN would be
+    locked out of /api entirely (found 2026-11-12 while answering "does
+    requireIdentity mean an API key is always required?").
+
+    A shared secret has no subject, so this resolves to the key class with the
+    token's FINGERPRINT (never the token) and via="api-token"; policy resolves
+    it through the default group exactly as it would an unbound key.
+    """
+    expected = [t.strip() for t in os.environ.get(API_TOKEN_ENV, "").split(",") if t.strip()]
+    if not expected:
+        return None
+    for provided in _presented_credentials(scope):
+        for candidate in expected:
+            if hmac.compare_digest(provided.encode("utf-8"), candidate.encode("utf-8")):
+                return Caller(cls=CALLER_CLASS_KEY, subject=None, key_fp=key_fp(candidate), via="api-token")
+    return None
+
+
 def resolve_bearer_jwt(scope) -> Caller | None:
     """The OIDC rung: a JWT-shaped Bearer that no static key owns.
 
@@ -412,9 +565,8 @@ def resolve_bearer_jwt(scope) -> Caller | None:
     if scheme.lower() != "bearer" or not token.strip():
         return None
     token = token.strip()
-    keys = _static_keys()
-    if match_api_key(token, keys) is not None:
-        return None  # a static key's credential — never parsed as JWT
+    if _match_configured_key(token) is not None:
+        return None  # a configured key's credential — never parsed as JWT
     if not _is_jwt_format(token):
         return None
     try:
@@ -444,9 +596,72 @@ def _static_keys() -> list[str]:
         return []
 
 
-#: Injected by server.py at import time (``identity.set_static_keys_source(
-#: _McpApiKeyMiddleware._keys)``) — avoids importing server from identity.
+#: Injected by server.py at import time (identity.set_static_keys_source(
+#: _McpApiKeyMiddleware._keys)) - avoids importing server from identity.
 _static_keys_fn: Callable[[], list[str]] | None = None
+
+#: Injected by server.py: fingerprint -> the subject a SELF-MINTED key is bound
+#: to (admin_keys keeps the mint-time-verified subject). Used so a subject-bound
+#: key presented over /api carries the same grants it has over /mcp; a plain
+#: admin-minted key has no subject and resolves as the key itself.
+_key_subject_fn: Callable[[str], str | None] | None = None
+
+#: The deployment-wide shared token (comma-separated list). Read here so the
+#: identity ladder can RESOLVE it, not just the /api gate that validates it.
+API_TOKEN_ENV = "SQLHANDLER_API_TOKEN"  # secret-scan:allow — env-var NAME, not a credential
+
+
+def set_key_subject_lookup(fn: Callable[[str], str | None] | None) -> None:
+    """Register the fingerprint -> subject lookup (server.py wires this)."""
+    global _key_subject_fn
+    _key_subject_fn = fn
+
+
+#: Injected by server.py: raw presented credential -> (fingerprint, subject).
+#: Covers BOTH credential stores the /mcp gate consults — the env key list and
+#: the minted keys file (which stores digests, not raw keys) — so the identity
+#: ladder authenticates exactly what the key gate accepts.
+_key_matcher_fn: Callable[[str], tuple[str, str | None] | None] | None = None
+
+
+def set_key_matcher(fn: Callable[[str], tuple[str, str | None] | None] | None) -> None:
+    """Register the raw-key matcher (server.py wires the env+store union)."""
+    global _key_matcher_fn
+    _key_matcher_fn = fn
+
+
+def _match_configured_key(raw: str) -> tuple[str, str | None] | None:
+    """Match one presented credential to a configured key: (fp, subject) or None.
+
+    Falls back to the env-only list when no matcher is injected (a unit test
+    driving the ladder directly), which is also the shape the /mcp middleware
+    records for env keys.
+    """
+    fn = _key_matcher_fn
+    if fn is not None:
+        try:
+            matched = fn(raw)
+        except Exception:  # a store hiccup must never crash the ladder
+            matched = None
+        if matched is not None:
+            return matched
+        return None
+    matched_key = match_api_key(raw, _static_keys())
+    if matched_key is None:
+        return None
+    fp = key_fp(matched_key)
+    return (fp, _key_subject_for_fp(fp))
+
+
+def _key_subject_for_fp(fp: str | None) -> str | None:
+    """The store-verified subject bound to a self-minted key, if any."""
+    fn = _key_subject_fn
+    if fn is None or not fp:
+        return None
+    try:
+        return fn(fp) or None
+    except Exception:
+        return None
 
 
 def set_static_keys_source(fn: Callable[[], list[str]]) -> None:
@@ -582,6 +797,17 @@ def caller_from_scope(scope) -> Caller:
     relay = resolve_relay_caller(scope, key_valid)
     if relay is not None:
         return Caller(cls=relay.cls, subject=relay.subject, key_fp=key_fpr, via="relay")
+    # D19 explicit-over-ambient: a key presented on THIS request outranks the
+    # ambient rungs below (SSO cookie, forwarded token, browser headers) and
+    # is the only credential the /api surface can carry without a gateway.
+    explicit_key = resolve_explicit_key_caller(scope)
+    if explicit_key is not None:
+        return explicit_key
+    # The shared deployment token is a credential too (a token-gated /api must
+    # not 401 under requireIdentity just because the credential is not a key).
+    shared_auth_caller = resolve_api_token_caller(scope)
+    if shared_auth_caller is not None:
+        return shared_auth_caller
     jwt_caller = resolve_bearer_jwt(scope)
     if jwt_caller is not None:
         return jwt_caller

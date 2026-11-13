@@ -14,8 +14,12 @@ The frontend-admin feature's seam between the three implementation owners:
   Secret's — kubectl; the frontend shows them read-only).
 
 Fail-closed defaults until the owners land: no keys file configured →
-empty store; ``is_admin`` → False for everyone (bootstrap is a one-time
-``admins:`` entry in the policy document, documented in DEPLOYMENT.md).
+empty store. ``is_admin`` is False for everyone EXCEPT the one bootstrap
+case: when NO policy document is enforcing, the configured API keys ARE the
+administration plane (``SQLHANDLER_BOOTSTRAP_ADMIN``, default on) — without
+it a fresh install has no reachable admin at all and the panel 403s forever.
+A policy that IS enforcing never bootstraps: an empty or stale ``admins``
+list stays fail-closed (a typo'd fingerprint must never grant admin).
 
 Pinned shapes (do not change — other files compile against them):
 
@@ -62,17 +66,35 @@ logger = logging.getLogger("sqlhandler.admin_keys")
 
 __all__ = [
     "ADMIN_KEYS_FILE_ENV",
+    "BOOTSTRAP_ADMIN_ENV",
+    "STORE_DISABLED",
+    "STORE_EMPTY",
+    "STORE_OK",
+    "STORE_UNREADABLE",
     "AdminKeysError",
     "add_key",
+    "bootstrap_admin_active",
+    "bootstrap_admin_enabled",
     "is_admin",
     "keys_file_path",
     "list_keys",
     "match_presentation",
     "remove_key",
+    "store_state",
 ]
 
 #: The keys-file path (empty/unset = store disabled — Secret keys only).
 ADMIN_KEYS_FILE_ENV = "SQLHANDLER_ADMIN_KEYS_FILE"
+
+#: Bootstrap-admin fallback switch. UNSET = ON (a fresh deployment with no
+#: policy must be administrable); 0/false/no/off = the strict fail-closed
+#: posture (nobody administers until the policy's 'admins' designates them).
+BOOTSTRAP_ADMIN_ENV = "SQLHANDLER_BOOTSTRAP_ADMIN"
+
+_BOOTSTRAP_OFF = frozenset({"0", "false", "no", "off"})
+
+#: One loud log line per process when the fallback actually grants.
+_bootstrap_warned = False
 
 _KEYS_FILE_NAME = "admin-keys.json"
 
@@ -100,6 +122,18 @@ _cache: list[dict] | None = None  # None = nothing loaded yet
 _cache_path: str | None = None  # the path the cache was loaded from
 _stat: tuple[int, int] | None = None  # (mtime_ns, size) of that path
 
+#: The four store states :func:`store_state` reports (the /mcp gate's input).
+STORE_DISABLED = "disabled"
+STORE_OK = "ok"
+STORE_EMPTY = "empty"
+STORE_UNREADABLE = "unreadable"
+
+#: path -> the (mtime_ns, size) signature that FAILED to read/parse. A
+#: configured store that exists but cannot be read is a DIFFERENT state from
+#: an empty one: "empty" is a valid, freshly-created store, while
+#: "unreadable" must fail CLOSED at the /mcp gate (audit 2026-11-12 P1-4).
+_unreadable: dict[str, tuple[int, int]] = {}
+
 
 def _stat_sig(path: str):
     try:
@@ -121,6 +155,11 @@ def _load(environ) -> list[dict]:
     A CHANGED configured path is a store switch, not a vanish: the cache
     is keyed on the path, so repointing the env starts fresh (the old
     path's entries must never bleed into the new store).
+
+    The EMPTY-vs-UNREADABLE distinction is recorded in :data:`_unreadable`
+    (keyed by the failing path+stat) and surfaced by :func:`store_state`:
+    this function still returns [] for both, because the AUTH decision
+    (refuse vs. no keys minted) belongs to the gate, not the loader.
     """
     global _cache, _cache_path, _stat
     path = keys_file_path(environ)
@@ -149,21 +188,41 @@ def _load(environ) -> list[dict]:
     with _lock:
         if _cache is not None and _cache_path == path and _stat == sig:
             return [dict(e) if isinstance(e, dict) else e for e in _cache]
+        if _unreadable.get(path) == sig:
+            # Known-bad content at this exact signature: keep serving the
+            # previous contents (if they are THIS store's) without re-reading
+            # a file we already know cannot be parsed.
+            if _cache is not None and _cache_path == path:
+                return [dict(e) if isinstance(e, dict) else e for e in _cache]
+            return []
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
         with _lock:
+            _unreadable[path] = sig
             if _cache is not None and _cache_path == path:
                 logger.warning("admin keys file %s unreadable (%s); keeping the previous contents", path, exc)
                 return [dict(e) if isinstance(e, dict) else e for e in _cache]
-        logger.error("admin keys file %s unreadable: %s — store reports EMPTY (fail-closed, loud)", path, exc)
+        logger.error(
+            "admin keys file %s unreadable: %s — store state is UNREADABLE (fail-closed; "
+            "store_state() reports it, list_keys() stays empty)",
+            path,
+            exc,
+        )
         return []
     keys = data.get("keys") if isinstance(data, dict) else None
     if not isinstance(keys, list):
+        # Valid JSON but not the store's shape: NOT a valid empty store. It
+        # parses, so a later edit is picked up by the stat signature, but the
+        # state must read UNREADABLE (fail closed) rather than "no keys".
         keys = []
-        logger.warning("admin keys file %s has no 'keys' list; treating as empty", path)
+        logger.warning("admin keys file %s has no 'keys' list; store state is UNREADABLE", path)
+        with _lock:
+            _unreadable[path] = sig
+        return []
     with _lock:
+        _unreadable.pop(path, None)
         _cache = keys
         _cache_path = path
         _stat = sig
@@ -207,6 +266,8 @@ def _write(entries: list[dict], environ) -> None:
         _cache = list(entries)
         _cache_path = path
         _stat = _stat_sig(path)
+        # Our own write is a VALID store: drop any earlier unreadable marker.
+        _unreadable.pop(path, None)
 
 
 def _now_iso() -> str:
@@ -216,6 +277,36 @@ def _now_iso() -> str:
 def list_keys(environ: dict[str, str] | None = None) -> list[dict]:
     """The minted keys (KeyEntry shapes), mtime-cached. [] when disabled."""
     return _load(environ)
+
+
+def store_state(environ: dict[str, str] | None = None) -> str:
+    """The keys store's state, for AUTH-GATE decisions (never raises).
+
+    * ``"disabled"``   - no store path configured (Secret keys only);
+    * ``"ok"``         - configured and serving >= 1 key;
+    * ``"empty"``      - configured and valid, but zero keys (also the
+      never-created / vanished-file state: a fresh store, nothing minted);
+    * ``"unreadable"`` - configured and the file EXISTS but cannot be read
+      or parsed (corrupt JSON, wrong shape, permissions).
+
+    THE POINT (audit 2026-11-12 P1-4): a corrupt store used to be
+    indistinguishable from an empty one, and the /mcp gate disarmed on an
+    empty store - so a truncated keys file silently removed authentication.
+    "unreadable" is the fail-closed signal; the gate must NOT treat it as
+    "nothing minted". Note the state describes the FILE: when a previously
+    loaded store turns unreadable, :func:`list_keys` keeps serving the last
+    valid contents (the documented fail-closed behavior), so a gate should
+    prefer arming on those non-empty contents over refusing outright.
+    """
+    path = keys_file_path(environ)
+    if path is None:
+        return STORE_DISABLED
+    entries = _load(environ)
+    sig = _stat_sig(path)
+    with _lock:
+        if sig is not None and _unreadable.get(path) == sig:
+            return STORE_UNREADABLE
+    return STORE_OK if entries else STORE_EMPTY
 
 
 def add_key(
@@ -313,32 +404,95 @@ def match_presentation(raw: str, environ: dict[str, str] | None = None) -> dict 
 # ---------------------------------------------------------------------------
 
 
+def bootstrap_admin_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Whether the bootstrap-admin fallback is PERMITTED (env-gated).
+
+    ``SQLHANDLER_BOOTSTRAP_ADMIN`` is ON when unset. A fresh deployment has
+    no policy document, and without this fallback it has no reachable admin
+    either: every /api/admin/* call 403s and the only cure is hand-editing a
+    file on a PVC. Set the env to 0/false/no/off for the strict posture —
+    nobody administers until the policy's ``admins`` list designates them.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(BOOTSTRAP_ADMIN_ENV, "").strip().lower() not in _BOOTSTRAP_OFF
+
+
+def bootstrap_admin_active(environ: dict[str, str] | None = None) -> bool:
+    """True when the fallback WOULD apply right now (no policy enforcing).
+
+    Deliberately narrow: ONLY the no-policy-document state bootstraps.
+
+    * policy disabled, or enabled with no file yet -> active;
+    * a VALID policy loaded -> inactive, whatever its ``admins`` says
+      (an empty or stale list stays fail-closed: a typo'd fingerprint
+      must never grant admin);
+    * present-but-INVALID file (the broken sentinel) or a degraded store
+      serving a previous policy -> inactive (fail closed).
+
+    Cheap enough for the admin path: ``get()`` is mtime-cached and
+    ``health()`` reads cached state without touching the filesystem.
+    """
+    if not bootstrap_admin_enabled(environ):
+        return False
+    try:
+        from .policy import policy_store
+
+        store = policy_store()
+        pol = store.get()
+        health = store.health()
+    except Exception:
+        return False
+    if getattr(pol, "admins", ()):
+        return False
+    return not (health.get("loaded") or health.get("broken") or health.get("degraded"))
+
+
 def is_admin(caller) -> bool:
     """True when the resolved Caller is a designated admin.
 
     Designation lives in the policy document (``admins:`` list of subjects
     and/or ``sha256:<12hex>`` fingerprints, hot-reloaded with the file;
     the loader normalizes the ``key:``-prefixed spelling to the bare fp).
-    Fail-closed: no policy, no admins list, or an anonymous caller → False.
+
+    Fail-closed EXCEPT for the bootstrap case: when no policy document is
+    enforcing (disabled, or enabled with no file yet) the configured API
+    keys ARE the administration plane — see :func:`bootstrap_admin_active`.
+    That grant is key-only (a subject caller still needs an ``admins``
+    entry) and logs one loud WARNING per process. A policy that IS
+    enforcing never bootstraps, and an anonymous caller is never admin.
     """
+    global _bootstrap_warned
+    if caller is None or getattr(caller, "is_anonymous", False):
+        return False
     try:
         from .policy import policy_store
 
         pol = policy_store().get()
     except Exception:
         return False
-    if pol is None or not getattr(pol, "admins", ()):
-        return False
-    if getattr(caller, "is_anonymous", False) or caller is None:
-        return False
+    admins = tuple(getattr(pol, "admins", ()) or ())
     subject = getattr(caller, "subject", None)
-    # BOTH subject spellings match: the bare name AND the
-    # 'subject:<name>' prefixed form (the datasets.assignments
-    # canonical spelling — the grant-by-name UI and the docs' examples
-    # write the prefix; live 2026-10-05 the prefixed spelling in
-    # admins never matched a bare Caller.subject, silently failing
-    # every subject-designated admin).
-    if subject and (subject in pol.admins or f"subject:{subject}" in pol.admins):
-        return True
     fp = getattr(caller, "key_fp", None)
-    return bool(fp) and fp in pol.admins
+    if admins:
+        # BOTH subject spellings match: the bare name AND the
+        # 'subject:<name>' prefixed form (the datasets.assignments
+        # canonical spelling — the grant-by-name UI and the docs' examples
+        # write the prefix; live 2026-10-05 the prefixed spelling in
+        # admins never matched a bare Caller.subject, silently failing
+        # every subject-designated admin).
+        if subject and (subject in admins or f"subject:{subject}" in admins):
+            return True
+        return bool(fp) and fp in admins
+    # No admins designated: the bootstrap fallback, key callers only.
+    if not fp or not bootstrap_admin_active():
+        return False
+    if not _bootstrap_warned:
+        _bootstrap_warned = True
+        logger.warning(
+            "BOOTSTRAP ADMIN ACTIVE: no policy is loaded, so the configured API key "
+            "(fp %s) is the administrator. Author a policy with an 'admins' entry to "
+            "replace this; set %s=0 to refuse it.",
+            fp,
+            BOOTSTRAP_ADMIN_ENV,
+        )
+    return True

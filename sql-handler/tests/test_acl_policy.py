@@ -48,6 +48,7 @@ from sqlhandler.policy import (
     POLICY_ENABLED_ENV,
     POLICY_FILE_ENV,
     PolicyError,
+    _acl_grants_group,
     _parse_text,
     canonical_hash,
     dump_doc,
@@ -392,7 +393,7 @@ def test_datasets_doc_hash_and_log_counts(tmp_path, datasets_env, caplog):
     assert pol.datasets is not None
     assert pol.default_group == "_acl_global"
     assert "_acl_global" in pol.groups
-    assert pol.subjects["alice"] == ("_acl_global", "_acl_id_0")
+    assert pol.subjects["alice"] == ("_acl_global", _acl_grants_group(["payroll/*"]))
     with caplog.at_level(logging.INFO, logger="sqlhandler.policy"):
         spec = json.loads(datasets_env.read_text())
         spec["datasets"]["assignments"].pop(key_fingerprint(FP_KEY))  # 2 -> 1 assignment
@@ -421,7 +422,7 @@ def test_datasets_prefixed_key_spelling_compiles_same(tmp_path, monkeypatch):
     monkeypatch.setenv(POLICY_FILE_ENV, str(pf))
     reset_policy_store()
     pol = load_policy(str(pf))
-    assert pol.key_fps == {fp: ("_acl_global", "_acl_id_0")}
+    assert pol.key_fps == {fp: ("_acl_global", _acl_grants_group(["payroll/*"]))}
     assert pol.subjects == {}
     eng = _make_engine(tmp_path)
     caller = _caller(key="prefix-spelling-key")
@@ -604,13 +605,67 @@ def test_effective_hash_changes_when_assignment_added(tmp_path, datasets_env):
     assert pol2.effective_hash("alice", None) != h_before, "assignment edit ⇒ new caller hash"
 
 
+def test_identical_grants_share_effective_hash(tmp_path):
+    """Two identities granted the SAME globs compile to ONE content-addressed
+    group ⇒ one effective hash ⇒ one cache-key space (the sharing contract)."""
+    pf = _write_policy(
+        tmp_path,
+        {
+            "datasets": {
+                "global": ["workorder/*"],
+                "assignments": {"alice": ["payroll/*"], "bob": ["payroll/*"]},
+            }
+        },
+    )
+    pol = load_policy(str(pf))
+    assert pol.subjects["alice"] == pol.subjects["bob"], "same globs ⇒ same group"
+    assert pol.effective_hash("alice", None) == pol.effective_hash("bob", None)
+
+
+def test_unrelated_assignment_edit_does_not_rekey(tmp_path):
+    """Adding an assignment for someone ELSE leaves an existing caller's
+    effective hash (and therefore every cache entry) untouched; the caller's
+    OWN grant edit still changes it."""
+    doc = {"datasets": {"global": ["workorder/*"], "assignments": {"alice": ["payroll/*"]}}}
+    pf = _write_policy(tmp_path, doc)
+    h_before = load_policy(str(pf)).effective_hash("alice", None)
+
+    doc_other = json.loads(json.dumps(doc))
+    doc_other["datasets"]["assignments"]["bob"] = ["audit/*"]
+    pf_other = tmp_path / "policy_other.json"
+    pf_other.write_text(json.dumps(doc_other))
+    assert load_policy(str(pf_other)).effective_hash("alice", None) == h_before
+
+    doc_own = json.loads(json.dumps(doc))
+    doc_own["datasets"]["assignments"]["alice"] = ["payroll/*", "audit/*"]
+    pf_own = tmp_path / "policy_own.json"
+    pf_own.write_text(json.dumps(doc_own))
+    assert load_policy(str(pf_own)).effective_hash("alice", None) != h_before
+
+
+def test_group_names_do_not_affect_effective_hash(tmp_path):
+    """Two groups with IDENTICAL rules share a hash even under different
+    names: the hash is the composed rules, not the labels."""
+    spec = {"tables": {"t/*": {"column_masks": {"c": "redact"}}}, "hidden_tables": ["h/*"]}
+    pf = _write_policy(
+        tmp_path,
+        {
+            "groups": {"team_a": spec, "team_b": json.loads(json.dumps(spec))},
+            "subjects": {"alice": ["team_a"], "bob": ["team_b"]},
+            "default_group": "team_a",
+        },
+    )
+    pol = load_policy(str(pf))
+    assert pol.effective_hash("alice", None) == pol.effective_hash("bob", None)
+
+
 def test_policy_store_hot_reload_on_mtime(tmp_path, datasets_env):
     """The store hot-reloads on mtime bump: get() returns a policy with the
-    NEW hash after an edit adds an assignment (cache entries keyed by the
-    old hash age out without any purge)."""
-    eng = _make_engine(tmp_path)
-    h1 = eng._policy_hash_for(ALICE) if hasattr(eng, "_policy_hash_for") else None
+    NEW file hash after an edit adds an assignment. The edit belongs to
+    ANOTHER identity, so alice's EFFECTIVE hash (her cache-key space) must
+    NOT change — entries are keyed by resolved rules, not by the file."""
     pol_before = load_policy(str(datasets_env))
+    h_alice_before = pol_before.effective_hash(ALICE.subject, ALICE.key_fp)
     spec = json.loads(datasets_env.read_text())
     spec["datasets"]["assignments"]["bob"] = ["payroll/*"]
     datasets_env.write_text(json.dumps(spec))
@@ -620,8 +675,9 @@ def test_policy_store_hot_reload_on_mtime(tmp_path, datasets_env):
     pol_after = policy_store().get()
     assert pol_after.hash != pol_before.hash
     assert "bob" in pol_after.subjects
-    if h1 is not None:
-        assert h1 != pol_after.effective_hash(ALICE.subject, ALICE.key_fp)
+    assert pol_after.effective_hash(ALICE.subject, ALICE.key_fp) == h_alice_before, (
+        "an unrelated assignment edit must not fork alice's cache keys"
+    )
 
 
 def test_visible_tables_group_never_hashes_empty(tmp_path):
@@ -664,9 +720,9 @@ def test_canonicalize_group_includes_visible_tables():
     assert _canonicalize_group({})["visible_tables"] == []
 
 
-def test_effective_hash_off_vocabulary_unchanged(tmp_path):
-    """A policy with NEITHER datasets nor visible_tables hashes exactly as
-    before the ACL vocabulary existed (byte-identical backward compat)."""
+def test_effective_hash_payload_is_group_specs_only(tmp_path):
+    """The payload is the sorted list of the resolved group SPECS — no group
+    names, no datasets document. The hand-computed shape pins it."""
     pf = _write_policy(
         tmp_path,
         {
@@ -681,8 +737,8 @@ def test_effective_hash_off_vocabulary_unchanged(tmp_path):
     )
     pol = load_policy(str(pf))
     assert pol.datasets is None
-    eff = {"groups": {"g": _canonicalize_group_from(pol, "g")}}
-    assert pol.effective_hash(None, None) == canonical_hash(eff), "hand-computed historical shape"
+    eff = {"groups": [_canonicalize_group_from(pol, "g")]}
+    assert pol.effective_hash(None, None) == canonical_hash(eff), "hand-computed specs payload"
 
 
 def _canonicalize_group_from(pol, g):

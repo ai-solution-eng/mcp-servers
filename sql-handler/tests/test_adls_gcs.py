@@ -162,9 +162,14 @@ def test_load_adls_config_missing_required_is_unconfigured():
     assert not cfg.is_configured
 
 
-def test_load_adls_config_client_secret_without_trio_is_unconfigured():
-    cfg = load_adls_config({"ADLS_ACCOUNT": "a", "ADLS_CONTAINER": "c", "ADLS_AUTH": "client-secret"})
-    assert not cfg.is_configured  # no tenant/client/secret
+def test_load_adls_config_client_secret_without_secret_env_names_the_var():
+    """audit 2026-11-12 (P2): a missing ADLS_CLIENT_SECRET_ENV must name the
+    variable instead of degrading to the generic "not configured" message."""
+    import pytest as _pytest
+
+    with _pytest.raises(Exception) as exc:
+        load_adls_config({"ADLS_ACCOUNT": "a", "ADLS_CONTAINER": "c", "ADLS_AUTH": "client-secret"})
+    assert "ADLS_CLIENT_SECRET_ENV" in str(exc.value)
 
 
 def test_load_gcs_config_env_only():

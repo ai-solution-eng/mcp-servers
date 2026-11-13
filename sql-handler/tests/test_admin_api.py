@@ -152,7 +152,11 @@ def test_nonadmin_key_403(app, method, path):
     kwargs = {"json": body} if body is not None else {}
     r = getattr(app, method)(path, headers=_admin_headers(USER_KEY), **kwargs)
     assert r.status_code == 403, (method, path, r.text)
-    assert r.json() == {"error": "admin access required"}
+    # 2026-11-12: the 403 names the CAUSE instead of one generic string.
+    # This caller is authenticated and simply not designated.
+    error = r.json()["error"]
+    assert error.startswith("admin access required")
+    assert "is not in the policy's admins list" in error
 
 
 def test_invalid_key_401_not_403(app):
@@ -400,13 +404,17 @@ def test_policy_put_no_policy_file_gate_first_403(monkeypatch, tmp_path, keys_fi
     monkeypatch.setenv("MCP_API_KEYS", ADMIN_KEY)
     monkeypatch.delenv("SQLHANDLER_POLICY_FILE", raising=False)
     monkeypatch.setenv("SQLHANDLER_POLICY_ENABLED", "1")
+    # The DEFAULT is bootstrap-on (no policy -> the configured key IS the
+    # admin). SQLHANDLER_BOOTSTRAP_ADMIN=0 pins the strict posture this
+    # test has always described: nobody designated -> nobody administers.
+    monkeypatch.setenv("SQLHANDLER_BOOTSTRAP_ADMIN", "0")
     _policy.reset_policy_store()
     try:
         app = server_module._build_http_app()
         with TestClient(app) as c:
             r = c.put("/api/admin/policy", json={"policy": "{}"}, headers=_admin_headers())
             assert r.status_code == 403
-            assert r.json() == {"error": "admin access required"}
+            assert r.json()["error"].startswith("admin access required")
     finally:
         _policy.reset_policy_store()
 
@@ -1067,7 +1075,7 @@ def test_identity_gate_exempt_but_surface_stricter(monkeypatch, tmp_path, keys_f
         assert "identity required" in r.json()["error"]
         r = c.get("/api/admin/grants", headers=_admin_headers(USER_KEY))
         assert r.status_code == 403
-        assert r.json() == {"error": "admin access required"}
+        assert r.json()["error"].startswith("admin access required")
         assert c.get("/api/admin/grants", headers=_admin_headers()).status_code == 200
 
 

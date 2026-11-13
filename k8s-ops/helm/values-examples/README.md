@@ -21,7 +21,7 @@ Real per-site values (site endpoints, posture) live in `helm/local/` (gitignored
 ## Using on PCAI
 
 1. Import the packaged chart into the PCAI catalog (once per chart version).
-2. **Create the API-key Secret out of band first** — the chart never creates it and the Deployment fails loud until it exists (command in [../../documentation/DEPLOYMENT.md](../../documentation/DEPLOYMENT.md#required-values)).
+2. **Create the API-key Secret out of band first** — the chart never creates it and the Deployment fails loud until it exists (command in [../../documentation/DEPLOYMENT.md](../../documentation/DEPLOYMENT.md#31-required)).
 3. Adjust every `# SITE:` line (endpoint host, Secret name, exec posture, CRD groups).
 4. Paste the **whole document** into the chart's *Helm Values* editor and apply — it is a complete values document, not an overlay, because the PCAI values editor replaces the chart's bundled `values.yaml` entirely.
 

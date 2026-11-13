@@ -94,7 +94,7 @@ def _response_bytes(resp: SearXNGResponse) -> int:
     the response is small (KB range) so an exact-ish walk is cheap and
     avoids serializing a second copy.
     """
-    total = sys.getsizeof(resp) + sys.getsizeof(resp.query)
+    total = sys.getsizeof(resp) + sys.getsizeof(resp.query) + sys.getsizeof(resp.results)
     for result in resp.results:
         total += sys.getsizeof(result)
         total += sys.getsizeof(result.title) + sys.getsizeof(result.url)
@@ -194,8 +194,7 @@ class SearchResultCache:
         self._store[key] = (now + self.ttl_seconds, size, resp)
         self._bytes += size
         while self._store and (
-            len(self._store) > self.max_entries
-            or (self.max_bytes and self._bytes > self.max_bytes)
+            len(self._store) > self.max_entries or (self.max_bytes and self._bytes > self.max_bytes)
         ):
             self._drop(next(iter(self._store)))
 

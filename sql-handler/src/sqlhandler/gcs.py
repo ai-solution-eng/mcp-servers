@@ -37,7 +37,7 @@ import os
 import pyarrow.dataset as pad
 import pyarrow.fs as pafs
 
-from .config import GcsConfig
+from .config import GcsConfig, listing_max_entries
 from .provider import DataProvider, LakehouseError, TableInfo, _validate_snapshot_version
 from .rawfiles import (
     build_raw_dataset,
@@ -50,6 +50,14 @@ from .rawfiles import (
 )
 
 logger = logging.getLogger("sqlhandler.gcs")
+
+# GOOGLE_APPLICATION_CREDENTIALS is a PROCESS-global: pyarrow resolves GCS
+# credentials through it, so the FIRST credentials_file a build pins wins for
+# every later build (audit 2026-11-12 P2) — a second source with a different
+# key file would otherwise silently authenticate as the first source. Record
+# what WE pinned (never what the operator set) so the warning says which case
+# fired.
+_PINNED_GCS_CREDENTIALS_FILE: str | None = None
 
 _PARQUET_SUFFIX = ".parquet"
 _DELTA_LOG = "_delta_log"
@@ -69,8 +77,42 @@ def build_gcs_fs(config: GcsConfig) -> pafs.GcsFileSystem:
     custom endpoints for fake-gcs-server in tests. Malformed JSON fails
     loudly.
     """
-    if config.credentials_file and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = config.credentials_file
+    global _PINNED_GCS_CREDENTIALS_FILE
+    if config.credentials_file:
+        current = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if current is None:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = config.credentials_file
+            _PINNED_GCS_CREDENTIALS_FILE = config.credentials_file
+        elif current == config.credentials_file:
+            pass  # already pointing at exactly this file — ours or operator's
+        elif _PINNED_GCS_CREDENTIALS_FILE is None:
+            # The operator set the env var themselves; their value wins.
+            logger.warning(
+                "GOOGLE_APPLICATION_CREDENTIALS is already set outside sqlhandler — "
+                "credentialsFile %r is ignored (ambient/operator credentials win)",
+                config.credentials_file,
+            )
+        else:
+            # WE pinned a different key file earlier: source B would silently
+            # authenticate as source A. Loud warning; first source wins.
+            logger.warning(
+                "GCS credentials are process-global: this source's credentialsFile %r is "
+                "ignored; first source wins (%r) — give the source its own deployment "
+                "or pin one key file deliberately",
+                config.credentials_file,
+                _PINNED_GCS_CREDENTIALS_FILE,
+            )
+    elif _PINNED_GCS_CREDENTIALS_FILE is not None and not config.anonymous:
+        # A source with NO credentialsFile inherits whatever WE pinned for an
+        # earlier source (the env var is process-global) — so it silently
+        # authenticates as that source's service account. Ambient credentials
+        # were intended; the pin overrides them (cross-validation 2026-11-12,
+        # P2). Loud, once per build; the fix is a per-source deployment.
+        logger.warning(
+            "GCS source has no credentialsFile but this process already pinned %r for "
+            "another source — this source authenticates as THAT service account",
+            _PINNED_GCS_CREDENTIALS_FILE,
+        )
     kwargs: dict = {"anonymous": config.anonymous}
     if config.project_id:
         kwargs["project_id"] = config.project_id
@@ -219,6 +261,18 @@ class GcsProvider(DataProvider):
         try:
             selector = pafs.FileSelector(root, recursive=True)
             infos = fs.get_file_info(selector)
+            # Bounded discovery (audit 2026-11-12, P2): a recursive listing is
+            # fully materialized, so one huge prefix could exhaust the pod.
+            # Refuse past the cap rather than silently truncating (the S3 and
+            # NFS backends use the same knob).
+            cap = listing_max_entries()
+            if cap and len(infos) > cap:
+                raise LakehouseError(
+                    f"GCS listing under '{root}' returned {len(infos)} entries, over the "
+                    f"SQLHANDLER_LISTING_MAX_ENTRIES cap ({cap}); narrow the prefix or raise the cap"
+                )
+        except LakehouseError:
+            raise
         except Exception as exc:
             raise LakehouseError(f"Could not list GCS path '{root}': {_scrub(str(exc), self.config.credentials_file)}") from exc
 

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 
 __all__ = [
@@ -245,6 +246,35 @@ def _columns_for(node: dict) -> dict[str, str] | None:
     return out or None
 
 
+def _definition_type_error(sql: str) -> str | None:
+    """Real statement-type gate for virtual definitions (audit 2026-11-12 P3).
+
+    The old check trusted the first CHARACTER (any SET/SHOW passed); this
+    parses with sqlguard (DuckDB's real parser) and refuses anything that is
+    not a single read-only SELECT/WITH/EXPLAIN statement — the engine's
+    catalog-load gate stays the second line of defense.
+    """
+    from .sqlguard import extract_statement_spans
+
+    try:
+        spans = extract_statement_spans(sql)
+    except ValueError as exc:
+        return f"compiled_sql does not parse: {exc}"
+    if len(spans) != 1:
+        return f"compiled_sql must be exactly one statement, found {len(spans)}"
+    stype = spans[0][0]
+    # EXPLAIN is REFUSED (cross-validation 2026-11-12, P3): a virtual-table
+    # definition must produce ROWS, and `EXPLAIN ANALYZE <DML>` would execute
+    # the statement it explains — inert here only because the engine gate
+    # rejects every EXPLAIN, which is a backstop, not a reason to admit it.
+    if stype not in ("SELECT",):
+        return (
+            f"compiled_sql is not a read-only SELECT/WITH (found {stype}); "
+            "a virtual table definition must be a single SELECT"
+        )
+    return None
+
+
 def _definition_for(
     node: dict, meta: dict, virtual_enabled: bool, warnings: list[str], skipped: dict[str, str]
 ) -> str | None:
@@ -264,11 +294,11 @@ def _definition_for(
     if not isinstance(sql, str) or not sql.strip():
         skipped[name] = "meta.sqlhandler.virtual set but the node has no compiled_sql (run `dbt compile` first)"
         return None
-    first = sql.lstrip()[0:1].upper()
-    if first not in ("S", "W"):
+    error = _definition_type_error(sql)
+    if error is not None:
         skipped[name] = (
-            f"meta.sqlhandler.virtual set but compiled_sql is not a read-only SELECT/WITH "
-            f"(starts with {first!r}) — INSERT/DDL never becomes a virtual table"
+            f"meta.sqlhandler.virtual set but {error} — "
+            "INSERT/DDL/SET never becomes a virtual table"
         )
         return None
     return sql.strip()
@@ -442,10 +472,31 @@ def apply_import(engine, import_result: dict, *, force_overwrite: bool = False) 
     if not engine.catalog_uploads_enabled:
         raise ValueError("Semantic-catalog upload is disabled (SQLHANDLER_CATALOG_UPLOAD=0).")
     tables = _validated_tables(import_result.get("catalog") or {})
+    # No fallback on a failed read: merging onto an empty base would let the
+    # write below replace the store with ONLY the dbt entries, silently
+    # destroying every hand-written entry (audit 2026-11-12 P1-11).
+    #
+    # Read the FILE, not engine._catalog(): _catalog() deliberately degrades
+    # an unreadable/corrupt catalog to {} so a broken catalog never breaks
+    # queries — which is exactly the empty base this merge must not accept.
+    # Cross-validation 2026-11-12 proved the data loss end-to-end through the
+    # _catalog() path (chmod 000 on a 2-entry store -> apply returned ok and
+    # the store became dbt-only). _load_catalog_file RAISES, so the apply
+    # aborts and the store stays byte-identical.
     try:
-        current = dict(engine._catalog())
-    except Exception:
-        current = {}
+        _active = engine._effective_catalog_file()
+        # ABSENT file = a fresh deployment: an empty base is the correct start
+        # (the first dbt import creates the store). PRESENT-but-unreadable is
+        # the dangerous case and must abort.
+        if _active and os.path.exists(_active):
+            current = dict(engine._load_catalog_file(_active))
+        else:
+            current = {}
+    except Exception as exc:  # OSError, parse errors, store races
+        raise DbtImportError(
+            f"cannot read the current semantic catalog ({exc}); refusing to apply — "
+            "the write would replace the store with only the imported entries"
+        ) from exc
     merged = dict(current)
     overwritten = 0
     for key, entry in tables.items():

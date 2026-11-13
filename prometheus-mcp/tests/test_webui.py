@@ -213,6 +213,30 @@ def test_series_and_label_values():
         assert c.get("/api/label_values", params={"label": bad}).status_code == 400
 
 
+def test_series_and_label_values_over_the_real_client_envelope():
+    """The console endpoints through a REAL client, so the wire shape is
+    exercised too: /api/v1/series and /api/v1/label/<n>/values both return
+    their payload as a LIST in "data" (the stub above hides that layer)."""
+    import httpx2
+
+    from prometheus_mcp.prom_client import PrometheusClient
+
+    def handler(request):
+        if request.url.path == "/api/v1/series":
+            return httpx2.Response(200, json={"status": "success", "data": [{"__name__": "up", "pod": "p1"}]})
+        return httpx2.Response(200, json={"status": "success", "data": ["ns1", "ns2"]})
+
+    cfg = PromConfig(base_url="http://prom.test:9090", max_series=5, max_label_values=2)
+    real = PrometheusClient(cfg, transport=httpx2.MockTransport(handler))
+    c = TestClient(Starlette(routes=webui.build_ui_routes(real, cfg)))
+
+    series = c.get("/api/series", params={"match": "up"}).json()
+    assert series["n_total"] == 1 and series["result"][0]["pod"] == "p1"
+
+    labels = c.get("/api/label_values", params={"label": "namespace"}).json()
+    assert labels["values"] == ["ns1", "ns2"] and labels["n_total"] == 2
+
+
 # ---------------------------------------------------------------------------
 # alerts / rules
 # ---------------------------------------------------------------------------

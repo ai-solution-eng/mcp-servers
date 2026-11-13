@@ -65,7 +65,7 @@ image:
   # GitHub Container Registry (ghcr.io/ai-solution-eng/...) — same registry as
   # the sibling PCAI apps and the deploy-toromont values file.
   repository: ghcr.io/ai-solution-eng/sqlhandler
-  tag: v4.0.0
+  tag: v4.1.0
   # Optional: pin by digest for production (e.g. "sha256:abcd...").
   digest: ""
   pullPolicy: IfNotPresent
@@ -183,6 +183,43 @@ query:
   # concurrency-gate slots forever; genuine >10-minute queries must raise
   # this deliberately (the gateway itself caps calls at 3600s).
   timeoutSeconds: "600"
+  # Simultaneous DuckDB queries per pod (0 = unlimited); excess queues.
+  maxConcurrent: "8"
+  # Per-caller concurrency bucket. Empty = the global cap; "0" = no per-caller gate.
+  maxConcurrentPerCaller: ""
+  # Seconds a query may wait for a slot before a clean "retry later" error.
+  queueTimeoutSeconds: "30"
+  # Server-side row cap for run_sql (0 = unlimited).
+  maxRows: "1000"
+  # Max rows rendered per tool result.
+  maxOutputRows: "1000"
+  # Byte ceiling for ONE tool result (0 = off).
+  maxResultBytes: "100000"
+  # Tracked async jobs (MCP query_submit + /api/jobs) and per-caller running cap.
+  maxJobs: "8"
+  maxJobsPerCaller: ""
+  # Web UI /api/query/async registry: tracked jobs and per-caller running cap.
+  maxAsyncQueries: "100"
+  maxAsyncQueriesPerCaller: ""
+  # Rows per /api/query/{id}/rows page.
+  maxPageRows: "1000"
+  # Distinct caller scopes with their own bucket and metric series.
+  maxScopes: "256"
+  # Grace seconds after a timeout interrupt before the error is reported.
+  cancelGraceSeconds: "5"
+  # ask_data context budget: candidate tables, described columns, profiled columns.
+  askMaxTables: "5"
+  askMaxColumns: "20"
+  askMaxProfileColumns: "6"
+  # CSV/Parquet export: default rows and hard cap.
+  exportDefaultRows: "10000"
+  exportMaxRows: "100000"
+  # Fairness bucket key: "identity" (per caller) or "rules" (per policy group).
+  fairnessScope: identity
+  # Coalesce identical cold queries: one execution, the rest wait for the cache fill.
+  singleflight: true
+  # Waiter wait cap in seconds. Empty = derived from the query watchdog + grace.
+  singleflightTimeout: ""
 
 # -- Resources ----------------------------------------------------------------
 # Sized from the G2 concurrency benchmark (2026-09-08): 4 replicas held ~6 qps
@@ -268,6 +305,41 @@ security:
     existingSecret: ""
     existingSecretKey: api-keys
     openMode: false
+  # -- Identity rungs (identity.py) -----------------------------------------
+  # Both default OFF, and the chart renders the env ONLY when the flag is
+  # true (an absent env is the server's own off default).
+  #
+  # These were SILENTLY UNWIRED until now: values files set them, the chart
+  # accepted the keys and rendered nothing, so an operator could believe the
+  # oauth2-proxy browser rung and the anonymous-caller gate were enforcing
+  # when neither existed in the pod.
+  identity:
+    # TRUST GATE, not a convenience switch. When true the server accepts
+    # X-Auth-Request-User / X-Forwarded-Groups as the caller's identity with
+    # NO credential. Only safe when the deployment pins ingress to the
+    # gateway — security.authorizationPolicy.enabled plus the gateway's own
+    # oauth2-proxy. With the rung open and no pin, ANY client that can reach
+    # the pod can claim any subject, including one in the policy's admins
+    # list: a full admin takeover.
+    trustBrowserHeaders: false
+    # 401 anonymous callers on /mcp and /api/*. NEVER gates /health, /ready,
+    # /metrics, /ui, /api/whoami or /oauth/*, and never /api/admin/* (which
+    # self-gates with require_admin's 401-then-403).
+    #
+    # DEFAULT CHANGED TO true (audit 2026-11-12, P1-6). The /api surface is
+    # the REST twin of run_sql/export/preview and reaches the whole lake; the
+    # chart wires MCP_API_KEYS for /mcp but there is no equivalent token for
+    # /api, so an ANONYMOUS /api/* was the default posture for anything that
+    # could dial the Service directly (a neighbouring pod, an SSRF, a
+    # misconfigured NetworkPolicy). requireIdentity closes that with the
+    # existing identity ladder instead of adding a second credential.
+    #
+    # BREAKING for a deployment whose humans reach the UI without an SSO
+    # cookie and without pasting an API key: they will get 401 on /api/*
+    # (the UI shell and /api/whoami stay open, so the page still loads and
+    # can prompt for a key). Set false ONLY when the gateway authenticates
+    # every caller and nothing else can reach the pod.
+    requireIdentity: true
   # Optional auth gate on /metrics + /ready (audit: both leak table counts,
   # RSS and error strings unauthenticated). Default false = today's
   # behavior (open). When true, a scrape/read must present SQLHANDLER_API_TOKEN
@@ -276,6 +348,14 @@ security:
   # Prometheus scrape config; liveness probes keep using /health (open).
   # With the gate on but NO credential source configured, both endpoints
   # 401 for everyone (fail closed, loud startup warning).
+  #
+  # NOTE (audit 2026-11-12, P2): with this OFF, /metrics is readable by any
+  # pod that can reach the Service — the exposition includes per-table row
+  # counts, per-caller-scope histograms and outcome counters. Turn it on for
+  # production; when podMonitor.enabled is also true, set
+  # metrics.podMonitor.bearerTokenSecret or the render fails (a gated
+  # endpoint with an unauthenticated scrape target fails silently in
+  # Prometheus, which is the one failure mode worth a hard error).
   metricsAuth: false
   # Ingress NetworkPolicy: default-deny, then allow (a) the pod's own
   # namespace, (b) the Istio gateway namespace below, (c) allowedNamespaces.
@@ -290,6 +370,25 @@ security:
   networkPolicy:
     enabled: false
     gatewayNamespace: istio-system
+    # Egress (audit 2026-11-12, P2): the pod holds the Fabric service-
+    # principal secret / S3 keys, and with no egress rule it can reach ANY
+    # host — including the cloud metadata endpoint (169.254.169.254), which
+    # turns any code-execution bug into credential theft. Enabling this
+    # renders a default-deny egress policy plus DNS, the configured storage
+    # / identity endpoints and any extra CIDRs you list. FQDN egress needs
+    # a CNI that supports it (Cilium); with plain NetworkPolicy use CIDRs.
+    egress:
+      enabled: false
+      # Extra egress peers appended verbatim (CIDRs, namespaceSelectors...).
+      additional: []
+      # Allow the cluster DNS resolver (required by every backend).
+      allowDns: true
+      # CIDRs for the storage + identity endpoints (S3/MinIO, OneLake/ABFS,
+      # Iceberg REST, AAD/Entra). Empty = only DNS + additional peers.
+      # A listed CIDR is trusted on ALL ports (no port pinning): a MinIO on
+      # :9000 or an Iceberg REST catalog on :8181 would otherwise be blocked
+      # while 443 stayed open.
+      allowCidrs: []
     # Extra namespaces whose pods may call this service directly
     # (in-cluster MCP clients, OWUI, DSH, ...). Cluster-internal access
     # stays frictionless: add the client's namespace here.
@@ -322,6 +421,16 @@ security:
     # ENABLED=1 (policy.py's truthy set: 1/true/yes/on). Default false:
     # policy-as-code is opt-in per site.
     enabled: false
+    # Bootstrap admin fallback (admin_keys.py -> SQLHANDLER_BOOTSTRAP_ADMIN):
+    # when NO policy document is enforcing (policy disabled, or enabled with
+    # no file loaded yet), the configured /mcp API key IS the administrator.
+    # Without it a fresh install has no reachable admin at all — every
+    # /api/admin/* call 403s and the only cure is hand-editing a file on a PVC.
+    # A policy that IS enforcing never bootstraps: an empty or stale 'admins'
+    # list stays fail-closed (a typo'd fingerprint must not grant admin).
+    # Set false for the strict posture: nobody administers until the policy
+    # designates them in 'admins'.
+    bootstrapAdmin: true
     # Name of an EXISTING ConfigMap carrying the policy document (key:
     # existingConfigMapKey) — manage it out-of-band like the credential
     # Secrets. REQUIRED unless existingClaim is set; the render fails
@@ -438,6 +547,29 @@ security:
   # Self-mint rotate cap: minting beyond this revokes the OLDEST
   # self-minted key for the subject (server.py _self_mint_enforce_cap).
   selfMintMaxKeys: 1
+
+  # Audit trail (audit 2026-11-12, P2). The image implements
+  # SQLHANDLER_AUDIT_LOG: one JSONL line per query outcome, per scratch
+  # write, and per admin mutation (mint/revoke/policy-set, fingerprint only,
+  # never the key). The chart previously wired nothing, so every deployment
+  # ran with NO per-request audit trail (documentation/CONFIGURATION.md
+  # listed it as an operator gap).
+  #
+  # Off by default because it needs durable storage: a compliance trail on
+  # an emptyDir dies with the pod, so enabling this REQUIRES a claim (or an
+  # existing one). RWX is required when replicas can exceed 1 (the same
+  # render-time rule as the catalog store and the policy claim).
+  audit:
+    enabled: false
+    mountPath: /var/lib/sqlhandler-audit
+    fileName: audit.jsonl
+    # Use a claim you manage (recommended: your log-shipping volume).
+    existingClaim: ""
+    pvc:
+      create: false
+      size: 10Gi
+      storageClass: ""
+      accessModes: ["ReadWriteMany"]
 
   runAsUser: 1000
   readOnlyRootFilesystem: true
@@ -609,6 +741,10 @@ cache:
   resultCacheTtl: 3600
   # In-memory byte cap for cached query results (LRU-evicted).
   resultCacheMaxBytes: "268435456"
+  # Rows profile_table/column_stats may scan (0 = full table).
+  profileMaxRows: "1000000"
+  # How many profile/column_stats results to keep in memory (0 = unbounded).
+  profileCacheSize: "512"
   # -- Shared L2 result cache (cross-replica) -------------------------------
   # The memory cache above is PER REPLICA: with N replicas behind one Service,
   # a repeated query lands on a different pod ~(N-1)/N of the time and pays

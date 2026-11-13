@@ -17,11 +17,11 @@ Transport is **`streamable-http`**, stateless per-request (`stateless_http=True`
 
 The same process also serves the read-only web UI (`/ui`, `/`), a JSON API (`/api/*` — the REST twins of most tools), `/health`, `/ready`, and `/metrics`.
 
-**Auth — MANDATORY for /mcp (breaking change, 2026-11).** SQLhandler reads the WHOLE data lake, so it now uses the same posture as applygate/k8s-mcp: the chart wires `MCP_API_KEYS` from an operator-created Kubernetes Secret **unconditionally** (`security.apiKey.existingSecret`, empty = `<fullname>-apikey`; `secretKeyRef`, never values literals), so the pod fails loudly (`CreateContainerConfigError`) until that Secret exists — the chart never creates it (see the chart's NOTES for the `kubectl create secret` command). The server accepts `X-API-Key` or `Authorization: Bearer <key>` on `/mcp`; keys are re-read per request, but Kubernetes does not update a `secretKeyRef` env var in a running pod, so rotation needs a **rollout restart** (append the new key to the Secret, move clients over, drop the old, then `kubectl rollout restart`). **Local-dev escape:** `security.apiKey.openMode=true` leaves the env unwired and `/mcp` runs open with a loud startup warning — off by default, never for a deployment anything else can reach. Write-capable tools (`query_save` / `query_delete`, and the write tier) are **auth-gated regardless**: with no credential configured they refuse or degrade loudly, never silently. The underlying env the chart renders (`MCP_API_KEYS`; `SQLHANDLER_API_TOKEN` for the REST `/api/*` surface) is an implementation detail — operators set values, not envs. See the *Key configuration knobs* table in [FEATURES.md](FEATURES.md).
+**Auth — MANDATORY for /mcp (breaking change, 2026-11).** SQLhandler reads the WHOLE data lake, so it now uses the same posture as applygate/k8s-mcp: the chart wires `MCP_API_KEYS` from an operator-created Kubernetes Secret **unconditionally** (`security.apiKey.existingSecret`, empty = `<fullname>-apikey`; `secretKeyRef`, never values literals), so the pod fails loudly (`CreateContainerConfigError`) until that Secret exists — the chart never creates it (see the chart's NOTES for the `kubectl create secret` command). The server accepts `X-API-Key` or `Authorization: Bearer <key>` on `/mcp`; keys are re-read per request, but Kubernetes does not update a `secretKeyRef` env var in a running pod, so rotation needs a **rollout restart** (append the new key to the Secret, move clients over, drop the old, then `kubectl rollout restart`). **Local-dev escape:** `security.apiKey.openMode=true` leaves the env unwired and `/mcp` runs open with a loud startup warning — off by default, never for a deployment anything else can reach. Write-capable tools (`query_save` / `query_delete`, and the write tier) are **auth-gated regardless**: with no credential configured they refuse or degrade loudly, never silently. The underlying env the chart renders (`MCP_API_KEYS`; `SQLHANDLER_API_TOKEN` for an optional shared-token gate on the REST `/api/*` surface) is an implementation detail — operators set values, not envs. **The `/api/*` surface is the REST twin of the tools and reaches the same lake, so it is identity-gated by default too:** the chart sets `SQLHANDLER_REQUIRE_IDENTITY=1` (audit 2026-11-12, P1-6), which refuses anonymous callers on `/mcp` **and** `/api/*` with 401 while leaving `/health`, `/ready`, `/ui`, `/api/whoami` and `/oauth/*` open. A browser user behind the gateway resolves through the SSO cookie / trusted browser headers; a direct caller must present a key. Opt out only with `security.identity.requireIdentity: false` when the gateway authenticates every caller and nothing else can reach the pod. See the environment reference in [CONFIGURATION.md](CONFIGURATION.md).
 
 **Strict Host pinning.** `/mcp` rejects requests whose `Host` header does not match the configured host (DNS-rebinding defense; HTTP 421 on mismatch). Route agents through the deployed hostname or the port-forward above.
 
-**Policy cache separation (when policy-as-code is on — the `security.policy.enabled` chart value).** Every cache key (result L1/L2, virtual materialization, describe, profile, column stats) carries `policy=<sha256>` of the caller's effective rules — masked and unmasked callers never share an entry, while two identically-restricted callers still share.
+**Policy cache separation (when policy-as-code is on — the `security.policy.enabled` chart value).** Every cache identity (result L1/L2, virtual materialization, describe, profile, column stats, and the shared metadata tier) carries `policy=<sha256>` computed from the caller's **resolved** effective rules: the sorted, de-duplicated group specs. Group names and the caller's identity are deliberately not part of it, so two callers whose rules are identical share entries — the same named group, the same `datasets` grants (each assignment compiles to a content-addressed group), or an unbound caller falling to `default_group` — while any rule difference forks them and masked/unmasked callers never share. Enforcement off omits the part entirely (byte-identical legacy keys). The **file** hash still folds the whole document for hot-reload; the **effective** hash does not, so editing an unrelated assignment no longer rekeys existing callers. Every tool, MCP resource and web route forwards the resolved caller into the engine (the request-scoped engine contextvar is the backstop), and a build whose hash included group names/documents rekeys once on upgrade — old entries age out via TTL, no purge is needed.
 
 ---
 
@@ -36,7 +36,7 @@ Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables
 | `list_tables()` | Enumerate every table in the configured data source, annotated with semantic-catalog descriptions; plus a live inventory of attached (read-only) external databases (postgres/mysql/mariadb/sqlite/sqlserver/ducklake/mongodb/bigquery — the last two need their community extensions baked into the image; see README: External databases). Source-qualified names in federated mode. | Table list (name, schema, format, rows, URI, catalog docs) |
 | `search_tables(keyword)` | Keyword search over table names, column names **and** catalog docs, ranked best-first (exact/substring, then a fuzzy layer so typo'd names still match). Each hit carries its `matched_on` reasons. | Ranked matches |
 | `describe_table(table)` | Columns, types, canonical URI + catalog docs for one table. Cached (`cache.ttl`); instant warm. | Column/type list + URI |
-| `profile_table(table, columns?)` | Column-level statistics **before** writing SQL: min/max, approx distinct count, null %, avg/std, q25/q50/q75, exact row count from Parquet/Delta metadata. Scans a bounded sample (chart value `query.profileMaxRows`, default 1M; 0 = full). | Stats table |
+| `profile_table(table, columns?)` | Column-level statistics **before** writing SQL: min/max, approx distinct count, null %, avg/std, q25/q50/q75, exact row count from Parquet/Delta metadata. Scans a bounded sample (`SQLHANDLER_PROFILE_MAX_ROWS`, default 1M; 0 = full — not chart-wired yet, see [CONFIGURATION.md §9](CONFIGURATION.md#9-what-the-chart-does-not-wire)). | Stats table |
 | `column_stats(table, column)` | The same statistics for ONE column, plus top-5 values with counts — over the same bounded sample (never a full-table scan beyond it). Pick filter values, spot skew. | Stats + top values |
 | `sample_rows(table, limit?, columns?)` | A bounded head of actual rows with per-column fill rates (fill %, null counts) — one bounded look at the DATA before writing SQL. The scan stops early. | Sample rows + fill rates |
 | `whoami()` | The caller's own ACL view: which identity the request resolved to (caller class: key fingerprint / relay-attributed subject / SSO bearer / browser headers) and, when the dataset policy is on, which datasets are visible to it (granted minus blocked). Read-only introspection of the caller's OWN access — never other identities'. | Identity + visible datasets |
@@ -54,7 +54,7 @@ Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables
 
 | Tool | Purpose | Returns |
 |---|---|---|
-| `query_submit(sql, params?, limit?)` | Start an async query job, return its `job_id` immediately — for queries that may outlive a tool-call timeout. Read-only guard applied at SUBMIT; same engine path, same timeout watchdog (chart value `query.timeoutSeconds`, 600s default), registry cap (chart value `query.maxJobs`, default 8). | `job_id` |
+| `query_submit(sql, params?, limit?)` | Start an async query job, return its `job_id` immediately — for queries that may outlive a tool-call timeout. Read-only guard applied at SUBMIT; same engine path, same timeout watchdog (chart value `query.timeoutSeconds`, 600s default), registry cap (`SQLHANDLER_MAX_JOBS`, default 8 — not chart-wired yet). | `job_id` |
 | `query_status(job_id)` | Poll: state (running/done/error/cancelled), elapsed, error, and — when done, unfetched — column names and row count. No row data. | Status object |
 | `query_result(job_id, output_format?)` | Fetch a finished job's result **ONCE** (markdown default, json, csv, arrow), then the spooled result is freed — a second fetch of the same job is refused (resubmit instead). | Result in chosen format |
 | `query_cancel(job_id)` | Cancel a running job (DuckDB interrupt). | Cancellation confirmation |
@@ -63,7 +63,7 @@ Grouped by role. **The recommended agent loop** is: `search_tables`/`list_tables
 > clears it). On a scaled-out deployment the stateless HTTP layer may route
 > `query_status` / `query_result` to any replica — without a shared store a
 > poll for a job submitted on another replica returns *"Unknown job id"*. With
-> `SQLHANDLER_JOBS_DIR` (chart `query.jobsDir`, an RWX PVC) finished jobs
+> `SQLHANDLER_JOBS_DIR` (a shared RWX directory — not chart-wired yet) finished jobs
 > publish state + result to the shared dir, any replica can poll/fetch/cancel,
 > and the fetch-once contract holds cluster-wide (an atomic claim file
 > serializes fetches). A cancel is still owner-only while the job runs — the
@@ -88,7 +88,7 @@ Beyond tools, the server exposes two read-only **resources** and two **prompts**
 |---|---|
 | `sqlhandler://catalog` | Every table + its business description — the data dictionary (semantic catalog merged in; can be sourced from a dbt manifest via `POST /api/semantic-catalog/import-dbt` — see [docs/semantic-catalog.md](../docs/semantic-catalog.md#importing-from-dbt)). |
 | `sqlhandler://table/<name>/schema` (template) | One table's schema + column docs. |
-| `sqlhandler://query-memory` | The last 50 query outcomes (chart value `query.queryMemorySize`) — later sessions reuse proven SQL patterns instead of rediscovering them. |
+| `sqlhandler://query-memory` | The last 50 query outcomes (`SQLHANDLER_QUERY_MEMORY_SIZE`) — later sessions reuse proven SQL patterns instead of rediscovering them. |
 | Prompt `explore-data` | Guided loop: list → catalog → profile → SQL. |
 | Prompt `analyze-table` | Profile-first deep dive on one table. |
 
@@ -99,11 +99,11 @@ Beyond tools, the server exposes two read-only **resources** and two **prompts**
 - **markdown** (default) — compact, agent-readable; types are inferred, wide results truncate.
 - **json / csv** — full fidelity for rows; csv loses dtypes on round-trip.
 - **arrow** — base64-encoded Arrow IPC stream; exact dtypes (decimals, timestamps, NULLs) preserved; use for programmatic callers and wide results.
-- All query tools cap rows (chart value `query.maxRows`, default 1000) and render nothing beyond it — pages are explicit (`limit`), not streamed.
-- **Result budget + pagination.** One tool result can never blow the caller's context: a byte ceiling (`SQLHANDLER_MAX_RESULT_BYTES`, default 100000) bounds the rendered page on top of the row cap. When rows or bytes are withheld, the result ends with ONE deterministic marker — a human line plus `{"truncated": {"total", "returned", "offset", "next_offset", "resume": {"tool", "arguments": {"offset"}}, "fix_hints"}}` — so the total, the returned count and the exact way to fetch more are always stated (rows are never dropped silently). `run_sql`, `scan_table` and `query_saved` accept `offset` to page; JSON output carries the same fields inside its payload as `page`; arrow output comment-prefixes the marker so the base64 body still decodes. `query_result` is fetch-once, so it reports the cap with `next_offset: null` and a hint to resubmit narrower.
+- All query tools cap rows (`SQLHANDLER_MAX_ROWS`, default 1000; chart `query.maxRows`) and render nothing beyond it — pages are explicit (`limit`), not streamed.
+- **Result budget + pagination.** One tool result can never blow the caller's context: a byte ceiling (`SQLHANDLER_MAX_RESULT_BYTES`, default 100000; chart `query.maxResultBytes`) bounds the rendered page on top of the row cap. When rows or bytes are withheld, the result ends with ONE deterministic marker — a human line plus `{"truncated": {"total", "returned", "offset", "next_offset", "resume": {"tool", "arguments": {"offset"}}, "fix_hints"}}` — so the total, the returned count and the exact way to fetch more are always stated (rows are never dropped silently). `run_sql`, `scan_table` and `query_saved` accept `offset` to page; JSON output carries the same fields inside its payload as `page`; arrow output comment-prefixes the marker so the base64 body still decodes. `query_result` is fetch-once, so it reports the cap with `next_offset: null` and a hint to resubmit narrower.
 - **Tool annotations.** Every tool declares the MCP hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) explicitly, so clients that default pessimistically never present a read-only tool as destructive. Read-only: every catalog/query reader (including `run_sql` under the default guard, `query_submit`, `query_saved`). Destructive: `admin_policy_set`, `admin_key_revoke`, `query_delete`. Not idempotent: `admin_key_mint`, `query_submit`, `query_result` (fetch-once), `query_save` (bumps `updated_at`). Open-world: anything that reaches the lake or an attached database.
 
-> Raw-format (CSV/JSON) landing-zone tables, where enabled, behave identically at the tool surface — see the raw-format section of [FEATURES.md](FEATURES.md) for the discovery rules and honest performance notes. They are enabled via the `rawFiles.*` Helm values (discovery size-capped), badge as `RAW` in listings, and never take the count(*) metadata fast path.
+> Raw-format (CSV/JSON) landing-zone tables, where enabled, behave identically at the tool surface — see the raw-format section of [FEATURES.md](FEATURES.md) for the discovery rules and honest performance notes. They are enabled by `SQLHANDLER_RAW_FORMATS` / `SQLHANDLER_RAW_MAX_FILE_MB` (image-only — no chart value yet), badge as `RAW` in listings, and never take the count(*) metadata fast path.
 
 ---
 
@@ -143,7 +143,7 @@ All 23 tools are exposed on every connection; the client's `tools` config can hi
 }
 ```
 
-In-cluster (behind oauth2-proxy/EZUA), include the bearer token header exactly as in 5.1. The Helm chart wires `mcp.apiKeys` to a Secret for key auth (see [DEPLOYMENT.md](DEPLOYMENT.md)).
+In-cluster (behind oauth2-proxy/EZUA), include the bearer token header exactly as in 5.1. The Helm chart wires `MCP_API_KEYS` from the Secret named by `security.apiKey.existingSecret` (data key `security.apiKey.existingSecretKey`, defaulting to `<fullname>-apikey` / `api-keys`) — see [DEPLOYMENT.md §2.1](DEPLOYMENT.md#21-secrets-the-operator-creates) and [CONFIGURATION.md §7](CONFIGURATION.md#7-identity-policy-and-writes).
 
 ### 5.3 Worked example (the agent loop)
 
@@ -169,11 +169,11 @@ On error (e.g. a typo'd table name), the response includes structured code + did
 - `explain_query` before an expensive `run_sql` — the warm/cold band tells you whether the result cache will answer instantly.
 - `query_submit` → `query_status` → `query_result` when a query may outlive the client timeout.
 - `query_save` + `query_saved` for repeated analytics; bind params keep the cache key shared across param values where the engine can reuse them (same SQL text).
-- Bare LIMIT previews take a first-row-group fast path (query.previewFastpath).
+- Bare LIMIT previews take a first-row-group fast path (`SQLHANDLER_PREVIEW_FASTPATH`, on by default, image-only).
 
 ### 5.5 Backends: what the tools see
 
-The tool surface is identical on every backend (values `backend:` / federated `sources:`): OneLake (Fabric Delta), S3/MinIO (Parquet/Delta), ADLS Gen2 (`adls.enabled` + `adls.account`/`adls.filesystem` — Parquet/Delta via pyarrow's AzureFileSystem, Entra client-secret or anonymous), GCS (`gcs.enabled` + `gcs.bucket` — Parquet/Delta via pyarrow's GcsFileSystem, mounted key file or anonymous), Iceberg (REST — incl. Databricks Unity Catalog — SQL, Glue, Hive-metastore, or Nessie catalogs), NFS/local (Delta/Parquet + raw landing-zone files), and Delta Sharing (`sharing.enabled` + a profile ConfigMap or endpoint/token Secret — tables address as `<share>_<schema>_<table>`). No tool changes per backend; only `list_tables`/`describe_table` output (URIs, formats, badges) reflects the source. Backend selection is deployment configuration, never a tool argument.
+The tool surface is identical on every backend (values `backend:` / federated `sources:`): OneLake (Fabric Delta), S3/MinIO (Parquet/Delta), ADLS Gen2 and GCS (image-only backends — `SQLHANDLER_BACKEND=adls` / `gcs`, Parquet/Delta via pyarrow's Azure and GCS filesystems; no chart value), Iceberg (REST — incl. Databricks Unity Catalog — SQL, Glue, Hive-metastore, or Nessie catalogs), NFS/local (Delta/Parquet + raw landing-zone files), and Delta Sharing (image-only: `SQLHANDLER_BACKEND=sharing`; tables address as `<share>_<schema>_<table>`). No tool changes per backend; only `list_tables`/`describe_table` output (URIs, formats, badges) reflects the source. Backend selection is deployment configuration, never a tool argument.
 
 ---
 
@@ -183,4 +183,4 @@ The Data Explorer's **Inspector** tab (next to Query/Schema/Semantic) is a brows
 
 ---
 
-*Generated from the tool registrations in `src/sqlhandler/server.py` (2.3.2 tree). When tools change, update this file — the signatures above mirror the MCP `input_schema` blocks.*
+*Generated from the tool registrations in `src/sqlhandler/server.py` (the `_TOOLS` list is the single source of truth, also served to the UI Inspector). When tools change, update this file — the signatures above mirror the MCP `input_schema` blocks.*

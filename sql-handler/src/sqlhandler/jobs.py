@@ -65,15 +65,22 @@ Non-negotiable constraints (all shared with the synchronous path):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
+
+try:  # POSIX advisory locks: cross-process claim arbitration
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 from . import errors as _errors
 from . import limits as _limits
@@ -303,6 +310,42 @@ class _SharedJobStore:
     def _cancel_flag_path(self, job_id: str) -> Path:
         return self.root / ("cancel-" + job_id)
 
+    @contextlib.contextmanager
+    def _claim_guard(self, job_id: str):
+        """Serialize the claim DECISION across threads AND processes.
+
+        The mkdir/rename protocol alone cannot be made exact: between a
+        stealer's rename and its re-create there is a window where the claim
+        path is absent, so a second caller's plain mkdir wins as well — the
+        "exactly one winner" invariant failed in 15/50 stress trials
+        (cross-validation 2026-11-12, P2). Every replica runs THIS code, so an
+        advisory flock around the decision makes it exact; the mkdir/rename
+        protocol inside the lock still covers a peer that does not cooperate
+        (an older build, an external tool) as well as it did before.
+        """
+        if fcntl is None:  # pragma: no cover - non-POSIX
+            yield
+            return
+        lock_path = self.root / ("." + job_id + ".claim.lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(lock_path, "a+")
+        except OSError:  # an unwritable root: fall back to the bare protocol
+            yield
+            return
+        try:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                pass
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
     # ------------------------------------------------------------ publish
     def publish_running(self, job_id: str, sql: str, owner: str | None = None) -> None:
         """Tombstone at submit: foreign replicas see running, not 404."""
@@ -364,18 +407,26 @@ class _SharedJobStore:
             )
 
     def mark_fetched(self, job_id: str) -> None:
-        """Flip `fetched` in the shared record, drop the result + the claim."""
+        """Flip `fetched` in the shared record, drop the result + the claim.
+
+        Order matters (audit F6): the Parquet sidecar is unlinked FIRST. If
+        the record rewrite then fails, a foreign replica still sees
+        fetched=false but ALSO has_result_file=false and refuses the fetch —
+        fail closed — instead of re-serving rows that were already handed
+        over once. The old order (rewrite, then unlink) skipped the unlink on
+        a rewrite failure and left the result re-fetchable cluster-wide.
+        """
         try:
+            try:
+                self._result_path(job_id).unlink()
+            except FileNotFoundError:
+                pass
             path = self._job_path(job_id)
             if path.exists():
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 payload["fetched"] = True
                 payload["has_result_file"] = False
                 _write_json_atomic(self.root, path, payload)
-            try:
-                self._result_path(job_id).unlink()
-            except FileNotFoundError:
-                pass
         except Exception as exc:
             logger.warning("shared job %s fetch-mark failed: %s", job_id, exc)
         finally:
@@ -446,30 +497,107 @@ class _SharedJobStore:
         winner releases the claim via :meth:`mark_fetched`. A stale claim
         (the claimant crashed mid-fetch) may be stolen after
         `CLAIM_STEAL_SECONDS`.
+
+        Steal protocol (audit F6): the old flow (stat stale -> rmdir -> mkdir)
+        could delete a FRESH claim another stealer had just put in place —
+        two stealers racing the stat/rmdir window then BOTH believed they
+        held the claim and both served the result. Now each claim carries a
+        random token file and the steal RENAMES the dir aside first (an
+        atomic ownership transfer), re-reads the token of the dir it now
+        owns, and restores it when it turned out to be a different (fresh)
+        claim — a fresh claim is never destroyed and ownership is never
+        duplicated.
+        """
+        with self._claim_guard(job_id):
+            claim = self._claim_dir(job_id)
+            try:
+                claim.mkdir(parents=True)
+                self._write_claim_token(claim)
+                return True
+            except FileExistsError:
+                if not self._steal_stale_claim(job_id):
+                    return False
+                try:
+                    claim.mkdir(parents=True)
+                    self._write_claim_token(claim)
+                    return True
+                except FileExistsError:
+                    return False
+            except OSError:
+                return False
+
+    @staticmethod
+    def _write_claim_token(claim) -> None:
+        """Best-effort identity token for the claim (an unwritable claim
+        still functions as a claim; the steal then compares empty tokens)."""
+        try:
+            (claim / "token").write_text(uuid.uuid4().hex, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _steal_stale_claim(self, job_id: str) -> bool:
+        """Take ownership of a stale claim dir; True when it was removed.
+
+        The rename is the whole trick: exactly one caller can move the dir
+        aside, and the caller that wins the rename owns whatever was there.
+        The token compare then tells whether the dir we own is the one we
+        judged stale — if another stealer replaced it in our window, we put
+        THEIR (fresh) claim back and defer.
         """
         claim = self._claim_dir(job_id)
         try:
-            claim.mkdir(parents=True)
-            return True
-        except FileExistsError:
-            try:
-                age = time.time() - claim.stat().st_mtime
-            except OSError:
-                return False
-            if age <= self.CLAIM_STEAL_SECONDS:
-                return False
-            self._release_claim(job_id)
-            try:
-                claim.mkdir(parents=True)
-                return True
-            except FileExistsError:
-                return False
+            mtime = claim.stat().st_mtime
         except OSError:
+            return False  # gone already: the caller's mkdir retry decides
+        if time.time() - mtime <= self.CLAIM_STEAL_SECONDS:
+            return False
+        try:
+            before = (claim / "token").read_text(encoding="utf-8")
+        except OSError:
+            before = ""
+        stolen = self.root / ("." + claim.name + ".stealing-" + uuid.uuid4().hex)
+        try:
+            os.rename(claim, stolen)
+        except OSError:
+            return False  # another stealer moved it first (or it vanished)
+        try:
+            # RE-CHECK STALENESS ON THE DIR WE ACTUALLY MOVED (cross-validation
+            # 2026-11-12, P2): the stat above can be stale by the time the
+            # rename lands, so a stealer could rename a FRESH claim another
+            # stealer had just installed and — because it had read that same
+            # token into `before` — believe it owned a stale dir. Two threads
+            # then both returned True (the flaky "exactly one winner" test).
+            # The renamed dir's own mtime is the truth.
+            if time.time() - os.stat(stolen).st_mtime <= self.CLAIM_STEAL_SECONDS:
+                try:
+                    os.rename(stolen, claim)
+                except OSError:
+                    shutil.rmtree(stolen, ignore_errors=True)
+                return False
+            after = ""
+            try:
+                after = (stolen / "token").read_text(encoding="utf-8")
+            except OSError:
+                pass
+            if after != before:
+                # Not the dir we judged stale — another stealer replaced it
+                # inside our window. Restore it (the path is free: we hold
+                # the rename) and refuse to steal.
+                try:
+                    os.rename(stolen, claim)
+                except OSError:
+                    shutil.rmtree(stolen, ignore_errors=True)
+                return False
+            shutil.rmtree(stolen, ignore_errors=True)
+            return True
+        except Exception:  # pragma: no cover - defensive
+            shutil.rmtree(stolen, ignore_errors=True)
             return False
 
     def _release_claim(self, job_id: str) -> None:
+        """The holder releases its claim (the dir may carry a token file)."""
         try:
-            self._claim_dir(job_id).rmdir()
+            shutil.rmtree(self._claim_dir(job_id), ignore_errors=True)
         except OSError:
             pass
 
@@ -530,12 +658,17 @@ class _SharedJobStore:
             finished.sort(key=lambda e: e[1])
             for job_id, _wall in finished[: len(finished) - self.max_jobs + 1]:
                 self._drop(job_id)
-        for claim in self.root.glob("fetch-*"):
-            try:
-                if now - claim.stat().st_mtime > 2 * self.CLAIM_STEAL_SECONDS:
-                    claim.rmdir()
-            except OSError:
-                pass
+        # Claims AND the orphaned ".fetch-*.stealing-*" dirs a crashed stealer
+        # leaves behind (cross-validation 2026-11-12, P3: the glob was
+        # "fetch-*", so a rename that never completed leaked a directory
+        # forever). Both carry only a token file.
+        for pattern in ("fetch-*", ".fetch-*.stealing-*"):
+            for claim in self.root.glob(pattern):
+                try:
+                    if now - claim.stat().st_mtime > 2 * self.CLAIM_STEAL_SECONDS:
+                        shutil.rmtree(claim, ignore_errors=True)
+                except OSError:
+                    pass
 
     def _drop(self, job_id: str) -> None:
         for path in (self._job_path(job_id), self._result_path(job_id)):
@@ -716,7 +849,12 @@ class McpJobManager:
             if len(self._records) >= self._max_jobs:
                 # A racing submit filled the last slot: cancel and refuse
                 # (the losing job releases its gate slot when it unwinds).
+                # audit F5 (jobs.py half): yield a moment so a job cancelled
+                # before its first byte releases the slot promptly; the
+                # ENGINE half (an early _cancelled exit at the top of
+                # QueryJob._run) is what makes the unwind instant.
                 job.cancel()
+                job.wait(1.0)
                 return {
                     "error": _errors.enrich(
                         f"Too many active query jobs ({self._max_jobs}, "
@@ -729,7 +867,9 @@ class McpJobManager:
                 # A racing submit from the same caller filled its last slot:
                 # cancel (the losing job releases its gate slot when it
                 # unwinds) and refuse exactly like the pre-check would have.
+                # audit F5 (jobs.py half): see the sibling cancel above.
                 job.cancel()
+                job.wait(1.0)
                 return refusal
             record = _JobRecord(job, job_id, owner=owner or None, caller_scope=scope)
             self._records[job_id] = record
@@ -848,11 +988,10 @@ class McpJobManager:
                     raise _refuse_owner(job_id)
                 if not record.fetched:
                     self._reconcile_shared_locked(record)
-                fetched = record.fetched
                 timed_out = record.timed_out
                 self._maybe_disarm_locked(record)
             else:
-                fetched = timed_out = False
+                timed_out = False
             shared = None
             if record is None and self._shared is not None:
                 shared = self._shared.load(job_id)
@@ -873,9 +1012,21 @@ class McpJobManager:
         payload["state"] = state
         if record.timed_out and state == "error" and record.timeout_message:
             payload["error"] = record.timeout_message
-        payload.update({"job_id": job_id, "result_fetched": fetched, "timed_out": timed_out})
-        if state == "done" and not fetched:
-            arrow = record.job.result
+        # audit F7: the fetched sample and the result read must share the
+        # lock. take_result sets fetched and releases the spooled table under
+        # the same lock, so a poll racing a fetch sees both or neither — the
+        # old sampling read a RELEASED result outside the lock and surfaced
+        # "Query result was already fetched and released" as a spurious 500.
+        with self._lock:
+            fetched_now = record.fetched
+            arrow = None
+            if state == "done" and not fetched_now:
+                try:
+                    arrow = record.job.result
+                except LakehouseError:
+                    arrow = None  # a racing fetch released it mid-read
+        payload.update({"job_id": job_id, "result_fetched": fetched_now, "timed_out": timed_out})
+        if arrow is not None:
             payload["columns"] = [f.name for f in arrow.schema]
             payload["n_rows"] = arrow.num_rows
         self._publish_if_shared(record, payload)
@@ -1033,10 +1184,16 @@ class McpJobManager:
             )
         arrow = self._shared.read_shared_result(job_id)
         if arrow is None:
-            self._shared.mark_fetched(job_id)  # release the claim either way
+            # RELEASE THE CLAIM ONLY (cross-validation 2026-11-12, P2): the old
+            # path called mark_fetched(), which unlinks the sidecar and Parquet
+            # — so one transient PVC read error permanently destroyed a
+            # finished result (a 30-minute query lost to a hiccup). The claim
+            # still has to go, or nobody can retry; the ARTIFACT stays.
+            self._shared._release_claim(job_id)
             raise JobError(
                 f"Job {job_id}'s shared result could not be read from "
-                f"{self._shared.root}; see the server log. Resubmit for a fresh result.",
+                f"{self._shared.root} (transient storage error) — retry the fetch; "
+                "the result is kept.",
                 status=409,
             )
         self._shared.mark_fetched(job_id)

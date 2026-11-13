@@ -31,7 +31,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.7.0   # keep in lockstep with Chart.yaml appVersion
+  tag: v1.7.1
   pullPolicy: IfNotPresent
 
 # GHCR-pull Secret, only if the package stays PRIVATE (public pulls are anonymous):
@@ -81,9 +81,11 @@ service:
   targetPort: 9090
   searxngPort: 8080 # SearXNG UI/API (served at the VirtualService root)
 
+# 1Gi limit = burst headroom for large-page extraction; the cache byte
+# bounds (fetch./search. below) are the real fix.
 resources:
   requests: {cpu: 200m, memory: 200Mi}
-  limits: {cpu: "1", memory: 512Mi}
+  limits: {cpu: "1", memory: 1Gi}
 
 # ============================================================================
 # Headless-browser Sidecar (optional)
@@ -95,12 +97,13 @@ browser:
   enabled: false
   image:
     repository: ghcr.io/ai-solution-eng/searxng-mcp-browser
-    tag: v1.6.1
+    tag: v1.7.1
     pullPolicy: IfNotPresent
 
+  # 1536Mi limit: rendering bursts OOM-killed the sidecar at 1Gi (2026-10-27).
   resources:
     requests: {cpu: 250m, memory: 512Mi}
-    limits: {memory: 1Gi}
+    limits: {memory: 1536Mi}
   # Corporate MITM CA for Chromium — the ConfigMap must exist in the release namespace:
   #   kubectl get cm ezaf-root-ca -n <ns> -o yaml | yq 'del(.metadata.namespace,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp)' | kubectl apply -n <ns> -f -
   caCert:
@@ -156,12 +159,29 @@ fetch:
   allowHosts: ""   # SEARXNG_FETCH_ALLOW_HOSTS — hosts/CIDRs that may resolve internal
   denyExtra: ""    # SEARXNG_FETCH_DENY_EXTRA — deny wins over the allowlist
   cacheTtl: ""     # SEARXNG_FETCH_CACHE_TTL ("" = built-in 300; "0" off)
+  # Byte/entry bounds on the fetch cache: entries larger than the per-entry
+  # cap are returned but never cached, so large pages cannot balloon RSS.
+  cacheMaxBytes: ""     # SEARXNG_FETCH_CACHE_MAX_BYTES ("" = built-in 33554432)
+  cacheMaxEntries: ""   # SEARXNG_FETCH_CACHE_MAX_ENTRIES ("" = built-in 64)
+  cacheMaxEntryBytes: ""   # SEARXNG_FETCH_CACHE_MAX_ENTRY_BYTES ("" = built-in 2097152)
   maxBodyBytes: "" # SEARXNG_FETCH_MAX_BODY_BYTES ("" = built-in 5000000)
   maxScreenshotKb: ""   # SEARXNG_FETCH_MAX_SCREENSHOT_KB ("" = 512)
   maxRedirects: ""      # SEARXNG_FETCH_MAX_REDIRECTS ("" = 5)
   # FETCH_TLS_INSECURE_FALLBACK — one unverified retry on a certificate error
   # ("" = off); the caCert bundle below is the proper fix.
   tlsInsecureFallback: ""
+
+# ============================================================================
+# Search Result Cache
+# ============================================================================
+
+# Search cache bounds; empty strings keep the built-in defaults. Entries
+# larger than the per-entry cap are returned but never cached.
+search:
+  cacheTtl: ""            # SEARXNG_SEARCH_CACHE_TTL ("" = built-in 120; "0" off)
+  cacheMaxBytes: ""       # SEARXNG_SEARCH_CACHE_MAX_BYTES ("" = built-in 8388608)
+  cacheMaxEntries: ""     # SEARXNG_SEARCH_CACHE_MAX_ENTRIES ("" = built-in 64)
+  cacheMaxEntryBytes: ""  # SEARXNG_SEARCH_CACHE_MAX_ENTRY_BYTES ("" = built-in 262144)
 
 # ============================================================================
 # Corporate Egress CA / Egress Proxy

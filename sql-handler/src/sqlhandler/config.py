@@ -8,7 +8,10 @@ Toromont must NOT be committed to source control.
 
 from __future__ import annotations
 
+import contextvars
+import functools
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -16,10 +19,58 @@ from dataclasses import dataclass, field
 
 from .provider import LakehouseError
 
+logger = logging.getLogger("sqlhandler.config")
+
+#: The per-call env mapping that must OVERRIDE os.environ (audit 2026-11-12,
+#: P0-2). load_*_config(env) is called with a synthetic mapping in two
+#: places: federation (load_source_providers builds one per source) and the
+#: tests. Historically every loader read os.environ FIRST and treated the
+#: mapping as a default, so a global SQLHANDLER_BACKEND / S3_* silently
+#: replaced a source's own settings - a source declaring backend: s3 resolved
+#: to onelake, and per-source credentials were ignored.
+#:
+#: A ContextVar (not a module global) keeps this thread/task-scoped: the
+#: loaders run on request threads, and one caller's mapping must never leak
+#: into another's resolution.
+_OVERRIDE_ENV: contextvars.ContextVar[Mapping[str, str] | None] = contextvars.ContextVar(
+    "sqlhandler_config_env_override", default=None
+)
+
 
 def _getenv(name: str, default: str = "") -> str:
-    """Read an environment variable with a stripped fallback."""
+    """Read an environment variable with a stripped fallback.
+
+    When a loader is running under _with_env_override, a key present in that
+    mapping WINS over the process environment; os.environ remains the
+    fallback for keys the mapping does not carry. With no override active
+    (env=None, the single-backend path) the behavior is exactly the
+    historical os.environ-only lookup.
+    """
+    override = _OVERRIDE_ENV.get()
+    if override is not None and name in override:
+        return str(override[name]).strip()
     return os.environ.get(name, default).strip()
+
+
+def _with_env_override(fn):
+    """Run a load_*_config(env) body with env as the winning mapping.
+
+    A decorator rather than 48 call-site edits: every loader reads its
+    variables through _getenv (directly or via _to_int/_to_bool), so
+    installing the mapping for the duration of one call makes the whole body
+    explicit-override - including the helpers - with no change to the
+    existing call sites or their defaults.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(env=None, *args, **kwargs):
+        token = _OVERRIDE_ENV.set(env)
+        try:
+            return fn(env, *args, **kwargs)
+        finally:
+            _OVERRIDE_ENV.reset(token)
+
+    return wrapper
 
 
 def _to_int(name: str, env: Mapping[str, str], default: int) -> int:
@@ -78,7 +129,37 @@ def raw_max_file_mb(env: Mapping[str, str] | None = None) -> int:
     decompression bomb can exceed it - the default stays on because the
     landing zone is operator-authored storage, not untrusted upload.
     """
-    return max(_to_int("SQLHANDLER_RAW_MAX_FILE_MB", env or os.environ, 64), 0)
+    value = _to_int("SQLHANDLER_RAW_MAX_FILE_MB", env or os.environ, 64)
+    if value < 0:
+        # A negative is a config mistake (an intent like "disable raw discovery"
+        # would arrive as 0) — silently meaning UNLIMITED is the opposite of the
+        # intent (audit 2026-11-12 P3): fall back to the default, loudly.
+        raw = _getenv("SQLHANDLER_RAW_MAX_FILE_MB", (env or {}).get("SQLHANDLER_RAW_MAX_FILE_MB", ""))
+        logger.warning(
+            "SQLHANDLER_RAW_MAX_FILE_MB=%r is negative — using the default 64 (0 means unlimited)",
+            raw,
+        )
+        return 64
+    return value
+
+
+def listing_max_entries(env: Mapping[str, str] | None = None) -> int:
+    """Upper bound on ONE discovery listing (SQLHANDLER_LISTING_MAX_ENTRIES).
+
+    Backends that materialize a full recursive listing (s3/nfs get_file_info)
+    or iterate every catalog namespace x table (iceberg) refuse with a loud
+    error PAST this bound instead of silently chewing through an unbounded
+    tree — mirroring the OneLake DFS page cap. Generous default; 0 = unlimited.
+    """
+    value = _to_int("SQLHANDLER_LISTING_MAX_ENTRIES", env or os.environ, 250_000)
+    if value < 0:
+        raw = _getenv("SQLHANDLER_LISTING_MAX_ENTRIES", (env or {}).get("SQLHANDLER_LISTING_MAX_ENTRIES", ""))
+        logger.warning(
+            "SQLHANDLER_LISTING_MAX_ENTRIES=%r is negative — using the default 250000 (0 means unlimited)",
+            raw,
+        )
+        return 250_000
+    return value
 
 
 @dataclass(frozen=True)
@@ -124,6 +205,7 @@ class FabricConfig:
         return f"abfss://{self.workspace_id}@{self.fabric_authority}/{self.lakehouse_id}/Tables"
 
 
+@_with_env_override
 def load_config(env: dict | None = None) -> FabricConfig:
     """Build a :class:`FabricConfig` from the environment (or a provided dict).
 
@@ -190,6 +272,7 @@ class S3Config:
         return bool(self.access_key and self.secret_key)
 
 
+@_with_env_override
 def load_s3_config(env: dict | None = None) -> S3Config:
     """Build a :class:`S3Config` from the environment (or a provided dict).
 
@@ -282,13 +365,14 @@ class IcebergConfig:
         return bool(self.catalog_uri)
 
 
+@_with_env_override
 def load_iceberg_config(env: dict | None = None) -> IcebergConfig:
     """Build an :class:`IcebergConfig` from the environment (or a provided dict).
 
     Environment variables:
       ICEBERG_CATALOG_TYPE   (rest | sql | glue | hive | nessie; default rest;
-                              an unknown value falls back to rest — same
-                              LakehouseError-adjacent tolerance as before)
+                              an unknown value raises LakehouseError — the
+                              same loud-typo rule as SQLHANDLER_BACKEND)
       ICEBERG_CATALOG_URI    (REST/Nessie endpoint, thrift://host:9083 for
                               hive, or sqlite:///path for sql)
       ICEBERG_CATALOG_TOKEN  (optional bearer token for REST/nessie/UC)
@@ -305,7 +389,10 @@ def load_iceberg_config(env: dict | None = None) -> IcebergConfig:
     e = env if env is not None else os.environ
     ctype = _getenv("ICEBERG_CATALOG_TYPE", e.get("ICEBERG_CATALOG_TYPE", "rest")).strip().lower()
     if ctype not in IcebergConfig.KNOWN_CATALOG_TYPES:
-        ctype = "rest"
+        raise LakehouseError(
+            f"Invalid ICEBERG_CATALOG_TYPE {ctype!r}: use one of "
+            f"{', '.join(IcebergConfig.KNOWN_CATALOG_TYPES)}."
+        )
     return IcebergConfig(
         catalog_type=ctype,
         catalog_uri=_getenv("ICEBERG_CATALOG_URI", e.get("ICEBERG_CATALOG_URI", "")),
@@ -334,6 +421,7 @@ class FileConfig:
         return bool(self.root_dir)
 
 
+@_with_env_override
 def load_file_config(env: dict | None = None) -> FileConfig:
     """Build a :class:`FileConfig` from the environment.
 
@@ -344,6 +432,7 @@ def load_file_config(env: dict | None = None) -> FileConfig:
     return FileConfig(root_dir=_getenv("NFS_ROOT", e.get("NFS_ROOT", "")))
 
 
+@_with_env_override
 def load_backend_config(env: dict | None = None) -> tuple[str, object]:
     """Select and load the backend config from the environment.
 
@@ -444,27 +533,60 @@ def load_source_providers(env: dict | None = None) -> object | None:
         if label in labels:
             raise ValueError(f"SQLHANDLER_SOURCES[{idx}] name {label!r} is duplicated; source names must be unique")
         backend = str(src.get("backend") or "s3").lower()
-        src_env = {
-            "SQLHANDLER_BACKEND": backend,
-            "S3_ENDPOINT_URL": src.get("endpointUrl", ""),
-            "S3_REGION": src.get("region", "us-east-1"),
-            "S3_ACCESS_KEY": src.get("accessKey", ""),
-            "S3_SECRET_KEY": src.get("secretKey", ""),
-            "S3_SESSION_TOKEN": src.get("sessionToken", ""),
-            "S3_BUCKET": src.get("bucket", ""),
-            "S3_PREFIX": src.get("prefix", ""),
-            "S3_ANONYMOUS": "true" if src.get("anonymous") else "false",
-            "S3_USE_SSL": "true" if src.get("useSsl") else "false",
-            "S3_FORMAT": src.get("format", "auto"),
-            "FABRIC_LAKEHOUSE_ABFSS_URL": src.get("abfssUrl", ""),
-            "FABRIC_WORKSPACE_ID": src.get("workspaceId", ""),
-            "FABRIC_LAKEHOUSE_ID": src.get("lakehouseId", ""),
-            "NFS_ROOT": src.get("rootDir", ""),
-            "ICEBERG_CATALOG_TYPE": src.get("catalogType", "rest"),
-            "ICEBERG_CATALOG_URI": src.get("catalogUri", ""),
-            "ICEBERG_CATALOG_NAME": src.get("catalogName", "sqlhandler"),
-            "ICEBERG_WAREHOUSE": src.get("warehouse", ""),
+        # SPARSE per-source mapping (audit 2026-11-12, P0-2). Two rules:
+        #   1. a key present in the source WINS over os.environ (that is the
+        #      P0: the loaders used to read os.environ first, so a global
+        #      SQLHANDLER_BACKEND made every source resolve to the same
+        #      backend);
+        #   2. a key the source OMITS falls through to os.environ and then the
+        #      loader's own default, so an operator can set a global default
+        #      (S3_REGION, credentials) once for every source. Materializing
+        #      "" — or a baked-in default like "us-east-1" — would shadow that.
+        #
+        # EXCEPTION: `backend` is ALWAYS materialized below (default "s3").
+        # A global SQLHANDLER_BACKEND is therefore never a multi-source
+        # default — each source names its own backend, and an omitted one is
+        # s3 by the documented per-source default. That asymmetry is
+        # deliberate (a single global backend silently deciding what a
+        # per-source block means is exactly the P0-2 failure), and it is
+        # called out here because the comment above would otherwise imply
+        # otherwise (cross-validation 2026-11-12, P2).
+        src_env: dict[str, str] = {"SQLHANDLER_BACKEND": backend}
+        _optional = {
+            "endpointUrl": "S3_ENDPOINT_URL",
+            "region": "S3_REGION",
+            "accessKey": "S3_ACCESS_KEY",
+            "secretKey": "S3_SECRET_KEY",
+            "sessionToken": "S3_SESSION_TOKEN",
+            "bucket": "S3_BUCKET",
+            "prefix": "S3_PREFIX",
+            "format": "S3_FORMAT",
+            "abfssUrl": "FABRIC_LAKEHOUSE_ABFSS_URL",
+            "workspaceId": "FABRIC_WORKSPACE_ID",
+            "lakehouseId": "FABRIC_LAKEHOUSE_ID",
+            "rootDir": "NFS_ROOT",
+            "catalogType": "ICEBERG_CATALOG_TYPE",
+            "catalogUri": "ICEBERG_CATALOG_URI",
+            "catalogName": "ICEBERG_CATALOG_NAME",
+            "warehouse": "ICEBERG_WAREHOUSE",
         }
+        for _src_key, _env_key in _optional.items():
+            _val = src.get(_src_key)
+            if _val is not None and str(_val) != "":
+                src_env[_env_key] = str(_val)
+        if "anonymous" in src:
+            src_env["S3_ANONYMOUS"] = "true" if src.get("anonymous") else "false"
+        if "useSsl" in src:
+            # https by default (audit 2026-11-12, P1-13): a source that omits
+            # useSsl must NOT be silently downgraded to plaintext http with its
+            # access/secret keys on the wire. Only an explicit falsy value opts
+            # out — the single-backend path has the same rule (S3Config.use_ssl
+            # defaults True).
+            src_env["S3_USE_SSL"] = (
+                "false"
+                if str(src.get("useSsl")).strip().lower() in ("false", "0", "no", "off")
+                else "true"
+            )
         _, cfg = load_backend_config(src_env)
         providers.append(make_provider(cfg))
         labels.append(label)
@@ -502,6 +624,7 @@ class CacheConfig:
         return self.ttl_seconds > 0
 
 
+@_with_env_override
 def load_cache_config(env: dict | None = None) -> CacheConfig:
     """Build a :class:`CacheConfig` from the environment (or a provided dict).
 
@@ -654,6 +777,7 @@ def _read_sharing_profile(path: str) -> dict:
     return data
 
 
+@_with_env_override
 def load_sharing_config(env: dict | None = None) -> SharingConfig:
     """Build a :class:`SharingConfig` from the environment (or a provided dict).
 
@@ -752,6 +876,7 @@ class AdlsConfig:
         return f"{self.account}.blob.{self.endpoint_suffix}"
 
 
+@_with_env_override
 def load_adls_config(env: dict | None = None) -> AdlsConfig:
     """Build an :class:`AdlsConfig` from the environment (or a provided dict).
 
@@ -780,6 +905,16 @@ def load_adls_config(env: dict | None = None) -> AdlsConfig:
             f"Invalid ADLS_AUTH {auth!r}: use 'anon' (public container) or 'client-secret' (Entra service principal)."
         )
     secret_env_name = _getenv("ADLS_CLIENT_SECRET_ENV", e.get("ADLS_CLIENT_SECRET_ENV", ""))
+    if auth == "client-secret" and not secret_env_name:
+        # A configured client-secret auth without the NAME of the env var that
+        # carries the secret used to slip through as secret="" and fail later
+        # with the generic "not configured" message naming variables the
+        # operator had already set (audit 2026-11-12 P2) — refuse loudly here.
+        raise LakehouseError(
+            "ADLS_AUTH=client-secret requires ADLS_CLIENT_SECRET_ENV — the NAME of the env "
+            "var holding the client secret (the helm chart wires that var from a Kubernetes "
+            "Secret secretKeyRef)."
+        )
     secret = ""
     if auth == "client-secret" and secret_env_name:
         secret = _getenv(secret_env_name, e.get(secret_env_name, ""))
@@ -838,6 +973,7 @@ class GcsConfig:
         return bool(self.bucket)
 
 
+@_with_env_override
 def load_gcs_config(env: dict | None = None) -> GcsConfig:
     """Build a :class:`GcsConfig` from the environment (or a provided dict).
 
@@ -880,6 +1016,7 @@ class CompressionConfig:
     min_size: int = 1024
 
 
+@_with_env_override
 def load_compression_config(env: dict | None = None) -> CompressionConfig:
     """Build a :class:`CompressionConfig` from the environment (or a dict).
 

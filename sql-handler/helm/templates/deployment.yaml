@@ -159,6 +159,13 @@ spec:
                   name: {{ .Values.security.apiKey.existingSecret | default (printf "%s-apikey" (include "sqlhandler.fullname" .)) }}
                   key: {{ .Values.security.apiKey.existingSecretKey }}
             {{- end }}
+            {{- /* Bootstrap admin fallback (admin_keys.py): when NO policy is
+                   enforcing, the configured API key IS the administrator —
+                   otherwise a fresh install has no reachable admin at all.
+                   Rendered ALWAYS, not inside the policy-enabled block: a
+                   policy-less deployment still needs an administration plane. */}}
+            - name: SQLHANDLER_BOOTSTRAP_ADMIN
+              value: {{ ternary "1" "0" .Values.security.policy.bootstrapAdmin | quote }}
             {{- if .Values.semanticCatalog.store.enabled }}
             # Upload store on the shared PVC (values: semanticCatalog.store):
             # UI/API uploads become cross-pod + durable and still hot-reload.
@@ -187,6 +194,13 @@ spec:
             {{- if $sqPath }}
             - name: SQLHANDLER_SAVED_QUERIES_PATH
               value: {{ $sqPath | quote }}
+            {{- end }}
+            {{- if .Values.security.audit.enabled }}
+            {{- /* Audit trail (audit 2026-11-12): query, write and admin
+                   events, one JSON line each. Needs a durable volume — the
+                   render below fails without a claim source. */}}
+            - name: SQLHANDLER_AUDIT_LOG
+              value: {{ printf "%s/%s" (.Values.security.audit.mountPath | default "/var/lib/sqlhandler-audit") (.Values.security.audit.fileName | default "audit.jsonl") | quote }}
             {{- end }}
             {{- if .Values.security.policy.enabled }}
             {{- $pol := .Values.security.policy }}
@@ -279,6 +293,20 @@ spec:
             - name: SQLHANDLER_SELF_MINT_MAX_KEYS
               value: {{ . | quote }}
             {{- end }}
+            {{- /* Identity rungs (identity.py env contract). Rendered ONLY
+                   when true: an absent env is the server's off default.
+                   These were silently unwired before — values files set them
+                   and nothing ever reached the pod. */}}
+            {{- with .Values.security.identity }}
+            {{- if .trustBrowserHeaders }}
+            - name: SQLHANDLER_TRUST_BROWSER_HEADERS
+              value: "1"
+            {{- end }}
+            {{- if .requireIdentity }}
+            - name: SQLHANDLER_REQUIRE_IDENTITY
+              value: "1"
+            {{- end }}
+            {{- end }}
             {{- with .Values.security.oidc }}
             {{- $pcaEnv := .platformCa | default dict }}
             {{- if and .enabled $pcaEnv.enabled }}
@@ -297,11 +325,20 @@ spec:
           {{- $needStore := .Values.semanticCatalog.store.enabled }}
           {{- $needPolicy := .Values.security.policy.enabled }}
           {{- $needPolicySeed := and $needPolicy (or .Values.security.policy.existingClaim .Values.security.policy.claim.create) .Values.security.policy.seedFromConfigMap }}
-          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy }}
+          {{- $audit := .Values.security.audit }}
+          {{- $needAudit := $audit.enabled }}
+          {{- if and $needAudit (not (or $audit.existingClaim $audit.pvc.create)) }}
+          {{- fail "security.audit.enabled requires security.audit.existingClaim or security.audit.pvc.create — an audit trail on an ephemeral volume dies with the pod and is not a compliance trail." }}
+          {{- end }}
+          {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needAudit }}
           volumeMounts:
             {{- if $needTmp }}
             - name: tmp
               mountPath: /tmp
+            {{- end }}
+            {{- if $needAudit }}
+            - name: audit
+              mountPath: {{ $audit.mountPath | default "/var/lib/sqlhandler-audit" }}
             {{- end }}
             {{- if $needData }}
             - name: data
@@ -402,11 +439,18 @@ spec:
       {{- $needStore := .Values.semanticCatalog.store.enabled }}
       {{- $needPolicy := .Values.security.policy.enabled }}
       {{- $needPolicySeed := and $needPolicy (or .Values.security.policy.existingClaim .Values.security.policy.claim.create) .Values.security.policy.seedFromConfigMap }}
-      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy }}
+      {{- $auditV := .Values.security.audit }}
+      {{- $needAuditV := $auditV.enabled }}
+      {{- if or $needTmp $needData $needCatalog $needStore $needPolicy $needAuditV }}
       volumes:
         {{- if $needTmp }}
         - name: tmp
           emptyDir: {}
+        {{- end }}
+        {{- if $needAuditV }}
+        - name: audit
+          persistentVolumeClaim:
+            claimName: {{ $auditV.existingClaim | default (printf "%s-audit" (include "sqlhandler.fullname" .)) }}
         {{- end }}
         {{- if $needData }}
         - name: data

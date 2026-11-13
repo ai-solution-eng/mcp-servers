@@ -148,6 +148,33 @@ curl -X DELETE -H "X-API-Token: $TOKEN" https://sqlhandler.<domain>/api/semantic
 
 **D. Out-of-band ConfigMap** (platform teams): set `semanticCatalog.existingConfigMap: <name>` to a ConfigMap you own carrying a `semantic-catalog.json` key; manage it with your own pipeline.
 
+### Importing from dbt
+
+If your data team already documents models in dbt, that documentation is the
+catalog. `POST /api/semantic-catalog/import-dbt` takes a `target/manifest.json`
+from `dbt compile`/`dbt build` and maps it to catalog entries — no dbt install,
+no warehouse query (the manifest is parsed as plain JSON).
+
+What is consumed: `model` / `seed` / `snapshot` nodes (tests, analyses and
+exposures are ignored — they document assertions and ad-hoc queries, not
+tables); `description` (falling back to `meta.sqlhandler.description`) and
+`columns.<col>.description`; `meta.sqlhandler.aliases` for search terms;
+`meta.sqlhandler.hide` to omit a node; and `meta.sqlhandler.virtual` +
+`compiled_sql` to export a virtual table — double-gated on both the node's meta
+and a request-level `allow_virtual`.
+
+Two rules make it safe to re-run:
+
+- **The import proposes, it does not overwrite.** An existing key is replaced
+  only when it is a previous dbt import (the entry carries
+  `meta.imported_from: "dbt"`) or `force_overwrite` is set; everything else
+  comes back as a proposed addition for the operator to apply
+  (`POST /api/semantic-catalog/import-dbt/apply`).
+- **Keys are resolved the way the engine lists tables** (`path → qualified_name
+  → name`), because dbt names carry dots (`analytics.stg_orders`) while catalog
+  keys are `schema/name` paths; an explicit `alias_map` wins over every
+  generated form.
+
 ### Which catalog wins?
 
 Uploaded catalog (B/C) → configured file (A/D) → nothing. An upload overrides the configured file **until it is deleted** (or the pod's ephemeral store disappears). With route A seeded and route B used for live edits, the values file remains the auditable baseline.
@@ -177,7 +204,7 @@ RWX (ReadWriteMany) is mandatory for multi-replica deployments — the chart ref
 
 - **Hot reload** — every route: edits appear in `list`/`describe` without a restart (file mtime is watched; cached describes are invalidated).
 - **Fail-open** — a broken/unreadable catalog degrades to *no documentation*; queries never break. (Uploads are the exception: invalid content is rejected with a precise error, before anything is written.)
-- **Validation** — top-level object with a `tables` mapping; each table entry a mapping; ≤ 1 MB; UTF-8. YAML needs the `pyyaml` package (bundled since v1.4.0).
+- **Validation** — top-level object with a `tables` mapping; each table entry a mapping; ≤ 1 MB; UTF-8. YAML needs the `pyyaml` package, which is a base dependency of the image.
 - **Multi-replica convergence** — shared-PVC/ConfigMap updates propagate to each pod via the kubelet (typically seconds, worst case ~1 minute); replicas can briefly disagree on wording, then converge.
 - **Upload is gated** — same auth as the rest of `/api/*` (`SQLHANDLER_API_TOKEN` / PCAI gateway); disable entirely with `SQLHANDLER_CATALOG_UPLOAD=0`.
 
@@ -187,6 +214,6 @@ RWX (ReadWriteMany) is mandatory for multi-replica deployments — the chart ref
 |---|---|
 | Descriptions don't show | `GET /api/semantic-catalog` → `active_source` / `active_tables`; or the UI panel status line |
 | Upload rejected "not valid JSON or YAML" | Lint the file locally (`python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" catalog.yaml`) |
-| Upload rejected "PyYAML is not installed" | YAML route needs image ≥ v1.4.0 (or convert to JSON) |
+| Upload rejected "PyYAML is not installed" | The image was built without `pyyaml` (it is a base dependency) — convert to JSON or use a current image |
 | One pod shows old wording | Someone uploaded to that pod (store wins); `DELETE /api/semantic-catalog` or let it reschedule |
 | PVC stuck Pending | StorageClass lacks RWX — pick an NFS-backed class or run single-replica with `accessModes: [ReadWriteOnce]` |
