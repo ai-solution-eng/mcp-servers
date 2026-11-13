@@ -2856,11 +2856,15 @@ check("install request hygiene (bad json / traversal dir / missing repo)",
 print("14. Configured store repos")
 
 set_env(EZAPP_MCP_STORE_REPOS="acme/charts, https://github.com/acme/other ,"
-                               "acme/charts,  ,",
+                               "acme/charts,  ,"
+                               "https://github.com/acme/charts,"
+                               "https://github.com/acme/pinned/tree/v2.1",
         EZAPP_MCP_API_KEY="s3cret")
 check("repo list parses, trims, dedupes and drops empties",
       server._configured_store_repos()
-      == ["acme/charts", "https://github.com/acme/other"],
+      == ["acme/charts", "https://github.com/acme/other",
+          "https://github.com/acme/charts",
+          "https://github.com/acme/pinned/tree/v2.1"],
       str(server._configured_store_repos()))
 
 router = server._UiRouterApp(
@@ -2894,11 +2898,22 @@ async def _repos_endpoint_scenarios():
 
 repos = asyncio.run(_repos_endpoint_scenarios())
 repos_body = json.loads(repos["repos"][1]["body"])
-check("repos endpoint returns the configured list with the default first",
+check("repos endpoint returns raw + parsed entries, default first, deduped",
       repos["repos"][0]["status"] == 200
       and repos_body["default"] == "acme/charts"
-      and repos_body["repos"] == ["acme/charts", "https://github.com/acme/other"],
+      and repos_body["repos"] == [
+          {"raw": "acme/charts", "repo": "acme/charts", "ref": ""},
+          {"raw": "https://github.com/acme/other", "repo": "acme/other",
+           "ref": ""},
+          {"raw": "https://github.com/acme/pinned/tree/v2.1",
+           "repo": "acme/pinned@v2.1", "ref": "v2.1"},
+      ],
       str(repos_body))
+check("URL and shorthand forms of the same repo collapse to one entry",
+      len({e["repo"] for e in repos_body["repos"]}) == len(repos_body["repos"])
+      and all("/" in e["repo"] and ":" not in e["repo"]
+              for e in repos_body["repos"]),
+      str([e["repo"] for e in repos_body["repos"]]))
 check("POST /api/store/repos → 405", repos["repos_post"][0]["status"] == 405,
       str(repos["repos_post"][0]))
 check("disabled store → 404 on the repos endpoint",

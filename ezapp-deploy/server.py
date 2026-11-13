@@ -3584,8 +3584,11 @@ async def _manifest_http(scope, receive, send):
 async def _store_repos_http(scope, receive, send):
     """GET /api/store/repos — the preconfigured store repos for the UI.
 
-    Returns {"default": <first repo or null>, "repos": [...]}. API-key
-    gated upstream; disabled with EZAPP_MCP_STORE_ENABLED=false (404).
+    Returns {"default": <first repo or null>, "repos": [{"raw", "repo",
+    "ref"} …]} — `repo` is the parsed owner/repo (+@ref when pinned) so the
+    UI can dedupe against locally saved repos. Two configured entries that
+    resolve to the same repo (a URL and its bare shorthand) are collapsed.
+    API-key gated upstream; disabled with EZAPP_MCP_STORE_ENABLED=false (404).
     """
     if (scope.get('method') or '').upper() != 'GET':
         for message in _json_asgi_response(
@@ -3599,10 +3602,21 @@ async def _store_repos_http(scope, receive, send):
         for message in _json_asgi_response(send, 404, b'{"error": "not found"}'):
             await send(message)
         return
-    repos = _configured_store_repos()
+    entries = []
+    seen = set()
+    for raw in _configured_store_repos():
+        try:
+            owner, name, ref = parse_store_repo(raw)
+            repo_norm = f'{owner}/{name}' + (f'@{ref}' if ref else '')
+        except ValueError:
+            repo_norm = raw   # unparseable — the catalog will error clearly
+        if repo_norm in seen:
+            continue          # same repo via a URL and its bare shorthand
+        seen.add(repo_norm)
+        entries.append({'raw': raw, 'repo': repo_norm, 'ref': ref or ''})
     body = {
-        'default': repos[0] if repos else None,
-        'repos': repos,
+        'default': entries[0]['raw'] if entries else None,
+        'repos': entries,
     }
     for message in _json_asgi_response(
         send, 200, json.dumps(body, indent=2).encode('utf-8'),
