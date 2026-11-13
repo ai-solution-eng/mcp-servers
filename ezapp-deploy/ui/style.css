@@ -97,6 +97,14 @@ footer p { margin: 0.2rem 0; }
 /* ── App store ──────────────────────────────────────────────────────── */
 
 #repoline { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+#repodropdown {
+  max-width: 20rem;
+  padding: 0.35rem 0.4rem;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
 #repobox {
   flex: 1;
   min-width: 20rem;

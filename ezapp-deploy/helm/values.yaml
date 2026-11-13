@@ -137,6 +137,15 @@ ui:
 # endpoints are gated by the same API key as /mcp.
 store:
   enabled: true
+  # Preconfigured store repos shown in the UI's repo dropdown — the FIRST
+  # entry is the default the store tab opens with. Full URLs or bare
+  # owner/repo (against the configured GitHub host). Any other repo URL can
+  # still be typed in the UI. Empty = no preconfigured default.
+  # Example:
+  #   repos:
+  #     - acme/helm-charts
+  #     - https://github.com/acme/extra-charts
+  repos: []
   # Repo tarball download cap (decoded). Charts inside still go through the
   # EZAPP_MCP_MAX_CHART_MB cap at upload time.
   maxRepoMB: 200

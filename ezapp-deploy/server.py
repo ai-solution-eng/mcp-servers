@@ -181,6 +181,7 @@ GITHUB_API_URL_ENV = "GITHUB_API_URL"
 GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
 GITHUB_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
 MAX_REPO_MB_ENV = "EZAPP_MCP_MAX_REPO_MB"
+STORE_REPOS_ENV = "EZAPP_MCP_STORE_REPOS"
 
 DEFAULT_EZAPPCONFIG_KIND = "EzAppConfig"
 DEFAULT_EZAPPCONFIG_API_VERSION = "ezconfig.hpe.ezaf.com/v1alpha1"
@@ -219,20 +220,11 @@ _STORE_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # package (icon.png / logo.png …); a logo is REQUIRED — when a package ships
 # none, the UI's upload dialog provides one and the API accepts it via the
 # `logo` field (a data: URI or base64 of the raw image bytes, <= 256 KB).
-# Inside-package lookup: the explicit candidate names below first (in
-# order), then any .png/.svg under the chart root whose name mentions
-# icon/logo (shallower first, then alphabetical). PNG and SVG both work:
-# the tile renders either as a data: URI; the CR's default logoImage is raw
-# base64 for PNG (the platform template's documented shape) and a
-# self-describing data:image/svg+xml;base64 URI for SVG.
-_STORE_LOGO_CANDIDATES = (
-    "icon.png", "logo.png", "icon.svg", "logo.svg",
-    "chart-icon.png", "chart-logo.png", "chart-icon.svg", "chart-logo.svg",
-    "img/icon.png", "img/logo.png", "img/icon.svg", "img/logo.svg",
-    "images/icon.png", "images/logo.png", "images/icon.svg", "images/logo.svg",
-    "icons/icon.png", "icons/logo.png", "icons/icon.svg", "icons/logo.svg",
-    "assets/icon.png", "assets/logo.png", "assets/icon.svg", "assets/logo.svg",
-)
+# Logo lookup is a SCORED SCAN of the actual files (never a fixed name
+# list): basename starting with logo / icon first, then <app-or-chart
+# name>.<ext>, then anything containing logo / icon, then — as a last
+# resort — a lone image at the top level. Judged by CONTENT (magic bytes):
+# a logo.png that is really a JPEG works. See _logo_candidate_score.
 
 # Teardown watch: after an accepted DELETE the CR lingers in Terminating
 # while the operator uninstall (finalizer) runs — on the operator's own
@@ -1769,6 +1761,19 @@ def _store_enabled() -> bool:
     return os.environ.get(STORE_ENABLED_ENV, '').strip().lower() != 'false'
 
 
+def _configured_store_repos() -> list:
+    """Preconfigured store repos, in order — the FIRST one is the default
+    the store tab opens with. From EZAPP_MCP_STORE_REPOS (comma-separated;
+    full URLs or bare owner/repo against the configured GitHub host).
+    """
+    repos = []
+    for part in os.environ.get(STORE_REPOS_ENV, '').split(','):
+        entry = part.strip()
+        if entry and entry not in repos:
+            repos.append(entry)
+    return repos
+
+
 def _max_repo_bytes() -> int:
     raw = os.environ.get(MAX_REPO_MB_ENV, '').strip()
     try:
@@ -2156,26 +2161,18 @@ def _packaged_chart_extras(data: bytes) -> dict:
         except UnicodeDecodeError:
             values = ''
 
-    # logo lookup: explicit candidates at the package root first, then the
-    # chart's own name as a filename (<chartname>.png …), then any accepted
-    # image anywhere under the package root whose name mentions icon/logo —
-    # shallower paths first, then alphabetical.
+    # logo lookup: a SCORED SCAN over every file in the package (any depth)
+    # — scored on the basename (logo* > icon* > <chartname>.* > *logo* >
+    # *icon* > a lone top-level image), shallower first, then alphabetical;
+    # each candidate is content-checked until one is usable.
     logo_value, logo_file = '', ''
     logo_note = ''
     rejected = []
-    ordered = [c for c in _STORE_LOGO_CANDIDATES if c in files]
-    chart_stem = str((meta or {}).get('name') or '').strip().lower()
-    for cand in _logo_name_candidates(chart_stem):
-        if cand in files and cand not in ordered:
-            ordered.append(cand)
-    scan = sorted(
-        (rel for rel in files
-         if rel not in _STORE_LOGO_CANDIDATES
-         and rel not in ordered
-         and ('icon' in rel.lower() or 'logo' in rel.lower())),
-        key=lambda r: (r.count('/'), r),
-    )
-    for rel in ordered + scan:
+    chart_stem = str((meta or {}).get('name') or '').strip()
+    ranked = _rank_logo_candidates(
+        files.keys(), [chart_stem],
+        sizes={rel: len(data) for rel, data in files.items()})
+    for rel in ranked:
         data = files.get(rel)
         fmt = _sniff_chart_logo(data or b'')
         if fmt is None:
@@ -2210,20 +2207,63 @@ def _sniff_svg(data: bytes) -> bool:
     return head.startswith(b'<svg')
 
 
-def _logo_name_candidates(*stems) -> list:
-    """Image filenames derived from name stems: `logo` → logo.png, logo.svg,
-    … (png first — the dominant convention). Used for app-name-based logos
-    (`<appname>.png`) and chart-name-based logos inside packages."""
-    out = []
-    for stem in stems:
-        stem = (stem or '').strip().strip('/').lower()
-        if not stem or '/' in stem:
-            continue
-        for ext in ('png', 'svg', 'jpeg', 'jpg', 'webp', 'gif'):
-            candidate = f'{stem}.{ext}'
-            if candidate not in out:
-                out.append(candidate)
-    return out
+_LOGO_EXTS = ('png', 'svg', 'jpeg', 'jpg', 'webp', 'gif')
+
+
+def _logo_candidate_score(rel: str, stems: list, sizes: 'dict | None' = None) -> 'tuple | None':
+    """Preference score for one candidate logo path (lower = better), or
+    None when the file is not an accepted image name.
+
+    Judged on the BASENAME, content-checked separately:
+      0  starts with 'logo'   (logo.png, logos.svg — the stated convention)
+      1  starts with 'icon'   (icon.png, icon-…)
+      2  named after the app/chart itself (<stem>.<ext>)
+      3  contains 'logo'      (kafka_logo.png, mariadblogo.png)
+      4  contains 'icon'      (app-icon.png)
+      5  FINAL FALLBACK: a top-level .png — the SMALLEST one wins (logos are
+         almost always the smallest image in a chart; screenshots and
+         diagrams are big). Nested non-logo images are never chosen.
+    Within tiers 0-4: shallower first, then shorter, then alphabetical.
+    `sizes` (rel → bytes) only orders tier 5; omitted → alphabetical.
+    """
+    base = rel.rsplit('/', 1)[-1].lower()
+    stem, _, ext = base.rpartition('.')
+    if ext not in _LOGO_EXTS or not stem:
+        return None
+    lowered_stems = [s.lower() for s in stems if s]
+    if stem.startswith('logo'):
+        tier = 0
+    elif stem.startswith('icon'):
+        tier = 1
+    elif lowered_stems and stem in lowered_stems:
+        tier = 2
+    elif 'logo' in stem:
+        tier = 3
+    elif 'icon' in stem:
+        tier = 4
+    elif ext == 'png' and '/' not in rel:
+        tier = 5
+    else:
+        return None
+    if tier == 5:
+        size = (sizes or {}).get(rel, 0)
+        return (tier, size, rel)
+    return (tier, rel.count('/'), len(rel), rel)
+
+
+def _rank_logo_candidates(rel_paths: list, stems: list,
+                          sizes: 'dict | None' = None) -> list:
+    """Order candidate logo paths best-first (see _logo_candidate_score).
+
+    `sizes` (rel → byte length) breaks tier-5 ties by file size — the
+    smallest top-level .png wins.
+    """
+    scored = []
+    for rel in rel_paths:
+        score = _logo_candidate_score(rel, stems, sizes)
+        if score is not None:
+            scored.append((score, rel))
+    return [rel for _, rel in sorted(scored)]
 
 
 _LOGO_MIME = {
@@ -2406,8 +2446,12 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
     tree = tree_doc.get('tree') or []
     tree_paths = {str(entry.get('path')) for entry in tree
                   if isinstance(entry, dict) and entry.get('type') == 'blob'}
+    tree_sizes = {str(entry.get('path')): int(entry.get('size') or 0)
+                  for entry in tree
+                  if isinstance(entry, dict) and entry.get('type') == 'blob'}
     if progress:
-        await progress({'type': 'stage', 'stage': 'listing'})
+        await progress({'type': 'stage', 'stage': 'listing',
+                        'total': len(tree_paths), 'done': 0})
 
     chart_entries, skipped = [], []
     # Charts are always PACKAGED: every .tgz / .tar.gz `helm package` file
@@ -2477,10 +2521,10 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
     # ── group into app tiles and resolve each tile's logo ────────────────
     # One tile per app (repo top-level dir). Tile logo priority: the newest
     # version's own package logo (extracted during the metadata fetch — no
-    # extra requests), then an app-level logo file sitting NEXT TO the
-    # packages in the repo — the conventional logo.png / icon.png names plus
-    # the app's own name as a filename (<app>/arize-phoenix.png …). Only
-    # paths present in the repo listing are fetched (no 404 probing).
+    # extra requests), then a SCORED SCAN of the files sitting NEXT TO the
+    # packages in the app directory (logo* > icon* > <appname>.* > *logo* >
+    # *icon* > a lone image) — only files present in the repo listing are
+    # fetched (no 404 probing), each content-checked until one is usable.
     apps = []
     for group in _group_catalog_apps(chart_entries):
         app_name = group['app']
@@ -2492,15 +2536,16 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
                 break
         if not app_logo_uri and app_name != '(repo root)':
             app_prefix = f'{app_name}/'
-            app_candidates = list(_STORE_LOGO_CANDIDATES)
-            for cand in (_logo_name_candidates(app_name)
-                         + _logo_name_candidates(app_name.lower())):
-                if cand not in app_candidates:
-                    app_candidates.append(cand)
-            present = [c for c in app_candidates
-                       if app_prefix + c in tree_paths]
-            for candidate in present:
-                logo_path = app_prefix + candidate
+            app_root_files = [p[len(app_prefix):] for p in tree_paths
+                              if p.startswith(app_prefix)
+                              and '/' not in p[len(app_prefix):]]
+            app_file_sizes = {p[len(app_prefix):]: tree_sizes.get(p, 0)
+                              for p in tree_paths
+                              if p.startswith(app_prefix)
+                              and '/' not in p[len(app_prefix):]}
+            for rel in _rank_logo_candidates(app_root_files, [app_name],
+                                             app_file_sizes):
+                logo_path = app_prefix + rel
                 try:
                     lcode, logo_bytes = await _github_fetch_bytes(
                         _github_raw_url(endpoints, owner, repo, ref, logo_path),
@@ -2510,7 +2555,7 @@ async def _build_store_catalog(repo_str: str, ref_override: str = '',
                     continue
                 uri = _logo_data_uri(logo_bytes) if lcode == 200 else None
                 if uri:
-                    app_logo_uri, app_logo_file = uri, candidate
+                    app_logo_uri, app_logo_file = uri, rel
                     break
         apps.append({
             'app': app_name,
@@ -2554,19 +2599,9 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
     (<app>/logo.png … — the common one-logo-per-app-directory convention).
     """
     packaged_bytes = None
-    app_logo_bytes = None
-    app_logo_path = ''
+    app_logo_files = {}   # <app>/<image> → bytes: app-root images only
     app = _app_name_of(file_path)
-    app_wanted = {}
-    if app != '(repo root)':
-        app_stems = [app]
-        if app.lower() != app:
-            app_stems.append(app.lower())
-        for cand in _logo_name_candidates(*app_stems) + list(_STORE_LOGO_CANDIDATES):
-            app_wanted[f'{app}/{cand}'] = cand
-    else:
-        for cand in _STORE_LOGO_CANDIDATES:
-            app_wanted[cand] = cand
+    app_prefix = f'{app}/' if app != '(repo root)' else ''
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
             for m in tar.getmembers():
@@ -2577,15 +2612,13 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
                     payload = tar.extractfile(m)
                     if payload is not None:
                         packaged_bytes = payload.read()
-                elif not app_logo_bytes and rel in app_wanted:
+                elif (rel.startswith(app_prefix)
+                      and '/' not in rel[len(app_prefix):]
+                      and rel[len(app_prefix):].lower().rpartition('.')[2]
+                          in _LOGO_EXTS):
                     payload = tar.extractfile(m)
                     if payload is not None:
-                        candidate_bytes = payload.read()
-                        if _sniff_chart_logo(candidate_bytes):
-                            app_logo_bytes = candidate_bytes
-                            app_logo_path = rel
-                if packaged_bytes is not None and app_logo_bytes is not None:
-                    break
+                        app_logo_files[rel] = payload.read()
     except tarfile.TarError as e:
         raise ValueError(
             f'repo tarball is not a readable gzipped archive: {e}'
@@ -2605,9 +2638,19 @@ def _extract_packaged_chart_from_repo_tarball(data: bytes,
     warnings = []
     if extras.get('logo_note'):
         warnings.append(f"{extras['logo_note']} (inside the package)")
-    if not logo_value and app_logo_bytes is not None:
-        logo_value = _cr_logo_image(app_logo_bytes) or ''
-        logo_file = app_logo_path
+    if not logo_value and app_logo_files:
+        # fall back to a scored scan of the app directory (logo* > icon* >
+        # <appname>.* > *logo* > *icon* > the SMALLEST top-level .png).
+        # Ranked on app-RELATIVE names so tier-5's top-level check works.
+        app_rel_files = {rel[len(app_prefix):]: payload
+                         for rel, payload in app_logo_files.items()}
+        for rel in _rank_logo_candidates(
+                app_rel_files.keys(), [app],
+                sizes={rel: len(data) for rel, data in app_rel_files.items()}):
+            logo_value = _cr_logo_image(app_rel_files.get(rel) or b'') or ''
+            if logo_value:
+                logo_file = f'{app}/{rel}'
+                break
     return {
         'tgz': packaged_bytes,
         'name': name,
@@ -3370,6 +3413,36 @@ async def _manifest_http(scope, receive, send):
         await send(message)
 
 
+async def _store_repos_http(scope, receive, send):
+    """GET /api/store/repos — the preconfigured store repos for the UI.
+
+    Returns {"default": <first repo or null>, "repos": [...]}. API-key
+    gated upstream; disabled with EZAPP_MCP_STORE_ENABLED=false (404).
+    """
+    if (scope.get('method') or '').upper() != 'GET':
+        for message in _json_asgi_response(
+            send, 405,
+            b'{"error": "GET the repo list here", "method": "GET"}',
+            [(b'allow', b'GET')],
+        ):
+            await send(message)
+        return
+    if not _store_enabled():
+        for message in _json_asgi_response(send, 404, b'{"error": "not found"}'):
+            await send(message)
+        return
+    repos = _configured_store_repos()
+    body = {
+        'default': repos[0] if repos else None,
+        'repos': repos,
+    }
+    for message in _json_asgi_response(
+        send, 200, json.dumps(body, indent=2).encode('utf-8'),
+        [(b'cache-control', b'no-store')],
+    ):
+        await send(message)
+
+
 async def _store_catalog_http(scope, receive, send):
     """GET /api/store/catalog?repo=<github-url>[&ref=<ref>][&refresh=true]
     [&stream=1]
@@ -3608,6 +3681,9 @@ class _ApiOrMcpApp:
                 return
             if path == "/manifest":
                 await _manifest_http(scope, receive, send)
+                return
+            if path == "/api/store/repos":
+                await _store_repos_http(scope, receive, send)
                 return
             if path == "/api/store/catalog":
                 await _store_catalog_http(scope, receive, send)

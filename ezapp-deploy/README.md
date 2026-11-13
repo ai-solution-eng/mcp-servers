@@ -74,7 +74,7 @@ Hygiene (same model as the k8s-ops console): the shell is inert — it carries n
 
 ## App store (GitHub repo of charts → one-click install)
 
-The second UI tab turns any **GitHub repository of Helm charts** into an app store.
+The second UI tab turns any **GitHub repository of Helm charts** into an app store. Operators preconfigure repos via `store.repos` (chart) / `EZAPP_MCP_STORE_REPOS` (env, comma-separated — the **first entry is the default** the store tab opens with, preloaded automatically); the UI shows them in a dropdown, remembers repos you load manually (browser-local), and any other repo URL can always be typed.
 
 **Store repo layout** — the repository's **top-level directories are the individual apps**; charts are **always packaged**: inside each app directory, every **`.tgz` / `.tar.gz` `helm package` file** is an installable chart version (e.g. `arize-phoenix/arize-phoenix-1.2.0.tgz`, `arize-phoenix/arize-phoenix-1.3.0.tgz`, `grafana/grafana-10.0.0.tgz`, … — subdirectories are not scanned; unpacked chart sources are ignored). Name, version, description, values and logo are read from inside each package; files that are not valid helm packages are reported in the catalog's `skipped` list, never fatal. A `.tgz` at the repo root belongs to the "(repo root)" app.
 
@@ -227,6 +227,7 @@ This is a **write-capable** server (it deploys things). Every mutating path is b
 | `GITHUB_TOKEN` | unset (anonymous) | GitHub token for authenticated store calls (higher rate limits, private catalog repos); the chart wires it from an out-of-band Secret |
 | `GITHUB_CA_BUNDLE` | unset (system trust) | `--cacert` pin for the outbound GitHub calls (corporate MITM CAs); mutually exclusive with nothing — ChartMuseum's TLS knobs are separate |
 | `EZAPP_MCP_MAX_REPO_MB` | `200` | Repo-tarball download cap for store installs (decoded; the chart inside still goes through `EZAPP_MCP_MAX_CHART_MB`) |
+| `EZAPP_MCP_STORE_REPOS` | unset (no default) | Comma-separated preconfigured store repos shown in the UI dropdown — the FIRST is the default the store tab opens with; users can still scan any repo |
 | `EZAPP_MCP_CHUNKED_UPLOAD_ENABLED` | `true` | Chunked upload tools (`false` drops the three tools from the server) |
 | `EZAPP_MCP_DELETE_ENABLED` | `true` | `delete_chart` / `delete_ezappconfig` (`false` drops both tools — decommissioning becomes a purely human action) |
 | `MCP_HOSTNAME` | unset | Hostname(s) for DNS-rebinding protection — one FQDN or a comma-separated list (external gateway FQDN, internal service DNS name, …); `localhost`/`127.0.0.1` always allowed |

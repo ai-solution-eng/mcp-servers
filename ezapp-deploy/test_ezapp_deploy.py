@@ -1774,10 +1774,35 @@ REPO_FILES = {
     # an app with NO logo anywhere (package + app dir) — install needs an upload
     "logoless/logoless-1.0.0.tgz": make_chart_tgz(
         chart_name="logoless", version="1.0.0"),
+    # the final fallback: no logo-named files, so the SMALLEST top-level
+    # .png wins (nested images are never chosen)
+    "smallest/smallest-1.0.0.tgz": make_chart_tgz(
+        chart_name="smallest", version="1.0.0"),
+    "smallest/big.png": png + b"padding" * 60,
+    "smallest/small.png": png,
+    "smallest/docs/huge.png": png + b"x" * 200,
+    # the reported real-world naming patterns at the APP level (next to the
+    # packages) — all must resolve
+    "kafka/kafka-1.0.0.tgz": make_chart_tgz(
+        chart_name="kafka", version="1.0.0"),
+    "kafka/kafka_logo.png": png,
+    "mariadb/mariadb-1.0.0.tgz": make_chart_tgz(
+        chart_name="mariadb", version="1.0.0"),
+    "mariadb/mariadblogo.png": png,
+    "litellm/litellm-1.0.0.tgz": make_chart_tgz(
+        chart_name="litellm", version="1.0.0"),
+    "litellm/litellm_logo.jpg": b"\xff\xd8\xff\xe0" + b"jpeg" * 4,
+    "dify/dify-1.0.0.tgz": make_chart_tgz(
+        chart_name="dify", version="1.0.0"),
+    "dify/dify-logo.png": png,
     # an app whose logo is named after the APP (appname.png), not logo.png
     "named/named-1.0.0.tgz": make_chart_tgz(
         chart_name="named", version="1.0.0"),
     "named/named.png": png,
+    # a package whose logo rides INSIDE under the chart's own name
+    "hashicorp-vault/hashicorp-vault-1.0.0.tgz": make_chart_tgz(
+        chart_name="hashicorp-vault", version="1.0.0",
+        extra_members=[("hashicorp-vault/hashicorp-vault.png", png)]),
     "broken/broken-9.9.9.tgz": make_chart_tgz(
         chart_name="broken", version="9.9.9",
         chart_yaml="name: [unclosed"),
@@ -1835,6 +1860,38 @@ check("chartname.png inside the package is found by the chart's own name",
       chartname_extras["logo"] == base64.b64encode(png).decode()
       and chartname_extras["logo_file"] == "chartname.png",
       str((chartname_extras["logo_file"], chartname_extras["logo_note"])))
+
+# scored scan covers the naming patterns seen in real repos
+check("scoring: the reported real-world names all rank as candidates",
+      server._logo_candidate_score("kafka_logo.png", ["kafka"])[:1] == (3,)
+      and server._logo_candidate_score("mariadblogo.png", ["mariadb"])[:1] == (3,)
+      and server._logo_candidate_score("hashicorp-vault.png",
+                                       ["hashicorp-vault"])[:1] == (2,)
+      and server._logo_candidate_score("logo.png", [])[:1] == (0,))
+check("scoring: logo-prefixed beats appname beats *logo* beats lone image",
+      server._rank_logo_candidates(
+          ["screenshot.png", "kafka_logo.png", "logo.png", "kafka.png"],
+          ["kafka"])
+      == ["logo.png", "kafka.png", "kafka_logo.png", "screenshot.png"],
+      str(server._rank_logo_candidates(
+          ["screenshot.png", "kafka_logo.png", "logo.png", "kafka.png"],
+          ["kafka"])))
+check("scoring: nested non-logo images are never candidates",
+      server._logo_candidate_score("docs/screenshot.png", []) is None)
+lone_pkg = make_chart_tgz(
+    chart_name="vault", version="1.0.0",
+    extra_members=[("vault/vault.png", png)])
+lone_extras = server._packaged_chart_extras(lone_pkg)
+check("a lone top-level image in the package is used as the logo",
+      lone_extras["logo"] == base64.b64encode(png).decode()
+      and lone_extras["logo_file"] == "vault.png",
+      str((lone_extras["logo_file"], lone_extras["logo_note"])))
+multi_pkg = make_chart_tgz(
+    chart_name="both", version="1.0.0",
+    extra_members=[("both/screenshot.png", png), ("both/logo.png", png)])
+multi_extras = server._packaged_chart_extras(multi_pkg)
+check("logo.png beats a random image in the same package",
+      multi_extras["logo_file"] == "logo.png", str(multi_extras["logo_file"]))
 
 # nested + mislabeled logos inside the package
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"jpegdata" * 6
@@ -2360,7 +2417,9 @@ cat = json.loads(store["catalog"][1]["body"])
 check("catalog endpoint lists one tile per app",
       store["catalog"][0]["status"] == 200
       and [a["app"] for a in cat["apps"]]
-          == ["foo", "logoless", "named", "nested-two", "plain"]
+          == ["dify", "foo", "hashicorp-vault", "kafka", "litellm",
+              "logoless", "mariadb", "named", "nested-two", "plain",
+              "smallest"]
       and cat["ref"] == "main"
       and cat["cached"] is False,
       str(store["catalog"][0]) + store["catalog"][1]["body"][:300].decode())
@@ -2401,11 +2460,45 @@ check("appname.png (named after the app) feeds the tile",
       and named_tile["icon"].startswith("data:image/png;base64,")
       and named_tile["logo_file"] == "named.png",
       str((named_tile or {}).get("logo_file")))
-logoless_tile = next((a for a in cat["apps"] if a["app"] == "logoless"), None)
-check("apps with no logo anywhere keep the tile flagged",
-      logoless_tile is not None
-      and logoless_tile["icon"] == "" and logoless_tile["logo_file"] == "",
-      str((logoless_tile or {}).get("logo_file")))
+for app_name in ("kafka", "mariadb", "dify", "litellm", "hashicorp-vault"):
+    tile = next((a for a in cat["apps"] if a["app"] == app_name), None)
+    check(f"reported case: {app_name} tile resolves its logo",
+          tile is not None
+          and tile["icon"].startswith("data:image/")
+          and bool(tile["logo_file"]),
+          str((tile or {}).get("logo_file")))
+check("scoring: nested non-logo images are never candidates",
+      server._logo_candidate_score("docs/screenshot.png", []) is None)
+check("scoring: tier-5 orders top-level pngs by SIZE (smallest wins)",
+      server._rank_logo_candidates(
+          ["a-big.png", "b-small.png"], [],
+          sizes={"a-big.png": 500, "b-small.png": 10})
+      == ["b-small.png", "a-big.png"],
+      str(server._rank_logo_candidates(
+          ["a-big.png", "b-small.png"], [],
+          sizes={"a-big.png": 500, "b-small.png": 10})))
+two_png_pkg = make_chart_tgz(
+    chart_name="twopng", version="1.0.0",
+    extra_members=[("twopng/a-big.png", png + b"p" * 300),
+                   ("twopng/b-small.png", png),
+                   ("twopng/docs/huge.png", png + b"x" * 500)])
+two_png_extras = server._packaged_chart_extras(two_png_pkg)
+check("package final fallback: smallest png picked, nested ignored",
+      two_png_extras["logo_file"] == "b-small.png"
+      and two_png_extras["logo"] == base64.b64encode(png).decode(),
+      str(two_png_extras["logo_file"]))
+smallest_installed = server._extract_packaged_chart_from_repo_tarball(
+    make_repo_tarball(REPO_FILES), "smallest/smallest-1.0.0.tgz")
+check("install final fallback: smallest app-dir png becomes the CR logo",
+      smallest_installed["logo"] == base64.b64encode(png).decode()
+      and smallest_installed["logo_file"] == "smallest/small.png",
+      str((smallest_installed["logo_file"], smallest_installed["logo"])[:1]))
+smallest_tile = next((a for a in cat["apps"] if a["app"] == "smallest"), None)
+check("final fallback: the SMALLEST top-level png becomes the tile logo",
+      smallest_tile is not None
+      and smallest_tile["icon"].startswith("data:image/png;base64,")
+      and smallest_tile["logo_file"] == "small.png",
+      str((smallest_tile or {}).get("logo_file")))
 check("apps without a valid version disappear (reported as skipped)",
       all(a["app"] != "broken" for a in cat["apps"])
       and {s["dir"] for s in cat["skipped"]} == {"broken/broken-9.9.9.tgz",
@@ -2419,7 +2512,7 @@ progress_events = [e for e in events if e.get("type") == "progress"]
 final_event = next((e for e in events if e.get("type") == "catalog"), None)
 check("streaming catalog reports live progress per package",
       bool(progress_events)
-      and progress_events[0]["total"] == 10         # 10 packaged chart files
+      and progress_events[0]["total"] == 16         # 16 packaged chart files
       and progress_events[-1]["done"] == progress_events[-1]["total"]
       and any("current" in e for e in progress_events),
       f"{len(progress_events)} progress events")
@@ -2606,6 +2699,67 @@ check("install request hygiene (bad json / traversal dir / missing repo)",
       and store["install_no_repo"][0]["status"] == 400,
       f"{store['install_bad_body'][0]['status']} / "
       f"{store['install_bad_dir'][0]['status']} / {store['install_no_repo'][0]['status']}")
+
+
+# ─── 14. configured store repos (default repo + dropdown source) ─────────
+
+print("14. Configured store repos")
+
+set_env(EZAPP_MCP_STORE_REPOS="acme/charts, https://github.com/acme/other ,"
+                               "acme/charts,  ,",
+        EZAPP_MCP_API_KEY="s3cret")
+check("repo list parses, trims, dedupes and drops empties",
+      server._configured_store_repos()
+      == ["acme/charts", "https://github.com/acme/other"],
+      str(server._configured_store_repos()))
+
+router = server._UiRouterApp(
+    server._ApiKeyAuthMiddleware(server._ApiOrMcpApp(_dummy_mcp_app())),
+    server._UiApp(os.path.join(os.path.dirname(server.__file__), "ui")))
+
+
+async def _repos_endpoint_scenarios():
+    out = {}
+    out["repos"] = await _drive(router, {
+        "type": "http", "method": "GET", "path": "/api/store/repos",
+        "query_string": b"", "headers": AUTH_HEADERS})
+    out["repos_post"] = await _drive_body(router, {
+        "type": "http", "method": "POST", "path": "/api/store/repos",
+        "query_string": b"", "headers": AUTH_HEADERS}, b"")
+    set_env(EZAPP_MCP_STORE_ENABLED="false")
+    out["repos_disabled"] = await _drive(router, {
+        "type": "http", "method": "GET", "path": "/api/store/repos",
+        "query_string": b"", "headers": AUTH_HEADERS})
+    set_env(EZAPP_MCP_STORE_ENABLED=None)
+    set_env(EZAPP_MCP_STORE_REPOS=None)
+    out["repos_empty"] = await _drive(router, {
+        "type": "http", "method": "GET", "path": "/api/store/repos",
+        "query_string": b"", "headers": AUTH_HEADERS})
+    out["repos_no_auth"] = await _drive(router, {
+        "type": "http", "method": "GET", "path": "/api/store/repos",
+        "query_string": b"", "headers": []})
+    set_env(EZAPP_MCP_API_KEY=None, EZAPP_MCP_STORE_REPOS=None)
+    return out
+
+
+repos = asyncio.run(_repos_endpoint_scenarios())
+repos_body = json.loads(repos["repos"][1]["body"])
+check("repos endpoint returns the configured list with the default first",
+      repos["repos"][0]["status"] == 200
+      and repos_body["default"] == "acme/charts"
+      and repos_body["repos"] == ["acme/charts", "https://github.com/acme/other"],
+      str(repos_body))
+check("POST /api/store/repos → 405", repos["repos_post"][0]["status"] == 405,
+      str(repos["repos_post"][0]))
+check("disabled store → 404 on the repos endpoint",
+      repos["repos_disabled"][0]["status"] == 404, str(repos["repos_disabled"][0]))
+check("no configured repos → default null, empty list",
+      repos["repos_empty"][0]["status"] == 200
+      and json.loads(repos["repos_empty"][1]["body"])
+      == {"default": None, "repos": []},
+      repos["repos_empty"][1]["body"].decode())
+check("repos endpoint is API-key gated",
+      repos["repos_no_auth"][0]["status"] == 401, str(repos["repos_no_auth"][0]))
 
 
 # ─── Summary ─────────────────────────────────────────────────────────────

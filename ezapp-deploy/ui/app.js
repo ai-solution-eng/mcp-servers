@@ -316,6 +316,66 @@ function updateProgress(done, total, current) {
     (short ? " — last: " + short : "");
 }
 
+const USER_REPOS_KEY = "ezappStoreRepos";
+let configuredRepos = [];   // server-configured repo list (from /api/store/repos)
+let storeBootstrapped = false;
+
+function userRepos() {
+  try { return JSON.parse(localStorage.getItem(USER_REPOS_KEY) || "[]"); }
+  catch (e) { return []; }
+}
+
+function saveUserRepo(repo) {
+  const repos = userRepos();
+  if (!repos.includes(repo)) {
+    repos.push(repo);
+    try { localStorage.setItem(USER_REPOS_KEY, JSON.stringify(repos)); }
+    catch (e) { /* storage full/blocked — the dropdown just won't remember */ }
+  }
+}
+
+async function loadRepoOptions() {
+  // merge server-configured repos with locally saved ones (server first;
+  // the first server entry is the default)
+  let serverRepos = [];
+  const key = getKey();
+  if (key) {
+    try {
+      const resp = await fetch("/api/store/repos", {
+        headers: { "Authorization": "Bearer " + key },
+      });
+      if (resp.ok) serverRepos = (await resp.json()).repos || [];
+    } catch (err) { /* offline/local-only is fine */ }
+  }
+  configuredRepos = serverRepos.slice();
+  const all = [...new Set([...serverRepos, ...userRepos()])];
+  const dropdown = $("repodropdown");
+  dropdown.textContent = "";
+  for (const r of all) {
+    const opt = document.createElement("option");
+    opt.value = r;
+    opt.textContent = r + (r === serverRepos[0] ? " (default)" : "");
+    dropdown.appendChild(opt);
+  }
+  const custom = document.createElement("option");
+  custom.value = "__custom__";
+  custom.textContent = "Other repo…";
+  dropdown.appendChild(custom);
+  dropdown.classList.toggle("hidden", all.length === 0);
+  return { all, serverDefault: serverRepos[0] || null };
+}
+
+async function bootstrapStore() {
+  if (storeBootstrapped) return;
+  storeBootstrapped = true;
+  const { serverDefault } = await loadRepoOptions();
+  if (serverDefault && !$("repobox").value) {
+    $("repobox").value = serverDefault;
+    $("repodropdown").value = serverDefault;
+    loadCatalog(false);   // open the store tab already showing the default repo
+  }
+}
+
 async function loadCatalog(refresh) {
   const key = getKey();
   if (!key) {
@@ -393,6 +453,17 @@ async function loadCatalog(refresh) {
 
 function finishCatalog(body, refresh) {
   renderTiles(body);
+  // remember manually-loaded repos in the dropdown (server-configured ones
+  // are already there)
+  if (currentRepo && !configuredRepos.includes(currentRepo)
+      && !userRepos().includes(currentRepo)) {
+    saveUserRepo(currentRepo);
+    loadRepoOptions().then(() => {
+      if (currentRepo && configuredRepos.concat(userRepos()).includes(currentRepo)) {
+        $("repodropdown").value = currentRepo;
+      }
+    });
+  }
   const apps = body.apps || [];
   const versionCount = apps.reduce((n, a) => n + (a.versions || []).length, 0);
   storeStatus(
@@ -561,7 +632,19 @@ $("autorefresh").addEventListener("change", (event) => {
 });
 
 $("tab-apps").addEventListener("click", () => showView("apps"));
-$("tab-store").addEventListener("click", () => showView("store"));
+$("tab-store").addEventListener("click", () => {
+  showView("store");
+  bootstrapStore();   // first open: load the repo list + the default repo
+});
+$("repodropdown").addEventListener("change", (event) => {
+  const value = event.target.value;
+  if (value === "__custom__") {
+    $("repobox").focus();
+    return;
+  }
+  $("repobox").value = value;
+  loadCatalog(false);
+});
 $("loadstore").addEventListener("click", () => loadCatalog(false));
 $("repobox").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {

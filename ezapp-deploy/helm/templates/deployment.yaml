@@ -152,6 +152,11 @@ spec:
             {{- end }}
             - name: EZAPP_MCP_MAX_REPO_MB
               value: {{ .Values.store.maxRepoMB | quote }}
+            {{- with .Values.store.repos }}
+            # Preconfigured store repos (first entry = the UI default).
+            - name: EZAPP_MCP_STORE_REPOS
+              value: {{ . | join "," | quote }}
+            {{- end }}
             {{- if not .Values.chunkedUpload.enabled }}
             - name: EZAPP_MCP_CHUNKED_UPLOAD_ENABLED
               value: "false"
