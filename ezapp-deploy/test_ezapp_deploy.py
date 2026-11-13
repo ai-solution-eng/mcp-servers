@@ -1680,6 +1680,23 @@ check("template carries the imported-app marker + fixed fields",
 check("template keeps the user's values byte-identical inside the block scalar",
       '  values: |-\n    k: v\n  version: ""\n' in full, full[-120:])
 
+full_with_release = server._render_store_ezappconfig(
+    kind="EzAppConfig", api_version="ezconfig.hpe.ezaf.com/v1alpha1",
+    cr_name="foo-1-0-0-1700000000000", chart_name="foo", chart_version="1.0.0",
+    category="dataScience", label="Foo", description="D", namespace="foo-ns",
+    values_text="k: v\n", logo_b64="QUJD", release_name="my-release")
+rel_doc = yaml.safe_load(full_with_release)
+check("releaseName renders only when set (between options and values)",
+      rel_doc["spec"].get("releaseName") == "my-release"
+      and '  options:\n' in full_with_release
+      and full_with_release.index('releaseName:') > full_with_release.index('options:')
+      and full_with_release.index('releaseName:') < full_with_release.index('values: |-'),
+      full_with_release)
+check("no releaseName line when unset",
+      "releaseName" not in full)
+check("releaseName-bearing CR passes the validator",
+      server._validate_ezappconfig(full_with_release) is not None)
+
 check("CR name segment sanitizes semver build metadata",
       server._sanitize_cr_name_segment("1.2.3+build.5") == "1.2.3-build.5",
       server._sanitize_cr_name_segment("1.2.3+build.5"))
@@ -1722,6 +1739,21 @@ check("namespace stays user-selectable verbatim",
 check("label/description/category default to empty in the payload (resolved at install)",
       (_defaults["label"], _defaults["description"], _defaults["category"]) == ("", "", ""),
       str((_defaults["label"], _defaults["description"], _defaults["category"])))
+
+# optional custom release name (spec.releaseName)
+check("releaseName passes through when provided",
+      server._validate_store_install_payload(
+          {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz",
+           "releaseName": "my-release"})["releaseName"] == "my-release")
+check("releaseName is absent when not provided",
+      server._validate_store_install_payload(
+          {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz"})["releaseName"] == "")
+check_raises("invalid releaseName (not a DNS label) is rejected", "invalid release name",
+             server._validate_store_install_payload,
+             {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz", "releaseName": "Bad_Name!"})
+check_raises("releaseName with a leading dash is rejected", "invalid release name",
+             server._validate_store_install_payload,
+             {"repo": "acme/charts", "dir": "foo/foo-1.0.0.tgz", "releaseName": "-nope"})
 
 # ── 13d. chart repackage from a GitHub repo tarball ──────────────────────
 
@@ -2420,6 +2452,23 @@ async def _store_endpoint_scenarios():
     sub.restore()
     stub_cm.stop()
 
+    # install: optional custom release name (spec.releaseName)
+    stub_cm = _StubChartMuseum([201])
+    set_env(CHARTMUSEUM_URL=stub_cm.url)
+    server._ledger_instance = FakeLedger()
+    sub = CapturingSubprocess([
+        (1, "", f'Error from server (NotFound): {STORE_RESOURCE}."x" not found'),
+        (0, f"{STORE_RESOURCE}/foo-1.0.0-1700000000008 created", ""),
+    ]).install()
+    payload_rel = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
+                   "releaseName": "my-custom-release", "values": "x: 1\n"}
+    out["install_release"] = await _drive_body(
+        server._store_install_http, install_scope(),
+        json.dumps(payload_rel).encode())
+    out["install_release_manifest"] = next(iter(sub.files.values()), "")
+    sub.restore()
+    stub_cm.stop()
+
     # install: unknown category is rejected by payload validation alone
     stub_gh.requests.clear()
     payload6 = {"repo": repo_url, "dir": "foo/foo-1.0.0.tgz", "ref": "main",
@@ -2704,6 +2753,16 @@ check("an uploaded logo overrides the package's own",
       and override_doc.get("spec", {}).get("logoImage")
           == base64.b64encode(png_upload).decode(),
       store["install_override_manifest"][:400])
+release_resp = json.loads(store["install_release"][1]["body"])
+release_doc = (yaml.safe_load(store["install_release_manifest"])
+               if store["install_release_manifest"] else {})
+check("optional releaseName lands in the CR as spec.releaseName",
+      store["install_release"][0]["status"] == 200
+      and release_doc.get("spec", {}).get("releaseName") == "my-custom-release",
+      store["install_release_manifest"][:400])
+check("installs without a releaseName omit spec.releaseName entirely",
+      "releaseName" not in (inst_doc.get("spec") or {}),
+      str(inst_doc.get("spec", {}).keys()))
 check("humanized label splits multi-word chart names",
       server._humanize_chart_name("nested-two") == "Nested Two")
 check("unknown category is a 400 before any GitHub request",

@@ -515,6 +515,9 @@ function openInstallDialog(chart) {
     "(namespace " + nsDefault(chart.name) + " by default). Every field below is editable.";
   $("dlg-namespace").value = nsDefault(chart.name);
   $("dlg-category").value = "dataScience";
+  $("dlg-release-tick").checked = false;
+  $("dlg-releasename").value = chart.name || "";
+  $("dlg-releasename").disabled = true;
   $("dlg-label").value = humanizeChartName(chart.name);
   $("dlg-description").value = chart.name || "";
   $("dlg-values").value = chart.values || "";
@@ -651,6 +654,18 @@ async function confirmInstall() {
     values: $("dlg-values").value,
   };
   if (ref) payload.ref = ref;
+  if ($("dlg-release-tick").checked) {
+    const releaseName = $("dlg-releasename").value.trim();
+    if (!releaseName) {
+      showDlgError("A custom release name is ticked on — enter a name, or untick to skip.");
+      return;
+    }
+    if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(releaseName)) {
+      showDlgError("Invalid release name — use lowercase letters, digits and dashes (e.g. my-release).");
+      return;
+    }
+    payload.releaseName = releaseName;
+  }
   if (dlgLogoUpload) {
     payload.logo = dlgLogoUpload;         // uploaded logo (overrides package)
   } else if (dlgChart && !dlgChart.icon) {
@@ -789,6 +804,13 @@ $("dlg-cancel").addEventListener("click", () => $("installdialog").close());
 $("dlg-install").addEventListener("click", confirmInstall);
 $("dlg-back").addEventListener("click", backToSettings);
 $("dlg-close").addEventListener("click", () => $("installdialog").close());
+
+$("dlg-release-tick").addEventListener("change", (event) => {
+  $("dlg-releasename").disabled = !event.target.checked;
+  if (event.target.checked) {
+    $("dlg-releasename").focus();
+  }
+});
 
 $("dlg-logo").addEventListener("change", () => {
   const file = $("dlg-logo").files[0];

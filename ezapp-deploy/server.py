@@ -2682,13 +2682,16 @@ def _render_store_ezappconfig(*, kind: str, api_version: str, cr_name: str,
                               chart_name: str, chart_version: str,
                               category: str, label: str, description: str,
                               namespace: str, values_text: str,
-                              logo_b64: str) -> str:
+                              logo_b64: str,
+                              release_name: str = '') -> str:
     """The deterministic EzAppConfig template for store installs.
 
     Layout matches the platform's imported-app template exactly; the edited
     values ride inside the `values` block scalar verbatim (each line indented
-    by 4). Rendering is pure string work so the output is byte-for-byte
-    reproducible for identical inputs apart from the epoch-ms CR name.
+    by 4). `release_name` adds an optional `spec.releaseName` (custom Helm
+    release name — omitted entirely when not set). Rendering is pure string
+    work so the output is byte-for-byte reproducible for identical inputs
+    apart from the epoch-ms CR name.
     """
     values_block = '  values: |-'
     if values_text:
@@ -2697,6 +2700,8 @@ def _render_store_ezappconfig(*, kind: str, api_version: str, cr_name: str,
             normalized = normalized[:-1]  # each emitted line closes itself
         indented = ''.join(f'    {line}\n' for line in normalized.split('\n'))
         values_block = f'  values: |-\n{indented}'.rstrip('\n')
+    release_line = (f'  releaseName: {json.dumps(release_name)}\n'
+                    if release_name else '')
     return (
         f'apiVersion: {api_version}\n'
         f'kind: {kind}\n'
@@ -2718,6 +2723,7 @@ def _render_store_ezappconfig(*, kind: str, api_version: str, cr_name: str,
         f'    namespace: {json.dumps(namespace)}\n'
         '    timeout: 45m\n'
         '    wait: "true"\n'
+        f'{release_line}'
         f'{values_block}\n'
         '  version: ""\n'
     )
@@ -2786,6 +2792,17 @@ def _validate_store_install_payload(payload: dict) -> dict:
                 f'{STORE_LOGO_MAX_BYTES // 1024} KB'
             )
 
+    # optional custom Helm release name (spec.releaseName): a lowercase
+    # DNS-1123 label, present only when the user opts in
+    release_name = _opt('releaseName', 63, 'release name')
+    if release_name:
+        release_name = release_name.lower()
+        if not re.fullmatch(r'[a-z0-9](?:[-a-z0-9]*[a-z0-9])?', release_name):
+            raise ValueError(
+                f'invalid release name {release_name!r} — use a lowercase '
+                'DNS-1123 label (letters, digits and dashes)'
+            )
+
     return {
         'repo': repo,
         'dir': chart_dir,
@@ -2796,6 +2813,7 @@ def _validate_store_install_payload(payload: dict) -> dict:
         'description': _opt('description', MAX_STORE_STRING_CHARS, 'description'),
         'namespace': str(payload.get('namespace') or '').strip().lower(),
         'logo': (logo or '').strip(),
+        'releaseName': release_name,
     }
 
 
@@ -2804,6 +2822,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
                          label: str = '', description: str = '',
                          values: 'str | None' = None,
                          logo: str = '',
+                         release_name: str = '',
                          progress=None) -> dict:
     """Full store install pipeline; returns a JSON-ready result dict.
 
@@ -2988,6 +3007,7 @@ async def _store_install(repo_str: str, chart_dir: str, ref: str = '',
         namespace=namespace,
         values_text=values,
         logo_b64=logo_image,
+        release_name=release_name,
     )
     result['manifest'] = manifest_yaml
     result['ezappconfig'] = cr_name
@@ -3694,6 +3714,7 @@ async def _store_install_http(scope, receive, send):
                 namespace=request['namespace'], category=request['category'],
                 label=request['label'], description=request['description'],
                 values=request['values'], logo=request['logo'],
+                release_name=request['releaseName'],
             )
         status_to_code = {
             'installed': 200, 'invalid': 400, 'refused': 409, 'error': 502,
@@ -3735,6 +3756,7 @@ async def _store_install_http(scope, receive, send):
                 namespace=request['namespace'], category=request['category'],
                 label=request['label'], description=request['description'],
                 values=request['values'], logo=request['logo'],
+                release_name=request['releaseName'],
                 progress=progress,
             )
         except Exception as e:  # noqa: BLE001 — the stream must always close
