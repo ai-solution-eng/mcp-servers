@@ -350,6 +350,7 @@ async function loadRepoOptions() {
   configuredRepos = serverRepos.slice();
   const all = [...new Set([...serverRepos, ...userRepos()])];
   const dropdown = $("repodropdown");
+  const previous = dropdown.value;
   dropdown.textContent = "";
   for (const r of all) {
     const opt = document.createElement("option");
@@ -362,17 +363,23 @@ async function loadRepoOptions() {
   custom.textContent = "Other repo…";
   dropdown.appendChild(custom);
   dropdown.classList.toggle("hidden", all.length === 0);
+  if (previous && all.includes(previous)) {
+    dropdown.value = previous;   // keep the user's selection across rebuilds
+  }
   return { all, serverDefault: serverRepos[0] || null };
 }
 
-async function bootstrapStore() {
-  if (storeBootstrapped) return;
-  storeBootstrapped = true;
+async function refreshStore() {
+  // refresh the repo dropdown (server-configured + saved) and, the first
+  // time the store opens, auto-load the configured default repo
   const { serverDefault } = await loadRepoOptions();
-  if (serverDefault && !$("repobox").value) {
-    $("repobox").value = serverDefault;
-    $("repodropdown").value = serverDefault;
-    loadCatalog(false);   // open the store tab already showing the default repo
+  if (!storeBootstrapped) {
+    storeBootstrapped = true;
+    if (serverDefault && !$("repobox").value) {
+      $("repobox").value = serverDefault;
+      $("repodropdown").value = serverDefault;
+      loadCatalog(false);   // open the store tab already showing the default repo
+    }
   }
 }
 
@@ -471,7 +478,7 @@ function finishCatalog(body, refresh) {
     ", ref " + (body.ref || "?") + "): " + apps.length + " app" +
     (apps.length === 1 ? "" : "s") + ", " + versionCount + " installable chart version" +
     (versionCount === 1 ? "" : "s") + ". Pick a version, then Install." +
-    (refresh ? "" : " (Load again with refresh to force a re-fetch)"),
+    (refresh ? "" : " (shift-click Load to force a re-fetch)"),
   );
 }
 
@@ -617,6 +624,7 @@ $("savekey").addEventListener("click", () => {
     sessionStorage.removeItem(KEY_STORAGE);
   }
   load();
+  refreshStore();   // the repo dropdown needs the key — populate it now
 });
 
 $("keybox").addEventListener("keydown", (event) => {
@@ -634,7 +642,7 @@ $("autorefresh").addEventListener("change", (event) => {
 $("tab-apps").addEventListener("click", () => showView("apps"));
 $("tab-store").addEventListener("click", () => {
   showView("store");
-  bootstrapStore();   // first open: load the repo list + the default repo
+  refreshStore();   // every open: fresh repo list; first open: default repo
 });
 $("repodropdown").addEventListener("change", (event) => {
   const value = event.target.value;
@@ -645,7 +653,10 @@ $("repodropdown").addEventListener("change", (event) => {
   $("repobox").value = value;
   loadCatalog(false);
 });
-$("loadstore").addEventListener("click", () => loadCatalog(false));
+$("loadstore").addEventListener("click", (event) => {
+  // plain click: cached scan; shift-click (or ctrl/meta): force a re-fetch
+  loadCatalog(event.shiftKey || event.ctrlKey || event.metaKey);
+});
 $("repobox").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     loadCatalog(false);

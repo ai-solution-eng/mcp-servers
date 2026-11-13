@@ -207,7 +207,9 @@ GITHUB_TARBALL_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_REPO_MB = 200
 GITHUB_MAX_TREES_BODY_CHARS = 50_000_000   # trees/recursive listing cap
 GITHUB_MAX_RAW_BODY_CHARS = 5_000_000      # Chart.yaml / values.yaml / logo cap
-STORE_CATALOG_TTL_SECONDS = 600
+STORE_CATALOG_TTL_SECONDS = 86_400   # catalog cached for a full day;
+                                     # manual refresh (refresh=true / the
+                                     # UI's shift-click Load) bypasses it
 STORE_CATALOG_MAX = 8
 STORE_INSTALL_MAX_CONCURRENT = 2
 MAX_STORE_VALUES_CHARS = 262_144
