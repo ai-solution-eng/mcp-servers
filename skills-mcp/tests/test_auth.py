@@ -1,0 +1,140 @@
+"""Authentication: the operator base key, minted per-person keys, and SSO."""
+
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from skills_mcp import auth, prefs
+
+
+def scope_with(header: str, value: str) -> dict:
+    return {"type": "http", "headers": [(header.lower().encode(), value.encode())]}
+
+
+@pytest.fixture(autouse=True)
+def _env(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_MCP_API_KEYS", "base-key-123")
+    monkeypatch.delenv("MCP_API_KEYS", raising=False)
+    monkeypatch.delenv("SKILLS_TRUST_PROXY_IDENTITY", raising=False)
+    yield
+
+
+# ------------------------------------------------------------------ env keys
+
+
+def test_operator_base_key_resolves_anonymously() -> None:
+    found = auth.resolve(scope_with("x-api-key", "base-key-123"))
+    assert found is not None
+    assert found.name is None
+    assert found.source == "env-base"
+
+
+def test_bearer_header_is_accepted() -> None:
+    found = auth.resolve(scope_with("authorization", "Bearer base-key-123"))
+    assert found is not None
+
+
+def test_unknown_key_is_anonymous() -> None:
+    assert auth.resolve(scope_with("x-api-key", "nope")) is None
+
+
+def test_no_key_is_anonymous() -> None:
+    assert auth.resolve({"type": "http", "headers": []}) is None
+
+
+# ------------------------------------------------------------------ minted
+
+
+def test_minted_key_resolves_its_identity() -> None:
+    key = auth.mint("carol")
+    found = auth.resolve(scope_with("x-api-key", key))
+    assert found.name == "carol"
+    assert found.source == "minted"
+
+
+def test_revoking_a_key_kills_only_that_key() -> None:
+    first = auth.mint("carol", label="one")
+    second = auth.mint("carol", label="two")
+    victim = [k for k in prefs.keys("carol") if k["label"] == "one"][0]["id"]
+    assert prefs.revoke_key("carol", victim) is True
+    assert auth.resolve(scope_with("x-api-key", first)) is None
+    assert auth.resolve(scope_with("x-api-key", second)).name == "carol"
+
+
+def test_an_expired_key_does_not_resolve() -> None:
+    key = auth.mint("carol", expires_at="2020-01-01T00:00:00Z")
+    assert auth.resolve(scope_with("x-api-key", key)) is None
+
+
+def test_minted_index_is_cached_but_refreshes(tmp_path) -> None:
+    auth.minted_index()
+    key = auth.mint("dave")
+    assert auth.resolve(scope_with("x-api-key", key)).name == "dave"
+
+
+# ------------------------------------------------------------------ sso
+
+
+def test_sso_header_is_ignored_by_default() -> None:
+    scope = scope_with("x-forwarded-user", "alice@corp")
+    assert auth.resolve(scope) is None
+
+
+def test_sso_header_resolves_when_trusted(monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    found = auth.resolve(scope_with("x-forwarded-user", "Alice@Corp"))
+    assert found.name == "alice@corp"
+    assert found.source == "sso"
+
+
+def test_a_key_beats_the_sso_header(monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    key = auth.mint("alice")
+    scope = {
+        "type": "http",
+        "headers": [(b"x-api-key", key.encode()), (b"x-forwarded-user", b"mallory@corp")],
+    }
+    assert auth.resolve(scope).name == "alice"
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def test_fingerprint_is_short_and_stable() -> None:
+    one = auth._fingerprint("abc")
+    assert one == auth._fingerprint("abc")
+    assert one.startswith("sha256:") and len(one) == len("sha256:") + 12
+    assert one != auth._fingerprint("abd")
+
+
+def test_unmatched_bearer_falls_back_to_the_sso_header(monkeypatch) -> None:
+    """The bug this pins: an enforcing proxy injects Authorization: Bearer
+    <id_token> upstream. That looks like a key but matches nothing — the resolver
+    must still fall through to the identity header."""
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"authorization", b"Bearer eyJhbGciOiJSUzI1NiJ9.fake.id-token"),
+            (b"x-auth-request-preferred-username", b"bryan-lliguicota"),
+        ],
+    }
+    found = auth.resolve(scope)
+    assert found is not None
+    assert found.name == "bryan-lliguicota"
+    assert found.source == "sso"
+
+
+def test_a_matching_key_still_beats_the_sso_header(monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
+    key = auth.mint("alice")
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"authorization", b"Bearer " + key.encode()),
+            (b"x-auth-request-preferred-username", b"mallory"),
+        ],
+    }
+    assert auth.resolve(scope).name == "alice"

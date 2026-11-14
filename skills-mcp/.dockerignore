@@ -1,0 +1,26 @@
+# VCS / metadata
+.git
+.gitignore
+
+# python
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+
+# build output
+dist/
+build/
+*.tgz
+
+# never needed in the image — the Dockerfile COPYs only pyproject.toml, src/, mcp_auth.py
+helm/
+tests/
+README.md
+documentation/
+*.log
