@@ -23,8 +23,10 @@ from __future__ import annotations
 import asyncio
 import html
 import os
+import re
 from datetime import datetime, timezone
 
+from markdown_it import MarkdownIt
 from starlette.responses import HTMLResponse, PlainTextResponse
 from starlette.routing import Route
 
@@ -44,6 +46,21 @@ _IDENTITY_HEADERS = (
     "x-auth-request-user",
     "x-auth-request-preferred-username",
 )
+
+
+#: CommonMark with raw HTML DISABLED. Skills are content we render for other
+#: people, and private ones are user-authored, so markup in the file must never
+#: become markup in the page. markdown-it's default validateLink also refuses
+#: javascript:/data: targets.
+_MD = (
+    MarkdownIt("commonmark", {"html": False, "linkify": False, "typographer": False})
+    .enable("table")
+    .enable("strikethrough")
+)
+
+
+def render_markdown(text: str) -> str:
+    return _MD.render(text or "")
 
 
 def ui_enabled() -> bool:
@@ -75,7 +92,36 @@ _CSS = """
   --radius:.625rem; --radius-lg:14px;
   --sidebar-w:16rem; --sidebar-w-collapsed:3rem;
   --row-h:2rem;
+  color-scheme:dark;
 }
+[data-theme=light]{
+  --bg:#ffffff; --surface:#fafafa; --surface-2:#f0f0f2;
+  --border:rgba(0,0,0,.12); --fg:#17171b; --muted:#5c5c68;
+  --primary:#2f6fed; --primary-dim:rgba(47,111,237,.12);
+  color-scheme:light;
+}
+.theme{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+.theme button{background:none;border:0;color:var(--muted);font-size:12px;padding:4px 10px;cursor:pointer}
+.theme button[aria-pressed=true]{background:var(--surface-2);color:var(--fg)}
+.md{font-size:14px;line-height:1.65;max-width:78ch}
+.md h1,.md h2,.md h3,.md h4{margin:22px 0 8px;line-height:1.35;font-weight:600;letter-spacing:-.01em}
+.md>h1:first-child,.md>h2:first-child{margin-top:0}
+/* the body's own #title sits UNDER the page title, so keep it smaller than an
+   <h1> would be — the page name is the real heading */
+.md h1{font-size:17px}.md h2{font-size:15px}.md h3{font-size:13.5px}
+.md h3{color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.md p{margin:10px 0}
+.md ul,.md ol{margin:10px 0 10px 22px}
+.md li{margin:4px 0}
+.md code{background:var(--surface-2);padding:2px 5px;border-radius:4px;font-size:12.5px}
+.md pre{background:var(--surface-2);padding:12px;border-radius:8px;overflow:auto}
+.md pre code{background:none;padding:0}
+.md table{border-collapse:collapse;margin:12px 0;font-size:13px;display:block;overflow:auto}
+.md th,.md td{border:1px solid var(--border);padding:6px 10px;text-align:left}
+.md th{background:var(--surface-2)}
+.md blockquote{border-left:3px solid var(--border);margin:12px 0;padding:2px 12px;color:var(--muted)}
+.md a{color:var(--primary)}
+.md hr{border:0;border-top:1px solid var(--border);margin:18px 0}
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);
@@ -101,7 +147,7 @@ a{color:inherit;text-decoration:none}
 .role{font-size:12px;color:var(--primary);border:1px solid var(--border);border-radius:999px;padding:2px 10px}
 
 /* the shell: bordered, rounded, sidebar + inset (borrowed from the fleet UI) */
-.shell{display:flex;min-height:78vh;border:1px solid var(--border);
+.shell{display:flex;height:calc(100vh - 132px);min-height:420px;border:1px solid var(--border);
   border-radius:var(--radius-lg);overflow:hidden;background:var(--surface)}
 .sidebar{width:var(--sidebar-w);flex:0 0 var(--sidebar-w);border-right:1px solid var(--border);
   display:flex;flex-direction:column;background:var(--bg);transition:flex-basis .15s,width .15s}
@@ -156,8 +202,14 @@ pre.body{background:var(--bg);border:1px solid var(--border);border-radius:var(-
 .row input[type=checkbox]{flex:0 0 auto;margin:0;cursor:pointer;accent-color:var(--primary)}
 .shell.collapsed .row input[type=checkbox]{display:none}
 .sidebar-form{display:flex;flex-direction:column;flex:1;min-height:0}
-.sidebar-foot{display:flex;gap:6px;padding:8px;border-top:1px solid var(--border)}
+.sidebar-foot{display:flex;gap:6px;padding:8px;border-top:1px solid var(--border);
+  background:var(--bg);position:sticky;bottom:0}
 .sidebar-foot .icon-btn{flex:1;border:1px solid var(--border);padding:6px 8px;font-size:12px}
+.sidebar-foot .icon-btn.save{background:var(--primary);border-color:var(--primary);color:#fff}
+.shell.collapsed .sidebar-foot{display:none}
+.sidebar-head .all{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;
+  cursor:pointer;user-select:none}
+.shell.collapsed .sidebar-head .all{display:none}
 .row.off .badge{display:inline}
 .badge.off{color:var(--muted)}
 .toggle{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;
@@ -178,6 +230,11 @@ _FOLDER_ICON = (
     "stroke-width=2 stroke-linecap=round stroke-linejoin=round aria-hidden=true>"
     "<path d='M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 8.9 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z'/></svg>"
 )
+_CHEVRON_ICON = (
+    "<svg width=16 height=16 viewBox='0 0 24 24' fill='none' stroke='currentColor' "
+    "stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d='M15 6l-6 6 6 6'/></svg>"
+)
+
 _PANEL_ICON = (
     "<svg width=16 height=16 viewBox='0 0 24 24' fill='none' stroke='currentColor' "
     "stroke-width=2 stroke-linecap=round stroke-linejoin=round aria-hidden=true>"
@@ -194,6 +251,10 @@ def _page(title: str, body: str, identity: str | None, status_code: int = 200) -
     return HTMLResponse(
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<script>(function(){var t=localStorage.getItem('ui.theme')||'auto';"
+        "var m=window.matchMedia('(prefers-color-scheme: light)');"
+        "document.documentElement.dataset.theme="
+        "(t==='auto'?(m.matches?'light':'dark'):t);})();</script>"
         f"<title>{html.escape(title)}</title><style>{_CSS}</style></head><body>"
         f"<div class=wrap>{body}</div></body></html>",
         status_code=status_code,
@@ -220,6 +281,26 @@ def _ago(stamp: str | None) -> str:
     return f"{int(hours / 24)}d ago"
 
 
+def repo_url(state) -> str:
+    """Where a human can browse the served skills.
+
+    Derived from SKILLS_SOURCE_URL so a fork points at itself:
+      https://codeload.github.com/<org>/<repo>/tar.gz  ->  github.com/<org>/<repo>/tree/<ref>/<path>
+    SKILLS_REPO_URL overrides it (for a mirror or a different host).
+    """
+    explicit = os.getenv("SKILLS_REPO_URL", "").strip()
+    if explicit:
+        return explicit
+    url = os.getenv("SKILLS_SOURCE_URL", "").strip()
+    match = re.match(r"https?://codeload\.github\.com/([^/]+)/([^/]+)/tar\.gz", url)
+    if not match:
+        return ""
+    org, repo = match.group(1), match.group(2)
+    ref = state.source.ref or "main"
+    paths = (os.getenv("SKILLS_SOURCE_PATHS") or "skills").split(",")[0].strip() or "skills"
+    return f"https://github.com/{org}/{repo}/tree/{ref}/{paths}"
+
+
 def _source_line(state) -> str:
     """One glanceable line. The exact sha and timestamp are tooltips, not noise."""
     source = state.source
@@ -228,7 +309,14 @@ def _source_line(state) -> str:
         "local": "local checkout",
         "bundled": "bundled snapshot",
     }.get(source.origin, source.origin)
-    bits = [html.escape(origin)]
+    href = repo_url(state) if source.origin == "github" else ""
+    label = html.escape(origin)
+    bits = [
+        f"<a href='{html.escape(href)}' target=_blank rel=noopener "
+        f"title='open the skills folder in the repository'>{label}</a>"
+        if href
+        else label
+    ]
     if source.ref:
         tip = f"{source.ref} @ {source.commit}" if source.commit else source.ref
         bits.append(f"<span title='{html.escape(tip)}'>{html.escape(source.ref)}</span>")
@@ -327,20 +415,28 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
     else:
         who = "<span class='who anon'>anonymous</span>"
         actions = ""
+    theme = (
+        "<span class=theme role=group aria-label='theme'>"
+        "<button type=button data-theme-btn=auto aria-pressed=false>Auto</button>"
+        "<button type=button data-theme-btn=light aria-pressed=false>Light</button>"
+        "<button type=button data-theme-btn=dark aria-pressed=false>Dark</button></span>"
+    )
     return (
         "<div class=page-head>"
         f"<h1><a href='/'>skills</a></h1><span class=count>{len(listed)} skills</span>"
         f"<span class=source>{_source_line(state)}</span>"
-        f"<span class=head-right>{actions}{who}</span></div>"
+        f"<span class=head-right>{actions}{theme}{who}</span></div>"
         + _flash_for(identity)
         + _first_run_banner(identity)
         + "<div class=shell id=shell>"
         "<aside class=sidebar>"
         "<div class=sidebar-head>"
-        "<button class=icon-btn id=toggle title='collapse'>" + _PANEL_ICON + "</button>"
+        "<button class=icon-btn id=toggle title='collapse or expand the sidebar'>"
+        + _CHEVRON_ICON + "</button>"
         "<span class=label>Files</span>"
-        + ("<input type=checkbox id=pickall title='select all' checked "
-           "style='margin-left:auto;cursor:pointer;accent-color:var(--primary)'>" if identity else "")
+        + ("<label class=all title='select or clear every skill'>"
+           "<input type=checkbox id=pickall checked style='cursor:pointer;accent-color:var(--primary)'>"
+           "<span>All</span></label>" if identity else "")
         + "</div>"
         "<input class=search id=q placeholder='filter…' autocomplete=off>"
         + (
@@ -348,8 +444,8 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
             "<input type=hidden name=next id=next value='/'>"
             "<nav class=tree id=tree>" + "".join(rows) + "</nav>"
             "<div class=sidebar-foot>"
-            "<button class=icon-btn type=button id=alloff>Disable all</button>"
-            "<button class=icon-btn type=submit>Save</button>"
+            "<button class=icon-btn type=button id=alloff title='untick every skill'>Disable all</button>"
+            "<button class='icon-btn save' type=submit>Save</button>"
             "</div></form>"
             if identity
             else "<nav class=tree id=tree>" + "".join(rows) + "</nav>"
@@ -374,6 +470,11 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         "boxes().forEach(c=>c.addEventListener('change',sync));sync();"
         "document.getElementById('alloff').onclick=()=>{boxes().forEach(c=>c.checked=false);sync()};"
         "form.addEventListener('submit',()=>{document.getElementById('next').value=location.pathname});}"
+        "const apply=t=>{localStorage.setItem('ui.theme',t);const m=matchMedia('(prefers-color-scheme: light)');"
+        "document.documentElement.dataset.theme=(t==='auto'?(m.matches?'light':'dark'):t);"
+        "document.querySelectorAll('[data-theme-btn]').forEach(x=>x.setAttribute('aria-pressed',String(x.dataset.themeBtn===t)))};"
+        "document.querySelectorAll('[data-theme-btn]').forEach(b=>b.onclick=()=>apply(b.dataset.themeBtn));"
+        "apply(localStorage.getItem('ui.theme')||'auto');"
         "const sf=document.getElementById('syncform');"
         "if(sf){sf.addEventListener('submit',()=>{document.getElementById('syncnext').value=location.pathname});}"
         "</script>"
@@ -390,6 +491,12 @@ async def index(request):
         return RedirectResponse(f"/skills/{visible[0].name}", status_code=307)
     inset = "<p class=empty>No skills are visible to you. Check /admin/status.</p>"
     return _page("skills", _shell(state, identity, None, inset), identity)
+
+
+def _view_toggle(name: str, raw: bool) -> str:
+    if raw:
+        return f"<a class=btn href='/skills/{html.escape(name)}'>rendered</a>"
+    return f"<a class=btn href='/skills/{html.escape(name)}?raw=1'>raw</a>"
 
 
 async def skill_detail(request):
@@ -412,6 +519,11 @@ async def skill_detail(request):
         items = "".join(f"<li>{html.escape(path)}</li>" for path in skill.files)
         files = f"<h3 class=sec>Files</h3><ul class=files>{items}</ul>"
 
+    raw = bool(request.query_params.get("raw"))
+    if raw:
+        body_html = f"<h3 class=sec>Body (raw)</h3><pre class=body id=body>{html.escape(skill.body)}</pre>"
+    else:
+        body_html = f"<h3 class=sec>Body</h3><div class='md' id=body>{render_markdown(skill.body)}</div>"
     hidden = identity is not None and skill.name in prefs_mod.disabled(identity)
     if identity is None:
         toggle = (
@@ -436,13 +548,14 @@ async def skill_detail(request):
         f"<p class=desc>{html.escape(skill.description)}</p>"
         f"{state_note}"
         "<div class=actions>"
-        f"<a class=btn href='/skills/{html.escape(skill.name)}/raw'>raw markdown</a>"
+        f"{_view_toggle(skill.name, raw)}"
         "<button class=btn id=copy>copy markdown</button>"
         f"{toggle}</div>"
         f"{files}"
-        f"<h3 class=sec>Body</h3><pre class=body id=body>{html.escape(skill.body)}</pre>"
+        f"{body_html}"
+        f"<textarea id=rawsrc hidden>{html.escape(skill.body)}</textarea>"
         "<script>document.getElementById('copy').onclick=async()=>{"
-        "await navigator.clipboard.writeText(document.getElementById('body').innerText);"
+        "await navigator.clipboard.writeText(document.getElementById('rawsrc').value);"
         "const b=document.getElementById('copy');b.textContent='copied';"
         "setTimeout(()=>b.textContent='copy markdown',1200)};</script>"
     )

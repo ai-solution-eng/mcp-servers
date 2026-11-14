@@ -25,6 +25,7 @@ def make_request(
     path_params: dict | None = None,
     method: str = "GET",
     body: bytes = b"",
+    query: str = "",
 ) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     sent = False
@@ -42,7 +43,7 @@ def make_request(
             "method": method,
             "path": path,
             "headers": raw,
-            "query_string": b"",
+            "query_string": query.encode(),
             "path_params": path_params or {},
         },
         receive,
@@ -107,7 +108,7 @@ def test_detail_page_renders_the_skill() -> None:
     assert response.status_code == 200
     body = response.body.decode()
     assert "<h2>beta</h2>" in body
-    assert "raw markdown" in body
+    assert ">raw<" in body
     assert "Use when testing beta." in body
 
 
@@ -289,6 +290,9 @@ def test_the_sidebar_has_checkboxes_and_a_save_button(tmp_path, monkeypatch) -> 
     assert "name=visible" in body and "id=skillform" in body
     assert "Disable all" in body and ">Save<" in body
     assert "id=pickall" in body
+    assert "class=all" in body and ">All<" in body        # labelled master checkbox
+    assert "class='icon-btn save'" in body                # the Save is the primary action
+    assert "id=toggle" in body and "M15 6l-6 6 6 6" in body   # chevron, not a square
 
 
 def test_sidebar_is_read_only_when_anonymous() -> None:
@@ -524,3 +528,93 @@ def test_how_to_connect_page_renders_the_steps(tmp_path, monkeypatch) -> None:
     assert "/mcp" in body
     assert "either or both" in body            # (a) gateway or (b) direct
     assert "Verify" not in body                # the curl step was removed
+
+
+def test_the_shell_is_height_bounded_so_the_body_scrolls_alone() -> None:
+    body = run(ui.skill_detail(make_request("/skills/alpha", path_params={"name": "alpha"}))).body.decode()
+    assert "height:calc(100vh - 132px)" in body
+    assert "position:sticky;bottom:0" in body      # footer stays visible
+
+
+# ------------------------------------------------------------------ markdown
+
+
+def test_markdown_renders_structure() -> None:
+    out = ui.render_markdown("# Title\n\n- one\n- two\n")
+    assert "<h1>Title</h1>" in out
+    assert "<li>one</li>" in out
+
+
+def test_markdown_escapes_raw_html() -> None:
+    out = ui.render_markdown("<script>alert(1)</script>")
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+
+def test_markdown_refuses_javascript_links() -> None:
+    out = ui.render_markdown("[click](javascript:alert(1))")
+    assert "href" not in out
+
+
+def test_markdown_renders_fenced_code_and_tables() -> None:
+    assert "<pre>" in ui.render_markdown("```\ncode\n```")
+    assert "<table>" in ui.render_markdown("| a | b |\n|---|---|\n| 1 | 2 |")
+
+
+def test_detail_renders_markdown_by_default_and_raw_on_demand() -> None:
+    rendered = run(ui.skill_detail(make_request("/skills/beta", path_params={"name": "beta"}))).body.decode()
+    assert "class='md'" in rendered
+    assert ">raw<" in rendered
+
+    raw = run(ui.skill_detail(
+        make_request("/skills/beta", path_params={"name": "beta"}, query="raw=1")
+    )).body.decode()
+    assert "Body (raw)" in raw and "pre class=body" in raw
+
+
+# ------------------------------------------------------------------ theme
+
+
+def test_theme_control_is_in_the_header_for_everyone() -> None:
+    body = run(ui.skill_detail(make_request("/skills/alpha", path_params={"name": "alpha"}))).body.decode()
+    assert "data-theme-btn=auto" in body
+    assert "data-theme-btn=light" in body and "data-theme-btn=dark" in body
+
+
+def test_light_palette_and_prepaint_script_exist() -> None:
+    body = run(ui.skill_detail(make_request("/skills/alpha", path_params={"name": "alpha"}))).body.decode()
+    assert "[data-theme=light]" in body
+    assert "localStorage.getItem('ui.theme')" in body
+
+
+def test_github_label_links_to_the_repo_folder(monkeypatch) -> None:
+    from skills_mcp.state import Source
+
+    class _S:
+        source = Source(origin="github", ref="main", commit="abc1234", refreshed_at=None)
+
+    monkeypatch.setenv("SKILLS_SOURCE_URL", "https://codeload.github.com/ai-solution-eng/tools/tar.gz")
+    monkeypatch.setenv("SKILLS_SOURCE_PATHS", "skills")
+    line = ui._source_line(_S())
+    assert "href='https://github.com/ai-solution-eng/tools/tree/main/skills'" in line
+    assert "target=_blank" in line and "rel=noopener" in line
+
+
+def test_a_non_github_source_is_not_linked(monkeypatch) -> None:
+    from skills_mcp.state import Source
+
+    class _S:
+        source = Source(origin="local", ref=None, commit=None, refreshed_at=None)
+
+    monkeypatch.setenv("SKILLS_SOURCE_URL", "https://example.com/skills.tar.gz")
+    assert "href=" not in ui._source_line(_S())
+
+
+def test_skills_repo_url_overrides_the_derivation(monkeypatch) -> None:
+    from skills_mcp.state import Source
+
+    class _S:
+        source = Source(origin="github", ref="main", commit=None, refreshed_at=None)
+
+    monkeypatch.setenv("SKILLS_REPO_URL", "https://git.example.com/mirror/skills")
+    assert "https://git.example.com/mirror/skills" in ui._source_line(_S())

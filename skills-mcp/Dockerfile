@@ -18,7 +18,7 @@ RUN apt-get update \
 # re-resolves and re-downloads every dependency. This list must stay equal to
 # [project].dependencies — the sanity gate at the bottom catches drift.
 COPY pyproject.toml ./
-RUN uv pip install --system mcp starlette uvicorn pyyaml
+RUN uv pip install --system mcp starlette uvicorn pyyaml markdown-it-py
 
 # App code after the dependency layer (cheap code-only rebuilds). The
 # non-editable install ships exactly what pyproject declares (package-dir

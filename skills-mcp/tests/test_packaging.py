@@ -243,3 +243,25 @@ def test_sso_gate_paths_cover_the_browser_and_spare_mcp() -> None:
     assert "/me" in paths and "/me/*" in paths
     assert "/api/*" in paths
     assert "/mcp" not in paths, "MCP clients use tokens, not SSO"
+
+
+def test_dockerfile_installs_every_declared_dependency() -> None:
+    """Regression: the Dockerfile installs a PINNED list (for layer caching) and
+    then `--no-deps .` — so a dependency added to pyproject but not to that list
+    builds green and crash-loops at import time."""
+    tree = Path(__file__).resolve().parents[1]
+    declared = tomllib.loads((tree / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+    names = {
+        dep.split(">")[0].split("=")[0].split("[")[0].strip().lower().replace("_", "-")
+        for dep in declared
+    }
+    dockerfile = (tree / "Dockerfile").read_text(encoding="utf-8")
+    install_line = next(
+        line for line in dockerfile.splitlines() if line.startswith("RUN uv pip install --system")
+    )
+    installed = {
+        token.strip().lower().replace("_", "-")
+        for token in install_line.split("--system", 1)[1].split()
+    }
+    missing = names - installed
+    assert not missing, f"add {sorted(missing)} to the Dockerfile's uv pip install line"
