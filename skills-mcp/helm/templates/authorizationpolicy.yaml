@@ -33,6 +33,14 @@ spec:
         - operation:
             hosts:
               - {{ .Values.ezua.virtualService.endpoint | required "ezua.virtualService.endpoint is required when the authorization policy is enabled" }}
+            {{- with .Values.ezua.authorizationPolicy.paths }}
+            # BROWSER PATHS ONLY. /mcp is deliberately absent: MCP clients
+            # authenticate with a token, not an SSO session, and must not be
+            # redirected to Keycloak. Leave this list empty to gate the whole
+            # host (previous behaviour).
+            paths:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
   selector:
     matchLabels:
       {{- toYaml .Values.ezua.authorizationPolicy.gatewayLabels | nindent 6 }}

@@ -87,7 +87,6 @@ curl -s -X POST localhost:9101/mcp \
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `SKILLS_MCP_API_KEYS` | *(unset)* | Comma-separated keys for `/mcp` **and** `/admin/*`. **Unset = fail open** (local only). |
-| `SKILLS_MCP_CLIENTS` | *(unset)* | Per-user key → name registry: `alice:keyA;bob:keyB` (semicolons). Rides the Secret under key `clients`. Unset = anonymous callers, unchanged output. |
 | `SKILLS_STATE_DIR` | `/data/state` | Per-identity JSON: disabled skills + minted token hash. Needs the PVC. |
 | `SKILLS_PRIVATE_DIR` | `/data/private` | Per-identity private skills (`<id>/<skill>/SKILL.md`). Needs the PVC. |
 | `SKILLS_TRUST_PROXY_IDENTITY` | `"false"` | Believe `X-Forwarded-User` from an SSO proxy. Only safe with a NetworkPolicy limiting ingress to that proxy. |

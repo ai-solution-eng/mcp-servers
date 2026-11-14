@@ -36,7 +36,6 @@ Configuration:
   SKILLS_BUNDLED_ROOT   snapshot baked into the image (default /opt/skills-bundled).
   SKILLS_MCP_API_KEYS   comma-separated keys for /mcp and /admin (the
                         fleet-universal MCP_API_KEYS is honoured too).
-  SKILLS_MCP_CLIENTS    per-user key -> name registry, "alice:keyA;bob:keyB".
                         SECRET material (it carries the keys) — lives in the
                         Secret. Unset = anonymous callers, unchanged output.
 
@@ -92,7 +91,6 @@ AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, API_KEYS_ENV)
 # re-read per request so a Secret rotation reaches a running pod). This is
 # SECRET material — it carries the keys themselves — so it lives in the Secret,
 # never in values. Unset = every caller is anonymous, exactly as before.
-CLIENTS_ENV = "SKILLS_MCP_CLIENTS"
 
 # Hard ceiling on any single file served by get_skill_file. The response is the
 # agent's context window; a skill may ship a script, not a data dump.
@@ -474,11 +472,6 @@ async def _me_token(request):
     identity = _current_identity()
     if not identity:
         return JSONResponse({"error": "no identity"}, status_code=401)
-    if identity in auth_mod.env_managed_names():
-        return JSONResponse(
-            {"error": f"{identity!r} is managed by the operator key registry; ask an operator to rotate it"},
-            status_code=409,
-        )
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001

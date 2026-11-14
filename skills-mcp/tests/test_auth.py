@@ -1,4 +1,4 @@
-"""Authentication: env keys (operator) union minted keys (PVC), plus SSO header."""
+"""Authentication: the operator base key, minted per-person keys, and SSO."""
 
 import hashlib
 from pathlib import Path
@@ -17,7 +17,6 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("SKILLS_MCP_API_KEYS", "base-key-123")
     monkeypatch.delenv("MCP_API_KEYS", raising=False)
-    monkeypatch.delenv("SKILLS_MCP_CLIENTS", raising=False)
     monkeypatch.delenv("SKILLS_TRUST_PROXY_IDENTITY", raising=False)
     yield
 
@@ -30,13 +29,6 @@ def test_operator_base_key_resolves_anonymously() -> None:
     assert found is not None
     assert found.name is None
     assert found.source == "env-base"
-
-
-def test_named_env_key_resolves_the_name(monkeypatch) -> None:
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA;bob:keyB")
-    found = auth.resolve(scope_with("x-api-key", "keyA"))
-    assert found.name == "alice"
-    assert found.source == "env-user"
 
 
 def test_bearer_header_is_accepted() -> None:
@@ -76,12 +68,6 @@ def test_an_expired_key_does_not_resolve() -> None:
     assert auth.resolve(scope_with("x-api-key", key)) is None
 
 
-def test_env_key_wins_over_a_minted_key(monkeypatch) -> None:
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
-    found = auth.resolve(scope_with("x-api-key", "keyA"))
-    assert found.source == "env-user"
-
-
 def test_minted_index_is_cached_but_refreshes(tmp_path) -> None:
     auth.minted_index()
     key = auth.mint("dave")
@@ -105,20 +91,15 @@ def test_sso_header_resolves_when_trusted(monkeypatch) -> None:
 
 def test_a_key_beats_the_sso_header(monkeypatch) -> None:
     monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
+    key = auth.mint("alice")
     scope = {
         "type": "http",
-        "headers": [(b"x-api-key", b"keyA"), (b"x-forwarded-user", b"mallory@corp")],
+        "headers": [(b"x-api-key", key.encode()), (b"x-forwarded-user", b"mallory@corp")],
     }
     assert auth.resolve(scope).name == "alice"
 
 
 # ------------------------------------------------------------------ helpers
-
-
-def test_env_managed_names(monkeypatch) -> None:
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA;bob:keyB")
-    assert auth.env_managed_names() == {"alice", "bob"}
 
 
 def test_fingerprint_is_short_and_stable() -> None:
@@ -148,11 +129,11 @@ def test_unmatched_bearer_falls_back_to_the_sso_header(monkeypatch) -> None:
 
 def test_a_matching_key_still_beats_the_sso_header(monkeypatch) -> None:
     monkeypatch.setenv("SKILLS_TRUST_PROXY_IDENTITY", "true")
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
+    key = auth.mint("alice")
     scope = {
         "type": "http",
         "headers": [
-            (b"authorization", b"Bearer keyA"),
+            (b"authorization", b"Bearer " + key.encode()),
             (b"x-auth-request-preferred-username", b"mallory"),
         ],
     }

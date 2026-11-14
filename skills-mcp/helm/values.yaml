@@ -13,7 +13,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/skills-mcp
-  tag: v0.2.4
+  tag: v0.3.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []   # only if the GHCR package stays PRIVATE
@@ -132,6 +132,14 @@ ezua:
     providerName: oauth2-proxy        # the ext_authz provider in Istio's MeshConfig
     gatewayLabels:
       istio: ingressgateway
+    # Paths the SSO gate covers. /mcp is intentionally NOT here: agents use a
+    # token and must reach the pod directly. Empty list = gate the whole host.
+    paths:
+      - /
+      - /skills/*
+      - /me
+      - /me/*
+      - /api/*
   domainName: "${DOMAIN_NAME}"
   virtualService:
     enabled: true

@@ -19,18 +19,42 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def make_request(path: str = "/", headers: dict | None = None, path_params: dict | None = None) -> Request:
+def make_request(
+    path: str = "/",
+    headers: dict | None = None,
+    path_params: dict | None = None,
+    method: str = "GET",
+    body: bytes = b"",
+) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
     return Request(
         {
             "type": "http",
-            "method": "GET",
+            "method": method,
             "path": path,
             "headers": raw,
             "query_string": b"",
             "path_params": path_params or {},
-        }
+        },
+        receive,
     )
+
+
+def form_request(path: str, fields: list[tuple[str, str]], headers: dict) -> Request:
+    from urllib.parse import urlencode
+
+    merged = dict(headers)
+    merged["content-type"] = "application/x-www-form-urlencoded"
+    return make_request(path, headers=merged, method="POST", body=urlencode(fields).encode())
 
 
 def write_skill(root: Path, folder: str, body: str = "Do the thing.", files: dict | None = None) -> None:
@@ -202,9 +226,22 @@ def test_mint_shows_the_key_once_and_allows_more(tmp_path, monkeypatch) -> None:
     assert len(prefs.keys("alice")) == 2
 
 
-def test_mint_refused_for_operator_managed_names(tmp_path, monkeypatch) -> None:
+def test_mint_with_an_expiry_date(tmp_path, monkeypatch) -> None:
+    """The date input sends YYYY-MM-DD; the key must expire at the END of it."""
+    from skills_mcp import prefs
+
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setenv("SKILLS_MCP_CLIENTS", "alice:keyA")
     headers = _trusted(monkeypatch)
-    response = run(ui.me_token(make_request("/me/token", headers=headers)))
-    assert response.status_code == 409
+    request = form_request("/me/token", [("label", "temp"), ("expires", "2026-12-14")], headers)
+    response = run(ui.me_token(request))
+    assert response.status_code == 200
+    record = prefs.keys("alice")[0]
+    assert record["expires_at"] == "2026-12-14T23:59:59Z"
+    assert record["label"] == "temp"
+
+
+def test_the_me_page_offers_an_expiry_input(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.me_page(make_request("/me", headers=headers))).body.decode()
+    assert "type=date" in body and "name=expires" in body

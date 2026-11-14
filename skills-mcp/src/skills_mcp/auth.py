@@ -1,13 +1,16 @@
-"""Who is calling — env keys (operator) UNION minted keys (PVC).
+"""Who is calling — the shared operator key, a minted per-person key, or SSO.
 
-Two sources, one rule: an operator-managed name always wins, and self-mint
-refuses names the env registry owns (one owner per key, so rotation can never
-race).
+Two credentials, one rule: a NAMED identity always beats the anonymous base.
 
-Resolution order for a presented key:
-  1. SKILLS_MCP_CLIENTS   "alice:keyA;bob:keyB"   -> named identity (env-user)
-  2. SKILLS_MCP_API_KEYS  / MCP_API_KEYS          -> operator key  (env-base)
-  3. sha256(key) in any /data/state/<identity>.json -> minted identity
+Resolution order:
+  1. SKILLS_MCP_API_KEYS / MCP_API_KEYS   -> operator key   (env-base, NO name)
+  2. sha256(key) in /data/state/<identity>.json -> minted key (named)
+  3. no key, trusted SSO header from the enforcing proxy -> sso identity
+
+There is deliberately no env->name registry: a name comes only from a minted
+key or from SSO, so every named identity is self-service and revocable by its
+owner. The base key stays nameless, which is what makes it a safe default
+credential for the gateway.
 
 Why a custom middleware instead of mcp_auth.ApiKeyAuthMiddleware: that one only
 knows env keys, and a minted key is created at runtime. We still use mcp_auth's
@@ -28,7 +31,6 @@ from starlette.responses import JSONResponse
 
 from . import prefs
 
-CLIENTS_ENV = "SKILLS_MCP_CLIENTS"
 TRUST_PROXY_ENV = "SKILLS_TRUST_PROXY_IDENTITY"
 # Ordered: the HUMAN name first, the opaque ids last. The edge injects all of
 # them; x-auth-request-user carries the Keycloak UUID (claim "user"), which is
@@ -49,28 +51,12 @@ DEFAULT_PROTECTED = ("/mcp", "/admin", "/api")
 
 class Identity(NamedTuple):
     name: str | None      # None for the shared operator/base key
-    source: str           # "env-user" | "env-base" | "minted"
+    source: str           # "env-base" | "minted" | "sso"
     key_fp: str           # sha256:<12 hex> of the presented key
 
 
 def _fingerprint(key: str) -> str:
     return "sha256:" + hashlib.sha256(key.encode()).hexdigest()[:12]
-
-
-def client_registry() -> dict[str, str]:
-    """{key: name} from SKILLS_MCP_CLIENTS ("name:key;name:key")."""
-    registry: dict[str, str] = {}
-    raw = os.getenv(CLIENTS_ENV, "")
-    for chunk in raw.split(";"):
-        name, _, key = chunk.partition(":")
-        name, key = name.strip().lower(), key.strip()
-        if name and key:
-            registry[key] = name
-    return registry
-
-
-def env_managed_names() -> set[str]:
-    return set(client_registry().values())
 
 
 _minted_cache: tuple[float, dict[str, str]] | None = None
@@ -128,10 +114,6 @@ def resolve(scope) -> Identity | None:
     browser session would resolve to anonymous.
     """
     keys = mcp_auth.presented_keys(scope)
-    registry = client_registry()
-    for key in keys:
-        if key in registry:
-            return Identity(registry[key], "env-user", _fingerprint(key))
     env_keys = set(mcp_auth.configured_keys(ENV_KEY_NAMES))
     for key in keys:
         if key in env_keys:

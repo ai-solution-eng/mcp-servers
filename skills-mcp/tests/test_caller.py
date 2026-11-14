@@ -33,7 +33,6 @@ def write_skill(root: Path, folder: str, body: str = "Do the thing.") -> None:
 def _isolate(monkeypatch):
     monkeypatch.setenv("SKILLS_SOURCE_PATHS", "skills")
     monkeypatch.delenv("SKILLS_SOURCE_DIR", raising=False)
-    monkeypatch.delenv("SKILLS_MCP_CLIENTS", raising=False)
     CALLER_CONTEXT.set(None)
     yield
     CALLER_CONTEXT.set(None)
@@ -90,8 +89,7 @@ def test_anonymous_caller_has_no_caller_field(tmp_path: Path) -> None:
 
 
 def test_matched_key_without_registry_name_is_anonymous(tmp_path: Path) -> None:
-    """A valid key with no SKILLS_MCP_CLIENTS entry: attributable by fingerprint,
-    never by name."""
+    """The shared base key: attributable by fingerprint, never by name."""
     use(tmp_path)
     as_caller(None)
 

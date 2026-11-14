@@ -365,7 +365,6 @@ async def me_page(request):
     hidden = sorted(prefs_mod.disabled(identity))
     private = visibility_mod.private_skills(identity)
     keys = prefs_mod.keys(identity)
-    can_mint = identity not in auth_mod.env_managed_names()
     rows = []
     for record in keys:
         active = prefs_mod.is_active(record)
@@ -387,13 +386,15 @@ async def me_page(request):
             f"<span style='margin-left:auto'>{action}</span></div>"
         )
     key_rows = "".join(rows) or "<p>No keys yet.</p>"
+    field_style = (
+        "padding:6px 10px;border-radius:8px;border:1px solid var(--border);"
+        "background:var(--bg);color:var(--fg)"
+    )
     mint_form = (
-        "<form method=post action='/me/token' style='display:flex;gap:8px;margin-top:12px'>"
-        "<input name=label placeholder='label (e.g. laptop-dsh)' "
-        "style='padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)'>"
+        "<form method=post action='/me/token' style='display:flex;gap:8px;margin-top:12px;flex-wrap:wrap'>"
+        f"<input name=label placeholder='label (e.g. laptop-dsh)' style='{field_style}'>"
+        f"<input name=expires type=date title='optional expiry date' style='{field_style}'>"
         "<button class=toggle type=submit>Mint a key</button></form>"
-        if can_mint
-        else "<p class=warn>This identity is operator-managed; ask an operator to rotate it.</p>"
     )
     token_panel = (
         f"<div class=panel><h3>Your keys ({len(keys)})</h3>"
@@ -445,21 +446,18 @@ async def me_token(request):
     identity = identity_of(request)
     if identity is None:
         return _page("sign in required", "<h1>Sign in required</h1>", None, status_code=401)
-    if identity in auth_mod.env_managed_names():
-        return _page(
-            "operator-managed",
-            f"<h1>Operator-managed identity</h1><p class=desc>{html.escape(identity)} is in the "
-            "operator key registry; an operator must rotate that key.</p><a class=btn href='/me'>back</a>",
-            identity,
-            status_code=409,
-        )
     label = ""
+    expires_at = None
     try:
         form = await request.form()
         label = str(form.get("label") or "").strip()
+        raw_expiry = str(form.get("expires") or "").strip()
     except Exception:  # noqa: BLE001 - a plain POST without a body is fine
-        label = ""
-    key = auth_mod.mint(identity, label=label)
+        raw_expiry = ""
+    if raw_expiry:
+        # <input type=date> sends YYYY-MM-DD; the key dies at the END of that day.
+        expires_at = raw_expiry if len(raw_expiry) > 10 else f"{raw_expiry}T23:59:59Z"
+    key = auth_mod.mint(identity, label=label, expires_at=expires_at)
     return _key_page(request, identity, key, rotated=False)
 
 
