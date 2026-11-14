@@ -49,12 +49,23 @@ def make_request(
     )
 
 
-def form_request(path: str, fields: list[tuple[str, str]], headers: dict) -> Request:
+def form_request(
+    path: str,
+    fields: list[tuple[str, str]],
+    headers: dict,
+    path_params: dict | None = None,
+) -> Request:
     from urllib.parse import urlencode
 
     merged = dict(headers)
     merged["content-type"] = "application/x-www-form-urlencoded"
-    return make_request(path, headers=merged, method="POST", body=urlencode(fields).encode())
+    return make_request(
+        path,
+        headers=merged,
+        method="POST",
+        body=urlencode(fields).encode(),
+        path_params=path_params,
+    )
 
 
 def write_skill(root: Path, folder: str, body: str = "Do the thing.", files: dict | None = None) -> None:
@@ -164,6 +175,16 @@ def test_routes_present_by_default() -> None:
     assert paths == [
         "/",
         "/me",
+        "/how-to-connect",
+        "/me/sync",
+        "/me/skills",
+        "/me/skills",
+        "/me/private/new",
+        "/me/private",
+        "/me/private/{name}/edit",
+        "/me/private/{name}/delete",
+        "/me/private/{name}/delete",
+        "/me/private/{name}",
         "/me/token",
         "/me/keys/{key_id}/revoke",
         "/skills/{name}",
@@ -245,3 +266,261 @@ def test_the_me_page_offers_an_expiry_input(tmp_path, monkeypatch) -> None:
     headers = _trusted(monkeypatch)
     body = run(ui.me_page(make_request("/me", headers=headers))).body.decode()
     assert "type=date" in body and "name=expires" in body
+
+
+# ------------------------------------------------------------------ bulk manage
+
+
+def test_manage_page_renders_one_checkbox_per_global_skill(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.manage_skills(make_request("/me/skills", headers=headers))).body.decode()
+    # each skill appears twice: once in the sidebar, once in the manage list
+    assert body.count("value='alpha'") == 2
+    assert body.count("value='beta'") == 2
+    assert "Select all" in body and "Disable all" in body
+
+
+def test_the_sidebar_has_checkboxes_and_a_save_button(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.skill_detail(make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"}))).body.decode()
+    assert "name=visible" in body and "id=skillform" in body
+    assert "Disable all" in body and ">Save<" in body
+    assert "id=pickall" in body
+
+
+def test_sidebar_is_read_only_when_anonymous() -> None:
+    body = run(ui.skill_detail(make_request("/skills/alpha", path_params={"name": "alpha"}))).body.decode()
+    assert "type=checkbox name=visible" not in body and "id=skillform" not in body
+
+
+def test_save_returns_to_the_page_you_came_from(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    request = form_request(
+        "/me/skills", [("visible", "beta"), ("next", "/skills/beta")], headers
+    )
+    response = run(ui.save_skills(request))
+    assert response.status_code == 303
+    assert response.headers["location"] == "/skills/beta"
+
+
+def test_save_ignores_a_dangerous_next(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    request = form_request("/me/skills", [("visible", "beta"), ("next", "//evil.example")], headers)
+    assert run(ui.save_skills(request)).headers["location"] == "/me/skills"
+
+
+def test_manage_page_lists_private_skills(tmp_path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "my-note", "Use when testing.", "body", forbidden={"alpha", "beta"})
+    body = run(ui.manage_skills(make_request("/me/skills", headers=headers))).body.decode()
+    assert "value='my-note'" in body
+    assert "private" in body
+
+
+def test_saving_the_checkbox_set_stores_the_hidden_ones(tmp_path, monkeypatch) -> None:
+    from skills_mcp import prefs
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    request = form_request("/me/skills", [("visible", "beta")], headers)   # alpha unchecked
+    response = run(ui.save_skills(request))
+    assert response.status_code == 303
+    assert prefs.disabled("alice") == {"alpha"}
+
+
+def test_unchecking_everything_hides_every_global_skill(tmp_path, monkeypatch) -> None:
+    from skills_mcp import prefs, visibility
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    run(ui.save_skills(form_request("/me/skills", [], headers)))
+    assert prefs.disabled("alice") == {"alpha", "beta"}
+    assert visibility.visible_names("alice") == []
+
+
+# ------------------------------------------------------------------ private skills
+
+
+def test_create_a_private_skill_then_read_it(tmp_path, monkeypatch) -> None:
+    from skills_mcp import visibility
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    request = form_request(
+        "/me/private",
+        [("name", "my-runbook"), ("description", "Use when the pager fires."), ("body", "# steps")],
+        headers,
+    )
+    response = run(ui.private_create(request))
+    assert response.status_code == 303
+    assert "my-runbook" in visibility.visible_names("alice")
+    assert "my-runbook" not in visibility.visible_names("bob")     # private, truly
+
+
+def test_private_name_cannot_reuse_a_global_name(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    request = form_request(
+        "/me/private",
+        [("name", "alpha"), ("description", "d"), ("body", "b")],
+        headers,
+    )
+    response = run(ui.private_create(request))
+    assert response.status_code == 200                       # re-rendered, not saved
+    assert "already used by a global skill" in response.body.decode()
+
+
+def test_private_rejects_a_bad_name(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    request = form_request(
+        "/me/private",
+        [("name", "Bad Name!"), ("description", "d"), ("body", "b")],
+        headers,
+    )
+    body = run(ui.private_create(request)).body.decode()
+    assert "lowercase letters" in body
+
+
+def test_edit_and_delete_a_private_skill(tmp_path, monkeypatch) -> None:
+    from skills_mcp import private, visibility
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "note", "first", "body one", forbidden={"alpha", "beta"})
+    private.invalidate("alice")
+
+    updated = form_request(
+        "/me/private/note",
+        [("description", "second"), ("body", "body two")],
+        headers,
+        path_params={"name": "note"},
+    )
+    assert run(ui.private_update(updated)).status_code == 303
+    assert private.read("alice", "note")["description"] == "second"
+
+    delete = make_request("/me/private/note/delete", headers=headers,
+                          path_params={"name": "note"}, method="POST")
+    assert run(ui.private_delete(delete)).status_code == 303
+    assert "note" not in visibility.visible_names("alice")
+
+
+# ------------------------------------------------------------------ header / sync
+
+
+def test_header_offers_the_three_actions(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "Sync now" in body
+    assert "New Private Skill" in body
+    assert "My keys" in body and "How to connect" in body
+    assert "href='/me'" in body            # the identity pill links to /me
+
+
+def test_header_hides_the_actions_when_anonymous() -> None:
+    body = run(ui.skill_detail(make_request("/skills/alpha", path_params={"name": "alpha"}))).body.decode()
+    assert "Sync now" not in body and "New Private Skill" not in body
+
+
+def test_source_line_is_human_with_tooltips() -> None:
+    from skills_mcp.state import Source
+
+    class _S:
+        source = Source(origin="github", ref="main", commit="edb1f6fa237f", refreshed_at=None)
+
+    line = ui._source_line(_S())
+    assert "GitHub" in line and "main" in line
+    assert "edb1f6fa237f" in line          # full sha lives in the tooltip
+    assert "edb1f6fa237f<" not in line      # not in the visible text
+
+
+def test_ago_reads_like_english() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    older = (datetime.now(timezone.utc) - timedelta(hours=40)).isoformat().replace("+00:00", "Z")
+    assert ui._ago(recent).endswith("m ago")
+    assert ui._ago(older) == "1d ago"
+
+
+def test_first_run_banner_until_a_key_exists(tmp_path, monkeypatch) -> None:
+    from skills_mcp import auth
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "You have no key yet" in body
+
+    auth.mint("alice")
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "You have no key yet" not in body
+
+
+def test_sync_reports_the_result_on_the_next_page(tmp_path, monkeypatch) -> None:
+    from skills_mcp import refresh
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    monkeypatch.setattr(
+        refresh, "refresh_from_source",
+        lambda: {"ok": True, "commit": "abc1234def", "count": 26, "ref": "main"},
+    )
+    request = form_request("/me/sync", [("next", "/skills/alpha")], headers)
+    response = run(ui.me_sync(request))
+    assert response.status_code == 303
+    assert response.headers["location"] == "/skills/alpha"
+
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "Synced" in body and "26 skills" in body and "abc1234" in body
+
+
+def test_sync_failure_keeps_serving_and_says_so(tmp_path, monkeypatch) -> None:
+    from skills_mcp import refresh
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+
+    def boom():
+        raise refresh.RefreshError("proxy unreachable")
+
+    monkeypatch.setattr(refresh, "refresh_from_source", boom)
+    run(ui.me_sync(form_request("/me/sync", [("next", "/")], headers)))
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "Sync failed" in body and "proxy unreachable" in body
+
+
+def test_how_to_connect_page_renders_the_steps(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.how_to_connect(make_request("/how-to-connect", headers=headers))).body.decode()
+    assert "How to connect" in body
+    assert "Mint a key" in body and "gateway" in body.lower()
+    assert "/mcp" in body
+    assert "either or both" in body            # (a) gateway or (b) direct
+    assert "Verify" not in body                # the curl step was removed

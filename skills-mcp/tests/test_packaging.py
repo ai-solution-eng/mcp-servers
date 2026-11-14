@@ -221,3 +221,25 @@ def test_wheel_contains_all_required_modules(tmp_path: Path) -> None:
             f"wheel {wheels[0].name} does not contain {module}.py: the image "
             "would crash-loop at startup (ModuleNotFoundError)"
         )
+
+
+# ---------------------------------------------------------------------------
+# The SSO gate must cover every browser path, and must NOT cover /mcp.
+# ---------------------------------------------------------------------------
+
+
+def test_sso_gate_paths_cover_the_browser_and_spare_mcp() -> None:
+    """Regression: /how-to-connect shipped without being added here, so the
+    page rendered as 'anonymous' — the proxy only injects identity on the paths
+    this policy matches."""
+    chart = Path(__file__).resolve().parents[1] / "helm" / "values.yaml"
+    text = chart.read_text(encoding="utf-8")
+    block = text.split("authorizationPolicy:", 1)[1].split("paths:", 1)[1].split("selector", 1)[0]
+    paths = [line.strip().lstrip("- ").strip() for line in block.splitlines() if line.strip().startswith("- ")]
+
+    assert "/" in paths
+    assert "/how-to-connect" in paths, "add every new browser page here or it renders anonymous"
+    assert "/skills/*" in paths
+    assert "/me" in paths and "/me/*" in paths
+    assert "/api/*" in paths
+    assert "/mcp" not in paths, "MCP clients use tokens, not SSO"

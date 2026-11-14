@@ -151,6 +151,14 @@ def set_disabled(identity: str, name: str, is_disabled: bool) -> list[str]:
     return doc["disabled"]
 
 
+def set_disabled_bulk(identity: str, names: set[str]) -> list[str]:
+    """Replace the whole hidden set in one write (the manage-skills page)."""
+    doc = load(identity)
+    doc["disabled"] = sorted({str(n) for n in names if str(n).strip()})
+    save(identity, doc)
+    return doc["disabled"]
+
+
 # ------------------------------------------------------------------ keys
 
 
