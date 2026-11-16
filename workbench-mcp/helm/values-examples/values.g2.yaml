@@ -39,7 +39,7 @@ deployment:
 # repository/tag/pullPolicy are release-managed — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  tag: v0.4.0
+  tag: v0.4.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).

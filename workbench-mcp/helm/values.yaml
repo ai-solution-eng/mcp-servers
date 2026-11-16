@@ -35,7 +35,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/workbench-mcp
-  tag: v0.4.0   # keep in lockstep with Chart.yaml appVersion
+  tag: v0.4.1
   pullPolicy: IfNotPresent
 
 # Only needed if the GHCR package stays PRIVATE (public packages pull anonymously).

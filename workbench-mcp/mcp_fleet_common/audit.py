@@ -34,6 +34,11 @@ import json
 import os
 import sys
 import threading
+
+try:  # POSIX advisory locks: process-safe chaining (Windows has no fcntl)
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -163,18 +168,44 @@ class HashChainedAuditLog:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with self._lock:
-                record["prev_sha256"] = self._last_line_sha(resolved)
-                if self.caller_provider is not None:
-                    try:
-                        caller = self.caller_provider()
-                    except Exception:
-                        caller = None
-                    if caller is not None:
-                        record["caller"] = caller
-                line = json.dumps(record, sort_keys=True)
+                # PROCESS safety, not just thread safety (audit 2026-11-12,
+                # P3): the instance lock serializes threads in ONE process, but
+                # two replicas / a sidecar appending to a shared trail would
+                # both read the same last line and FORK the chain - the
+                # verifier then reports tampering that never happened. The
+                # flock is advisory and POSIX-only; without fcntl we keep the
+                # old single-process guarantee.
                 with open(resolved, "a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
-        except OSError as exc:
+                    locked = False
+                    if fcntl is not None:
+                        try:
+                            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                            locked = True
+                        except OSError:
+                            locked = False
+                    try:
+                        record["prev_sha256"] = self._last_line_sha(resolved)
+                        if self.caller_provider is not None:
+                            try:
+                                caller = self.caller_provider()
+                            except Exception:
+                                caller = None
+                            if caller is not None:
+                                record["caller"] = caller
+                        line = json.dumps(record, sort_keys=True)
+                        fh.write(line + "\n")
+                        fh.flush()
+                    finally:
+                        if locked:
+                            try:
+                                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                            except OSError:
+                                pass
+        except (OSError, TypeError, ValueError) as exc:
+            # Best-effort by design - but never quiet. TypeError/ValueError are
+            # included because json.dumps raises them for a non-serializable
+            # entry, and this writer's contract is "never raises": a bad field
+            # must warn, not take down the operation being recorded.
             # Best-effort by design — but never quiet.
             print(
                 f"[audit] WARNING: could not append audit entry to {resolved}: {exc}",

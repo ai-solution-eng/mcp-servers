@@ -1662,8 +1662,10 @@ def _mcp_transport_security():
 #   the console a login is the documented follow-up.
 # * One-address wiring: the UNIVERSAL MCP_API_KEYS is honored alongside the
 #   per-server APPLYGATE_API_KEYS (key sets unioned, constant-time compares).
-#   Comma-separated keys within either var are the rotation mechanism —
-#   append the new key, move clients over, drop the old one, no downtime.
+#   Comma-separated keys are the OVERLAP mechanism: append the new key,
+#   move clients over, drop the old one. Env is read once at pod start, so
+#   an env-only change still needs a restart; the mounted *_FILE channel
+#   (mcp_auth.configured_keys) is what makes the rotation live.
 
 APPLYGATE_API_KEYS_ENV = "APPLYGATE_API_KEYS"
 
@@ -1671,7 +1673,9 @@ AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, APPLYGATE_API_KEYS_ENV)
 
 # Per-request caller-name registry (fleet Item A4): "name:key;name:key;..."
 # — OPTIONAL, off by default (default render stays fp-only). Read PER REQUEST
-# by mcp_auth.capture_caller (Secret rotation without restart). The registry
+# by mcp_auth.capture_caller — but os.environ is fixed at process start, so a
+# rotated Secret still needs a pod restart here; only the mounted API-key FILE
+# (configured_keys' *_FILE channel) rotates live. The registry
 # only NAMES keys that the auth middleware already matched — it can never
 # unlock anything; an unparseable entry is skipped loudly and degrades to
 # fp-only attribution. Chart: values.clients.existingSecret → this env.

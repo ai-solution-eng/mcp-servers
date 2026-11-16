@@ -46,6 +46,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            # The Secret mounted as a FILE — the LIVE key source (it WINS over
+            # the env value above): kubelet refreshes it in place, so a rotated
+            # key is accepted AND a revoked one refused on the next request,
+            # with NO pod restart (os.environ is only the start-up fallback).
+            - name: PROMETHEUS_API_KEYS_FILE
+              value: /etc/mcp-keys/{{ .Values.apiKey.existingSecretKey }}
             {{- end }}
             {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
@@ -142,16 +148,35 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.persistence.enabled }}
+          {{- if or .Values.persistence.enabled .Values.apiKey.existingSecret }}
           volumeMounts:
+            {{- if .Values.persistence.enabled }}
             - name: data
               mountPath: {{ .Values.persistence.mountPath | quote }}
+            {{- end }}
+            {{- if .Values.apiKey.existingSecret }}
+            # Mounted Secret directory: kubelet refreshes the key file in
+            # place, which is what makes rotation restart-free.
+            - name: mcp-keys
+              mountPath: /etc/mcp-keys
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.persistence.enabled }}
+      {{- if or .Values.persistence.enabled .Values.apiKey.existingSecret }}
       volumes:
+        {{- if .Values.persistence.enabled }}
         # PVC-backed: user-saved queries survive pod updates and reschedules.
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Values.deployment.name }}-data
+        {{- end }}
+        {{- if .Values.apiKey.existingSecret }}
+        # API-key Secret mounted as a directory (optional: the chart must not
+        # require it to exist at install time; auth stays open until it does).
+        - name: mcp-keys
+          secret:
+            secretName: {{ .Values.apiKey.existingSecret }}
+            optional: true
+        {{- end }}
       {{- end }}
 

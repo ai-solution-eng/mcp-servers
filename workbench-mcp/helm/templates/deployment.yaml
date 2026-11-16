@@ -144,6 +144,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            # The Secret mounted as a FILE — the LIVE key source (it WINS over
+            # the env value above): kubelet refreshes it in place, so a rotated
+            # key is accepted AND a revoked one refused on the next request,
+            # with NO pod restart (os.environ is only the start-up fallback).
+            - name: WORKBENCH_API_KEYS_FILE
+              value: /etc/mcp-keys/{{ .Values.apiKey.existingSecretKey }}
             {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
             {{- if $transportActive }}
@@ -238,6 +244,11 @@ spec:
               subPath: ca.crt
               readOnly: true
             {{- end }}
+            # Mounted Secret directory: kubelet refreshes the key file in
+            # place, which is what makes rotation restart-free.
+            - name: mcp-keys
+              mountPath: /etc/mcp-keys
+              readOnly: true
       volumes:
         {{- if .Values.persistence.enabled }}
         # PVC-backed: workspaces survive pod restarts and are shared by all
@@ -264,3 +275,9 @@ spec:
               - key: {{ .Values.caCert.configMapKey }}
                 path: ca.crt
         {{- end }}
+        # API-key Secret mounted as a directory (optional: a missing Secret
+        # must still fail loud on the env above, not on the mount).
+        - name: mcp-keys
+          secret:
+            secretName: {{ .Values.apiKey.existingSecret }}
+            optional: true

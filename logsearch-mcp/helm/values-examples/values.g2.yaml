@@ -36,7 +36,7 @@ deployment:
 # Release-managed (lockstep with Chart.yaml) — leave at the chart default.
 image:
   repository: ghcr.io/ai-solution-eng/logsearch-mcp
-  tag: v0.4.0
+  tag: v0.4.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []   # only needed if the GHCR package stays PRIVATE

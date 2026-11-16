@@ -1,0 +1,69 @@
+# fleet_secrets registry - apps that need pre-deployment Secrets.
+# values + site_values are deep-merged; existingSecret / credentialsSecret knobs
+# in the result name the Secret and its data key. namespace is where it lands.
+version: 1
+
+apps:
+  # ── MCP servers ────────────────────────────────────────────────────────────
+  - name: searxng_mcp
+    chart: mcp_servers/searxng_mcp/helm
+    namespace: searxng-mcp
+    values: [mcp_servers/searxng_mcp/helm/values.yaml]
+    site_values: [mcp_servers/searxng_mcp/helm/local/values.g2.yaml]
+
+  - name: prometheus_mcp
+    chart: mcp_servers/prometheus_mcp/helm
+    namespace: prometheus-mcp
+    values: [mcp_servers/prometheus_mcp/helm/values.yaml]
+    site_values: [mcp_servers/prometheus_mcp/helm/local/values.g2.yaml]
+
+  - name: logsearch_mcp
+    chart: mcp_servers/logsearch_mcp/helm
+    namespace: logsearch-mcp
+    values: [mcp_servers/logsearch_mcp/helm/values.yaml]
+    site_values: [mcp_servers/logsearch_mcp/helm/local/values.g2.yaml]
+
+  - name: applygate_mcp
+    chart: mcp_servers/applygate_mcp/helm
+    namespace: applygate-mcp
+    values: [mcp_servers/applygate_mcp/helm/values.yaml]
+    site_values: [mcp_servers/applygate_mcp/helm/local/values.g2.yaml]
+
+  - name: workbench_mcp
+    chart: mcp_servers/workbench_mcp/helm
+    namespace: workbench-mcp
+    values: [mcp_servers/workbench_mcp/helm/values.yaml]
+    site_values: [mcp_servers/workbench_mcp/helm/local/values.g2.yaml]
+
+  - name: k8s_mcp
+    chart: mcp_servers/K8S-MCP/helm
+    namespace: k8s-mcp-ops      # NOT k8s-mcp - verified against the cluster
+    values: [mcp_servers/K8S-MCP/helm/values.yaml]
+    site_values: [mcp_servers/K8S-MCP/helm/local/values.g2.yaml]
+
+  # ezapp-deploy is NOT tracked here on purpose: that deployment belongs to
+  # another owner, and a Secret in this file is written by 'kubectl apply' even
+  # when it is excluded from rotation - i.e. tracking it would let a routine
+  # rotation overwrite a key this operator does not own. Its key is managed by
+  # its own owner; see NOT_OWNED in fleet_secrets.py.
+
+  # ── RAG ────────────────────────────────────────────────────────────────────
+  - name: MultimodalRAG
+    chart: MultimodalRAG/helm-scale-large
+    namespace: mm-rag
+    values: [MultimodalRAG/helm-scale-large/values.yaml]
+    site_values: [MultimodalRAG/helm-scale-large/local/values.g2.yaml]
+
+  # ── SQL ────────────────────────────────────────────────────────────────────
+  - name: SQLhandler
+    chart: SQLhandler/helm
+    namespace: sqlhandler
+    values: [SQLhandler/helm/values.yaml]
+    site_values: [SQLhandler/helm/local/values.g2.yaml]
+
+  # ── PCAI LLM Gateway ───────────────────────────────────────────────────────
+  - name: PCAI_LLM
+    chart: PCAI_LLM/helm
+    namespace: pcai-llm
+    values: [PCAI_LLM/helm/values.yaml]
+    site_values: [PCAI_LLM/helm/local/values.g2.yaml]

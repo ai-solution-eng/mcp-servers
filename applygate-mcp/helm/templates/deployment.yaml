@@ -118,6 +118,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            # The Secret mounted as a FILE — the LIVE key source (it WINS over
+            # the env value above): kubelet refreshes it in place, so a rotated
+            # key is accepted AND a revoked one refused on the next request,
+            # with NO pod restart (os.environ is only the start-up fallback).
+            - name: APPLYGATE_API_KEYS_FILE
+              value: /etc/mcp-keys/{{ .Values.apiKey.existingSecretKey }}
             {{- if .Values.clients.existingSecret }}
             # Caller-name registry (values: clients.existingSecret →
             # APPLYGATE_CLIENTS, "name:key;name:key;..."). Only rendered when
@@ -189,6 +195,11 @@ spec:
             # needs a writable /tmp.
             - name: tmp
               mountPath: /tmp
+            # Mounted Secret directory: kubelet refreshes the key file in
+            # place, which is what makes rotation restart-free.
+            - name: mcp-keys
+              mountPath: /etc/mcp-keys
+              readOnly: true
       volumes:
         {{- if .Values.persistence.enabled }}
         - name: audit
@@ -200,6 +211,12 @@ spec:
         {{- end }}
         - name: tmp
           emptyDir: {}
+        # API-key Secret mounted as a directory (optional: a missing Secret
+        # must still fail loud on the env above, not on the mount).
+        - name: mcp-keys
+          secret:
+            secretName: {{ .Values.apiKey.existingSecret }}
+            optional: true
 ---
 {{- if .Values.persistence.enabled }}
 # The audit trail must survive restarts to be worth anything — dedicated PVC.

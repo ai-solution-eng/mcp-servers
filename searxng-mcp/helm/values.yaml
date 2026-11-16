@@ -31,7 +31,7 @@ deployment:
 
 image:
   repository: ghcr.io/ai-solution-eng/searxng-mcp
-  tag: v1.7.1
+  tag: v1.7.2
   pullPolicy: IfNotPresent
 
 # GHCR-pull Secret, only if the package stays PRIVATE (public pulls are anonymous):

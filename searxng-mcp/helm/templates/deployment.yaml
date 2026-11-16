@@ -83,6 +83,14 @@ spec:
           configMap:
             name: {{ .Values.browser.caCert.configMap }}
         {{- end }}
+        {{- if .Values.apiKey.existingSecret }}
+        # API-key Secret mounted as a directory (optional: the chart must not
+        # require it to exist at install time; auth stays open until it does).
+        - name: mcp-keys
+          secret:
+            secretName: {{ .Values.apiKey.existingSecret }}
+            optional: true
+        {{- end }}
       containers:
         # ------------------------------------------------------------------
         # SearXNG sidecar — the metasearch engine itself (localhost:8080)
@@ -157,11 +165,20 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.service.targetPort }}
-          {{- if .Values.caCert.enabled }}
+          {{- if or .Values.caCert.enabled .Values.apiKey.existingSecret }}
           volumeMounts:
+            {{- if .Values.caCert.enabled }}
             - name: proxy-ca-bundle
               mountPath: /ca-bundle
               readOnly: true
+            {{- end }}
+            {{- if .Values.apiKey.existingSecret }}
+            # Mounted Secret directory: kubelet refreshes the key file in
+            # place, which is what makes rotation restart-free.
+            - name: mcp-keys
+              mountPath: /etc/mcp-keys
+              readOnly: true
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -176,6 +193,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKey.existingSecret }}
                   key: {{ .Values.apiKey.existingSecretKey }}
+            # The Secret mounted as a FILE — the LIVE key source (it WINS over
+            # the env value above): kubelet refreshes it in place, so a rotated
+            # key is accepted AND a revoked one refused on the next request,
+            # with NO pod restart (os.environ is only the start-up fallback).
+            - name: SEARXNG_API_KEYS_FILE
+              value: /etc/mcp-keys/{{ .Values.apiKey.existingSecretKey }}
             {{- end }}
             {{- $svcHost := printf "%s-service.%s.svc.cluster.local:*" .Values.deployment.name .Release.Namespace }}
             {{- $transportActive := and .Values.ezua.enabled .Values.ezua.virtualService.endpoint }}
