@@ -365,7 +365,11 @@ function appTile(app) {
   installBtn.textContent = "Install";
   installBtn.addEventListener("click", () => {
     const selected = versions.find((v) => v.dir === select.value) || defaultVersion;
-    openInstallDialog(selected);
+    // the tile's icon is the app's RESOLVED logo (package-embedded, or the
+    // app-level file sitting next to the packages) — versions whose package
+    // ships no embedded logo inherit it so the dialog matches the tile
+    openInstallDialog({ ...selected, icon: selected.icon || app.icon || "",
+                        logo_file: selected.logo_file || app.logo_file || "" });
   });
   box.appendChild(installBtn);
   return box;
@@ -876,8 +880,13 @@ async function confirmInstall() {
   }
   if (dlgLogoUpload) {
     payload.logo = dlgLogoUpload;         // uploaded logo (overrides package)
-  } else if (dlgChart && !dlgChart.icon) {
-    showDlgError("A logo is required — this package ships none. Choose a png/svg image (< 256 KB).");
+  } else if (dlgChart && dlgChart.icon) {
+    // WYSIWYG: bake the tile's resolved app logo into the CR — covers
+    // versions whose package ships no embedded logo but whose app
+    // directory has one (what the tile showed is what gets installed)
+    payload.logo = dlgChart.icon;
+  } else {
+    showDlgError("A logo is required — this package ships none and the store found none for this app. Choose a png/svg image (< 256 KB).");
     return;
   }
   installing = true;
