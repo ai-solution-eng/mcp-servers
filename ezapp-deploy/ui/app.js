@@ -409,6 +409,7 @@ function updateProgress(done, total, current) {
 
 const USER_REPOS_KEY = "ezappStoreRepos";
 let storeBootstrapped = false;   // first store-tab open auto-loads the default repo
+let serverRepoKeys = new Set();  // normalized keys of server-configured repos
 
 /* ── YAML syntax highlighting for the values editor ──────────────────── */
 
@@ -499,6 +500,17 @@ function saveUserRepo(repo) {
     catch (e) { /* storage full/blocked — the dropdown just won't remember */ }
   }
 }
+function removeUserRepo(repo) {
+  const repos = userRepos().filter((r) => r !== repo);
+  try { localStorage.setItem(USER_REPOS_KEY, JSON.stringify(repos)); }
+  catch (e) { /* ignore */ }
+}
+function normRepoKey(repo) {
+  // light canonicalization for duplicate detection: drop a trailing .git
+  // and trailing slashes — enough to recognize "the same repo" written as
+  // a URL, a shorthand, or an older saved form
+  return String(repo || "").trim().replace(/\.git$/i, "").replace(/\/+$/, "");
+}
 
 async function loadRepoOptions() {
   // merge server-configured repos with locally saved ones (server first;
@@ -524,8 +536,17 @@ async function loadRepoOptions() {
     entries.push({ value: e.raw || norm, label: norm,
                    isDefault: e.raw === (serverEntries[0] || {}).raw });
   }
-  for (const saved of userRepos()) {
-    if (seen.has(saved)) continue;   // already a server entry
+  serverRepoKeys = new Set(
+    serverEntries.flatMap((e) => [normRepoKey(e.raw), normRepoKey(e.repo)])
+      .filter(Boolean));
+  for (const saved of [...userRepos()]) {
+    // a locally saved repo that IS a server entry (same URL or same parsed
+    // owner/repo — e.g. saved by an older build) is dropped AND purged
+    const dup = serverEntries.some((e) =>
+      normRepoKey(e.raw) === normRepoKey(saved)
+      || normRepoKey(e.repo) === normRepoKey(saved));
+    if (dup) { removeUserRepo(saved); continue; }
+    if (seen.has(saved)) continue;
     seen.add(saved);
     entries.push({ value: saved, label: saved, isDefault: false });
   }
@@ -657,19 +678,26 @@ async function loadCatalog(refresh) {
 
 function finishCatalog(body, refresh) {
   renderTiles(body);
-  // remember manually-loaded repos in the dropdown (server-configured ones
-  // are already there — loadRepoOptions dedupes against their parsed form)
+  // remember manually-loaded repos in the dropdown — but never duplicate a
+  // server-configured entry (same URL or same parsed owner/repo)
   const repo = currentRepo();
-  if (repo && !userRepos().includes(repo)) {
+  if (repo && !serverRepoKeys.has(normRepoKey(repo))
+      && !userRepos().includes(repo)) {
     saveUserRepo(repo);
-    loadRepoOptions().then(() => {
-      const dropdown = $("repodropdown");
-      if (repo && [...dropdown.options].some(o => o.value === repo)) {
-        dropdown.value = repo;
-        syncRepoInputVisibility();
-      }
-    });
   }
+  loadRepoOptions().then(() => {
+    // snap the dropdown onto the loaded repo when it matches an entry
+    // (server or saved) — hides the Other box for a shorthand that IS the
+    // configured repo
+    const dropdown = $("repodropdown");
+    const match = [...dropdown.options].find(
+      (o) => o.value !== "__custom__"
+        && normRepoKey(o.value) === normRepoKey(repo));
+    if (repo && match) {
+      dropdown.value = match.value;
+      syncRepoInputVisibility();
+    }
+  });
   const apps = body.apps || [];
   const versionCount = apps.reduce((n, a) => n + (a.versions || []).length, 0);
   storeStatus(
