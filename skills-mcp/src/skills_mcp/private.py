@@ -6,14 +6,14 @@ Same contract as the git tier (name == folder, YAML frontmatter, no backups),
 because it goes through the SAME loader. The only difference is where it lives
 and who may see it.
 
-Names are UNIQUE: a private skill may not reuse a global skill's name. Shadowing
-was considered and rejected for v1 — two skills with one name is a support
-question waiting to happen, and the reader would silently stop showing the
-team's version. `save()` therefore takes the forbidden names and refuses.
+Names are unique WITHIN this tier (one folder per name). A private skill MAY
+reuse a global skill's name: the two sit side by side, both are listed, and the
+caller picks by description then fetches by id. Nothing is hidden.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -131,7 +131,7 @@ def validate(name: str, description: str, body: str, forbidden: set[str]) -> tup
     if not NAME_RE.match(name):
         raise PrivateError("name must be lowercase letters, digits and dashes (max 63), e.g. my-runbook")
     if name in forbidden:
-        raise PrivateError(f"the name {name!r} is already used by a global skill — pick another")
+        raise PrivateError(f"the name {name!r} is already taken in this tier — pick another")
     if not description:
         raise PrivateError("description is required (one line: when should an agent use this?)")
     if len(description) > 400:
@@ -149,8 +149,11 @@ def save(identity: str, name: str, description: str, body: str, *, forbidden: se
     path = skill_path(identity, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".md.tmp")
+    # Quote both scalars: an unquoted `description: 12` becomes a YAML int and
+    # would be read back as "no description".
     temporary.write_text(
-        f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n", encoding="utf-8"
+        f"---\nname: {json.dumps(name)}\ndescription: {json.dumps(description)}\n---\n\n{body}\n",
+        encoding="utf-8",
     )
     os.replace(temporary, path)
     invalidate(identity)

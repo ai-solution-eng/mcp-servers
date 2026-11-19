@@ -26,10 +26,24 @@ def test_missing_state_is_empty() -> None:
 
 
 def test_disable_and_reenable_round_trip() -> None:
-    prefs.set_disabled("alice", "beta", True)
-    assert prefs.disabled("alice") == {"beta"}
-    prefs.set_disabled("alice", "beta", False)
+    prefs.set_disabled("alice", "github:beta", True)
+    assert prefs.disabled("alice") == {"github:beta"}
+    prefs.set_disabled("alice", "github:beta", False)
     assert prefs.disabled("alice") == set()
+
+
+def test_legacy_name_entries_migrate_to_github_ids(tmp_path) -> None:
+    """v0.5.0 stored bare names. Before duplicates existed, a name could only
+    match the global tier — so the migration is exact, not a guess."""
+    import json
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "alice.json").write_text(json.dumps({"disabled": ["beta", "gamma"]}), encoding="utf-8")
+
+    assert prefs.disabled("alice") == {"github:beta", "github:gamma"}
+    stored = json.loads((state / "alice.json").read_text(encoding="utf-8"))
+    assert stored["disabled"] == ["github:beta", "github:gamma"]     # written back
 
 
 def test_identity_is_filename_safe(tmp_path) -> None:
@@ -113,3 +127,16 @@ def test_legacy_single_token_is_migrated(tmp_path) -> None:
 def test_writes_are_atomic_no_temp_file_left(tmp_path) -> None:
     prefs.add_key("alice", "sk_live_x")
     assert list((tmp_path / "state").glob("*.tmp")) == []
+
+
+def test_a_saved_skill_round_trips_through_the_loader(tmp_path, monkeypatch) -> None:
+    """The writer must quote its YAML: a numeric description is the case that
+    silently produced a skipped skill."""
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    private.save("alice", "numeric-desc", "12", "body", forbidden=set())
+    skills, warnings = private.load("alice")
+    assert [s.name for s in skills] == ["numeric-desc"]
+    assert skills[0].description == "12"
+    assert warnings == ()

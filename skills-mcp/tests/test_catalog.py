@@ -211,3 +211,14 @@ def test_split_frontmatter_rejects_non_mapping() -> None:
         assert "not a YAML mapping" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected SkillError")
+
+
+def test_numeric_frontmatter_scalars_are_coerced(tmp_path: Path) -> None:
+    """YAML gives us an int for `description: 12`; the skill must still load."""
+    directory = tmp_path / "skills" / "numeric"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: numeric\ndescription: 12\n---\n\nbody\n", encoding="utf-8"
+    )
+    skill = load_skill(directory)
+    assert skill.description == "12"

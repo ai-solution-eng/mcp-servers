@@ -78,7 +78,7 @@ def test_list_skills_never_ships_bodies(tmp_path: Path) -> None:
     use(tmp_path)
 
     payload = json.loads(run(server.list_skills()))
-    assert set(payload["skills"][0]) == {"name", "description", "has_files"}
+    assert set(payload["skills"][0]) == {"id", "name", "description", "has_files"}
     assert "SECRET INSTRUCTIONS" not in json.dumps(payload)
 
 
@@ -232,3 +232,81 @@ def test_tools_never_raise_on_an_empty_catalogue() -> None:
     assert json.loads(run(server.list_skills()))["count"] == 0
     assert "error" in json.loads(run(server.get_skill("alpha")))
     assert "error" in json.loads(run(server.get_skill_file("alpha", "x")))
+
+
+# ---------------------------------------------------------------- ids + ambiguity
+
+
+def test_list_skills_carries_a_github_id(tmp_path: Path) -> None:
+    write_skill(tmp_path, "alpha")
+    use(tmp_path)
+    rows = json.loads(run(server.list_skills()))["skills"]
+    assert rows[0]["id"] == "github:alpha"
+
+
+def test_get_skill_accepts_an_id(tmp_path: Path) -> None:
+    write_skill(tmp_path, "alpha", body="the body")
+    use(tmp_path)
+    payload = json.loads(run(server.get_skill("github:alpha")))
+    assert payload["id"] == "github:alpha"
+    assert payload["body"].strip() == "the body"
+
+
+def test_a_private_copy_makes_the_name_ambiguous(tmp_path: Path, monkeypatch) -> None:
+    """The same name in two tiers is not an error: the caller gets both and
+    picks by description, then fetches by id."""
+    from skills_mcp import private
+
+    from mcp_auth import CALLER_CONTEXT, Caller
+
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    write_skill(tmp_path, "triage")
+    use(tmp_path)
+    private.save("alice", "triage", "MY private triage variant.", "private body",
+                 forbidden=set())
+    CALLER_CONTEXT.set(Caller(key_fp="sha256:abc123def456", client="test", name="alice"))
+
+    payload = json.loads(run(server.get_skill("triage")))
+    assert payload["ambiguous"] is True
+    ids = {c["id"] for c in payload["candidates"]}
+    assert ids == {"github:triage", "private:alice:triage"}
+    assert "hint" in payload
+
+    # and each candidate can be fetched by id
+    mine = json.loads(run(server.get_skill("private:alice:triage")))
+    assert mine["description"] == "MY private triage variant."
+
+
+def test_another_persons_private_id_is_invisible(tmp_path: Path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    from mcp_auth import CALLER_CONTEXT, Caller
+
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    write_skill(tmp_path, "alpha")
+    use(tmp_path)
+    private.save("bob", "secret-note", "bob only", "body", forbidden=set())
+    CALLER_CONTEXT.set(Caller(key_fp="sha256:abc123def456", client="test", name="alice"))
+
+    payload = json.loads(run(server.get_skill("private:bob:secret-note")))
+    assert "error" in payload
+    CALLER_CONTEXT.set(None)
+
+
+def test_get_skill_file_asks_for_an_id_when_ambiguous(tmp_path: Path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    from mcp_auth import CALLER_CONTEXT, Caller
+
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    write_skill(tmp_path, "triage", files={"run.py": "print(1)"})
+    use(tmp_path)
+    private.save("alice", "triage", "mine", "body", forbidden=set())
+    CALLER_CONTEXT.set(Caller(key_fp="sha256:abc123def456", client="test", name="alice"))
+
+    payload = json.loads(run(server.get_skill_file("triage", "run.py")))
+    assert "error" in payload and "candidates" in payload
+
+    ok = json.loads(run(server.get_skill_file("github:triage", "run.py")))
+    assert ok["content"] == "print(1)"
+    assert ok["id"] == "github:triage"
