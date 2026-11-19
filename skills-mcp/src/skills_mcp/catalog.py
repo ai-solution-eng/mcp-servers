@@ -54,6 +54,13 @@ _FRONTMATTER_RE = re.compile(
 )
 
 
+def _scalar(value: object) -> str:
+    """Frontmatter value -> str. YAML may hand us an int/bool/float."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
 class SkillError(ValueError):
     """A skill directory that cannot be loaded. Always caught by the loader."""
 
@@ -168,10 +175,14 @@ def load_skill(directory: Path, source_path: str = "") -> Skill:
     meta, body = split_frontmatter(text)
 
     raw_name = meta.get("name")
-    raw_description = meta.get("description")
-    if not isinstance(raw_name, str) or not raw_name.strip():
+    # YAML turns unquoted scalars into ints/floats/bools: `description: 12` is an
+    # int, `name: 2024` an int. Coerce instead of dropping the skill — a numeric
+    # description is odd, but losing the whole skill is worse.
+    raw_name = _scalar(meta.get("name"))
+    raw_description = _scalar(meta.get("description"))
+    if not raw_name.strip():
         raise SkillError("frontmatter has no 'name'")
-    if not isinstance(raw_description, str) or not raw_description.strip():
+    if not raw_description.strip():
         raise SkillError("frontmatter has no 'description'")
 
     name = raw_name.strip()

@@ -362,34 +362,41 @@ def _first_run_banner(identity: str | None) -> str:
 
 def _shell(state, identity: str | None, selected: str | None, inset: str) -> str:
     hidden = prefs_mod.disabled(identity)
-    all_skills = visibility_mod.visible_skills(identity)
     private_names = {s.name for s in visibility_mod.private_skills(identity)}
-    # disabled skills are not "visible" for tools, but the UI still lists them
-    # so their owner can switch them back on.
-    listed = list(all_skills)
-    for name in sorted(hidden):
-        skill = state.catalog.get(name)
-        if skill is not None and name not in {s.name for s in listed}:
-            listed.append(skill)
+    # hidden skills are not "visible" for tools, but the UI still lists them so
+    # their owner can switch them back on.
+    listed = list(visibility_mod.visible_skills(identity))
+    seen = {visibility_mod.skill_id(skill, identity) for skill in listed}
+    for key in sorted(hidden):
+        _verdict, found = visibility_mod.resolve(key, identity, include_hidden=True)
+        for skill in found:
+            if visibility_mod.skill_id(skill, identity) not in seen:
+                listed.append(skill)
+                seen.add(visibility_mod.skill_id(skill, identity))
     listed.sort(key=lambda s: s.name)
+    counts: dict[str, int] = {}
+    for skill in listed:
+        counts[skill.name] = counts.get(skill.name, 0) + 1
 
     rows = []
     for skill in listed:
         name = skill.name
+        key = visibility_mod.skill_id(skill, identity)
         classes = "row"
-        if name == selected:
+        if key == selected:
             classes += " active"
-        if name in hidden:
+        if key in hidden:
             classes += " off"
-        if name in private_names:
+        # The badge describes THIS row's tier, never the name: a global and a
+        # private copy share a name, and labelling both "private" is a lie.
+        if skill.source_path == "private":
             badge = "<span class='badge off'>private</span>"
-        elif skill.files:
-            badge = f"<span class=badge>{len(skill.files)}</span>"
         else:
-            badge = ""
+            files = f" ·{len(skill.files)}" if skill.files else ""
+            badge = f"<span class=badge title='from git (the team copy)'>{files and 'team' + files or 'team'}</span>"
         pick = (
-            f"<input type=checkbox name=visible value='{html.escape(name)}'"
-            + ("" if name in hidden else " checked")
+            f"<input type=checkbox name=visible value='{html.escape(key)}'"
+            + ("" if key in hidden else " checked")
             + ">"
             if identity
             else ""
@@ -397,7 +404,7 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         rows.append(
             f"<div class='{classes}' data-name='{html.escape(name)}'>"
             + (f"<label class=pick>{pick}{_FOLDER_ICON}</label>" if identity else _FOLDER_ICON)
-            + f"<a class=rowlink href='/skills/{html.escape(name)}'>"
+            + f"<a class=rowlink href='{_href(skill, identity, counts)}'>"
             f"<span class=name>{html.escape(name)}</span>{badge}</a></div>"
         )
     if identity:
@@ -434,9 +441,10 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         "<button class=icon-btn id=toggle title='collapse or expand the sidebar'>"
         + _CHEVRON_ICON + "</button>"
         "<span class=label>Files</span>"
-        + ("<label class=all title='select or clear every skill'>"
-           "<input type=checkbox id=pickall checked style='cursor:pointer;accent-color:var(--primary)'>"
-           "<span>All</span></label>" if identity else "")
+        + (f"<label class=all title='select or clear every skill'>"
+           f"<input type=checkbox id=pickall{'' if hidden else ' checked'} "
+           f"style='cursor:pointer;accent-color:var(--primary)'>"
+           f"<span>All</span></label>" if identity else "")
         + "</div>"
         "<input class=search id=q placeholder='filter…' autocomplete=off>"
         + (
@@ -444,7 +452,8 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
             "<input type=hidden name=next id=next value='/'>"
             "<nav class=tree id=tree>" + "".join(rows) + "</nav>"
             "<div class=sidebar-foot>"
-            "<button class=icon-btn type=button id=alloff title='untick every skill'>Disable all</button>"
+            "<button class=icon-btn type=submit name=bulk value=disable "
+            "title='hide every skill, then Save'>Disable all</button>"
             "<button class='icon-btn save' type=submit>Save</button>"
             "</div></form>"
             if identity
@@ -466,10 +475,13 @@ def _shell(state, identity: str | None, selected: str | None, inset: str) -> str
         "const all=document.getElementById('pickall');"
         "const sync=()=>{const bs=boxes(),on=bs.filter(c=>c.checked).length;"
         "all.checked=on===bs.length;all.indeterminate=on>0&&on<bs.length};"
-        "all.addEventListener('change',()=>{boxes().forEach(c=>c.checked=all.checked);sync()});"
-        "boxes().forEach(c=>c.addEventListener('change',sync));sync();"
-        "document.getElementById('alloff').onclick=()=>{boxes().forEach(c=>c.checked=false);sync()};"
-        "form.addEventListener('submit',()=>{document.getElementById('next').value=location.pathname});}"
+        "let dirty=false;"
+        "all.addEventListener('change',()=>{boxes().forEach(c=>c.checked=all.checked);sync();dirty=true});"
+        "boxes().forEach(c=>c.addEventListener('change',()=>{sync();dirty=true}));sync();"
+        "document.querySelectorAll('.rowlink').forEach(a=>a.addEventListener('click',e=>{"
+        "if(dirty&&!confirm('You have unsaved skill changes. Leave without saving?'))e.preventDefault()}));"
+        "form.addEventListener('submit',()=>{dirty=false;"
+        "document.getElementById('next').value=location.pathname});}"
         "const apply=t=>{localStorage.setItem('ui.theme',t);const m=matchMedia('(prefers-color-scheme: light)');"
         "document.documentElement.dataset.theme=(t==='auto'?(m.matches?'light':'dark'):t);"
         "document.querySelectorAll('[data-theme-btn]').forEach(x=>x.setAttribute('aria-pressed',String(x.dataset.themeBtn===t)))};"
@@ -493,6 +505,14 @@ async def index(request):
     return _page("skills", _shell(state, identity, None, inset), identity)
 
 
+def _href(skill, identity: str | None, counts: dict[str, int] | None = None) -> str:
+    """Names are pretty URLs; ids are unambiguous ones. Use the id only when the
+    name is duplicated (team copy + yours)."""
+    duplicated = (counts or {}).get(skill.name, 1) > 1
+    key = visibility_mod.skill_id(skill, identity) if duplicated else skill.name
+    return "/skills/" + key
+
+
 def _view_toggle(name: str, raw: bool) -> str:
     if raw:
         return f"<a class=btn href='/skills/{html.escape(name)}'>rendered</a>"
@@ -503,10 +523,29 @@ async def skill_detail(request):
     name = request.path_params.get("name", "")
     state = state_mod.current_state()
     identity = identity_of(request)
-    skill = visibility_mod.get_visible(name, identity)
-    if skill is None and identity and name in prefs_mod.disabled(identity):
+    verdict, found = visibility_mod.resolve(name, identity)
+    if verdict == "ambiguous":
+        rows = "".join(
+            "<div class=panel>"
+            f"<h3><a href='{_href(candidate, identity, {candidate.name: 2})}'>"
+            f"{html.escape(candidate.name)}</a> "
+            f"<span class=badge>{'private' if candidate.source_path == 'private' else 'team'}</span></h3>"
+            f"<p>{html.escape(candidate.description)}</p></div>"
+            for candidate in found
+        )
+        inset = (
+            f"<h2>{html.escape(name)}</h2>"
+            "<p class=desc>Two skills share this name — pick the one you meant.</p>"
+            f"{rows}"
+        )
+        return _page(name, _shell(state, identity, None, inset), identity)
+    skill = found[0] if found else None
+    if skill is None and identity:
         # Hidden for its owner, but still theirs to switch back on.
-        skill = state.catalog.get(name)
+        _verdict_hidden, hidden_found = visibility_mod.resolve(
+            name, identity, include_hidden=True
+        )
+        skill = hidden_found[0] if hidden_found else None
     if skill is None:
         inset = (
             f"<h2>Unknown skill</h2><p class=desc>{html.escape(name)} is not in the catalogue.</p>"
@@ -524,7 +563,8 @@ async def skill_detail(request):
         body_html = f"<h3 class=sec>Body (raw)</h3><pre class=body id=body>{html.escape(skill.body)}</pre>"
     else:
         body_html = f"<h3 class=sec>Body</h3><div class='md' id=body>{render_markdown(skill.body)}</div>"
-    hidden = identity is not None and skill.name in prefs_mod.disabled(identity)
+    skill_key = visibility_mod.skill_id(skill, identity)
+    hidden = identity is not None and skill_key in prefs_mod.disabled(identity)
     if identity is None:
         toggle = (
             "<div class=banner>You are browsing anonymously. "
@@ -533,7 +573,7 @@ async def skill_detail(request):
     else:
         label = "Enable for me" if hidden else "Disable for me"
         toggle = (
-            f"<form method=post action='/skills/{html.escape(skill.name)}/toggle' style='display:inline'>"
+            f"<form method=post action='/skills/{html.escape(skill_key)}/toggle' style='display:inline'>"
             f"<button class=toggle type=submit>{label}</button></form>"
         )
     state_note = (
@@ -559,12 +599,13 @@ async def skill_detail(request):
         "const b=document.getElementById('copy');b.textContent='copied';"
         "setTimeout(()=>b.textContent='copy markdown',1200)};</script>"
     )
-    return _page(skill.name, _shell(state, identity, skill.name, inset), identity)
+    return _page(skill.name, _shell(state, identity, skill_key, inset), identity)
 
 
 async def skill_raw(request):
     name = request.path_params.get("name", "")
-    skill = visibility_mod.get_visible(name, identity_of(request))
+    _verdict, found = visibility_mod.resolve(name, identity_of(request))
+    skill = found[0] if found else None
     if skill is None:
         return PlainTextResponse("unknown skill: " + name, status_code=404)
     return PlainTextResponse(skill.body, media_type="text/markdown; charset=utf-8")
@@ -584,11 +625,13 @@ async def skill_toggle(request):
             None,
             status_code=401,
         )
-    if visibility_mod.get_visible(name, identity) is None and name not in prefs_mod.disabled(identity):
+    _verdict, found = visibility_mod.resolve(name, identity, include_hidden=True)
+    if not found:
         return _page("unknown skill", f"<h1>Unknown skill</h1><p class=desc>{html.escape(name)}</p>", identity, status_code=404)
-    currently_hidden = name in prefs_mod.disabled(identity)
-    prefs_mod.set_disabled(identity, name, not currently_hidden)
-    return RedirectResponse(f"/skills/{name}", status_code=303)
+    key = visibility_mod.skill_id(found[0], identity)
+    currently_hidden = key in prefs_mod.disabled(identity)
+    prefs_mod.set_disabled(identity, key, not currently_hidden)
+    return RedirectResponse(f"/skills/{key}", status_code=303)
 
 
 async def me_page(request):
@@ -603,7 +646,11 @@ async def me_page(request):
         )
         return _page("you", _shell(state, None, None, body), None)
 
-    hidden = sorted(prefs_mod.disabled(identity))
+    hidden_ids = sorted(prefs_mod.disabled(identity))
+    hidden = []
+    for key in hidden_ids:
+        _verdict, found = visibility_mod.resolve(key, identity, include_hidden=True)
+        hidden.append(found[0].name if found else key)
     private = visibility_mod.private_skills(identity)
     keys = prefs_mod.keys(identity)
     rows = []
@@ -650,11 +697,22 @@ async def me_page(request):
     )
     private_rows = "".join(
         "<div style='display:flex;gap:12px;align-items:center;padding:6px 0;border-top:1px solid var(--border)'>"
-        f"<a href='/skills/{html.escape(s.name)}' style='min-width:200px'>{html.escape(s.name)}</a>"
+        f"<a href='/skills/{visibility_mod.skill_id(s, identity)}' style='min-width:200px'>{html.escape(s.name)}</a>"
         f"<span class=desc style='flex:1'>{html.escape(s.description[:90])}</span>"
         f"<a class=btn href='/me/private/{html.escape(s.name)}/edit'>Edit</a>"
         f"<a class=btn href='/me/private/{html.escape(s.name)}/delete'>Delete</a></div>"
         for s in private
+    )
+    warnings = visibility_mod.private_warnings(identity)
+    warnings_block = (
+        "<div class=panel><h3>Private skills that did not load ("
+        + str(len(warnings))
+        + ")</h3><p>These folders are on disk but the loader rejected them, so "
+        "neither you nor your agent can see them.</p><ul>"
+        + "".join(f"<li><code>{html.escape(w)}</code></li>" for w in warnings)
+        + "</ul></div>"
+        if warnings
+        else ""
     )
     private_block = (
         f"<div class=panel><h3>Private skills ({len(private)})</h3>"
@@ -665,7 +723,7 @@ async def me_page(request):
     body = (
         f"<h2>{html.escape(identity)}</h2>"
         f"<p class=desc>Visible to you: {len(visibility_mod.visible_skills(identity))} skills</p>"
-        f"{token_panel}{hidden_block}{private_block}"
+        f"{token_panel}{hidden_block}{warnings_block}{private_block}"
         "<a class=btn href='/'>back to skills</a>"
     )
     return _page("you", _shell(state, identity, None, body), identity)
@@ -740,16 +798,20 @@ async def manage_skills(request):
     if identity is None:
         return _signed_out(state, "manage skills")
     hidden = prefs_mod.disabled(identity)
-    private_names = {skill.name for skill in visibility_mod.private_skills(identity)}
-    names = sorted(set(state.catalog.names()) | private_names)
+    entries = [
+        (visibility_mod.skill_id(skill, identity), skill)
+        for skill in visibility_mod.all_skills(identity)
+    ]
+    names = entries
     rows = "".join(
         "<label style='display:flex;gap:10px;align-items:center;padding:7px 0;border-top:1px solid var(--border)'>"
-        f"<input type=checkbox name=visible value='{html.escape(name)}'"
-        + ("" if name in hidden else " checked")
-        + f"><span>{html.escape(name)}</span>"
-        + ("<span class='badge off' style='margin-left:auto'>private</span>" if name in private_names else "")
+        f"<input type=checkbox name=visible value='{html.escape(key)}'"
+        + ("" if key in hidden else " checked")
+        + f"><span>{html.escape(skill.name)}</span>"
+        + f"<span class='badge off' style='margin-left:auto'>"
+        f"{'private' if skill.source_path == 'private' else 'team'}</span>"
         + "</label>"
-        for name in names
+        for key, skill in entries
     )
     body = (
         f"<h2>Manage skills</h2>"
@@ -782,36 +844,48 @@ async def save_skills(request):
     if identity is None:
         return _signed_out(state_mod.current_state(), "manage skills")
     form = await request.form()
-    visible = {str(name) for name in form.getlist("visible")}
-    universe = set(state_mod.current_state().catalog.names())
-    universe |= {skill.name for skill in visibility_mod.private_skills(identity)}
-    prefs_mod.set_disabled_bulk(identity, universe - visible)
+    universe = {
+        visibility_mod.skill_id(skill, identity)
+        for skill in visibility_mod.all_skills(identity)
+    }
+    bulk = str(form.get("bulk") or "")
+    if bulk == "disable":
+        prefs_mod.set_disabled_bulk(identity, universe)          # hide everything
+    elif bulk == "enable":
+        prefs_mod.set_disabled_bulk(identity, set())             # show everything
+    else:
+        visible = {str(name) for name in form.getlist("visible")}
+        prefs_mod.set_disabled_bulk(identity, universe - visible)
     next_path = str(form.get("next") or "/me/skills")
     if not next_path.startswith("/") or next_path.startswith("//"):
         next_path = "/me/skills"
     return RedirectResponse(next_path, status_code=303)
 
 
-def _editor(state, identity, *, name, description, body, is_new, error=""):
+def _editor(state, identity, *, name, description, body, is_new, error="", confirm=False):
     note = (
         "<p class=desc>A private skill is visible only to you. The name must be unique — "
         "it cannot reuse a global skill's name.</p>"
     )
     error_html = f"<div class=banner style='border-color:#c0392b'>{html.escape(error)}</div>" if error else ""
     name_field = (
-        f"<input name=name value='{html.escape(name)}' placeholder='my-runbook' style='{_INPUT_STYLE};width:100%'>"
+        f"<input name=name value='{html.escape(name)}' placeholder='my-runbook' "
+        f"autocomplete=off spellcheck=false style='{_INPUT_STYLE};width:100%'>"
         if is_new
         else f"<input name=name value='{html.escape(name)}' readonly style='{_INPUT_STYLE};width:100%;opacity:.7'>"
     )
     action = "/me/private" if is_new else f"/me/private/{html.escape(name)}"
+    confirm_field = "<input type=hidden name=confirm value=1>" if confirm else ""
     body_html = (
         f"<h2>{'New private skill' if is_new else 'Edit ' + html.escape(name)}</h2>"
         f"{error_html}{note}"
-        f"<form method=post action='{action}' class=panel>"
+        f"<form method=post action='{action}' class=panel autocomplete=off>"
+        f"{confirm_field}"
         "<p><b>Name</b><br>"
         f"{name_field}</p>"
         "<p><b>Description</b> — one line: when should an agent use this?<br>"
-        f"<input name=description value='{html.escape(description)}' style='{_INPUT_STYLE};width:100%'></p>"
+        f"<input name=description value='{html.escape(description)}' autocomplete=off "
+        f"style='{_INPUT_STYLE};width:100%'></p>"
         "<p><b>Body</b> — markdown<br>"
         "<textarea name=body rows=18 "
         f"style='{_INPUT_STYLE};width:100%;font-family:ui-monospace,monospace'>{html.escape(body)}</textarea></p>"
@@ -864,13 +938,34 @@ async def _private_write(request, *, name_from_form: bool):
     name = str(form.get("name") or "").strip() if name_from_form else request.path_params.get("name", "")
     description = str(form.get("description") or "")
     body = str(form.get("body") or "")
-    forbidden = set(state.catalog.names())
+    # Duplicate names are allowed ACROSS tiers (a private copy sits next to the
+    # team's). Within your own tier the name IS the folder, so a create with an
+    # existing name would silently replace that skill — ask first.
+    if name_from_form:
+        wanted = (name or "").strip().lower()
+        if private_mod.read(identity, wanted) is not None and not str(form.get("confirm") or ""):
+            return _editor(
+                state,
+                identity,
+                name=wanted,
+                description=description,
+                body=body,
+                is_new=True,
+                error=(
+                    f"You already have a private skill called {wanted!r}. "
+                    "Saving again will REPLACE it — change the name to create a new "
+                    "one, or press Save to overwrite."
+                ),
+                confirm=True,
+            )
     try:
-        saved = private_mod.save(identity, name, description, body, forbidden=forbidden)
+        saved = private_mod.save(identity, name, description, body, forbidden=set())
     except private_mod.PrivateError as exc:
         return _editor(state, identity, name=name, description=description, body=body,
                        is_new=name_from_form, error=str(exc))
-    return RedirectResponse(f"/skills/{saved}", status_code=303)
+    return RedirectResponse(
+        f"/skills/private:{identity}:{saved}", status_code=303
+    )
 
 
 async def private_delete_page(request):

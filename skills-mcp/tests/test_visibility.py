@@ -57,9 +57,27 @@ def test_disabling_hides_it_from_that_person_only(tree) -> None:
 
 
 def test_reenabling_brings_it_back(tree) -> None:
-    prefs.set_disabled("alice", "beta", True)
-    prefs.set_disabled("alice", "beta", False)
+    prefs.set_disabled("alice", "github:beta", True)
+    assert [s.name for s in visibility.visible_skills("alice")] == ["alpha"]
+    prefs.set_disabled("alice", "github:beta", False)
     assert [s.name for s in visibility.visible_skills("alice")] == ["alpha", "beta"]
+
+
+def test_hiding_one_tier_keeps_the_other(tree) -> None:
+    """The whole point of ids: hide the team's copy, keep your own."""
+    add_private(tree, "alice", "alpha")
+
+    prefs.set_disabled("alice", "github:alpha", True)
+    alices = [s for s in visibility.visible_skills("alice") if s.name == "alpha"]
+    assert [s.source_path for s in alices] == ["private"]
+
+    prefs.set_disabled("alice", "github:alpha", False)
+    prefs.set_disabled("alice", "private:alice:alpha", True)
+    alices = [s for s in visibility.visible_skills("alice") if s.name == "alpha"]
+    assert [s.source_path for s in alices] == ["skills"]
+
+    prefs.set_disabled("alice", "github:alpha", True)
+    assert [s for s in visibility.visible_skills("alice") if s.name == "alpha"] == []
 
 
 # ------------------------------------------------------------------ private
@@ -72,12 +90,29 @@ def test_private_skill_is_visible_only_to_its_owner(tree) -> None:
     assert "my-checklist" not in [s.name for s in visibility.visible_skills(None)]
 
 
-def test_private_skill_shadows_a_global_of_the_same_name(tree) -> None:
+def test_a_private_copy_does_not_hide_the_global(tree) -> None:
+    """No shadowing: both copies are visible to their owner, and a name lookup
+    is reported as ambiguous so the caller can choose by description."""
     add_private(tree, "alice", "alpha")
-    mine = visibility.get_visible("alpha", "alice")
-    theirs = visibility.get_visible("alpha", "bob")
-    assert mine.source_path == "private"
-    assert theirs.source_path == "skills"
+
+    alices = [s for s in visibility.visible_skills("alice") if s.name == "alpha"]
+    assert [s.source_path for s in alices] == ["skills", "private"]
+
+    verdict, found = visibility.resolve("alpha", "alice")
+    assert verdict == "ambiguous" and len(found) == 2
+    assert {visibility.skill_id(s, "alice") for s in found} == {
+        "github:alpha",
+        "private:alice:alpha",
+    }
+
+    # bob never sees alice's copy
+    assert [s.source_path for s in visibility.visible_skills("bob") if s.name == "alpha"] == ["skills"]
+    assert visibility.resolve("alpha", "bob")[0] == "one"
+
+
+def test_visible_names_deduplicates(tree) -> None:
+    add_private(tree, "alice", "alpha")
+    assert visibility.visible_names("alice").count("alpha") == 1
 
 
 # ------------------------------------------------------------------ MCP tools

@@ -3,7 +3,7 @@
 One JSON file per identity under SKILLS_STATE_DIR (default /data/state):
 
     {
-      "disabled": ["memory-curation"],          # global skills this person turned off
+      "disabled": ["github:memory-curation"],   # skill IDS this person turned off
       "keys": [                                  # credentials this person minted
         {"id": "k_9f3a1c", "label": "laptop-dsh",
          "sha256": "…", "prefix": "sk_live_9f3a",
@@ -77,15 +77,29 @@ def _now_dt() -> datetime:
 # ------------------------------------------------------------------ storage
 
 
+def _migrate_disabled(doc: dict[str, Any]) -> bool:
+    """Bare names -> ids. Before duplicate names were possible, a bare name could
+    only ever match the global tier, so `github:<name>` is exactly what it meant."""
+    entries = doc.get("disabled")
+    if not isinstance(entries, list):
+        return False
+    migrated = [str(entry) if ":" in str(entry) else f"github:{entry}" for entry in entries]
+    if migrated == entries:
+        return False
+    doc["disabled"] = migrated
+    return True
+
+
 def _migrate(doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """v0.2.x stored a single {"token": {...}}; v1.0 stores {"keys": [...]}.
 
     Migrated lazily and written back once, so an existing token keeps working
     across the upgrade without anyone re-minting.
     """
+    changed = _migrate_disabled(doc)
     token = doc.get("token")
     if not isinstance(token, dict) or not token.get("sha256"):
-        return doc, False
+        return doc, changed
     migrated = {
         "id": "k_legacy",
         "label": "default",
@@ -132,29 +146,34 @@ def save(identity: str, doc: dict[str, Any]) -> None:
 
 
 def disabled(identity: str | None) -> set[str]:
+    """The skill IDS this person hid (`github:<name>` / `private:<id>:<name>`)."""
     if not identity:
         return set()
-    names = load(identity).get("disabled") or []
-    return {str(name) for name in names if str(name).strip()}
+    entries = load(identity).get("disabled") or []
+    return {str(entry) for entry in entries if str(entry).strip()}
 
 
-def set_disabled(identity: str, name: str, is_disabled: bool) -> list[str]:
-    """Turn one global skill off/on for this identity. Returns the new list."""
+def is_hidden(identity: str | None, skill_id: str) -> bool:
+    return skill_id in disabled(identity)
+
+
+def set_disabled(identity: str, skill_id: str, is_disabled: bool) -> list[str]:
+    """Hide or show ONE skill by id. Returns the new list."""
     doc = load(identity)
-    current = {str(n) for n in (doc.get("disabled") or [])}
+    current = {str(entry) for entry in (doc.get("disabled") or [])}
     if is_disabled:
-        current.add(name)
+        current.add(skill_id)
     else:
-        current.discard(name)
+        current.discard(skill_id)
     doc["disabled"] = sorted(current)
     save(identity, doc)
     return doc["disabled"]
 
 
-def set_disabled_bulk(identity: str, names: set[str]) -> list[str]:
+def set_disabled_bulk(identity: str, skill_ids: set[str]) -> list[str]:
     """Replace the whole hidden set in one write (the manage-skills page)."""
     doc = load(identity)
-    doc["disabled"] = sorted({str(n) for n in names if str(n).strip()})
+    doc["disabled"] = sorted({str(entry) for entry in skill_ids if str(entry).strip()})
     save(identity, doc)
     return doc["disabled"]
 

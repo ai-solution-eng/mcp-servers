@@ -211,10 +211,10 @@ def test_toggle_disables_then_enables(tmp_path, monkeypatch) -> None:
 
     response = run(ui.skill_toggle(make_request("/skills/beta/toggle", headers=headers, path_params={"name": "beta"})))
     assert response.status_code == 303
-    assert "beta" in prefs.disabled("alice")
+    assert "github:beta" in prefs.disabled("alice")
 
     run(ui.skill_toggle(make_request("/skills/beta/toggle", headers=headers, path_params={"name": "beta"})))
-    assert "beta" not in prefs.disabled("alice")
+    assert "github:beta" not in prefs.disabled("alice")
 
 
 def test_toggle_requires_an_identity(tmp_path, monkeypatch) -> None:
@@ -278,8 +278,8 @@ def test_manage_page_renders_one_checkbox_per_global_skill(tmp_path, monkeypatch
     headers = _trusted(monkeypatch)
     body = run(ui.manage_skills(make_request("/me/skills", headers=headers))).body.decode()
     # each skill appears twice: once in the sidebar, once in the manage list
-    assert body.count("value='alpha'") == 2
-    assert body.count("value='beta'") == 2
+    assert body.count("value='github:alpha'") == 2
+    assert body.count("value='github:beta'") == 2
     assert "Select all" in body and "Disable all" in body
 
 
@@ -304,7 +304,7 @@ def test_save_returns_to_the_page_you_came_from(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     headers = _trusted(monkeypatch)
     request = form_request(
-        "/me/skills", [("visible", "beta"), ("next", "/skills/beta")], headers
+        "/me/skills", [("visible", "github:beta"), ("next", "/skills/beta")], headers
     )
     response = run(ui.save_skills(request))
     assert response.status_code == 303
@@ -314,7 +314,7 @@ def test_save_returns_to_the_page_you_came_from(tmp_path, monkeypatch) -> None:
 def test_save_ignores_a_dangerous_next(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     headers = _trusted(monkeypatch)
-    request = form_request("/me/skills", [("visible", "beta"), ("next", "//evil.example")], headers)
+    request = form_request("/me/skills", [("visible", "github:beta"), ("next", "//evil.example")], headers)
     assert run(ui.save_skills(request)).headers["location"] == "/me/skills"
 
 
@@ -326,7 +326,7 @@ def test_manage_page_lists_private_skills(tmp_path, monkeypatch) -> None:
     headers = _trusted(monkeypatch)
     private.save("alice", "my-note", "Use when testing.", "body", forbidden={"alpha", "beta"})
     body = run(ui.manage_skills(make_request("/me/skills", headers=headers))).body.decode()
-    assert "value='my-note'" in body
+    assert "value='private:alice:my-note'" in body
     assert "private" in body
 
 
@@ -336,10 +336,10 @@ def test_saving_the_checkbox_set_stores_the_hidden_ones(tmp_path, monkeypatch) -
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
     headers = _trusted(monkeypatch)
-    request = form_request("/me/skills", [("visible", "beta")], headers)   # alpha unchecked
+    request = form_request("/me/skills", [("visible", "github:beta")], headers)   # alpha unchecked
     response = run(ui.save_skills(request))
     assert response.status_code == 303
-    assert prefs.disabled("alice") == {"alpha"}
+    assert prefs.disabled("alice") == {"github:alpha"}
 
 
 def test_unchecking_everything_hides_every_global_skill(tmp_path, monkeypatch) -> None:
@@ -349,7 +349,7 @@ def test_unchecking_everything_hides_every_global_skill(tmp_path, monkeypatch) -
     monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
     headers = _trusted(monkeypatch)
     run(ui.save_skills(form_request("/me/skills", [], headers)))
-    assert prefs.disabled("alice") == {"alpha", "beta"}
+    assert prefs.disabled("alice") == {"github:alpha", "github:beta"}
     assert visibility.visible_names("alice") == []
 
 
@@ -373,18 +373,25 @@ def test_create_a_private_skill_then_read_it(tmp_path, monkeypatch) -> None:
     assert "my-runbook" not in visibility.visible_names("bob")     # private, truly
 
 
-def test_private_name_cannot_reuse_a_global_name(tmp_path, monkeypatch) -> None:
+def test_private_name_may_reuse_a_global_name(tmp_path, monkeypatch) -> None:
+    """Duplicates across tiers are allowed — both are listed and the caller
+    picks by description."""
+    from skills_mcp import visibility
+
     monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
     headers = _trusted(monkeypatch)
     request = form_request(
         "/me/private",
-        [("name", "alpha"), ("description", "d"), ("body", "b")],
+        [("name", "alpha"), ("description", "my own alpha"), ("body", "b")],
         headers,
     )
     response = run(ui.private_create(request))
-    assert response.status_code == 200                       # re-rendered, not saved
-    assert "already used by a global skill" in response.body.decode()
+    assert response.status_code == 303
+    assert response.headers["location"] == "/skills/private:alice:alpha"
+
+    verdict, found = visibility.resolve("alpha", "alice")
+    assert verdict == "ambiguous" and len(found) == 2
 
 
 def test_private_rejects_a_bad_name(tmp_path, monkeypatch) -> None:
@@ -618,3 +625,154 @@ def test_skills_repo_url_overrides_the_derivation(monkeypatch) -> None:
 
     monkeypatch.setenv("SKILLS_REPO_URL", "https://git.example.com/mirror/skills")
     assert "https://git.example.com/mirror/skills" in ui._source_line(_S())
+
+
+# ------------------------------------------------------------------ ids
+
+
+def test_detail_accepts_a_github_id(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    body = run(ui.skill_detail(
+        make_request("/skills/github:alpha", path_params={"name": "github:alpha"})
+    )).body.decode()
+    assert "<h2>alpha</h2>" in body
+
+
+def test_a_duplicated_name_shows_a_chooser(tmp_path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "alpha", "my own alpha", "private body", forbidden=set())
+
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "Two skills share this name" in body
+    assert "github:alpha" in body and "private:alice:alpha" in body
+
+
+def test_the_sidebar_links_by_id_only_when_the_name_is_duplicated(tmp_path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "alpha", "my own alpha", "private body", forbidden=set())
+
+    body = run(ui.skill_detail(
+        make_request("/skills/beta", headers=headers, path_params={"name": "beta"})
+    )).body.decode()
+    assert "href='/skills/github:alpha'" in body
+    assert "href='/skills/beta'" in body          # unique name stays pretty
+
+
+def test_me_page_shows_private_skills_that_failed_to_load(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    broken = tmp_path / "private" / "alice" / "broken"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text("---\nname: other-name\n---\n\nbody\n", encoding="utf-8")
+
+    body = run(ui.me_page(make_request("/me", headers=headers))).body.decode()
+    assert "Private skills that did not load" in body
+    assert "broken" in body
+
+
+def test_duplicate_rows_are_labelled_by_tier_not_by_name(tmp_path, monkeypatch) -> None:
+    """A global and a private copy share a name — each row must say which it is."""
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "alpha", "my own alpha", "body", forbidden=set())
+
+    body = run(ui.skill_detail(
+        make_request("/skills/beta", headers=headers, path_params={"name": "beta"})
+    )).body.decode()
+
+    # exactly one row is badged private, and the team copy is badged team
+    assert body.count(">private</span>") == 1
+    assert "title='from git (the team copy)'" in body
+    assert body.count("href='/skills/github:alpha'") == 1
+    assert body.count("href='/skills/private:alice:alpha'") == 1
+
+
+def test_only_the_selected_row_is_highlighted(tmp_path, monkeypatch) -> None:
+    """Two rows can share a name; the active class must follow the id."""
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "alpha", "my own alpha", "body", forbidden=set())
+
+    body = run(ui.skill_detail(
+        make_request("/skills/private:alice:alpha", headers=headers,
+                     path_params={"name": "private:alice:alpha"})
+    )).body.decode()
+    assert body.count("row active") == 1
+
+
+def test_every_github_row_is_badged_team(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", path_params={"name": "alpha"})
+    )).body.decode()
+    assert body.count("title='from git (the team copy)'") == 2   # alpha + beta
+
+
+def test_creating_over_an_existing_private_skill_asks_first(tmp_path, monkeypatch) -> None:
+    from skills_mcp import private
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SKILLS_PRIVATE_DIR", str(tmp_path / "private"))
+    headers = _trusted(monkeypatch)
+    private.save("alice", "note", "first", "body one", forbidden=set())
+
+    form = [("name", "note"), ("description", "second"), ("body", "body two")]
+    first = run(ui.private_create(form_request("/me/private", form, headers)))
+    assert first.status_code == 200                     # not saved, asked
+    assert "already have a private skill" in first.body.decode()
+    assert private.read("alice", "note")["description"] == "first"
+
+    confirm = form + [("confirm", "1")]
+    second = run(ui.private_create(form_request("/me/private", confirm, headers)))
+    assert second.status_code == 303
+    assert private.read("alice", "note")["description"] == "second"
+
+
+def test_the_editor_disables_autofill(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.private_new(make_request("/me/private/new", headers=headers))).body.decode()
+    assert "autocomplete=off" in body
+
+
+def test_disable_all_persists_without_ticking_anything(tmp_path, monkeypatch) -> None:
+    """Disable all is a real save now, so navigating away cannot undo it."""
+    from skills_mcp import prefs
+
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    request = form_request("/me/skills", [("bulk", "disable"), ("next", "/skills/beta")], headers)
+    response = run(ui.save_skills(request))
+    assert response.status_code == 303
+    assert prefs.disabled("alice") == {"github:alpha", "github:beta"}
+
+    request = form_request("/me/skills", [("bulk", "enable")], headers)
+    run(ui.save_skills(request))
+    assert prefs.disabled("alice") == set()
+
+
+def test_the_sidebar_has_a_warning_for_unsaved_changes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SKILLS_STATE_DIR", str(tmp_path / "state"))
+    headers = _trusted(monkeypatch)
+    body = run(ui.skill_detail(
+        make_request("/skills/alpha", headers=headers, path_params={"name": "alpha"})
+    )).body.decode()
+    assert "unsaved skill changes" in body
+    assert "name=bulk value=disable" in body
