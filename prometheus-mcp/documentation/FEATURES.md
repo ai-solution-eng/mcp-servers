@@ -185,7 +185,8 @@ name→{query, params} store:
 
 The read-only, HPE-branded console at `/` is **always served** (this chart
 has deliberately no webui toggle — every dashboard card fails soft, and the
-API mirrors the MCP-side caps):
+API reuses the MCP-side client and shaping; only the query-table row window
+is console-sized):
 
 - **Dashboard** — the at-a-glance aggregate (the `/api/overview` payload,
   cached per D14).
@@ -200,17 +201,28 @@ API mirrors the MCP-side caps):
   default (auto-detected from the nvidia GPU allocatable); `nodeFilter`
   (values) or the browser filter input changes the selection (`all` =
   every node).
-- **Query editor** with charts, shareable **deep links**: the expression +
-  time range ride in the URL *fragment* (`#q=…&range=…`) — never the query
-  string — so a shared link re-sends nothing to the server and never lands
-  in access logs. Decoded values only ever land in input `.value`
-  assignments (never `innerHTML`) — the console's escape-clean rendering
-  rule applies to the fragment too.
+- **Query editor** with charts, paged tables and shareable **deep links**:
+  the expression + time range ride in the URL *fragment* (`#q=…&range=…`) —
+  never the query string — so a shared link re-sends nothing to the server
+  and never lands in access logs. Decoded values only ever land in input
+  `.value` assignments (never `innerHTML`) — the console's escape-clean
+  rendering rule applies to the fragment too.
+- **Paged query results, page-free CSV** — the table shows
+  `PROM_UI_PAGE_SIZE` rows per page (default 100, hard ceiling 1000) with
+  prev/next over the **full** result set, while **copy CSV** exports every
+  series, not just the visible page (`POST /api/query.csv` /
+  `POST /api/query_range.csv`). Range points keep the same
+  shape-preserving downsample as the table; only the row window changes.
+  Paging re-sends the *resolved* timestamp/step from the first page, so
+  clicking through a live query never silently re-evaluates "now".
 - **Alerts & rules browser** — over the same client and caps as the tools.
 
 **Philosophy: humans and agents see the same data through the same
-shaping.** The console API is the tool code; there is no second path that
-could return unclamped data.
+shaping — but not the same window.** Downsampling, rounding and validation
+are shared (the console API is the tool code; there is no second path that
+could return unshaped data). The row *window* differs by consumer: the MCP
+tools cap series at `PROM_MAX_SERIES` because a model's context cannot
+scroll, while the console pages through everything because a browser can.
 
 ---
 

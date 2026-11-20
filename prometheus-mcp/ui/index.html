@@ -165,7 +165,13 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    transition: width .16s ease, min-width .16s ease;
   }
+  /* Collapsed preset library. visibility:hidden (not just width:0) so the
+     search box and every preset button leave the tab order too, rather than
+     becoming invisible-but-focusable. */
+  .layout.collapsed aside { width: 0; min-width: 0; border-right-color: transparent; visibility: hidden; }
+  .icon-btn { padding: 4px 9px; font-size: 14px; line-height: 1; border-radius: 6px; }
   aside .search { padding: 10px 12px; border-bottom: 1px solid var(--border); }
   aside input[type="search"] {
     width: 100%;
@@ -397,6 +403,7 @@
   .loading { color: var(--muted); padding: 12px; font-size: 12px; }
   .result-meta { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; margin: 10px 0; flex-wrap: wrap; }
   .result-meta .ok { color: var(--green); font-weight: 600; }
+  .pager { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 8px; flex-wrap: wrap; }
   .toast {
     position: fixed;
     bottom: 18px;
@@ -485,6 +492,8 @@
 </head>
 <body>
 <header>
+  <button id="sidebar-toggle" class="ghost icon-btn" type="button"
+          title="Hide query library (Ctrl+B)" aria-controls="sidebar" aria-expanded="true">&laquo;</button>
   <div class="brand">
     <span class="hpe-element" aria-hidden="true"></span>
     <div class="brand-text">
@@ -506,7 +515,7 @@
 </header>
 
 <div class="layout">
-  <aside>
+  <aside id="sidebar">
     <div class="search">
       <input type="search" id="filter" placeholder="Filter preset queries…" autocomplete="off" />
     </div>
@@ -595,6 +604,12 @@
           <div><div class="hint" style="margin-bottom:4px">GPU utilization (avg %)</div><div id="chart-gpu-util-trend"><div class="loading">loading…</div></div></div>
           <div><div class="hint" style="margin-bottom:4px">GPU memory used (framebuffer)</div><div id="chart-gpu-mem-trend"><div class="loading">loading…</div></div></div>
         </div>
+      </div>
+
+      <div class="panel">
+        <h2>Allocation &amp; demand <span class="hint">who holds GPUs · requests served · 7 and 14 days</span></h2>
+        <div id="gpu-demand-note" class="hint" style="margin-bottom:8px"></div>
+        <div id="gpu-demand"><div class="loading">loading…</div></div>
       </div>
 
       <div class="panel">
@@ -791,6 +806,28 @@ function deepLinkDecode(hash) {
 }
 </script>
 
+<script id="tab-core">
+"use strict";
+// Selected-tab persistence. The active pane rides the URL fragment
+// (#tab=<name>) so a refresh, a bookmark, or a shared view link lands back on
+// the same tab -- the same mechanism the gateway console uses for #usage.
+// PURE functions (no DOM): the test suite executes this block under node.
+//
+// mergeTabHash MERGES instead of replacing, so an existing query deep link
+// (#q=...&range=...) survives a tab click rather than being clobbered.
+function tabFromHash(hash) {
+  if (!hash || hash.charAt(0) !== "#") return null;
+  try { return new URLSearchParams(hash.slice(1)).get("tab"); } catch (e) { return null; }
+}
+
+function mergeTabHash(hash, tab) {
+  let p;
+  try { p = new URLSearchParams((hash || "").slice(1)); } catch (e) { p = new URLSearchParams(); }
+  p.set("tab", tab);
+  return "#" + p.toString();
+}
+</script>
+
 <script id="axis-core">
 "use strict";
 // Chart axis ticks (PURE functions, no DOM): the test suite executes this
@@ -846,11 +883,34 @@ function axisTicks(values, bytes) {
 }
 </script>
 
+<script id="result-page-core">
+"use strict";
+// Query-result paging math (PURE functions, no DOM): the test suite executes
+// this block verbatim under node (tests/test_webui.py), so the page bounds the
+// pager renders cannot drift from the API's offset/limit contract.
+function pageWindow(total, offset, limit) {
+  total = Math.max(0, Math.floor(Number(total) || 0));
+  limit = Math.max(1, Math.floor(Number(limit) || 1));
+  offset = Math.max(0, Math.floor(Number(offset) || 0));
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const page = Math.min(pages, Math.floor(offset / limit) + 1);
+  const first = total === 0 ? 0 : Math.min(total, offset + 1);
+  const last = Math.min(total, offset + limit);
+  return { total, offset, limit, page, pages, first, last };
+}
+</script>
+
 <script>
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 const state = { tab: "dashboard", alerts: [], autoTimer: null };
+// Query-result paging state (see the query section): pageSize is served by
+// /api/status (PROM_UI_PAGE_SIZE), lastResult is the payload the pager
+// navigates, pageRequest drops out-of-order page responses.
+let pageSize = 100;
+let lastResult = null;
+let pageRequest = 0;
 
 const PALETTE = ["#01a982","#4f8ff7","#f0b429","#ff6b6b","#b678f0","#3ecf8e","#6bc7e8","#e8875b","#c9d34f","#8f7ff0"];
 
@@ -944,6 +1004,7 @@ async function refreshStatus() {
     const s = await api("/api/status");
     $("status-dot").className = "dot ok";
     $("status-text").textContent = "connected";
+    if (s.caps && s.caps.ui_page_size) pageSize = s.caps.ui_page_size;
     let host = s.prometheus || "?";
     try { host = new URL(host).host; } catch (e) {}
     $("prom-url").textContent = "prometheus: " + host;
@@ -977,7 +1038,7 @@ function lineChart(hostId, seriesArr, opts) {
   opts = opts || {};
   const host = $(hostId);
   const parsed = (seriesArr || []).map((s) => ({
-    name: s.name,
+    name: s.name || s.series,  // query rows carry "series"; dashboard trends carry "name"
     pts: (s.values || [])
       .map((p) => ({ t: Number(p[0]), v: parseFloat(p[1]) }))
       .filter((p) => isFinite(p.t) && isFinite(p.v)),
@@ -1340,6 +1401,59 @@ function renderGpuTable(gpus) {
   });
 }
 
+// Allocation vs served demand. Deliberately independent of /api/gpu: a
+// cluster without DCGM still has allocation (kube-state-metrics) and request
+// counters, so this section must render when the rest of the tab cannot.
+async function loadGpuDemand() {
+  let d;
+  try { d = await api("/api/gpu/demand"); }
+  catch (e) { $("gpu-demand").innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; return; }
+  if (d.error) { $("gpu-demand").innerHTML = '<div class="empty">' + esc(trunc(d.error, 160)) + "</div>"; return; }
+  renderGpuDemand(d);
+}
+
+function renderGpuDemand(d) {
+  const rows = d.workloads || [];
+  if (!rows.length) { $("gpu-demand").innerHTML = '<div class="empty">no GPU allocation or model-serving telemetry</div>'; return; }
+  // A null request count means the runtime exports no counter -- NOT zero
+  // requests. It renders as a dash so an unmeasured model never reads as idle.
+  const reqCell = (r, w) => {
+    const v = (r.requests || {})[w];
+    if (v == null) return "<td><span class='hint' title='this runtime exports no request counter'>—</span></td>";
+    const style = v > 0 ? "" : " style='color:var(--red);font-weight:700'";
+    return "<td" + style + ">" + Math.round(v).toLocaleString() + "</td>";
+  };
+  renderSortableTable("gpu-demand", [
+    { key: "workload", label: "workload",
+      render: (r) => "<td title='" + esc(r.namespace + "/" + r.workload) + "'>" + esc(trunc(r.workload, 44)) + "</td>",
+      sortVal: (r) => r.workload },
+    { key: "gpus", label: "GPUs",
+      render: (r) => "<td><b>" + r.gpus + "</b></td>", sortVal: (r) => r.gpus },
+    { key: "util7", label: "util 7d",
+      render: (r) => "<td style='color:" + utilColor(r.util_7d) + "'>" + (r.util_7d != null ? r.util_7d + "%" : "—") + "</td>",
+      sortVal: (r) => r.util_7d },
+    { key: "runtime", label: "runtime",
+      render: (r) => "<td>" + (r.runtime ? esc(r.runtime) : "<span class='hint'>no counter</span>") + "</td>",
+      sortVal: (r) => r.runtime || "~" },
+    { key: "r7", label: "requests 7d",
+      render: (r) => reqCell(r, "7d"), sortVal: (r) => (r.requests || {})["7d"] },
+    { key: "r14", label: "requests 14d",
+      render: (r) => reqCell(r, "14d"), sortVal: (r) => (r.requests || {})["14d"] },
+  ], rows, { fallback: (a, b) => b.gpus - a.gpus });
+  const s = d.summary || {};
+  // A failed counter query is NOT "no requests" — surface it, or a broken
+  // family looks exactly like an idle workload (which is how the sglang
+  // template bug hid: every SGLang row silently read "no counter").
+  const errs = Object.keys(d.errors || {});
+  $("gpu-demand-note").textContent =
+    (s.gpus_total != null ? s.gpus_total : "?") + " GPUs allocated across " +
+    (s.workloads != null ? s.workloads : "?") + " workloads" +
+    (s.no_requests_7d ? " · " + s.no_requests_7d + " with zero requests in 7d" : "") +
+    (s.uninstrumented ? " · " + s.uninstrumented + " with no request counter (shown —, never 0)" : "") +
+    (errs.length ? " · " + errs.length + " counter query error(s): " + errs.join(", ") : "");
+  $("gpu-demand-note").style.color = errs.length ? "var(--red)" : "";
+}
+
 async function loadGpuTrends() {
   const fill = async (id, query, bytes) => {
     try {
@@ -1506,6 +1620,7 @@ async function loadNodes() {
 }
 
 async function loadGpu() {
+  loadGpuDemand(); // independent of DCGM — allocation + demand work without it
   const blocks = ["gpu-domains", "gpu-table", "chart-gpu-util-trend", "chart-gpu-mem-trend"];
   const gpuCards = ["gpu-card-count", "gpu-card-util", "gpu-card-mem", "gpu-card-power", "gpu-card-temp", "gpu-card-nvlink"];
   let d;
@@ -1620,13 +1735,20 @@ async function runQuery() {
   setError("");
   $("run").disabled = true;
   $("result").innerHTML = '<div class="loading">running…</div>';
+  pageRequest++;  // a new query invalidates any in-flight page fetch
   try {
+    await statusReady;  // pageSize comes from /api/status (PROM_UI_PAGE_SIZE)
     let payload;
     if (currentMode() === "instant") {
       payload = await api("/api/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, time: $("q-time").value.trim() || "now" }),
+        body: JSON.stringify({
+          query: q,
+          time: $("q-time").value.trim() || "now",
+          offset: 0,
+          limit: pageSize,
+        }),
       });
     } else {
       payload = await api("/api/query_range", {
@@ -1637,10 +1759,13 @@ async function runQuery() {
           start: $("q-start").value.trim() || "now-1h",
           end: $("q-end").value.trim() || "now",
           step: $("q-step").value.trim(),
+          offset: 0,
+          limit: pageSize,
         }),
       });
     }
     markPromOk();
+    lastResult = payload;
     renderResult(payload);
     pushHistory(q, payload.duration_ms);
     updateDeepLink();
@@ -1652,19 +1777,40 @@ async function runQuery() {
   }
 }
 
+const CHART_SERIES = 20;  // chart density cap; the table still pages every row
+
+function resultPageSize(p) {
+  return (p && p.limit) || pageSize;
+}
+
+function pagerHtml(info) {
+  if (!info || info.pages <= 1) return "";
+  return '<div class="pager">' +
+    '<button class="ghost copy-btn" id="page-prev"' + (info.page <= 1 ? " disabled" : "") + '>‹ prev</button>' +
+    '<span>page ' + info.page + " of " + info.pages + " · series " + info.first + "–" + info.last + " of " + info.total + "</span>" +
+    '<button class="ghost copy-btn" id="page-next"' + (info.page >= info.pages ? " disabled" : "") + '>next ›</button>' +
+    "</div>";
+}
+
 function renderResult(payload) {
   const host = $("result");
   const rows = payload.result || [];
+  const total = payload.n_total || 0;
+  const info = pageWindow(total, payload.offset || 0, resultPageSize(payload));
   const meta =
-    '<div class="result-meta"><span class="ok">✓ ' + payload.n_shown + " series" +
-    (payload.n_total > payload.n_shown ? " of " + payload.n_total + " (capped — narrow the query)" : "") +
+    '<div class="result-meta"><span class="ok">✓ ' + total + " series" +
     "</span><span>took: " + payload.duration_ms + " ms</span>" +
     (payload.step ? "<span>step: " + esc(payload.step) + "</span>" : "") +
-    '<button class="ghost copy-btn" id="copy-csv">copy CSV</button></div>';
+    '<button class="ghost copy-btn" id="copy-csv" title="Copy all ' + total +
+    ' series as CSV — every page, not just this one">copy CSV</button></div>';
+  const pager = pagerHtml(info);
   if (payload.resultType === "matrix") {
-    host.innerHTML = meta + '<div id="range-chart"></div>' +
+    const chartNote = rows.length > CHART_SERIES
+      ? '<div class="hint" style="margin-top:4px">chart: first ' + CHART_SERIES + " of " + rows.length + " series on this page</div>"
+      : "";
+    host.innerHTML = meta + pager + '<div id="range-chart"></div>' + chartNote +
       '<div id="range-table" style="margin-top:10px"></div>';
-    lineChart("range-chart", rows, { bytes: /bytes|memory/i.test(payload.query) });
+    lineChart("range-chart", rows.slice(0, CHART_SERIES), { bytes: /bytes|memory/i.test(payload.query) });
     let html = '<div class="hint" style="margin-bottom:4px">values (' + (rows[0] ? rows[0].values.length : 0) + ' points/series, downsampled shape-preserving)</div>' +
       '<div style="overflow:auto;max-height:40vh;border:1px solid var(--border);border-radius:8px;"><table class="grid"><thead><tr><th>series</th><th>values</th></tr></thead><tbody>';
     rows.forEach((r) => {
@@ -1673,27 +1819,100 @@ function renderResult(payload) {
     });
     html += "</tbody></table></div>";
     $("range-table").innerHTML = html;
+  } else if (!rows.length) {
+    host.innerHTML = meta + pager + '<div class="empty">' +
+      (total ? "no rows on this page" : "no results (the query matched no series at that instant)") + "</div>";
   } else {
-    if (!rows.length) {
-      host.innerHTML = meta + '<div class="empty">no results (the query matched no series at that instant)</div>';
-    } else {
-      let html = "";
-      rows.forEach((r) => {
-        html += "<tr><td>" + esc(r.series) + "</td><td>" + esc(r.value) + "</td></tr>";
-      });
-      host.innerHTML = meta +
-        '<div style="overflow:auto;max-height:55vh;border:1px solid var(--border);border-radius:8px;">' +
-        '<table class="grid"><thead><tr><th>series</th><th>value</th></tr></thead><tbody>' + html + "</tbody></table></div>";
-    }
+    let html = "";
+    rows.forEach((r) => {
+      html += "<tr><td>" + esc(r.series) + "</td><td>" + esc(r.value) + "</td></tr>";
+    });
+    host.innerHTML = meta + pager +
+      '<div style="overflow:auto;max-height:55vh;border:1px solid var(--border);border-radius:8px;">' +
+      '<table class="grid"><thead><tr><th>series</th><th>value</th></tr></thead><tbody>' + html + "</tbody></table></div>";
   }
+  const prev = $("page-prev"), next = $("page-next");
+  if (prev) prev.onclick = () => gotoPage(info.page - 1);
+  if (next) next.onclick = () => gotoPage(info.page + 1);
   const cp = $("copy-csv");
-  if (cp) cp.onclick = () => {
-    const csv = rows.map((r) => {
-      if (payload.resultType === "matrix") return '"' + r.series.replaceAll('"', '""') + '",' + r.values.map((p) => p[0] + "," + p[1]).join(",");
-      return '"' + r.series.replaceAll('"', '""') + '",' + r.value;
-    }).join("\n");
-    navigator.clipboard.writeText(csv).then(() => toast("CSV copied"));
-  };
+  if (cp) cp.onclick = copyCsv;
+}
+
+async function gotoPage(page) {
+  const base = lastResult;
+  if (!base) return;
+  const size = resultPageSize(base);
+  const info = pageWindow(base.n_total || 0, base.offset || 0, size);
+  if (page < 1 || page > info.pages) return;
+  const body = { query: base.query, offset: (page - 1) * size, limit: size };
+  let path;
+  if (base.resultType === "matrix") {
+    path = "/api/query_range";
+    body.start = base.start;
+    body.end = base.end;
+    body.step = base.step;
+  } else {
+    path = "/api/query";
+    if (base.time) body.time = base.time;  // same snapshot: paging never re-evaluates "now"
+  }
+  const btn = page > info.page ? $("page-next") : $("page-prev");
+  if (btn) btn.disabled = true;  // one page fetch at a time
+  const token = ++pageRequest;
+  try {
+    const payload = await api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (token !== pageRequest) return;  // a newer page click won
+    markPromOk();
+    lastResult = payload;
+    renderResult(payload);
+  } catch (e) {
+    if (token === pageRequest) setError(e.message);
+  } finally {
+    if (btn) btn.disabled = false;  // no-op once the pager re-rendered
+  }
+}
+
+async function copyCsv() {
+  const base = lastResult;
+  if (!base) return;
+  // The export is page-free by design: every series, not just the visible page.
+  const body = { query: base.query };
+  let path;
+  if (base.resultType === "matrix") {
+    path = "/api/query_range.csv";
+    body.start = base.start;
+    body.end = base.end;
+    body.step = base.step;
+  } else {
+    path = "/api/query.csv";
+    if (base.time) body.time = base.time;
+  }
+  const btn = $("copy-csv");
+  if (btn) btn.disabled = true;
+  try {
+    if (!navigator.clipboard) throw new Error("clipboard unavailable (needs HTTPS)");
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let data = null;
+      try { data = await res.json(); } catch (e) { /* non-JSON error body */ }
+      throw new Error((data && data.error) || ("HTTP " + res.status));
+    }
+    const csv = await res.text();
+    if (!csv.trim()) { toast("nothing to copy — the query returned no rows"); return; }
+    await navigator.clipboard.writeText(csv);
+    toast("CSV copied — all " + (base.n_total || 0) + " series");
+  } catch (e) {
+    toast("copy failed: " + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // ---- presets ------------------------------------------------------------------------
@@ -1839,18 +2058,22 @@ function applyDeepLink(st) {
 
 function restoreDeepLink() {
   const st = deepLinkDecode(location.hash);
+  const wanted = tabFromHash(location.hash);
+  // /^[a-z]+$/ keeps the fragment from injecting a selector below.
+  const tab = wanted && /^[a-z]+$/.test(wanted) && document.querySelector('.tab[data-tab="' + wanted + '"]')
+    ? wanted
+    : null;
   if (st && applyDeepLink(st)) {
-    switchTab("query");
+    // An explicit #tab= wins over the query pane, so a shared query link opened
+    // on the GPU pane refreshes back onto the GPU pane.
+    switchTab(tab || "query", { updateHash: false });
     runQuery();
     toast("Restored shared query link");
     return;
   }
   // #tab=<name> — restore-only tab deep link (shareable view links; the
   // query fragment keeps its own #q=…&range=… format).
-  try {
-    const tab = new URLSearchParams(location.hash.slice(1)).get("tab");
-    if (tab && document.querySelector('.tab[data-tab="' + tab + '"]')) switchTab(tab);
-  } catch (e) { /* ignore */ }
+  if (tab) switchTab(tab, { updateHash: false });
 }
 
 function updateDeepLink() {
@@ -1862,7 +2085,11 @@ function updateDeepLink() {
     end: $("q-end").value.trim(),
     step: $("q-step").value.trim(),
   });
-  try { history.replaceState(null, "", location.pathname + location.search + frag); } catch (e) { /* ignore */ }
+  // Carry the selected tab too: a shared query link opened on the GPU pane must
+  // refresh back onto the GPU pane instead of jumping to Query. mergeTabHash
+  // leaves the #q=...&range=... keys intact.
+  const withTab = mergeTabHash(frag, state.tab || "dashboard");
+  try { history.replaceState(null, "", location.pathname + location.search + withTab); } catch (e) { /* ignore */ }
 }
 
 function copyDeepLink() {
@@ -1972,7 +2199,8 @@ function renderTools() {
 }
 
 // ---- tab switching ---------------------------------------------------------------------
-function switchTab(tab) {
+function switchTab(tab, opts) {
+  opts = opts || {};
   state.tab = tab;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $("pane-dashboard").classList.toggle("hidden", tab !== "dashboard");
@@ -1986,6 +2214,16 @@ function switchTab(tab) {
   if (tab === "alerts" && !state.alertsLoaded) { state.alertsLoaded = true; loadAlerts(); loadRules(); }
   if (tab === "gpu" && !state.gpuLoaded) { state.gpuLoaded = true; loadGpu(); }
   if (tab === "nodes" && !state.nodesLoaded) { state.nodesLoaded = true; loadNodes(); }
+  // Keep the fragment in step so a refresh lands back here. restoreDeepLink()
+  // and the hashchange handler pass updateHash:false so they cannot echo.
+  if (opts.updateHash !== false) writeTabHash(tab);
+}
+
+function writeTabHash(tab) {
+  const frag = mergeTabHash(location.hash, tab);
+  if (frag === location.hash) return;
+  try { history.replaceState(null, "", location.pathname + location.search + frag); }
+  catch (e) { /* ignore — history is unavailable in some embedded contexts */ }
 }
 
 // ---- theme control ----------------------------------------------------------------------
@@ -2009,8 +2247,48 @@ document.querySelectorAll("[data-theme-btn]").forEach((b) => {
   };
 });
 
+// ---- collapsible query library ------------------------------------------------------------
+// The preset library is 320px of screen that is not always wanted, so it
+// collapses away entirely and the preference survives a refresh — the same
+// localStorage pattern as the theme. Ctrl/Cmd+B mirrors the usual shortcut.
+const SIDEBAR_KEY = "prometheus-sidebar-collapsed";
+function applySidebar(collapsed) {
+  const layout = document.querySelector(".layout");
+  if (!layout) return;
+  layout.classList.toggle("collapsed", collapsed);
+  const btn = $("sidebar-toggle");
+  if (btn) {
+    btn.innerHTML = collapsed ? "&raquo;" : "&laquo;";
+    btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    btn.title = (collapsed ? "Show" : "Hide") + " query library (Ctrl+B)";
+  }
+  try { localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) { /* ignore */ }
+}
+function toggleSidebar() {
+  const layout = document.querySelector(".layout");
+  applySidebar(!(layout && layout.classList.contains("collapsed")));
+}
+
 // ---- wiring -----------------------------------------------------------------------------
 document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+// Back/forward, or a hand-edited #tab= in the address bar, re-selects the pane.
+window.addEventListener("hashchange", () => {
+  const wanted = tabFromHash(location.hash);
+  if (wanted && wanted !== state.tab && /^[a-z]+$/.test(wanted) &&
+      document.querySelector('.tab[data-tab="' + wanted + '"]')) {
+    switchTab(wanted, { updateHash: false });
+  }
+});
+$("sidebar-toggle").onclick = toggleSidebar;
+window.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || String(e.key).toLowerCase() !== "b") return;
+  const t = e.target;
+  // Don't steal the shortcut while someone is typing in the search box.
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  e.preventDefault();
+  toggleSidebar();
+});
+try { applySidebar(localStorage.getItem(SIDEBAR_KEY) === "1"); } catch (e) { applySidebar(false); }
 $("run").onclick = runQuery;
 $("save-query").onclick = saveCurrentQuery;
 $("copy-link").onclick = copyDeepLink;
@@ -2057,7 +2335,10 @@ renderPresets();
 renderTools();
 renderSaved();
 renderHistory();
-refreshStatus();
+// The console page size arrives with /api/status; runQuery awaits this
+// promise so the very FIRST query already uses PROM_UI_PAGE_SIZE (an
+// operator-tuned page size must not only apply from the second query).
+const statusReady = refreshStatus();
 syncModeInputs();
 loadOverview();
 startAuto();

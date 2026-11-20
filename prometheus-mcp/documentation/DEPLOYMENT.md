@@ -129,7 +129,9 @@ ezua:
 
 There is deliberately NO `webui` toggle: the read-only console at `/` and
 its `/api/*` endpoints are always served by the same container (every
-dashboard card fails soft, and the API mirrors the MCP-side caps).
+dashboard card fails soft, and the API reuses the MCP-side client and
+shaping; the query tables page the full result set at `PROM_UI_PAGE_SIZE`
+rows and the CSV export contains every series).
 
 ### 3.3 Underlying detail: values → environment variables
 
@@ -151,6 +153,9 @@ these directly):
 Server-side env knobs not wired by the chart (sane defaults built in,
 documented for completeness): `PROM_TIMEOUT` (30 s), `PROM_MAX_SERIES` (20),
 `PROM_MAX_POINTS` (60 per range series), `PROM_MAX_LABEL_VALUES` (200),
+`PROM_UI_PAGE_SIZE` (100 rows per console query page; clamped to 1000 —
+the MCP tools keep `PROM_MAX_SERIES`, the console pages the full result
+set and its CSV export is page-free),
 `PROM_BEARER_TOKEN_ENV` (name of an env var holding a bearer token, if your
 Prometheus requires auth — the token value itself never appears in config),
 `PROMETHEUS_MIN_STEP_SECONDS` (default 15 — see FEATURES.md D14), and

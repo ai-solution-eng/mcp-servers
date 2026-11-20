@@ -27,16 +27,21 @@ Endpoints (all JSON unless noted):
                            — fails soft per metric family
   GET  /api/alerts      -> {"alerts": [...], "n_total", "n_shown", "counts"}
   GET  /api/rules       -> {"groups": [...], "n_total"} (state/search filters)
-  POST /api/query       -> instant query  {"query", "time"?}
-  POST /api/query_range -> range query    {"query", "start", "end", "step"?}
+  POST /api/query       -> instant query  {"query", "time"?, "offset"?, "limit"?}
+  POST /api/query_range -> range query    {"query", "start", "end", "step"?,
+                                           "offset"?, "limit"?}
+  POST /api/query.csv   -> EVERY instant-query row as text/csv (page-free)
+  POST /api/query_range.csv -> EVERY range-query series as text/csv
   GET  /api/series      -> {"result": [...]} for a selector (label discovery)
   GET  /api/label_values-> {"values": [...]} for one label (+optional match)
 
-Browser payloads reuse the MCP server's LLM-safety caps: series counts are
-capped and range points downsampled (shape preserved) so a busy cluster
-never floods the browser either. Alerts/rules get their own caps with
-accurate ``n_total`` counts, since those lists are for scanning, not for a
-model's context window.
+The console is a human view, not a model context window: its query tables
+page through the FULL result set (PROM_UI_PAGE_SIZE, default 100 rows per
+page) and the CSV export always contains every row — a browser can scroll
+and export, a model's context cannot. The MCP tools keep their LLM-safety
+caps (PROM_MAX_SERIES, default 20). Range points stay downsampled (shape
+preserved) in both paths, and alerts/rules keep their own caps with
+accurate ``n_total`` counts, since those lists are for scanning.
 
 Wave-4 (D14): the dashboard aggregate ``/api/overview`` — ~14 upstream
 queries per refresh — is served from a short-TTL response cache
@@ -55,9 +60,10 @@ import json
 import os
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from .prom_client import (
@@ -109,6 +115,34 @@ _HTML_CANDIDATES = (
 _MAX_ALERTS = 500
 _MAX_RULES = 500
 
+# Web-console query paging. The MCP tools keep their LLM-context cap
+# (PROM_MAX_SERIES, default 20) — a model cannot scroll. The console pages
+# through the FULL result set and its CSV export always contains every row:
+# a human can scroll, filter and export. Console-only knobs.
+_UI_PAGE_SIZE_DEFAULT = 100
+_UI_MAX_PAGE_SIZE = 1000
+
+
+def _ui_page_size(environ: dict[str, str] | None = None) -> int:
+    """PROM_UI_PAGE_SIZE rows per console page (default 100).
+
+    Re-read per request (the fleet env pattern). Non-numeric / non-positive
+    values fall back to the default; values above _UI_MAX_PAGE_SIZE are
+    clamped — the API never builds an unbounded page.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("PROM_UI_PAGE_SIZE") or "").strip()
+    if not raw:
+        return _UI_PAGE_SIZE_DEFAULT
+    try:
+        size = int(raw)
+    except ValueError:
+        return _UI_PAGE_SIZE_DEFAULT
+    if size < 1:
+        return _UI_PAGE_SIZE_DEFAULT
+    return min(size, _UI_MAX_PAGE_SIZE)
+
+
 _LABEL_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Dashboard canned queries. Every stack is different, so each card degrades
@@ -125,8 +159,16 @@ _OVERVIEW_CARDS = (
     ),
     ("pods_running", 'sum(kube_pod_status_phase{phase="Running"})'),
     # GPU cards (DCGM exporter). Absent on clusters without DCGM -> fail soft.
-    ("gpu_count", "count(DCGM_FI_DEV_GPU_UTIL)"),
-    ("gpu_util_pct", "avg(DCGM_FI_DEV_GPU_UTIL)"),
+    # DCGM emits several series per physical GPU and, on this exporter, some
+    # samples with impossible values (a 0-100 gauge reporting 3.02e9). Counting
+    # raw series and averaging them unfiltered makes both cards lie: verified
+    # live on G2 at 16 GPUs, avg() read 12.2% against a true 5.4%. Count
+    # distinct (host, device) pairs and average only plausible samples.
+    ("gpu_count", "count(count by (Hostname, device) (DCGM_FI_DEV_GPU_UTIL))"),
+    (
+        "gpu_util_pct",
+        "avg(avg by (Hostname, device) (DCGM_FI_DEV_GPU_UTIL and (DCGM_FI_DEV_GPU_UTIL < 101)))",
+    ),
     (
         "gpu_mem_pct",
         "100 * sum(DCGM_FI_DEV_FB_USED) / (sum(DCGM_FI_DEV_FB_USED) + sum(DCGM_FI_DEV_FB_FREE))",
@@ -172,6 +214,65 @@ _GPU_QUERIES = (
     ("nvlink", "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"),
     ("xid", "DCGM_FI_DEV_XID_ERRORS"),
 )
+
+# GPU allocation vs served demand, behind /api/gpu/demand.
+#
+# Allocation is authoritative: kube-state-metrics says whether a pod requested
+# nvidia.com/gpu or not. Demand has no single source, because a fleet runs
+# several serving runtimes and each exports its OWN request counter:
+#
+#   vllm:request_success_total         standard vLLM serving
+#   vllm_omni:requests_success_total   vLLM-Omni (audio / multimodal)
+#   sglang:http_requests_total         SGLang (health/probe endpoints filtered)
+#   request_success_total              NVIDIA NIM (LLM)
+#
+# Any one of these queries returns 0 for a workload served by another runtime.
+# A runtime absent from this table (NIM embedding, e.g. nv-embedqa-e5-v5)
+# exports no counter at all and must report demand as unknown — never 0.
+_DEMAND_ALLOC_QUERY = 'sum by (namespace, pod) (kube_pod_container_resource_requests{resource="nvidia_com_gpu"})'
+_DEMAND_WINDOWS = ("7d", "14d")
+# (runtime, counter name, query template); {window} is substituted per window.
+_DEMAND_COUNTERS = (
+    (
+        "vllm",
+        "vllm:request_success_total",
+        "sum by (namespace, pod) (increase(vllm:request_success_total[{window}]))",
+    ),
+    (
+        "vllm_omni",
+        "vllm_omni:requests_success_total",
+        "sum by (namespace, pod) (increase(vllm_omni:requests_success_total[{window}]))",
+    ),
+    (
+        "sglang",
+        "sglang:http_requests_total",
+        (
+            "sum by (namespace, pod) (increase(sglang:http_requests_total"
+            '{exported_endpoint=~"/v1/chat/completions|/v1/embeddings'
+            '|/v1/completions|/generate"}[{window}]))'
+        ),
+    ),
+    (
+        "nim",
+        "request_success_total",
+        "sum by (namespace, pod) (increase(request_success_total[{window}]))",
+    ),
+)
+# GPU utilization attributed to the workload that held the device, averaged
+# over the demand window. The subquery clamp is not optional: this exporter
+# emits impossible samples (a 0-100 gauge reporting 3.02e9), and a plain
+# avg_over_time() over them reports nonsense. 5m steps over 7d keeps the
+# estimate stable without scanning every 15s sample.
+_DEMAND_UTIL_QUERY = (
+    "avg by (exported_namespace, exported_pod) (avg_over_time((DCGM_FI_DEV_GPU_UTIL < 101)[{window}:5m]))"
+)
+_DEMAND_UTIL_WINDOW = "7d"
+
+# KServe/Knative revision pods are named
+# <isvc>-predictor-<revision>-deployment-<hash>-<suffix>. Strip from the
+# predictor segment on, so every revision of one InferenceService rolls up to
+# a single workload row instead of one row per redeploy.
+_DEMAND_WORKLOAD_RE = re.compile(r"^(.*)-predictor-\d+-deployment")
 # H200 NVL (and most 8-GPU NVL-class hosts) ship as two 4-GPU NVLink islands
 # per node — verified live on G2: tensor-parallel workloads move NVLink
 # traffic exactly on GPUs 4-7 while 0-3 idle. Indices apply identically on
@@ -561,6 +662,130 @@ def _gpu_snapshot(
     }
 
 
+def _runtime_label(runtimes: set) -> str | None:
+    """Name the serving runtime that actually reported for this workload.
+
+    vLLM-Omni re-exports the plain vLLM counters, so an audio/TTS workload
+    reports under both families. Collapse that one pair to the specific name;
+    anything genuinely mixed stays "mixed" rather than being guessed at.
+    """
+    if not runtimes:
+        return None
+    if len(runtimes) == 1:
+        return next(iter(runtimes))
+    if runtimes == {"vllm", "vllm_omni"}:
+        return "vllm_omni"
+    return "mixed"
+
+
+def _workload_of(pod: str) -> str:
+    """Roll a KServe/Knative revision pod up to its InferenceService name."""
+    match = _DEMAND_WORKLOAD_RE.match(pod or "")
+    return match.group(1) if match else (pod or "")
+
+
+def _demand_snapshot(
+    alloc,
+    counters: dict,
+    windows,
+    errors: dict | None = None,
+    util: dict | None = None,
+) -> dict:
+    """Assemble /api/gpu/demand from the allocation + per-runtime counter blocks.
+
+    alloc is a raw instant-query payload (or None when that query failed).
+    counters maps runtime -> {(namespace, pod): {window: value}} for every
+    family that answered.
+
+    The contract this function exists to enforce: a workload whose runtime
+    exports no request counter reports demand as None, never as 0. There is no
+    fleet-wide counter -- vLLM, vLLM-Omni, SGLang and NIM each export a
+    different one, so any single query reads 0 for the rest. Rendering that 0
+    as "unused" is how a live model gets reclaimed: verified live, where a
+    vLLM-Omni TTS pod read as zero requests under the standard vLLM counter
+    while its own counter showed 81 served.
+    """
+    gpus: dict = {}
+    served: dict = {}
+    keys: set = set()
+
+    for series in (alloc or {}).get("result", []) or []:
+        labels = series.get("metric") or {}
+        pod = labels.get("pod", "")
+        if not pod:
+            continue
+        key = (labels.get("namespace", ""), pod)
+        keys.add(key)
+        try:
+            gpus[key] = gpus.get(key, 0.0) + float(series["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+
+    for runtime, per_pod in counters.items():
+        for key, per_window in (per_pod or {}).items():
+            keys.add(key)
+            served.setdefault(key, {})[runtime] = per_window
+
+    # Utilization is attributed per pod, but only where a GPU is actually
+    # allocated. DCGM's exported_pod attribution goes stale -- a pod with zero
+    # GPU requests has shown up carrying a live utilization reading -- and a
+    # utilization number on a 0-GPU row would be a lie.
+    util_by_workload: dict = {}
+    for key, value in (util or {}).items():
+        if gpus.get(key, 0.0) > 0:
+            util_by_workload.setdefault((key[0], _workload_of(key[1])), []).append(value)
+
+    rows: dict = {}
+    for key in keys:
+        namespace, pod = key
+        workload = _workload_of(pod)
+        row = rows.setdefault(
+            (namespace, workload),
+            {
+                "namespace": namespace,
+                "workload": workload,
+                "gpus": 0.0,
+                "_runtimes": set(),
+                "requests": {window: None for window in windows},
+                "util_7d": None,
+            },
+        )
+        row["gpus"] += gpus.get(key, 0.0)
+        for runtime, per_window in served.get(key, {}).items():
+            # A workload's runtime is whichever counter actually reported it.
+            row["_runtimes"].add(runtime)
+            for window in windows:
+                value = per_window.get(window)
+                if value is not None:
+                    row["requests"][window] = (row["requests"][window] or 0.0) + value
+
+    out = []
+    for row in rows.values():
+        row["runtime"] = _runtime_label(row.pop("_runtimes"))
+        row["gpus"] = int(row["gpus"])
+        row["requests"] = {w: _r(v, 2) for w, v in row["requests"].items()}
+        row["instrumented"] = any(v is not None for v in row["requests"].values())
+        samples = util_by_workload.get((row["namespace"], row["workload"]))
+        row["util_7d"] = _r(sum(samples) / len(samples), 1) if samples else None
+        out.append(row)
+    # A row with no GPU and no counter carries no signal (a pod that declares
+    # the resource with value 0, say) -- drop it rather than pad the table.
+    out = [r for r in out if r["gpus"] or r["instrumented"]]
+    out.sort(key=lambda r: (-r["gpus"], r["namespace"], r["workload"]))
+
+    return {
+        "windows": list(windows),
+        "workloads": out,
+        "summary": {
+            "gpus_total": sum(r["gpus"] for r in out),
+            "workloads": len(out),
+            "uninstrumented": sum(1 for r in out if not r["instrumented"]),
+            "no_requests_7d": sum(1 for r in out if r["requests"].get(windows[0]) == 0),
+        },
+        "errors": errors or {},
+    }
+
+
 def _nodes_snapshot(
     blocks: dict,
     gpu_nodes: set[str],
@@ -675,11 +900,8 @@ def _nodes_snapshot(
     for res in ("cpu", "mem"):
         total = summary[f"alloc_{res}"]
         for kind_ in ("req", "lim", "used"):
-            summary[f"{kind_}_{res}_pct"] = (
-                _r(100 * summary[f"{kind_}_{res}"] / total, 1)
-                if total and summary[f"{kind_}_{res}"] is not None
-                else None
-            )
+            value = summary[f"{kind_}_{res}"]
+            summary[f"{kind_}_{res}_pct"] = _r(100 * value / total, 1) if total and value is not None else None
 
     return {
         "summary": summary,
@@ -731,11 +953,48 @@ def _series_id(metric: dict) -> str:
     return _metric_str(dict(metric or {}))
 
 
-def _vec_rows(data: dict, cap: int) -> tuple[list[dict], int]:
-    """Instant-vector result -> [{series, value, ts}] (capped, formatted)."""
+async def _query_body(request) -> tuple[dict, str]:
+    """Parse a query request body -> (body, query text); ValueError -> 400."""
+    body = await _json_body(request)
+    q = str(body.get("query") or "").strip()
+    if not q:
+        raise ValueError("query is required")
+    return body, q
+
+
+def _page_params(body: dict, default_limit: int) -> tuple[int, int]:
+    """(offset, limit) for a query request — validated, capped, defaulted.
+
+    ``limit`` defaults to the MCP series cap, so callers that never page keep
+    exactly today's API behavior; the console asks for PROM_UI_PAGE_SIZE. An
+    oversized limit is clamped (a cap, like max_series); a nonsensical
+    offset/limit is a 400 — silently snapping to row 0 would lie about which
+    rows the caller is looking at.
+    """
+    raw_offset = body.get("offset")
+    raw_limit = body.get("limit")
+    try:
+        offset = int(raw_offset) if raw_offset is not None else 0
+        limit = int(raw_limit) if raw_limit is not None else default_limit
+    except (TypeError, ValueError) as exc:
+        raise ValueError("offset and limit must be integers") from exc
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    return offset, min(limit, _UI_MAX_PAGE_SIZE)
+
+
+def _vec_rows(data: dict, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
+    """Instant-vector result -> [{series, value, ts}] (windowed, formatted).
+
+    ``limit=None`` keeps every row; the console passes its page window and
+    gets the full ``n_total`` back so it can size the pager.
+    """
     result = data.get("result", [])
+    window = result[offset:] if limit is None else result[offset : offset + limit]
     rows = []
-    for r in result[:cap]:
+    for r in window:
         value = r.get("value", [None, None])
         rows.append(
             {
@@ -748,15 +1007,62 @@ def _vec_rows(data: dict, cap: int) -> tuple[list[dict], int]:
     return rows, len(result)
 
 
-def _matrix_rows(data: dict, cap_series: int, cap_points: int) -> tuple[list[dict], int]:
-    """Range-vector result -> [{series, values: [[ts, v], ...]}] (capped +
+def _matrix_rows(data: dict, cap_points: int, offset: int = 0, limit: int | None = None) -> tuple[list[dict], int]:
+    """Range-vector result -> [{series, values: [[ts, v], ...]}] (windowed +
     downsampled, values formatted, ts as int epoch seconds for charting)."""
     result = data.get("result", [])
+    window = result[offset:] if limit is None else result[offset : offset + limit]
     rows = []
-    for r in result[:cap_series]:
+    for r in window:
         values = [[int(float(t)), format_value(v)] for t, v in _downsample(r.get("values", []), cap_points)]
         rows.append({"series": _series_id(r.get("metric")), "labels": r.get("metric", {}), "values": values})
     return rows, len(result)
+
+
+def _csv_series(metric: dict) -> str:
+    """One CSV series field, RFC-4180 quoted (embedded quotes doubled)."""
+    return '"' + _series_id(metric).replace('"', '""') + '"'
+
+
+def _csv_value(value: object) -> str:
+    """One CSV value cell, formatted exactly like the table (4 sig digits)."""
+    if value is None:
+        return ""
+    return str(format_value(str(value)))
+
+
+def _csv_vector_lines(data: dict) -> Iterable[str]:
+    """EVERY instant-query row as CSV: ``"series",value`` (no series cap).
+
+    The CSV is the page-free escape hatch: paging is a view, the export is
+    the data. Values keep the same rounding as the table.
+    """
+    for r in data.get("result", []):
+        value = r.get("value") or [None, None]
+        yield _csv_series(r.get("metric") or {}) + "," + _csv_value(value[1] if len(value) > 1 else None)
+
+
+def _csv_matrix_lines(data: dict, cap_points: int) -> Iterable[str]:
+    """EVERY range-query series as CSV: ``"series",ts,value,…`` (no series
+    cap; points keep the same shape-preserving downsample as the table)."""
+    for r in data.get("result", []):
+        points = _downsample(r.get("values", []), cap_points)
+        cells = ",".join(f"{int(float(t))},{_csv_value(v)}" for t, v in points)
+        yield _csv_series(r.get("metric") or {}) + ("," + cells if cells else "")
+
+
+def _csv_response(lines: Iterable[str], filename: str) -> StreamingResponse:
+    """Stream CSV rows (one line each) — the export has no page cap."""
+
+    def _body() -> Iterable[str]:
+        for line in lines:
+            yield line + "\n"
+
+    return StreamingResponse(
+        _body(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def build_ui_routes(client, config) -> list[Route]:
@@ -781,6 +1087,10 @@ def build_ui_routes(client, config) -> list[Route]:
                     "max_label_values": config.max_label_values,
                     "max_alerts": _MAX_ALERTS,
                     "max_rules": _MAX_RULES,
+                    # Console-only: rows per query page and the hard ceiling
+                    # the API will build. The MCP cap above is unchanged.
+                    "ui_page_size": _ui_page_size(),
+                    "ui_max_page_size": _UI_MAX_PAGE_SIZE,
                 },
             }
         )
@@ -811,7 +1121,7 @@ def build_ui_routes(client, config) -> list[Route]:
         async def card(card_query):
             _, query = card_query
             try:
-                rows, _total = _vec_rows(await instant(query), 1)
+                rows, _total = _vec_rows(await instant(query), limit=1)
                 return {"value": rows[0]["value"] if rows else None, "query": query}
             except Exception as exc:
                 return {"error": str(exc), "query": query}
@@ -819,7 +1129,7 @@ def build_ui_routes(client, config) -> list[Route]:
         async def top(top_query):
             _, query = top_query
             try:
-                rows, _total = _vec_rows(await instant(query), config.max_series)
+                rows, _total = _vec_rows(await instant(query), limit=config.max_series)
                 return {
                     "items": [{"label": _short_top_label(r["labels"]), "value": r["value"]} for r in rows],
                     "query": query,
@@ -834,7 +1144,7 @@ def build_ui_routes(client, config) -> list[Route]:
                 e = parse_timestamp("now")
                 step, clamp_notice = resolve_step("", s, e)
                 data = await client.range_query(query, s, e, step)
-                rows, _total = _matrix_rows(data, 5, config.max_points)
+                rows, _total = _matrix_rows(data, config.max_points, limit=5)
                 block = {"series": rows, "start": s, "end": e, "step": step, "query": query}
                 if clamp_notice:
                     block["step_notice"] = clamp_notice
@@ -907,6 +1217,73 @@ def build_ui_routes(client, config) -> list[Route]:
         if ttl > 0 and memoizable:
             _overview_cache[key] = (time.monotonic(), payload)
         return _mark_overview(payload, cached=False, age=0.0)
+
+    async def gpu_demand(_request):
+        """GPU allocation vs served demand per workload, over the demand windows.
+
+        Allocation is authoritative (kube-state-metrics). Demand is read from
+        whichever counter the workload's runtime actually exports; a runtime
+        with no counter yields no series and therefore null demand, which the
+        UI renders as a dash rather than 0. Fails soft per query, like /api/gpu.
+        """
+        errors: dict = {}
+
+        async def fetch_alloc():
+            try:
+                return await client.instant_query(_DEMAND_ALLOC_QUERY)
+            except Exception as exc:
+                errors["allocation"] = str(exc)
+                return None
+
+        async def fetch_family(runtime, _counter, template):
+            out: dict = {}
+            for window in _DEMAND_WINDOWS:
+                try:
+                    # .replace, NOT .format: the sglang template carries a
+                    # literal {exported_endpoint=~"..."} matcher, which
+                    # str.format() parses as a replacement field and raises
+                    # on -- silently dropping every SGLang workload to
+                    # "no counter" while the vLLM rows looked healthy.
+                    data = await client.instant_query(template.replace("{window}", window))
+                except Exception as exc:
+                    errors[f"{runtime}:{window}"] = str(exc)
+                    continue
+                for series in (data or {}).get("result", []) or []:
+                    labels = series.get("metric") or {}
+                    pod = labels.get("pod", "")
+                    if not pod:
+                        continue
+                    try:
+                        value = float(series["value"][1])
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                    key = (labels.get("namespace", ""), pod)
+                    out.setdefault(key, {})[window] = value
+            return runtime, out
+
+        async def fetch_util():
+            query = _DEMAND_UTIL_QUERY.replace("{window}", _DEMAND_UTIL_WINDOW)
+            try:
+                data = await client.instant_query(query)
+            except Exception as exc:
+                errors["util"] = str(exc)
+                return {}
+            out: dict = {}
+            for series in (data or {}).get("result", []) or []:
+                labels = series.get("metric") or {}
+                pod = labels.get("exported_pod", "")
+                if not pod:
+                    continue
+                try:
+                    value = float(series["value"][1])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                out[(labels.get("exported_namespace", ""), pod)] = value
+            return out
+
+        results = await asyncio.gather(fetch_alloc(), fetch_util(), *(fetch_family(*spec) for spec in _DEMAND_COUNTERS))
+        payload = _demand_snapshot(results[0], dict(results[2:]), _DEMAND_WINDOWS, errors, results[1])
+        return JSONResponse(payload)
 
     async def gpu(_request):
         """NVIDIA GPU (DCGM) aggregate: per-GPU + NVLink-domain + node views.
@@ -1062,23 +1439,23 @@ def build_ui_routes(client, config) -> list[Route]:
 
     async def query(request):
         try:
-            body = await _json_body(request)
+            body, q = await _query_body(request)
+            offset, limit = _page_params(body, config.max_series)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        q = str(body.get("query") or "").strip()
-        if not q:
-            return JSONResponse({"error": "query is required"}, status_code=400)
         try:
             ts = parse_timestamp(str(body.get("time") or "") or None)
             started = time.perf_counter()
             data = await client.instant_query(q, ts)
-            rows, total = _vec_rows(data, config.max_series)
+            rows, total = _vec_rows(data, offset, limit)
             return JSONResponse(
                 {
                     "resultType": "vector",
                     "result": rows,
                     "n_total": total,
                     "n_shown": len(rows),
+                    "offset": offset,
+                    "limit": limit,
                     "query": q,
                     "time": ts,
                     "duration_ms": int((time.perf_counter() - started) * 1000),
@@ -1089,26 +1466,41 @@ def build_ui_routes(client, config) -> list[Route]:
         except Exception as exc:
             return _err_payload(exc)
 
-    async def query_range(request):
+    async def query_csv(request):
+        """EVERY instant-query row as CSV — paging is a view, not the data."""
         try:
-            body = await _json_body(request)
+            body, q = await _query_body(request)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        q = str(body.get("query") or "").strip()
-        if not q:
-            return JSONResponse({"error": "query is required"}, status_code=400)
+        try:
+            ts = parse_timestamp(str(body.get("time") or "") or None)
+            data = await client.instant_query(q, ts)
+            return _csv_response(_csv_vector_lines(data), "query.csv")
+        except PrometheusError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        except Exception as exc:
+            return _err_payload(exc)
+
+    async def query_range(request):
+        try:
+            body, q = await _query_body(request)
+            offset, limit = _page_params(body, config.max_series)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         try:
             s = parse_timestamp(str(body.get("start") or "") or None) or parse_timestamp("now-1h")
             e = parse_timestamp(str(body.get("end") or "") or None) or parse_timestamp("now")
             step, clamp_notice = resolve_step(str(body.get("step") or ""), s, e)
             started = time.perf_counter()
             data = await client.range_query(q, s, e, step)
-            rows, total = _matrix_rows(data, config.max_series, config.max_points)
+            rows, total = _matrix_rows(data, config.max_points, offset, limit)
             payload = {
                 "resultType": "matrix",
                 "result": rows,
                 "n_total": total,
                 "n_shown": len(rows),
+                "offset": offset,
+                "limit": limit,
                 "start": s,
                 "end": e,
                 "step": step,
@@ -1118,6 +1510,23 @@ def build_ui_routes(client, config) -> list[Route]:
             if clamp_notice:
                 payload["step_notice"] = clamp_notice
             return JSONResponse(payload)
+        except PrometheusError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        except Exception as exc:
+            return _err_payload(exc)
+
+    async def query_range_csv(request):
+        """EVERY range-query series as CSV — paging is a view, not the data."""
+        try:
+            body, q = await _query_body(request)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            s = parse_timestamp(str(body.get("start") or "") or None) or parse_timestamp("now-1h")
+            e = parse_timestamp(str(body.get("end") or "") or None) or parse_timestamp("now")
+            step, _clamp_notice = resolve_step(str(body.get("step") or ""), s, e)
+            data = await client.range_query(q, s, e, step)
+            return _csv_response(_csv_matrix_lines(data, config.max_points), "query_range.csv")
         except PrometheusError as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
         except Exception as exc:
@@ -1169,11 +1578,14 @@ def build_ui_routes(client, config) -> list[Route]:
         Route("/api/status", status),
         Route("/api/overview", overview),
         Route("/api/gpu", gpu),
+        Route("/api/gpu/demand", gpu_demand),
         Route("/api/nodes", nodes),
         Route("/api/alerts", alerts),
         Route("/api/rules", rules),
         Route("/api/query", query, methods=["POST"]),
         Route("/api/query_range", query_range, methods=["POST"]),
+        Route("/api/query.csv", query_csv, methods=["POST"]),
+        Route("/api/query_range.csv", query_range_csv, methods=["POST"]),
         Route("/api/series", series),
         Route("/api/label_values", label_values),
     ]

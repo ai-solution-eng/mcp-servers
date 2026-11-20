@@ -39,7 +39,9 @@ GPU/NVLink view, query editor, alerts & rules) at `/`.
 - **Humans need the same data without writing PromQL.** The web console at
   `/` provides a dashboard, a per-GPU/NVLink fleet view (DCGM), a per-node
   CPU & memory capacity view, a query editor with charts, and an alerts &
-  rules browser — over the same client and caps as the tools.
+  rules browser — over the same client and shaping as the tools, with a
+  paged full-result query table (100 rows/page) and a page-free CSV export
+  for the rows a model's context could never hold.
 - **GPU fleet visibility.** The GPU tab groups each node's GPUs into NVLink
   islands, detected from the hardware by an optional DaemonSet (or pinned
   explicitly via `gpuNvlinkDomains`).
@@ -116,8 +118,9 @@ honest about being a declaration, not locking. →
 
 **The web console** — always served (no toggle by design), fails soft card
 by card, GPU/NVLink islands from hardware detection, node capacity bars
-against allocatable, query-editor deep links that ride the URL fragment
-(never the query string, so shared links leak nothing). →
+against allocatable, query tables that page the full result set (100
+rows/page, copy-everything CSV), query-editor deep links that ride the URL
+fragment (never the query string, so shared links leak nothing). →
 [FEATURES.md#web-console](documentation/FEATURES.md#web-console)
 
 **NVLink auto-detect DaemonSet** — `nvidia-smi topo -m` at GPU-node boot,

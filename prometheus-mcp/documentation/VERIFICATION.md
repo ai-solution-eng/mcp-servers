@@ -88,5 +88,5 @@ kubectl get authorizationpolicy -n istio-system   # when the auth gate is enable
 | 403 at the gateway on `/mcp` | `ezua.authorizationPolicy.enabled=true` | Present a valid PCAI token (`Authorization: Bearer ...`), or disable the gate |
 | GPU tab empty or "no GPU data" | No DCGM exporter on the cluster, or no GPU nodes | Expected on CPU-only clusters; the rest of the console keeps working |
 | NVLink domains show the built-in 4+4 default | Detector disabled or failing on that node (driver tree missing) | Check the detector pod logs; or pin `gpuNvlinkDomains` explicitly |
-| Responses look truncated (`… N more`) | Series/label-value caps (20 / 200 by design) | Narrow the PromQL selector rather than raising caps |
+| Tool responses look truncated (`… N more`) | LLM-context caps (20 series / 200 label values by design) | Narrow the PromQL selector; the console is not capped — it pages 100/page and its copy-CSV exports every row |
 | Range query slow or 504 | Window/step too wide for the timeout | Narrow the time range; the 660s VS timeout exists for wide windows |

@@ -23,10 +23,13 @@ Plus a small saved-query store around those same query paths (Wave-5 F4):
 
 The streamable-http transport ALSO serves an HPE-branded, read-only web
 UI at / (dashboard, PromQL query, alerts & rules, tool catalog) plus a
-JSON API under /api/* — a human front-end over the same client and caps
-that back these tools (see webui.py). The query editor supports
-shareable deep links: the expression + time range live in the URL
-fragment (#q=…&range=…), restored on load.
+JSON API under /api/* — a human front-end over the same client and
+shaping that back these tools (see webui.py). The console's query tables
+page through the FULL result set (PROM_UI_PAGE_SIZE, default 100) and its
+copy-CSV export always contains every series; the MCP tools keep their
+LLM-context caps. The query editor supports shareable deep links: the
+expression + time range live in the URL fragment (#q=…&range=…),
+restored on load.
 
 Configuration (environment variables):
   PROM_URL                  Prometheus base URL (default: the kube-prometheus-
@@ -37,6 +40,10 @@ Configuration (environment variables):
   PROM_MAX_POINTS           Max points per range series, shape-preserving
                             downsample (default 60)
   PROM_MAX_LABEL_VALUES     Max label values per response (default 200)
+  PROM_UI_PAGE_SIZE         Rows per page in the console's query tables
+                            (default 100; clamped to 1000). The MCP tools
+                            keep PROM_MAX_SERIES; the console pages the
+                            full result set and copies every row to CSV.
   PROM_BEARER_TOKEN_ENV     Env-var NAME holding a bearer token (optional;
                             the token value itself never appears in config)
   PROMETHEUS_MIN_STEP_SECONDS  Range-query step floor in seconds (Wave-4
@@ -85,8 +92,7 @@ from mcp_types import ToolAnnotations
 # src layout package.
 import mcp_auth
 
-from . import mcp_metrics
-from . import saved_queries
+from . import mcp_metrics, saved_queries
 from .prom_client import (
     PrometheusClient,
     PrometheusError,
@@ -120,6 +126,7 @@ print(
 # comma-separated keys = the rotation story.
 PROMETHEUS_API_KEYS_ENV = "PROMETHEUS_API_KEYS"
 AUTH_ENV_NAMES = (mcp_auth.UNIVERSAL_API_KEYS_ENV, PROMETHEUS_API_KEYS_ENV)
+
 
 # Transport security (DNS-rebinding Host allowlist) via the shared helper:
 # MCP_HOSTNAME pins the public FQDN (rendered by the chart from

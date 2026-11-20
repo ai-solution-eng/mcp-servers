@@ -150,6 +150,18 @@ def test_status_endpoint_reports_caps():
     assert data["caps"]["max_alerts"] == webui._MAX_ALERTS
 
 
+def test_status_reports_console_page_size(monkeypatch):
+    c = make_client()
+    monkeypatch.setenv("PROM_UI_PAGE_SIZE", "250")
+    caps = c.get("/api/status").json()["caps"]
+    assert caps["ui_page_size"] == 250
+    assert caps["ui_max_page_size"] == webui._UI_MAX_PAGE_SIZE
+    monkeypatch.setenv("PROM_UI_PAGE_SIZE", "999999")
+    assert c.get("/api/status").json()["caps"]["ui_page_size"] == webui._UI_MAX_PAGE_SIZE
+    monkeypatch.setenv("PROM_UI_PAGE_SIZE", "banana")
+    assert c.get("/api/status").json()["caps"]["ui_page_size"] == webui._UI_PAGE_SIZE_DEFAULT
+
+
 # ---------------------------------------------------------------------------
 # query endpoints (caps, validation, error mapping)
 # ---------------------------------------------------------------------------
@@ -160,9 +172,95 @@ def test_query_caps_series_and_formats():
     data = c.post("/api/query", json={"query": "up"}).json()
     assert data["resultType"] == "vector"
     assert data["n_total"] == 30 and data["n_shown"] == 5  # capped by config
+    # No explicit limit -> the MCP cap stays the API default (unchanged
+    # behavior for callers that never page); the console asks for its own.
+    assert data["offset"] == 0 and data["limit"] == 5
     assert data["result"][0]["series"] == "up{pod=p0}"
     assert data["result"][0]["value"] == "0"
     assert "duration_ms" in data
+
+
+def test_query_paginates_with_offset_and_limit():
+    c = make_client()
+    data = c.post("/api/query", json={"query": "up", "offset": 10, "limit": 5}).json()
+    assert data["n_total"] == 30 and data["n_shown"] == 5
+    assert data["offset"] == 10 and data["limit"] == 5
+    assert [r["series"] for r in data["result"]] == [f"up{{pod=p{i}}}" for i in range(10, 15)]
+
+
+def test_query_page_params_are_validated_and_capped():
+    c = make_client()
+    data = c.post("/api/query", json={"query": "up", "limit": 10**9}).json()
+    assert data["limit"] == webui._UI_MAX_PAGE_SIZE  # clamped, like max_series
+    assert data["n_shown"] == 30  # only 30 rows exist
+    for bad in ({"offset": -1}, {"limit": 0}, {"limit": "ten"}, {"offset": "x"}):
+        assert c.post("/api/query", json={"query": "up", **bad}).status_code == 400
+
+
+def test_query_range_paginates_series():
+    class ThreeSeries(StubClient):
+        async def range_query(self, query, start, end, step):
+            return {
+                "resultType": "matrix",
+                "result": [
+                    {"metric": {"__name__": "m", "pod": f"p{i}"}, "values": [["1757337600", str(i)]]} for i in range(3)
+                ],
+            }
+
+    cfg = PromConfig(base_url="http://prom.test:9090", max_series=1, max_points=10)
+    c = TestClient(Starlette(routes=webui.build_ui_routes(ThreeSeries(), cfg)))
+    data = c.post(
+        "/api/query_range",
+        json={"query": "m", "start": "1757337600", "end": "1757337700", "step": "15s", "offset": 1, "limit": 1},
+    ).json()
+    assert data["n_total"] == 3 and data["n_shown"] == 1
+    assert data["offset"] == 1 and data["limit"] == 1
+    assert [r["series"] for r in data["result"]] == ["m{pod=p1}"]
+
+
+def test_query_csv_exports_every_series_not_the_page():
+    c = make_client()
+    page = c.post("/api/query", json={"query": "up"}).json()
+    assert page["n_shown"] == 5  # the JSON page is capped by max_series ...
+    r = c.post("/api/query.csv", json={"query": "up", "offset": 10, "limit": 5})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert 'attachment; filename="query.csv"' in r.headers["content-disposition"]
+    lines = r.text.strip().split("\n")
+    assert len(lines) == 30  # ... the export is page-free: every row
+    assert lines[0] == '"up{pod=p0}",0'
+    assert lines[-1] == '"up{pod=p29}",29'
+
+
+def test_query_range_csv_exports_every_series_downsampled():
+    class ThreeSeries(StubClient):
+        async def range_query(self, query, start, end, step):
+            return {
+                "resultType": "matrix",
+                "result": [
+                    {
+                        "metric": {"__name__": "m", "pod": f"p{i}"},
+                        "values": [[str(1757337600 + j), str(j)] for j in range(1000)],
+                    }
+                    for i in range(3)
+                ],
+            }
+
+    cfg = PromConfig(base_url="http://prom.test:9090", max_series=1, max_points=10)
+    c = TestClient(Starlette(routes=webui.build_ui_routes(ThreeSeries(), cfg)))
+    r = c.post("/api/query_range.csv", json={"query": "m", "start": "1757337600", "end": "1757341200", "step": "1s"})
+    lines = r.text.strip().split("\n")
+    assert len(lines) == 3  # max_series=1 does not cap the export
+    first = lines[0].split(",")
+    assert first[0] == '"m{pod=p0}"'
+    assert len(first) == 1 + 2 * 10  # 10 downsampled points, each ts+value
+    assert first[1] == "1757337600" and first[-1] == "999"  # edges preserved
+
+
+def test_query_csv_requires_a_query():
+    c = make_client()
+    assert c.post("/api/query.csv", json={}).status_code == 400
+    assert c.post("/api/query_range.csv", json={}).status_code == 400
 
 
 def test_query_requires_query_param():
@@ -287,8 +385,13 @@ def test_overview_gpu_cards_and_top_workloads():
     data = c.get("/api/overview").json()
     # The stub returns raw series (it does not evaluate count()/avg()), so
     # assert structure + the exact canned query each card runs.
-    assert data["cards"]["gpu_count"]["query"] == "count(DCGM_FI_DEV_GPU_UTIL)"
-    assert data["cards"]["gpu_util_pct"]["query"] == "avg(DCGM_FI_DEV_GPU_UTIL)"
+    # Both cards must dedupe per physical GPU and ignore impossible samples:
+    # DCGM emits several series per GPU here, and this exporter occasionally
+    # reports a 0-100 gauge in the billions, so raw count()/avg() both lie.
+    assert data["cards"]["gpu_count"]["query"] == "count(count by (Hostname, device) (DCGM_FI_DEV_GPU_UTIL))"
+    assert data["cards"]["gpu_util_pct"]["query"] == (
+        "avg(avg by (Hostname, device) (DCGM_FI_DEV_GPU_UTIL and (DCGM_FI_DEV_GPU_UTIL < 101)))"
+    )
     assert "100 * sum(DCGM_FI_DEV_FB_USED)" in data["cards"]["gpu_mem_pct"]["query"]
     # top_gpu_mem aggregates by (exported_namespace, exported_pod); the stub
     # has neither, so the label falls back to the bare pod name
@@ -763,6 +866,41 @@ def test_ui_serves_nodes_tab_and_axis_fix():
     assert 'id="axis-core"' in html and "axisTicks" in html
 
 
+def test_ui_serves_paged_results_and_page_free_csv():
+    html = webui._load_html()
+    assert 'id="result-page-core"' in html and "pageWindow" in html
+    assert "PROM_UI_PAGE_SIZE" in html  # the page-size knob is documented in the JS
+    # the copy button exports through the page-free CSV endpoints
+    assert "/api/query.csv" in html and "/api/query_range.csv" in html
+    assert "copy CSV" in html
+
+
+def test_page_window_math():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available — the pure-JS block cannot be executed here")
+    m = re.search(r'<script id="result-page-core">(.*?)</script>', webui._load_html(), re.DOTALL)
+    assert m, "result-page-core block missing from the UI"
+    harness = (
+        "const a = pageWindow(654, 0, 100);\n"
+        "if (a.page !== 1 || a.pages !== 7 || a.first !== 1 || a.last !== 100) throw new Error('first page: ' + JSON.stringify(a));\n"
+        "const b = pageWindow(654, 600, 100);\n"
+        "if (b.page !== 7 || b.first !== 601 || b.last !== 654) throw new Error('last page: ' + JSON.stringify(b));\n"
+        "const c = pageWindow(0, 0, 100);\n"
+        "if (c.page !== 1 || c.pages !== 1 || c.first !== 0 || c.last !== 0) throw new Error('empty: ' + JSON.stringify(c));\n"
+        "const d = pageWindow(30, 10, 5);\n"
+        "if (d.page !== 3 || d.pages !== 6 || d.first !== 11 || d.last !== 15) throw new Error('offset: ' + JSON.stringify(d));\n"
+        "const e = pageWindow(100, 0, 100);\n"
+        "if (e.pages !== 1 || e.first !== 1 || e.last !== 100) throw new Error('exact page: ' + JSON.stringify(e));\n"
+        "const f = pageWindow(10, -5, 0);\n"
+        "if (f.offset !== 0 || f.limit !== 1 || f.pages !== 10 || f.page !== 1 || f.first !== 1 || f.last !== 1) throw new Error('defensive: ' + JSON.stringify(f));\n"
+        "console.log('PAGER-ALL-OK');\n"
+    )
+    proc = subprocess.run([node, "-e", m.group(1) + "\n" + harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "PAGER-ALL-OK" in proc.stdout
+
+
 def test_axis_ticks_escalate_precision_for_flat_series():
     node = shutil.which("node")
     if not node:
@@ -790,3 +928,290 @@ def test_axis_ticks_escalate_precision_for_flat_series():
     proc = subprocess.run([node, "-e", js + "\n" + harness], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
     assert "AXIS-ALL-OK" in proc.stdout
+
+
+# ---- /api/gpu/demand: GPU allocation vs served demand ----------------------
+
+
+class DemandClient(StubClient):
+    """Allocation + per-runtime counters, shaped like the live fleet.
+
+    alpha  two revisions of one InferenceService (must roll up), vLLM
+    beta   CPU-served, counter present and genuinely 0 (must stay 0, not null)
+    gamma  holds a GPU, runtime exports no counter (must be null, not 0)
+    nb-0   a notebook holding a GPU, no counter at all
+    """
+
+    async def instant_query(self, query, ts=None):
+        if "kube_pod_container_resource_requests" in query:
+            return {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {"namespace": "ns-a", "pod": "alpha-predictor-00001-deployment-7d9f-x1"},
+                        "value": [1, "2"],
+                    },
+                    {
+                        "metric": {"namespace": "ns-a", "pod": "alpha-predictor-00002-deployment-5c2b-x2"},
+                        "value": [1, "1"],
+                    },
+                    {
+                        "metric": {"namespace": "ns-b", "pod": "beta-predictor-00001-deployment-88aa-y1"},
+                        "value": [1, "0"],
+                    },
+                    {
+                        "metric": {"namespace": "ns-b", "pod": "gamma-predictor-00001-deployment-44bb-z1"},
+                        "value": [1, "1"],
+                    },
+                    {"metric": {"namespace": "ns-c", "pod": "nb-0"}, "value": [1, "1"]},
+                ],
+            }
+        if "vllm:request_success_total" in query:
+            rev1, rev2, beta = {"7d": ("100", "40", "0"), "14d": ("250", "90", "0")}["7d" if "[7d]" in query else "14d"]
+            return {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {"namespace": "ns-a", "pod": "alpha-predictor-00001-deployment-7d9f-x1"},
+                        "value": [1, rev1],
+                    },
+                    {
+                        "metric": {"namespace": "ns-a", "pod": "alpha-predictor-00002-deployment-5c2b-x2"},
+                        "value": [1, rev2],
+                    },
+                    {
+                        "metric": {"namespace": "ns-b", "pod": "beta-predictor-00001-deployment-88aa-y1"},
+                        "value": [1, beta],
+                    },
+                ],
+            }
+        return {"resultType": "vector", "result": []}
+
+
+def _demand_client():
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    return TestClient(Starlette(routes=webui.build_ui_routes(DemandClient(), cfg)))
+
+
+def test_demand_workload_of_rolls_up_revisions_and_pod_hashes():
+    assert webui._workload_of("qwen-38-27b-predictor-00003-deployment-5d577df8fc-vs9rt") == "qwen-38-27b"
+    assert webui._workload_of("nv-embedqa-e5-v5-predictor-00001-deployment-cfc8f5d79-74tzw") == "nv-embedqa-e5-v5"
+    # both revisions of one InferenceService collapse to the same workload name
+    assert (
+        webui._workload_of("alpha-predictor-00001-deployment-7d9f-x1")
+        == webui._workload_of("alpha-predictor-00002-deployment-5c2b-x2")
+        == "alpha"
+    )
+    assert webui._workload_of("nb-0") == "nb-0"
+
+
+def test_demand_rolls_revisions_up_and_attributes_runtime():
+    data = _demand_client().get("/api/gpu/demand").json()
+    by_name = {r["workload"]: r for r in data["workloads"]}
+    alpha = by_name["alpha"]
+    assert alpha["gpus"] == 3  # 2 + 1 across both revisions
+    assert alpha["requests"] == {"7d": 140.0, "14d": 340.0}
+    assert alpha["runtime"] == "vllm" and alpha["instrumented"] is True
+    # ordered by GPU count, so the GPU holders come first
+    assert data["workloads"][0]["workload"] == "alpha"
+
+
+def test_demand_missing_counter_is_null_never_zero():
+    data = _demand_client().get("/api/gpu/demand").json()
+    by_name = {r["workload"]: r for r in data["workloads"]}
+    # gamma holds a GPU but its runtime exports no request counter at all
+    gamma = by_name["gamma"]
+    assert gamma["gpus"] == 1
+    assert gamma["requests"] == {"7d": None, "14d": None}
+    assert gamma["runtime"] is None and gamma["instrumented"] is False
+    assert by_name["nb-0"]["requests"] == {"7d": None, "14d": None}
+    # beta genuinely served zero and reported it -- that zero must survive
+    assert by_name["beta"]["requests"] == {"7d": 0.0, "14d": 0.0}
+    assert by_name["beta"]["instrumented"] is True
+    s = data["summary"]
+    assert s["gpus_total"] == 5 and s["workloads"] == 4
+    assert s["uninstrumented"] == 2 and s["no_requests_7d"] == 1
+
+
+def test_demand_counter_query_failure_is_null_never_zero():
+    class Broken(StubClient):
+        async def instant_query(self, query, ts=None):
+            if "request_success_total" in query:
+                raise PrometheusError("query error: timeout")
+            return await DemandClient.instant_query(self, query, ts)
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    data = TestClient(Starlette(routes=webui.build_ui_routes(Broken(), cfg))).get("/api/gpu/demand").json()
+    by_name = {r["workload"]: r for r in data["workloads"]}
+    # a failed counter query means "unknown", never "served nothing"
+    assert by_name["alpha"]["requests"] == {"7d": None, "14d": None}
+    assert by_name["alpha"]["instrumented"] is False
+    assert "vllm:7d" in data["errors"]
+    assert data["summary"]["gpus_total"] == 5  # allocation still answers
+
+
+def test_demand_route_registered():
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    paths = {r.path for r in webui.build_ui_routes(DemandClient(), cfg)}
+    assert "/api/gpu/demand" in paths
+
+
+def test_ui_tab_selection_persists_through_refresh():
+    html = webui._load_html()
+    assert 'id="tab-core"' in html
+    # written on switch, restored on load, followed when the address bar changes
+    assert "writeTabHash" in html and "mergeTabHash" in html and "tabFromHash" in html
+    assert "hashchange" in html
+    # the restore paths must not echo their own write back into the fragment
+    assert "updateHash: false" in html
+    # running a query rewrites the fragment, so it must carry the tab along
+    assert "mergeTabHash(frag" in html
+
+
+def test_tab_hash_merge_preserves_deep_links():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available - the pure-JS block cannot be executed here")
+    m = re.search(r'<script id="tab-core">(.*?)</script>', webui._load_html(), re.DOTALL)
+    assert m, "tab-core block missing from the UI"
+    harness = (
+        "if (mergeTabHash('', 'gpu') !== '#tab=gpu') throw new Error('empty: ' + mergeTabHash('', 'gpu'));\n"
+        "if (mergeTabHash('#', 'gpu') !== '#tab=gpu') throw new Error('bare: ' + mergeTabHash('#', 'gpu'));\n"
+        "if (mergeTabHash('#tab=nodes', 'gpu') !== '#tab=gpu') throw new Error('replace: ' + mergeTabHash('#tab=nodes', 'gpu'));\n"
+        "if (mergeTabHash('#q=up&range=now', 'gpu') !== '#q=up&range=now&tab=gpu') throw new Error('preserve: ' + mergeTabHash('#q=up&range=now', 'gpu'));\n"
+        "const once = mergeTabHash('#q=up&range=now-6h..now', 'gpu');\n"
+        "if (once !== '#q=up&range=now-6h..now&tab=gpu') throw new Error('range: ' + once);\n"
+        "if (mergeTabHash(once, 'gpu') !== once) throw new Error('must be idempotent');\n"
+        "if (tabFromHash('#tab=gpu') !== 'gpu') throw new Error('read');\n"
+        "if (tabFromHash('#q=up&range=now&tab=nodes') !== 'nodes') throw new Error('read mixed');\n"
+        "if (tabFromHash('') !== null || tabFromHash('#q=up&range=now') !== null) throw new Error('absent');\n"
+        "console.log('TAB-ALL-OK');\n"
+    )
+    proc = subprocess.run([node, "-e", m.group(1) + "\n" + harness], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "TAB-ALL-OK" in proc.stdout
+
+
+def test_demand_sglang_family_survives_the_promql_braces():
+    """Regression: str.format() ate the SGLang matcher's literal braces.
+
+    The sglang template carries {exported_endpoint=~"..."}, which str.format()
+    parsed as a replacement field and raised on. The per-family try/except
+    swallowed it, so every SGLang workload reported "no counter" while the
+    vLLM rows looked healthy -- an idle-looking panel over a busy runtime.
+    """
+    seen = []
+
+    class Recorder(StubClient):
+        async def instant_query(self, query, ts=None):
+            seen.append(query)
+            if "sglang:http_requests_total" in query:
+                return {
+                    "resultType": "vector",
+                    "result": [
+                        {
+                            "metric": {
+                                "namespace": "ns-a",
+                                "pod": "deepseek-predictor-00001-deployment-abc-1",
+                            },
+                            "value": [1, "14760"],
+                        }
+                    ],
+                }
+            return {"resultType": "vector", "result": []}
+
+    cfg = PromConfig(base_url="http://prom.test:9090")
+    data = TestClient(Starlette(routes=webui.build_ui_routes(Recorder(), cfg))).get("/api/gpu/demand").json()
+
+    sglang_queries = [q for q in seen if "sglang:http_requests_total" in q]
+    assert len(sglang_queries) == 2  # one per window
+    assert not [q for q in seen if "{window}" in q]  # every template substituted
+    assert any("[7d]" in q and 'exported_endpoint=~"/v1/chat/completions' in q for q in sglang_queries)
+    assert not [k for k in data["errors"] if k.startswith("sglang:")]
+    row = {r["workload"]: r for r in data["workloads"]}["deepseek"]
+    assert row["runtime"] == "sglang"
+    assert row["requests"]["7d"] == 14760.0
+    assert row["instrumented"] is True
+
+
+def test_demand_names_vllm_omni_rather_than_mixed():
+    pod = "tts-predictor-00001-deployment-aa-1"
+    alloc = {"result": [{"metric": {"namespace": "ns-a", "pod": pod}, "value": [1, "1"]}]}
+    counters = {
+        "vllm": {("ns-a", pod): {"7d": 0.0, "14d": 0.0}},
+        "vllm_omni": {("ns-a", pod): {"7d": 81.0, "14d": 81.0}},
+    }
+    snap = webui._demand_snapshot(alloc, counters, ("7d", "14d"))
+    row = snap["workloads"][0]
+    assert row["runtime"] == "vllm_omni"  # the specific runtime, not "mixed"
+    assert row["requests"]["7d"] == 81.0  # both families still sum
+
+
+def test_demand_drops_rows_with_neither_gpu_nor_counter():
+    alloc = {
+        "result": [
+            {"metric": {"namespace": "ns-a", "pod": "comfyui-abc-1"}, "value": [1, "0"]},
+            {
+                "metric": {"namespace": "ns-a", "pod": "real-predictor-00001-deployment-zz-9"},
+                "value": [1, "1"],
+            },
+        ]
+    }
+    snap = webui._demand_snapshot(alloc, {}, ("7d", "14d"))
+    assert [r["workload"] for r in snap["workloads"]] == ["real"]
+
+
+def test_demand_attributes_utilization_only_where_a_gpu_is_allocated():
+    gpu_pod = "alpha-predictor-00001-deployment-7d9f-x1"
+    cpu_pod = "beta-predictor-00001-deployment-88aa-y1"
+    alloc = {
+        "result": [
+            {"metric": {"namespace": "ns-a", "pod": gpu_pod}, "value": [1, "2"]},
+            {"metric": {"namespace": "ns-a", "pod": cpu_pod}, "value": [1, "0"]},
+        ]
+    }
+    # beta is CPU-served but still reports requests, so it survives the
+    # "no GPU and no counter" filter -- exactly like sms-gemma live, which
+    # carries a stale DCGM utilization reading despite holding zero GPUs.
+    counters = {"vllm": {("ns-a", cpu_pod): {"7d": 202.0, "14d": 202.0}}}
+    util = {("ns-a", gpu_pod): 41.5, ("ns-a", cpu_pod): 90.0}
+    snap = webui._demand_snapshot(alloc, counters, ("7d", "14d"), util=util)
+    rows = {r["workload"]: r for r in snap["workloads"]}
+    assert rows["alpha"]["util_7d"] == 41.5
+    # DCGM's exported_pod attribution goes stale; a 0-GPU pod must not
+    # inherit a utilization reading it cannot have.
+    assert rows["beta"]["util_7d"] is None
+
+
+def test_demand_utilization_averages_a_workloads_gpus():
+    pod_a = "twin-predictor-00001-deployment-aa-1"
+    pod_b = "twin-predictor-00001-deployment-bb-2"
+    alloc = {
+        "result": [
+            {"metric": {"namespace": "ns-a", "pod": pod_a}, "value": [1, "2"]},
+            {"metric": {"namespace": "ns-a", "pod": pod_b}, "value": [1, "2"]},
+        ]
+    }
+    util = {("ns-a", pod_a): 10.0, ("ns-a", pod_b): 50.0}
+    snap = webui._demand_snapshot(alloc, {}, ("7d", "14d"), util=util)
+    row = snap["workloads"][0]
+    assert row["workload"] == "twin" and row["gpus"] == 4
+    assert row["util_7d"] == 30.0  # mean across its two pods
+
+
+def test_ui_demand_table_shows_utilization():
+    html = webui._load_html()
+    assert 'label: "util 7d"' in html
+    assert "util_7d" in html
+
+
+def test_ui_sidebar_is_collapsible_and_remembers_state():
+    html = webui._load_html()
+    assert 'id="sidebar-toggle"' in html
+    assert 'aria-controls="sidebar"' in html and "aria-expanded" in html
+    assert 'id="sidebar"' in html
+    # the preference is persisted the same way the theme is
+    assert "prometheus-sidebar-collapsed" in html
+    assert "Ctrl+B" in html
+    # collapsed must leave the tab order, not merely leave the viewport
+    assert "visibility: hidden" in html
